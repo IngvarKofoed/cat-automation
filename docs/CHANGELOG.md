@@ -33,3 +33,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
    `/api/cameras` lists detected CSI cameras. Picamera2 is apt-only, so the Pi venv
    needs `--system-site-packages` (`EDGE_VENV_SYSTEM_SITE_PACKAGES=1 ./edge.sh`).
 
+7. `edge.sh` now enables the venv's `--system-site-packages` automatically on Linux
+   (so the Pi can import apt's picamera2), off elsewhere, and rebuilds the venv when
+   that setting changes — no more manual `rm -rf .venv` or env var on the Pi. The
+   `EDGE_VENV_SYSTEM_SITE_PACKAGES` var remains as an override.
+

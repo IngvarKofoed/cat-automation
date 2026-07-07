@@ -149,6 +149,54 @@ def test_cameras_lists_structural_entries(client):
         assert "label" in entry
 
 
+def test_cameras_includes_detected_csi(client, monkeypatch):
+    # When Picamera2 reports CSI cameras on Linux, they appear in the list.
+    from edge.server import app as appmod
+
+    monkeypatch.setattr(appmod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(appmod, "_list_v4l2_cameras", lambda: [])
+    monkeypatch.setattr(
+        appmod, "_list_csi_cameras",
+        lambda: [{"device": "csi:0", "label": "Pi Camera CSI 0 (imx708)"}],
+    )
+    devices = [c["device"] for c in client.get("/api/cameras").get_json()["cameras"]]
+    assert "csi:0" in devices
+
+
+# --- capture-source factory routing ---
+
+
+def test_factory_routes_csi_to_picamera():
+    from edge.capture.factory import create_source
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    assert isinstance(create_source("csi:0"), PicameraCaptureSource)
+    assert isinstance(create_source("csi"), PicameraCaptureSource)
+
+
+def test_factory_routes_index_and_path_to_opencv():
+    from edge.capture.factory import create_source
+    from edge.capture.opencv_source import OpenCVCaptureSource
+
+    assert isinstance(create_source(0), OpenCVCaptureSource)
+    assert isinstance(create_source("/dev/video0"), OpenCVCaptureSource)
+
+
+def test_picamera_read_without_picamera2_raises_captureerror():
+    # On a non-Pi dev box picamera2 is absent, so read() must surface a clean
+    # CaptureError (the ImportError is caught), never crash.
+    try:
+        import picamera2  # noqa: F401
+
+        pytest.skip("picamera2 is installed; this checks the absent-dependency path")
+    except ImportError:
+        pass
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    with pytest.raises(CaptureError):
+        PicameraCaptureSource(0).read()
+
+
 # --- / (config UI) ---
 
 

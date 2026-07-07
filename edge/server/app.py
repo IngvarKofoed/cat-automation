@@ -17,7 +17,7 @@ import cv2
 from flask import Flask, jsonify, request, send_from_directory
 
 from edge.capture.base import CaptureError, CaptureSource
-from edge.capture.opencv_source import OpenCVCaptureSource
+from edge.capture.factory import create_source
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 
 SourceFactory = Callable[["int | str"], CaptureSource]
@@ -39,6 +39,37 @@ def _coerce_device(device: "int | str") -> "int | str":
     raise ValueError("device must be an int or a non-empty string")
 
 
+def _list_v4l2_cameras() -> "list[dict]":
+    """USB/UVC and other V4L2 capture nodes on Linux."""
+    return [{"device": path, "label": path} for path in sorted(glob.glob("/dev/video*"))]
+
+
+def _list_csi_cameras() -> "list[dict]":
+    """Pi CSI cameras detected via Picamera2, or [] if unavailable (not a Pi)."""
+    try:
+        from picamera2 import Picamera2
+
+        infos = Picamera2.global_camera_info()
+    except Exception:  # noqa: BLE001 - picamera2 absent / not a Pi / libcamera error
+        return []
+    entries = []
+    for i, info in enumerate(infos):
+        model = info.get("Model", "camera") if isinstance(info, dict) else "camera"
+        entries.append({"device": f"csi:{i}", "label": f"Pi Camera CSI {i} ({model})"})
+    return entries
+
+
+def _enumerate_cameras() -> "list[dict]":
+    """Selectable cameras for this host — OS-specific (see the MVP spec)."""
+    system = platform.system()
+    if system == "Darwin":
+        return [{"device": 0, "label": "Built-in webcam (0)"}]
+    if system == "Linux":
+        # CSI first — it's the intended door camera when present.
+        return _list_csi_cameras() + _list_v4l2_cameras()
+    return []
+
+
 def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
     """Build the Flask app.
 
@@ -48,7 +79,7 @@ def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
     camera. No camera is opened here — the OpenCV source opens lazily on first
     read.
     """
-    factory: SourceFactory = source_factory or OpenCVCaptureSource
+    factory: SourceFactory = source_factory or create_source
 
     app = Flask(__name__)
 
@@ -131,17 +162,7 @@ def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
 
     @app.get("/api/cameras")
     def cameras():
-        system = platform.system()
-        if system == "Darwin":
-            entries = [{"device": 0, "label": "Built-in webcam (0)"}]
-        elif system == "Linux":
-            entries = [
-                {"device": path, "label": path}
-                for path in sorted(glob.glob("/dev/video*"))
-            ]
-        else:
-            entries = []
-        return jsonify(cameras=entries)
+        return jsonify(cameras=_enumerate_cameras())
 
     return app
 

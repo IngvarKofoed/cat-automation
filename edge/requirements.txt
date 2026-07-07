@@ -1,2 +1,5 @@
 flask
 opencv-python-headless
+# Pi CSI camera (Picamera2) is NOT pip-installed: `sudo apt install python3-picamera2`
+# and build the venv with --system-site-packages (see edge.sh). USB cameras need
+# nothing beyond the two deps above.

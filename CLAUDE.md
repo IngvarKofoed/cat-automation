@@ -54,11 +54,11 @@ Once the fixes are applied, report what changed:
 
 When you fan a task out across subagents — the Workflow tool ("ultracode") — tier each agent's model and reasoning effort to the work, so cost tracks value instead of every agent defaulting to the strongest (most expensive) model:
 
-- **Strongest model** (the session model) — contracts, correctness-critical implementation, adversarial review, per-finding verification, final synthesis. Never downgrade these; they are where quality is won or lost.
-- **Mid model** — build/test runners and straightforward mechanical implementation.
+- **Strongest model** (the session model) — contracts, correctness-critical implementation, adversarial review, and final synthesis. Never downgrade these; they are where quality is won or lost.
+- **Mid model** — build/test runners, straightforward mechanical implementation, and verifying concrete already-stated findings or applying decided fixes.
 - **Cheapest model + low effort** — docs/changelog, i18n, styling, and other boilerplate.
 
-The guardrail: only the mechanical stages get a cheaper model — the stages that *catch* problems stay strong. Set this per `agent()` call (`model` / `effort`); an agent that omits `model` inherits the session model, which is why an untiered fan-out silently runs everything on the most expensive tier. This section is inert unless you actually run a multi-agent workflow.
+The guardrail: the stage that *catches* problems (adversarial review) stays strong; the stages that merely *check* an already-caught finding (per-finding verification) drop a tier — unless the finding is subtle or security-/data-integrity-critical, where verification stays strong. Set this per `agent()` call (`model` / `effort`); an agent that omits `model` inherits the session model, which is why an untiered fan-out silently runs everything on the most expensive tier. This section is inert unless you actually run a multi-agent workflow.
 
 ## Git workflow
 

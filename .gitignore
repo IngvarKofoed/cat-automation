@@ -11,5 +11,8 @@ venv/
 # OS
 .DS_Store
 
+# Edge runtime settings (per docs/ARCHITECTURE.md — not committed)
+edge/config/settings.json
+
 # Model artifacts and captured media are not committed (see docs/ARCHITECTURE.md).
 # Add scoped ignores under compute/models and compute/dataset once they hold artifacts.

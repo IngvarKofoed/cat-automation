@@ -8,3 +8,18 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
    Framed as an early prototype on a trusted LAN: no auth between components, and door actuation
    plus its access-decision policy are deferred to a later phase.
 
+2. Edge tier first slice: Flask `/frame` (JPEG q90), config UI with Capture button, API (GET /api/cameras, GET|POST /api/config).
+   Pluggable CaptureSource (edge/capture/) with OpenCV backend; device id opaque (int or /dev/video* path) avoids lossy conversion.
+   FakeCaptureSource for tests. Persistent capture self-heals on failure; device switches new-before-close under lock.
+
+3. `POST /api/config` now returns 422 (not 503) when the candidate device fails to open.
+   503 stays reserved for `/frame`'s already-working camera failing at read time; a rejected
+   device selection is a client-input problem, not a service outage — per the MVP spec.
+
+4. Edge hardened after code review. A hand-edited or corrupt `settings.json` can no longer
+   crash boot: invalid or non-object values fall back to defaults, and `POST /api/config`
+   rejects a non-object body with 400 (was 500). Device switch now persists *before* the
+   in-memory swap and outside the slot lock, so a failed write can't leak the old capture
+   handle or diverge live-vs-saved state. Config UI always shows the active device even when
+   enumeration omits it (default index 0 vs Linux `/dev/video*`).
+

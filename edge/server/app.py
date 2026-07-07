@@ -18,6 +18,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.factory import create_source
+from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 
 SourceFactory = Callable[["int | str"], CaptureSource]
@@ -37,6 +38,31 @@ def _coerce_device(device: "int | str") -> "int | str":
     if isinstance(device, str) and device:
         return int(device) if device.isdigit() else device
     raise ValueError("device must be an int or a non-empty string")
+
+
+def _valid_rotation(rotation) -> bool:
+    """True if `rotation` is one of the accepted clockwise angles."""
+    return rotation in (0, 90, 180, 270)
+
+
+def _valid_clip(clip) -> bool:
+    """True if `clip` is None (no crop) or a well-formed normalized rect.
+
+    A rect is {x, y, w, h} with numeric values, 0<=x, 0<=y, w>0, h>0, and the
+    box fully inside the frame (x+w<=1, y+h<=1).
+    """
+    if clip is None:
+        return True
+    if not isinstance(clip, dict):
+        return False
+    try:
+        x, y, w, h = clip["x"], clip["y"], clip["w"], clip["h"]
+    except (KeyError, TypeError):
+        return False
+    for v in (x, y, w, h):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+    return x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1 and y + h <= 1
 
 
 def _list_v4l2_cameras() -> "list[dict]":
@@ -86,13 +112,21 @@ def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
     # The current-source slot: source + its device id, guarded by one lock.
     # /frame reads under the lock; POST /api/config swaps under it.
     lock = threading.Lock()
+    settings = load_settings()
     try:
-        device = _coerce_device(load_settings()["device"])
+        device = _coerce_device(settings["device"])
     except (ValueError, TypeError):
         # A hand-edited settings.json may hold a parseable-but-invalid device
         # (null, "", a float). Fall back to the default rather than crash boot.
         device = _coerce_device(DEFAULTS["device"])
-    state = {"source": factory(device), "device": device}
+    # rotation/clip need no validation at load: the transform functions are
+    # fail-safe, so a bad stored value degrades to 0°/full-frame at render time.
+    state = {
+        "source": factory(device),
+        "device": device,
+        "rotation": settings["rotation"],
+        "clip": settings["clip"],
+    }
 
     @app.get("/")
     def index():
@@ -100,14 +134,21 @@ def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
 
     @app.get("/frame")
     def frame():
+        # raw is on when the param is present and truthy: raw preview skips the
+        # crop (oriented but uncropped) so the UI can drag the ROI on it.
+        raw = request.args.get("raw") not in (None, "", "0", "false")
         with lock:
             source: CaptureSource = state["source"]
+            rotation, clip = state["rotation"], state["clip"]
             try:
                 img = source.read()
             except CaptureError as e:
                 return jsonify(error=str(e)), 503
-        # Encode outside the lock — it works on the already-captured frame, so it
-        # needn't serialize other reads or block a device swap.
+        # Transform + encode outside the lock — they work on the already-captured
+        # frame, so they needn't serialize other reads or block a device swap.
+        img = rotate(img, rotation)
+        if not raw:
+            img = crop(img, clip)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if not ok:
             return jsonify(error="failed to encode frame"), 500
@@ -116,49 +157,86 @@ def create_app(source_factory: "SourceFactory | None" = None) -> Flask:
     @app.get("/api/config")
     def get_config():
         with lock:
-            return jsonify(device=state["device"])
+            return jsonify(
+                device=state["device"],
+                rotation=state["rotation"],
+                clip=state["clip"],
+            )
 
     @app.post("/api/config")
     def set_config():
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             # Missing, non-JSON, or valid-but-non-object body (5, "x", [] …):
-            # fall through to the device check so it's a clean 400, not a 500.
+            # treat as empty so it becomes a clean 400, not a 500.
             body = {}
-        try:
-            device = _coerce_device(body.get("device"))
-        except (ValueError, TypeError):
-            return jsonify(error="device must be an int or a non-empty string"), 400
+        if not any(k in body for k in ("device", "rotation", "clip")):
+            return jsonify(error="config must set at least one of device, rotation, clip"), 400
 
-        # Build and validate the candidate OUTSIDE the lock (a real open is slow).
-        candidate = factory(device)
-        try:
-            candidate.read()
-        except CaptureError as e:
-            candidate.close()
-            # 4xx (not /frame's 503): the client picked a device that doesn't
-            # work, distinct from a previously-working camera failing at read
-            # time. Per docs/specs/2026-07-07-edge-stills-mvp.md.
-            return jsonify(error=str(e)), 422
+        # Validate every present field BEFORE any camera work; 400 on the first bad
+        # one. device is now optional (the UI sends rotation-only / clip-only POSTs).
+        device = None
+        if "device" in body:
+            try:
+                device = _coerce_device(body["device"])
+            except (ValueError, TypeError):
+                return jsonify(error="device must be an int or a non-empty string"), 400
+        if "rotation" in body and not _valid_rotation(body["rotation"]):
+            return jsonify(error="rotation must be one of 0, 90, 180, 270"), 400
+        if "clip" in body and not _valid_clip(body["clip"]):
+            return jsonify(error="clip must be null or a normalized rect within the frame"), 400
 
-        # Persist BEFORE swapping: if the write fails, the live source and the
-        # saved config still agree (both unchanged) instead of diverging, and the
-        # old handle is never leaked mid-swap. Outside the lock so the disk write
-        # doesn't stall concurrent /frame reads.
+        # Snapshot the current config to overlay the present fields onto and to
+        # detect whether the device actually changes.
+        cur_device = state["device"]
+        cur_rotation = state["rotation"]
+        cur_clip = state["clip"]
+
+        # Build+validate a new source only when the device changes (a real open is
+        # slow, so do it OUTSIDE the lock).
+        device_changed = "device" in body and device != cur_device
+        candidate = None
+        if device_changed:
+            candidate = factory(device)
+            try:
+                candidate.read()
+            except CaptureError as e:
+                candidate.close()
+                # 4xx (not /frame's 503): the client picked a device that doesn't
+                # work, distinct from a previously-working camera failing at read
+                # time. Per docs/specs/2026-07-07-edge-stills-mvp.md.
+                return jsonify(error=str(e)), 422
+
+        # Assemble the COMPLETE next config from the current state overlaid with the
+        # present fields, and persist it BEFORE swapping. save_settings overwrites
+        # the whole file, so it must get the full dict — a single key would wipe the
+        # others (e.g. changing the camera would erase a saved ROI/rotation). If the
+        # write fails, the live source and the saved config still agree (unchanged).
+        next_config = {
+            "device": device if "device" in body else cur_device,
+            "rotation": body["rotation"] if "rotation" in body else cur_rotation,
+            "clip": body["clip"] if "clip" in body else cur_clip,
+        }
         try:
-            save_settings({"device": device})
+            save_settings(next_config)
         except OSError as e:
-            candidate.close()
+            if candidate is not None:
+                candidate.close()
             return jsonify(error=f"failed to persist config: {e}"), 500
 
-        # New-before-close: a fast pointer swap under the lock, then close the
-        # old source outside it.
+        # New-before-close: a fast pointer swap under the lock (only if the device
+        # changed), plus the transform params; then close the old source outside it.
         with lock:
-            old = state["source"]
-            state["source"] = candidate
-            state["device"] = device
-        old.close()
-        return jsonify(device=device)
+            old = None
+            if device_changed:
+                old = state["source"]
+                state["source"] = candidate
+                state["device"] = device
+            state["rotation"] = next_config["rotation"]
+            state["clip"] = next_config["clip"]
+        if old is not None:
+            old.close()
+        return jsonify(next_config)
 
     @app.get("/api/cameras")
     def cameras():

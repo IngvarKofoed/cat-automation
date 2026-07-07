@@ -1,16 +1,20 @@
 """Tests for the edge Flask app (edge/server/app.py), against FakeCaptureSource.
 
 No real camera or settings.json is touched: CAT_EDGE_CONFIG is pointed at a
-tmp file for every test. See docs/specs/2026-07-07-edge-stills-mvp.md.
+tmp file for every test. See docs/specs/2026-07-07-edge-stills-mvp.md and
+docs/specs/2026-07-07-edge-clip-rotation.md.
 """
 from __future__ import annotations
 
 import json
 
+import cv2
+import numpy as np
 import pytest
 
 from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.fake_source import FakeCaptureSource
+from edge.clip.transform import crop, rotate
 from edge.config import settings
 from edge.server.app import create_app
 
@@ -73,7 +77,7 @@ def test_frame_returns_jpeg(client):
 def test_get_config_returns_default_device(client):
     resp = client.get("/api/config")
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0}
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
 
 
 # --- POST /api/config: valid device ---
@@ -82,10 +86,10 @@ def test_get_config_returns_default_device(client):
 def test_post_config_valid_device_updates_and_persists(client, config_path):
     resp = client.post("/api/config", json={"device": 1})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 1}
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None}
 
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 1}
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None}
 
     assert settings.load_settings()["device"] == 1
     saved = json.loads(config_path.read_text())
@@ -129,7 +133,7 @@ def test_post_config_source_open_failure_keeps_previous(config_path):
 
     # Previous source/device is kept.
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 0}
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
 
     # Nothing was ever persisted for the failed switch.
     assert not config_path.exists()
@@ -232,9 +236,185 @@ def test_create_app_bad_persisted_device_does_not_crash(config_path):
     app = create_app(source_factory=FakeCaptureSource)  # must not raise
     resp = app.test_client().get("/api/config")
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0}  # fell back to the default
+    # fell back to the default device; rotation/clip default too
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
 
 
 def test_save_settings_then_load_settings_roundtrips(config_path):
-    settings.save_settings({"device": "/dev/video0"})
-    assert settings.load_settings() == {"device": "/dev/video0"}
+    full = {"device": "/dev/video0", "rotation": 90, "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}}
+    settings.save_settings(full)
+    assert settings.load_settings() == full
+
+
+# --- edge/clip/transform.py: rotate() ---
+
+
+def test_rotate_90_swaps_width_and_height():
+    frame = FakeCaptureSource().read()
+    assert frame.shape == (240, 320, 3)
+    assert rotate(frame, 90).shape == (320, 240, 3)
+
+
+def test_rotate_180_keeps_dimensions():
+    frame = FakeCaptureSource().read()
+    assert rotate(frame, 180).shape == (240, 320, 3)
+
+
+def test_rotate_0_returns_unchanged():
+    frame = FakeCaptureSource().read()
+    result = rotate(frame, 0)
+    assert result.shape == (240, 320, 3)
+    assert np.array_equal(result, frame)
+
+
+def test_rotate_unknown_degrees_returns_unchanged():
+    # Fail-safe: an unrecognized angle is treated like 0.
+    frame = FakeCaptureSource().read()
+    result = rotate(frame, 45)
+    assert result.shape == (240, 320, 3)
+    assert np.array_equal(result, frame)
+
+
+# --- edge/clip/transform.py: crop() ---
+
+
+def test_crop_half_rect_returns_quarter_area():
+    frame = FakeCaptureSource().read()
+    result = crop(frame, {"x": 0, "y": 0, "w": 0.5, "h": 0.5})
+    assert result.shape == (120, 160, 3)
+
+
+def test_crop_none_clip_returns_unchanged():
+    frame = FakeCaptureSource().read()
+    result = crop(frame, None)
+    assert result.shape == (240, 320, 3)
+    assert np.array_equal(result, frame)
+
+
+def test_crop_empty_region_returns_unchanged():
+    # Fail-safe: a zero-area or malformed/empty clip falls back to the full frame.
+    frame = FakeCaptureSource().read()
+    assert np.array_equal(crop(frame, {"x": 0, "y": 0, "w": 0, "h": 0}), frame)
+    assert np.array_equal(crop(frame, {}), frame)
+
+
+# --- POST /api/config: rotation-only ---
+
+
+def test_post_config_rotation_updates_without_device_change(client, config_path):
+    resp = client.post("/api/config", json={"rotation": 90})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None}
+
+    resp = client.get("/api/config")
+    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None}
+
+    saved = json.loads(config_path.read_text())
+    assert saved == {"device": 0, "rotation": 90, "clip": None}
+
+
+# --- POST /api/config: clip-only ---
+
+
+def test_post_config_clip_updates_and_persists(client, config_path):
+    clip = {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
+    resp = client.post("/api/config", json={"clip": clip})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": clip}
+
+    resp = client.get("/api/config")
+    assert resp.get_json()["clip"] == clip
+
+    saved = json.loads(config_path.read_text())
+    assert saved["clip"] == clip
+
+
+def test_post_config_clip_null_clears(client, config_path):
+    clip = {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
+    client.post("/api/config", json={"clip": clip})
+
+    resp = client.post("/api/config", json={"clip": None})
+    assert resp.status_code == 200
+    assert resp.get_json()["clip"] is None
+
+    resp = client.get("/api/config")
+    assert resp.get_json()["clip"] is None
+
+
+# --- POST /api/config: rotation/clip validation ---
+
+
+def test_post_config_invalid_rotation_is_400(client):
+    resp = client.post("/api/config", json={"rotation": 45})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_post_config_invalid_clip_is_400(client):
+    resp = client.post("/api/config", json={"clip": {"x": 0, "y": 0, "w": 2, "h": 1}})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_post_config_empty_body_is_400(client):
+    # None of device/rotation/clip present.
+    resp = client.post("/api/config", json={})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+# --- POST /api/config: a device change must not wipe rotation/clip ---
+
+
+def test_post_config_device_change_preserves_clip(client, config_path):
+    clip = {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+    resp = client.post("/api/config", json={"clip": clip})
+    assert resp.status_code == 200
+
+    resp = client.post("/api/config", json={"device": 1})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": clip}
+
+    saved = json.loads(config_path.read_text())
+    assert saved["device"] == 1
+    assert saved["clip"] == clip
+
+
+# --- /frame: rotation + clip end-to-end ---
+
+
+def _decode_jpeg(data: bytes) -> np.ndarray:
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def test_frame_applies_configured_rotation(client):
+    resp = client.post("/api/config", json={"rotation": 90})
+    assert resp.status_code == 200
+
+    resp = client.get("/frame")
+    assert resp.status_code == 200
+    img = _decode_jpeg(resp.data)
+    assert img.shape == (320, 240, 3)
+
+
+def test_frame_applies_configured_clip(client):
+    resp = client.post("/api/config", json={"clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}})
+    assert resp.status_code == 200
+
+    resp = client.get("/frame")
+    assert resp.status_code == 200
+    img = _decode_jpeg(resp.data)
+    assert img.shape[0] < 240
+    assert img.shape[1] < 320
+
+
+def test_frame_raw_skips_crop_but_keeps_rotation(client):
+    resp = client.post("/api/config", json={"rotation": 90})
+    assert resp.status_code == 200
+    resp = client.post("/api/config", json={"clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}})
+    assert resp.status_code == 200
+
+    resp = client.get("/frame?raw=1")
+    assert resp.status_code == 200
+    img = _decode_jpeg(resp.data)
+    assert img.shape == (320, 240, 3)  # rotated, but the crop was skipped

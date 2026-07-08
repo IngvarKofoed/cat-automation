@@ -61,7 +61,8 @@ the clients that connect to it.** The Pi never dials out.
         │   Camera → Capture → Clip (ROI) → Motion gate ──┐            │
         │                                                 ▼            │
         │   ┌──────────────────── Pi web server ────────────────────┐  │
-        │   │ Video stream  (GET /stream, MJPEG, frames on motion)  │  │
+        │   │ Video stream  (GET /stream, MJPEG, continuous)        │  │
+        │   │ Status/motion (GET /status; X-Motion on /stream)      │  │
         │   │ Control API   (POST lock/unlock, sound, light)        │  │
         │   │ Config UI     (clip, focus, fps, background)          │  │
         │   └───────────────────────────────────────────────────────┘  │
@@ -105,8 +106,8 @@ the clients that connect to it.** The Pi never dials out.
 |---|---|
 | **Capture service** | Pull frames from the camera at the configured **fps** and **focus**, through a pluggable **capture-source interface** (CSI / USB / IP) so different cameras drop in without touching the rest of the edge. See *Camera source*. |
 | **Clipper** | Crop each frame to the configured **clipping rectangle** (region of interest) before anything else — the door area only. |
-| **Motion gate** | *Simple* motion detection (e.g. frame differencing / background subtraction) against a **dynamic reference (background)** that adapts to changing light. Frames are written onto the open video stream only when the clipped region changes. Motion decisions are logged, and the Pi can emit occasional frames even without motion, so missed or spurious triggers are auditable while tuning the background (see *Observability*). |
-| **Pi web server** | The Pi's single HTTP server. Hosts the **Video stream** (and single-frame **snapshots**), the **Control API**, and the **Config UI** (below). Purely inbound — the PC and browser connect to it. |
+| **Motion gate** | *Simple* motion detection (e.g. frame differencing / background subtraction) against a **dynamic reference (background)** that adapts to changing light. Motion does **not** gate frame delivery: `/stream` and `/frame` serve every frame continuously; the motion result is published as a *separate pulled signal* (`GET /status`, plus `X-Motion`/`X-Bbox`/`X-Area` headers on each `/stream` part) that the compute pulls to decide when to spend GPU. Motion decisions are logged, so missed or spurious triggers are auditable while tuning the background (see *Observability*). |
+| **Pi web server** | The Pi's single HTTP server. Hosts the **Video stream** (and single-frame **snapshots**), the **motion/health status signal** (`GET /status`), the **Control API**, and the **Config UI** (below). Purely inbound — the PC and browser connect to it. |
 | **Actuator drivers** *(optional)* | Hardware drivers behind the control API: door-lock (relay/servo over GPIO), speaker, and light. Present only if the hardware is installed. |
 | **Local clip buffer** *(optional)* | Retains recent clips when the compute tier is unreachable, for later review. |
 
@@ -116,7 +117,7 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 
 | Component | Responsibility |
 |---|---|
-| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped, motion-triggered frames off the open response as they arrive. |
+| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped frames off the open response as they arrive (delivered continuously; motion is a separate signal, read from `X-Motion` part headers or `GET /status`). |
 | **Detection + inference** | Detect that a cat is present, track it, crop, embed, and match against the resident gallery → identity + confidence. GPU-accelerated. |
 | **Tracker / direction resolver** | Associate detections across frames into tracks; resolve a track's path across the door zone into *enter* vs *leave*. |
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |
@@ -128,7 +129,9 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 
 ## The Pi as a thin smart-camera node
 
-The Pi runs **one small HTTP server** that exposes three surfaces, fed by a
+The Pi runs **one small HTTP server** that exposes three surfaces — the
+machine-facing **video stream** (with its paired `GET /status` motion/health
+signal), the **control API**, and the human-facing **config UI** — fed by a
 pluggable camera source and backed by optional actuators. Everything HTTP is
 **inbound**: the compute PC and the config browser connect *to* the Pi; the Pi
 never connects out.
@@ -165,11 +168,17 @@ UI-selectable.
 A long-lived `GET /stream` endpoint. When the PC connects, the Pi responds with
 `Content-Type: multipart/x-mixed-replace; boundary=…` and keeps the response
 open, writing the clipped frames into it one after another (**MJPEG over HTTP**)
-— but only while the motion gate says the scene is active; otherwise the stream
-idles with periodic keepalives. One request, one endless response, many frames —
-this is how streaming works over plain HTTP, and it puts the PC in the
-connection-initiating role. See *Communication and data flow* for the mechanism
-and the more-efficient alternatives.
+— **continuously**, every frame, *not* gated by motion. (Early-prototype
+decision: at ~5 fps on the small ROI over the LAN, bandwidth is trivial, so
+decoupling lets motion gate the compute's *GPU cost* — when to run detection —
+rather than frame delivery, keeping frames available for preview, enrollment, and
+audit regardless of motion.) Each part carries the frame's motion result in its
+headers (`X-Motion`, plus `X-Bbox`/`X-Area` when active), and the same signal is
+pullable via `GET /status`, so the compute reads motion inline while every frame
+keeps flowing. One request, one endless response, many frames — this is how
+streaming works over plain HTTP, and it puts the PC in the connection-initiating
+role. See *Communication and data flow* for the mechanism and the more-efficient
+alternatives.
 
 **Single stills.** The multipart wrapper is *only* for the continuous stream.
 For one image, the Pi serves an ordinary `GET /frame` → `Content-Type:
@@ -235,8 +244,7 @@ little is on the Pi:
 ```
 [Pi]  1. Capture (fps, focus)
 [Pi]  2. Clip to ROI rectangle
-[Pi]  3. Motion gate vs. dynamic background  ── motion? ──► emit frames onto the
-                                                            PC's open /stream
+[Pi]  3. Motion detection vs. dynamic background ─ publish on /status + X-Motion headers
 [GPU] 4. Cat detection ─ is there a cat? bounding box
 [GPU] 5. Tracking ─ associate boxes across frames into a track
 [GPU] 6. Crop + quality filter ─ pick the best views of the cat
@@ -248,8 +256,11 @@ little is on the Pi:
 [*]  11. Actuate (optional, via Pi control API) + record + notify
 ```
 
-The Pi's job ends at step 3: clip and gate. **Detecting that the moving thing is
-a cat happens on the GPU**, not the Pi.
+The Pi's job ends at step 3: clip and detect motion — but that motion result is
+now a *pulled signal* (`/status` + per-part stream headers) the compute uses to
+decide when to run the GPU, not a gate on frame delivery (frames stream
+continuously). **Detecting that the moving thing is a cat happens on the GPU**,
+not the Pi.
 
 ### Identification approach (decision)
 
@@ -340,11 +351,11 @@ when a foreign cat *lingers* or repeatedly works the flap, and is rate-limited.
 There is now a single decision path — the GPU — because the Pi can't recognize
 anything on its own:
 
-- **Normal operation.** The motion gate fires while a cat is still *approaching*
-  the door, so frames start flowing over the PC's open stream seconds before the
-  cat reaches the flap. A GPU identification (tens of ms) plus a LAN round trip is
-  small against a cat's approach time, so the decision usually arrives in time to
-  drive the lock via the control API.
+- **Normal operation.** Frames stream continuously, and the motion signal fires
+  while a cat is still *approaching* the door, so the compute can begin GPU
+  detection seconds before the cat reaches the flap. A GPU identification (tens of
+  ms) plus a LAN round trip is small against a cat's approach time, so the decision
+  usually arrives in time to drive the lock via the control API.
 - **Compute tier or network down.** Because the PC is the client, the Pi detects
   this directly: the stream/control connection drops, or no PC has connected for
   N seconds. The Pi cannot identify or decide on its own, so it **fails safe** —
@@ -365,7 +376,7 @@ anything on its own:
 Every connection is **initiated by the compute PC (and the config browser); the
 Pi only ever listens.** The Pi is a pure HTTP server and never dials out. This
 keeps it a self-contained, replaceable device and puts the brain in charge of
-when to connect. Three inbound surfaces:
+when to connect. Four inbound surfaces:
 
 - **Video stream (data plane).** The PC's stream client opens a single
   long-lived `GET /stream` to the Pi and holds it open. The Pi answers with
@@ -376,10 +387,13 @@ when to connect. Three inbound surfaces:
   IP-camera mechanism, and it is exactly how "streaming over HTTP" works: one
   request, one endless response, many frames. OpenCV can consume such a URL
   directly.
-  - **Motion gating still applies:** the Pi writes frames into the open stream
-    only while motion is active against the dynamic background; between events
-    the stream idles with periodic keepalives. The connection is persistent, but
-    the bytes are still motion-triggered.
+  - **Continuous, not motion-gated:** the Pi writes *every* frame into the open
+    stream — motion does not gate delivery (an early-prototype call: at ~5 fps on
+    the small ROI, LAN bandwidth is trivial, so decoupling motion from frame
+    delivery — letting motion gate the compute's *GPU cost*, not frame
+    availability — is worth more than the saved bytes). Each part carries the
+    frame's motion result in its headers (`X-Motion`, plus `X-Bbox`/`X-Area` when
+    active) so a stream consumer reads motion inline.
   - **Single stills:** the Pi also serves `GET /frame` — one plain image per
     request (JPEG by default, PNG/WebP when a lossless copy is needed) — for
     previews, enrollment grabs, and debugging, or for a client that prefers to
@@ -388,6 +402,12 @@ when to connect. Three inbound surfaces:
   - **Frame identity:** each streamed frame carries a monotonic timestamp / frame
     id (e.g. in its part headers) so the PC can order frames, account for drops,
     and keep event handling idempotent — rather than trusting arrival order alone.
+- **Status / motion (data plane).** The PC polls the Pi's `GET /status` for a
+  JSON snapshot of the latest frame's motion and camera health (`{frame_id, ts,
+  motion, bbox, area, camera_ok, last_error}`) — the signal it uses to decide when
+  to spend GPU on detection, and (via `camera_ok`) how it learns the camera has
+  died. Inbound, one request per poll; it correlates to stream frames by
+  `frame_id`.
 - **Control (control plane).** The decision engine's actuation hits the Pi's
   **control API** (`POST lock`/`unlock`/`sound`/`light`) — again the PC
   connecting inbound to the Pi.
@@ -400,12 +420,13 @@ the PC as present only while the stream is actively read and an application-leve
 keepalive keeps ticking, and fails safe once that keepalive times out.
 
 **Why MJPEG-over-HTTP — and the upgrade path.** At ~5 fps, over a LAN, carrying
-only the small motion-gated ROI, MJPEG is not merely tolerable but a genuinely
+only the small clipped ROI, MJPEG is not merely tolerable but a genuinely
 good fit. Its one real weakness — no inter-frame compression — barely bites here:
-bandwidth is trivial at this rate (a ~640×480 q90 JPEG × 5 fps ≈ 2–4 Mbit/s, and
-only while motion is present), and a video codec's temporal advantage actually
-*shrinks* at low fps and under motion gating, because the frames that get sent
-are the changing ones — the worst case for inter-frame prediction. Meanwhile
+bandwidth is trivial at this rate (a ~640×480 q90 JPEG × 5 fps ≈ 2–4 Mbit/s,
+streamed continuously rather than motion-gated — a cost this prototype gladly pays
+to keep motion decoupled from frame delivery), and a video codec's temporal
+advantage actually *shrinks* at low fps, because widely-spaced frames share little
+— a poor case for inter-frame prediction. Meanwhile
 MJPEG's strengths are exactly what a CV pipeline wants: every frame is an
 independent still (easy to grab, no decoder/keyframe state, a dropped frame is
 harmless), it is **low-latency** (no B-frame reordering or encoder lookahead —
@@ -537,7 +558,7 @@ outbound-internet dependency.
 | GPU detection | Ultralytics/YOLO | Mature, fast, GPU-accelerated cat detection. |
 | Identification | Embedding/re-ID model + gallery (open-set) | New cats without retraining; strangers → "unknown". |
 | Tracking | ByteTrack/SORT-style tracker | Standard; gives track IDs for direction + de-dup. |
-| Frame transport | MJPEG over HTTP (`multipart/x-mixed-replace`) + `GET /frame` stills | PC connects to the Pi; one long-lived response streams the clipped ROI (frames emitted on motion); stills as JPEG, or PNG/WebP when lossless is needed. |
+| Frame transport | MJPEG over HTTP (`multipart/x-mixed-replace`) + `GET /frame` stills | PC connects to the Pi; one long-lived response streams the clipped ROI continuously (motion is a separate pulled signal — `GET /status` + per-part `X-Motion` headers); stills as JPEG, or PNG/WebP when lossless is needed. |
 | Storage | SQLite → Postgres if needed | Simple single-host start; clear growth path. |
 | Notifications | ntfy / Pushover / Telegram | Simple push to phone; only outbound dependency. |
 | Dashboard + annotation UI | FastAPI backend + a lightweight SPA (Svelte/React); SSE or polling for live status | Main compute-side web app: occupancy, timeline, foreign-cat log, annotation queue, mode + training controls. HTMX + server-rendered Jinja is the simpler Python-only alternative. |

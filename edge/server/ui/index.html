@@ -88,8 +88,60 @@
         .live-btn.active:hover {
             background: #a02020;
         }
+        .overlay-btn.active {
+            background: #2e7d32;
+        }
+        .overlay-btn.active:hover {
+            background: #256428;
+        }
         .hidden {
             display: none !important;
+        }
+        h2 {
+            font-size: 18px;
+            margin: 0 0 12px;
+        }
+        .motion-status {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            background: #e0e0e0;
+            color: #333;
+            font-weight: 600;
+        }
+        .badge.active {
+            background: #2e7d32;
+            color: white;
+        }
+        .badge.bad {
+            background: #c62828;
+            color: white;
+        }
+        .tuning-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px 16px;
+        }
+        @media (max-width: 480px) {
+            .tuning-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        input[type="number"] {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
         }
         #error {
             background: #ffebee;
@@ -184,6 +236,7 @@
             <div class="btn-row">
                 <button id="captureBtn">Capture</button>
                 <button type="button" id="liveBtn" class="live-btn">Live: Off</button>
+                <button type="button" id="overlayBtn" class="overlay-btn">Overlay: Off</button>
             </div>
         </div>
 
@@ -194,6 +247,49 @@
                 <button type="button" id="saveRoiBtn" class="hidden">Save ROI</button>
                 <button type="button" id="cancelRoiBtn" class="btn-secondary hidden">Cancel</button>
                 <button type="button" id="clearRoiBtn" class="btn-secondary">Clear ROI</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <h2>Motion</h2>
+
+        <div id="motionStatus" class="motion-status">
+            <span id="motionState" class="badge">Motion: —</span>
+            <span id="motionArea" class="badge">Area: —</span>
+            <span id="cameraHealth" class="badge">Camera: —</span>
+        </div>
+
+        <div class="control-group">
+            <div class="btn-row">
+                <button type="button" id="relearnBtn" class="btn-secondary">Relearn background</button>
+            </div>
+        </div>
+
+        <div class="tuning-grid">
+            <div class="control-group">
+                <label for="varThreshold">Variance threshold</label>
+                <input type="number" id="varThreshold" step="1">
+            </div>
+            <div class="control-group">
+                <label for="learningRate">Learning rate</label>
+                <input type="number" id="learningRate" step="0.0001">
+            </div>
+            <div class="control-group">
+                <label for="minArea">Min area (fraction)</label>
+                <input type="number" id="minArea" step="0.001">
+            </div>
+            <div class="control-group">
+                <label for="maxAreaFraction">Max area fraction</label>
+                <input type="number" id="maxAreaFraction" step="0.01">
+            </div>
+            <div class="control-group">
+                <label for="persistence">Persistence (frames)</label>
+                <input type="number" id="persistence" step="1">
+            </div>
+            <div class="control-group">
+                <label for="motionDownscale">Motion downscale (px)</label>
+                <input type="number" id="motionDownscale" step="1">
             </div>
         </div>
     </div>
@@ -219,6 +315,7 @@
         const fpsSelect = document.getElementById('fps');
         const captureBtn = document.getElementById('captureBtn');
         const liveBtn = document.getElementById('liveBtn');
+        const overlayBtn = document.getElementById('overlayBtn');
         const errorDiv = document.getElementById('error');
         const stillImg = document.getElementById('still');
         const rotButtons = document.querySelectorAll('.rot-btn');
@@ -228,6 +325,16 @@
         const clearRoiBtn = document.getElementById('clearRoiBtn');
         const previewWrap = document.getElementById('previewWrap');
         const roiBox = document.getElementById('roiBox');
+        const motionStateEl = document.getElementById('motionState');
+        const motionAreaEl = document.getElementById('motionArea');
+        const cameraHealthEl = document.getElementById('cameraHealth');
+        const relearnBtn = document.getElementById('relearnBtn');
+        const varThresholdInput = document.getElementById('varThreshold');
+        const learningRateInput = document.getElementById('learningRate');
+        const minAreaInput = document.getElementById('minArea');
+        const maxAreaFractionInput = document.getElementById('maxAreaFraction');
+        const persistenceInput = document.getElementById('persistence');
+        const motionDownscaleInput = document.getElementById('motionDownscale');
 
         // The object URL currently shown, so we can revoke it on the next capture.
         let lastObjectUrl = null;
@@ -247,6 +354,12 @@
         // /stream feed rather than a captured still. Mutually exclusive with
         // roiMode (see enterRoiMode).
         let live = false;
+
+        // Overlay state: true while the still/live preview requests the
+        // server-drawn detection bbox (?overlay=1 on /stream and /frame).
+        // Meaningless in ROI-edit mode (loadRawPreview always fetches the
+        // plain raw frame), so the button is disabled there.
+        let overlay = false;
 
         // Show error message
         function showError(message) {
@@ -337,10 +450,24 @@
                 }
                 fpsSelect.value = fpsStr;
 
+                // Motion tuning fields: reflect whatever is persisted,
+                // unusual or not — the server is the source of truth, the
+                // UI doesn't second-guess it.
+                setIfPresent(varThresholdInput, data.var_threshold);
+                setIfPresent(learningRateInput, data.learning_rate);
+                setIfPresent(minAreaInput, data.min_area);
+                setIfPresent(maxAreaFractionInput, data.max_area_fraction);
+                setIfPresent(persistenceInput, data.persistence);
+                setIfPresent(motionDownscaleInput, data.motion_downscale);
+
                 clearError();
             } catch (err) {
                 showError(`Failed to load config: ${err.message}`);
             }
+        }
+
+        function setIfPresent(input, value) {
+            if (value !== undefined && value !== null) input.value = value;
         }
 
         // Highlight the active rotation button
@@ -350,10 +477,14 @@
 
         // Fetch a single frame as a blob. raw=true asks for the oriented but
         // uncropped frame (GET /frame?raw=1); otherwise the normal rotated +
-        // cropped frame (GET /frame).
+        // cropped frame (GET /frame), with the server-drawn overlay added
+        // when overlay is on (raw ignores overlay — it's meaningless in
+        // ROI-edit mode).
         async function fetchFrameBlob(raw) {
-            const url = (raw ? '/frame?raw=1&t=' : '/frame?t=') + Date.now();
-            const res = await fetch(url);
+            const params = new URLSearchParams({ t: String(Date.now()) });
+            if (raw) params.set('raw', '1');
+            else if (overlay) params.set('overlay', '1');
+            const res = await fetch('/frame?' + params.toString());
             if (!res.ok) throw new Error(await errorFromResponse(res));
             return res.blob();
         }
@@ -477,11 +608,19 @@
         function updateCaptureBtnState() {
             captureBtn.disabled = roiMode || live;
             liveBtn.disabled = roiMode;
+            // Overlay is meaningless in ROI-edit mode (the raw preview never
+            // requests it) — disable rather than let it silently do nothing.
+            overlayBtn.disabled = roiMode;
         }
 
         function setLiveButtonState() {
             liveBtn.textContent = live ? 'Live: On' : 'Live: Off';
             liveBtn.classList.toggle('active', live);
+        }
+
+        // The /stream URL for the current overlay state.
+        function streamUrl() {
+            return overlay ? '/stream?overlay=1' : '/stream';
         }
 
         // On: render the MJPEG /stream directly in the <img> (no JS timer —
@@ -494,7 +633,7 @@
             setLiveButtonState();
             updateCaptureBtnState();
             if (live) {
-                stillImg.src = '/stream';
+                stillImg.src = streamUrl();
             } else {
                 // removeAttribute, not src='': an empty src resolves against the
                 // page URL and fires a spurious GET to '/' (and a broken-image
@@ -505,6 +644,29 @@
         }
 
         liveBtn.addEventListener('click', () => setLive(!live));
+
+        // ---- Overlay toggle ----
+
+        function setOverlayButtonState() {
+            overlayBtn.textContent = overlay ? 'Overlay: On' : 'Overlay: Off';
+            overlayBtn.classList.toggle('active', overlay);
+        }
+
+        // On/off: re-request whichever preview is showing (the open /stream
+        // connection, or a fresh still) with/without ?overlay=1. No-op in
+        // ROI mode — the button is disabled there (see updateCaptureBtnState).
+        async function setOverlay(on) {
+            if (on === overlay || roiMode) return;
+            overlay = on;
+            setOverlayButtonState();
+            if (live) {
+                stillImg.src = streamUrl();
+            } else {
+                await captureFrame();
+            }
+        }
+
+        overlayBtn.addEventListener('click', () => setOverlay(!overlay));
 
         // ---- ROI mode entry/exit ----
 
@@ -737,13 +899,135 @@
             }
         }
 
+        // ---- Motion tuning controls ----
+
+        // Wire a numeric tuning input: on change (blur/enter, not every
+        // keystroke — same granularity as the fps select), POST just that
+        // field to /api/config. Reverts to the persisted value on rejection.
+        function wireMotionField(input, key) {
+            input.addEventListener('change', async () => {
+                const value = Number(input.value);
+                if (input.value === '' || Number.isNaN(value)) {
+                    showError(`Invalid value for ${key}`);
+                    await loadCurrentConfig();
+                    return;
+                }
+                try {
+                    clearError();
+                    const res = await fetch('/api/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ [key]: value })
+                    });
+                    if (!res.ok) {
+                        showError(`Config error: ${await errorFromResponse(res)}`);
+                        await loadCurrentConfig();
+                        return;
+                    }
+                    clearError();
+                } catch (err) {
+                    showError(`Config error: ${err.message}`);
+                }
+            });
+        }
+
+        [
+            [varThresholdInput, 'var_threshold'],
+            [learningRateInput, 'learning_rate'],
+            [minAreaInput, 'min_area'],
+            [maxAreaFractionInput, 'max_area_fraction'],
+            [persistenceInput, 'persistence'],
+            [motionDownscaleInput, 'motion_downscale'],
+        ].forEach(([input, key]) => wireMotionField(input, key));
+
+        relearnBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                relearnBtn.disabled = true;
+                const res = await fetch('/api/motion/reset', { method: 'POST' });
+                if (!res.ok) {
+                    showError(`Relearn error: ${await errorFromResponse(res)}`);
+                    return;
+                }
+                clearError();
+            } catch (err) {
+                showError(`Relearn error: ${err.message}`);
+            } finally {
+                relearnBtn.disabled = false;
+            }
+        });
+
+        // ---- Motion status polling ----
+
+        // Poll GET /status a few times a second for the motion indicator,
+        // area, and camera health — light enough to run continuously, but
+        // paused while the tab isn't visible so a backgrounded page doesn't
+        // keep hammering the Pi for nothing.
+        const STATUS_POLL_MS = 400;
+        let statusTimer = null;
+        let statusInFlight = false;  // skip a tick rather than pile up requests if /status is slow
+
+        async function pollStatus() {
+            if (statusInFlight) return;
+            statusInFlight = true;
+            try {
+                const res = await fetch('/status');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+
+                motionStateEl.textContent = data.motion ? 'Motion: Active' : 'Motion: Idle';
+                motionStateEl.classList.toggle('active', !!data.motion);
+
+                const areaPct = typeof data.area === 'number' ? (data.area * 100).toFixed(1) + '%' : '—';
+                motionAreaEl.textContent = `Area: ${areaPct}`;
+
+                if (data.camera_ok) {
+                    cameraHealthEl.textContent = 'Camera: OK';
+                    cameraHealthEl.classList.remove('bad');
+                } else {
+                    cameraHealthEl.textContent = `Camera: ${data.last_error || 'error'}`;
+                    cameraHealthEl.classList.add('bad');
+                }
+            } catch (err) {
+                motionStateEl.textContent = 'Motion: —';
+                motionStateEl.classList.remove('active');
+                motionAreaEl.textContent = 'Area: —';
+                cameraHealthEl.textContent = `Camera: unreachable (${err.message})`;
+                cameraHealthEl.classList.add('bad');
+            } finally {
+                statusInFlight = false;
+            }
+        }
+
+        function startStatusPolling() {
+            if (statusTimer) return;
+            pollStatus();
+            statusTimer = setInterval(pollStatus, STATUS_POLL_MS);
+        }
+
+        function stopStatusPolling() {
+            if (!statusTimer) return;
+            clearInterval(statusTimer);
+            statusTimer = null;
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') startStatusPolling();
+            else stopStatusPolling();
+        });
+
         // Event listeners
         captureBtn.addEventListener('click', captureFrame);
         cameraSelect.addEventListener('change', onCameraChange);
         fpsSelect.addEventListener('change', onFpsChange);
 
-        // On page load: load cameras and config
-        window.addEventListener('load', loadCameras);
+        // On page load: load cameras and config, and start the status poll
+        // (the page is visible at load, so no visibilitychange event fires
+        // for this first transition).
+        window.addEventListener('load', () => {
+            loadCameras();
+            startStatusPolling();
+        });
     </script>
 </body>
 </html>

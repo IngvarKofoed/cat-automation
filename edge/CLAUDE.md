@@ -17,7 +17,7 @@ Unit tests live alongside the edge packages using **pytest**. The edge is I/O- a
 - **Keep the Pi thin.** It must hold no ML models and make no recognition decisions — that is a guiding principle, not a convenience. Detection and identification live on `compute/`. If you're tempted to run inference here, stop: that's an architecture change, not an edge change.
 - **The Pi is a pure server.** It only ever *listens* (HTTP inbound: stream, control, config); it never dials out. Preserve that — no outbound connections from the edge.
 - **Verification workflow (on-device / against fakes).** The camera and GPIO can't be meaningfully unit-tested, so verify edge changes by running the service (on the Pi, or against a fake capture source) and:
-  1. Hit `/frame` and `/stream`; confirm frames flow — and that the stream only emits while there is motion.
+  1. Hit `/frame` and `/stream`; confirm frames flow continuously, and that motion is reported via `GET /status` and the `X-Motion` stream headers (not by gating frame delivery).
   2. Exercise the control API endpoints; confirm the actuator (or its no-op stub) responds.
   3. Confirm the config UI reflects and persists settings (clip, focus, fps, background).
   4. Only then report the change complete. Keep it light — this is a prototype.

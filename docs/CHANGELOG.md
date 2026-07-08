@@ -49,3 +49,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
    Config UI added Live toggle and fps control. CaptureSource.close() poisons
    read-after-close to seal the device-swap race; motion gating is the next increment.
 
+10. Edge motion detection (MOG2 on downscaled clipped ROI in the grabber loop): motion gates
+    the compute's GPU cost, not frame delivery—/stream stays continuous. Motion pulled via GET /status
+    (camera_ok, bbox, area) and X-Motion headers on /stream parts. Locality/area gating + slow
+    learning + persistence reject global illumination. Config UI: overlay + tuning + Relearn.
+    Fixed exposure deferred; ARCHITECTURE.md updated to match the pull-signal design.
+

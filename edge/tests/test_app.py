@@ -50,6 +50,48 @@ class FlakyCaptureSource(CaptureSource):
         pass
 
 
+class ControllableCaptureSource(CaptureSource):
+    """A synthetic source for motion tests, switchable between three scenes.
+
+    FakeCaptureSource's static gradient is unusable for motion tests: MOG2
+    absorbs it as background on frame one and never flags anything. This
+    source instead returns a uniform "background" frame by default, and can
+    be switched to a "blob" (a small filled rectangle in a sub-region — a
+    stand-in for a cat) or "bright" (the whole frame lightened — a stand-in
+    for a cloud/illumination change) so tests can drive MOG2 deterministically
+    via repeated ``grab_once()`` calls.
+    """
+
+    WIDTH = 160
+    HEIGHT = 120
+    BACKGROUND_LEVEL = 60
+    BRIGHT_LEVEL = 200
+    BLOB_LEVEL = 220
+    # Pixel rect (x, y, w, h) for "blob" mode: well inside the frame and small
+    # relative to it (~4.7% of the ROI), comfortably inside DEFAULTS'
+    # [min_area, max_area_fraction] band.
+    BLOB_RECT = (60, 40, 30, 30)
+
+    def __init__(self, device: "int | str" = 0) -> None:
+        del device  # unused: kept only for interface compatibility
+        self._closed = False
+        self.mode = "background"  # "background" | "blob" | "bright"
+
+    def read(self) -> np.ndarray:
+        if self._closed:
+            raise CaptureError("controllable capture source is closed")
+        frame = np.full((self.HEIGHT, self.WIDTH, 3), self.BACKGROUND_LEVEL, dtype=np.uint8)
+        if self.mode == "blob":
+            x, y, w, h = self.BLOB_RECT
+            frame[y : y + h, x : x + w] = self.BLOB_LEVEL
+        elif self.mode == "bright":
+            frame[:] = self.BRIGHT_LEVEL
+        return frame
+
+    def close(self) -> None:
+        self._closed = True
+
+
 def _factory_with_bad_device(bad_device: "int | str"):
     """A source_factory where `bad_device` yields a source that fails to read.
 
@@ -83,6 +125,47 @@ def client(config_path):
     app = create_app(source_factory=FakeCaptureSource, start_grabber=False)
     app.grabber.grab_once()
     return app.test_client()
+
+
+# The full default /api/config body, including the 6 motion keys. Every exact
+# config-dict assertion should build off this (with overrides) rather than
+# spell out the dict by hand, so a future key addition can't silently leave a
+# stale assertion behind (bit us with `fps` last increment).
+_DEFAULT_CONFIG = dict(settings.DEFAULTS)
+
+
+def _expected_config(**overrides) -> dict:
+    """The full /api/config dict, with defaults overridden by any kwargs."""
+    return {**_DEFAULT_CONFIG, **overrides}
+
+
+@pytest.fixture
+def motion_app(config_path):
+    """An app wired to a ControllableCaptureSource, for driving MOG2 motion
+    detection deterministically via grab_once(), using the production default
+    motion params (settings.DEFAULTS) unchanged. Returns (app, source) so a
+    test can flip the source's mode.
+    """
+    created = {}
+
+    def factory(device):
+        created["source"] = ControllableCaptureSource(device)
+        return created["source"]
+
+    app = create_app(source_factory=factory, start_grabber=False)
+    return app, created["source"]
+
+
+def _warm_up(grabber, n: int = 10) -> None:
+    """Feed the grabber `n` identical background frames to converge MOG2.
+
+    10 is comfortably enough here: the scene is a flat, noise-free synthetic
+    frame, so the default var_threshold/learning_rate settle within a couple
+    of frames (verified empirically) — nowhere near the minutes a real, noisy
+    camera scene needs (see the spec's "paused-cat absorption" section).
+    """
+    for _ in range(n):
+        grabber.grab_once()
 
 
 # --- /frame ---
@@ -170,6 +253,11 @@ def test_stream_returns_multipart_with_first_frame(config_path):
     assert b"\xff\xd8" in part
     assert b"X-Frame-Id" in part
     assert b"X-Timestamp" in part
+    # A single grab can't meet the default persistence (2 consecutive frames),
+    # so the first part's motion is deterministically off with no bbox/area.
+    assert b"X-Motion: 0" in part
+    assert b"X-Bbox" not in part
+    assert b"X-Area" not in part
     resp.close()
 
 
@@ -179,7 +267,7 @@ def test_stream_returns_multipart_with_first_frame(config_path):
 def test_get_config_returns_default_device(client):
     resp = client.get("/api/config")
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config()
 
 
 # --- POST /api/config: valid device ---
@@ -188,10 +276,10 @@ def test_get_config_returns_default_device(client):
 def test_post_config_valid_device_updates_and_persists(client, config_path):
     resp = client.post("/api/config", json={"device": 1})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config(device=1)
 
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config(device=1)
 
     assert settings.load_settings()["device"] == 1
     saved = json.loads(config_path.read_text())
@@ -237,7 +325,7 @@ def test_post_config_source_open_failure_keeps_previous(config_path):
 
     # Previous source/device is kept.
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config()
 
     # Nothing was ever persisted for the failed switch.
     assert not config_path.exists()
@@ -377,8 +465,8 @@ def test_create_app_bad_persisted_device_does_not_crash(config_path):
     )  # must not raise
     resp = app.test_client().get("/api/config")
     assert resp.status_code == 200
-    # fell back to the default device; rotation/clip/fps default too
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
+    # fell back to the default device; rotation/clip/fps/motion default too
+    assert resp.get_json() == _expected_config()
 
 
 def test_save_settings_then_load_settings_roundtrips(config_path):
@@ -387,6 +475,14 @@ def test_save_settings_then_load_settings_roundtrips(config_path):
         "rotation": 90,
         "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
         "fps": 5,
+        # Non-default motion values, so a roundtrip bug (e.g. load_settings
+        # silently falling back to DEFAULTS) can't hide behind equal values.
+        "var_threshold": 20.0,
+        "learning_rate": 0.05,
+        "min_area": 0.02,
+        "max_area_fraction": 0.5,
+        "persistence": 3,
+        "motion_downscale": 200,
     }
     settings.save_settings(full)
     assert settings.load_settings() == full
@@ -450,13 +546,13 @@ def test_crop_empty_region_returns_unchanged():
 def test_post_config_rotation_updates_without_device_change(client, config_path):
     resp = client.post("/api/config", json={"rotation": 90})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config(rotation=90)
 
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
+    assert resp.get_json() == _expected_config(rotation=90)
 
     saved = json.loads(config_path.read_text())
-    assert saved == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
+    assert saved == _expected_config(rotation=90)
 
 
 # --- POST /api/config: clip-only ---
@@ -466,7 +562,7 @@ def test_post_config_clip_updates_and_persists(client, config_path):
     clip = {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
     resp = client.post("/api/config", json={"clip": clip})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": clip, "fps": 5}
+    assert resp.get_json() == _expected_config(clip=clip)
 
     resp = client.get("/api/config")
     assert resp.get_json()["clip"] == clip
@@ -529,6 +625,58 @@ def test_post_config_invalid_fps_is_400(client, fps):
     assert "error" in resp.get_json()
 
 
+# --- POST /api/config: motion key validation ---
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("var_threshold", 20.0),
+        ("learning_rate", 0.05),
+        ("min_area", 0.02),
+        ("max_area_fraction", 0.5),
+        ("persistence", 3),
+        ("motion_downscale", 200),
+    ],
+)
+def test_post_config_valid_motion_key_updates_and_round_trips(client, key, value):
+    resp = client.post("/api/config", json={key: value})
+    assert resp.status_code == 200
+    assert resp.get_json()[key] == value
+
+    resp = client.get("/api/config")
+    assert resp.get_json()[key] == value
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("var_threshold", 0),
+        ("var_threshold", -1),
+        ("var_threshold", True),
+        ("learning_rate", -0.1),
+        ("learning_rate", 1.1),
+        ("learning_rate", True),
+        ("min_area", -0.01),
+        ("min_area", 1),
+        ("min_area", True),
+        ("max_area_fraction", 0),
+        ("max_area_fraction", 1.1),
+        ("max_area_fraction", True),
+        ("persistence", 0),
+        ("persistence", 1.5),
+        ("persistence", True),
+        ("motion_downscale", 16),
+        ("motion_downscale", 1000),
+        ("motion_downscale", True),
+    ],
+)
+def test_post_config_invalid_motion_key_is_400(client, key, value):
+    resp = client.post("/api/config", json={key: value})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
 # --- POST /api/config: a device change must not wipe rotation/clip ---
 
 
@@ -539,7 +687,7 @@ def test_post_config_device_change_preserves_clip(client, config_path):
 
     resp = client.post("/api/config", json={"device": 1})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": clip, "fps": 5}
+    assert resp.get_json() == _expected_config(device=1, clip=clip)
 
     saved = json.loads(config_path.read_text())
     assert saved["device"] == 1
@@ -587,3 +735,187 @@ def test_frame_raw_skips_crop_but_keeps_rotation(client):
     assert resp.status_code == 200
     img = _decode_jpeg(resp.data)
     assert img.shape == (320, 240, 3)  # rotated, but the crop was skipped
+
+
+# --- /frame: overlay ---
+
+
+def test_frame_overlay_returns_jpeg(client):
+    # Smoke check: the overlay draw-and-encode path succeeds whether or not
+    # the slot happens to have a bbox (a single grab never meets persistence).
+    client.application.grabber.grab_once()
+    resp = client.get("/frame?overlay=1")
+    assert resp.status_code == 200
+    assert resp.content_type == "image/jpeg"
+    assert resp.data[:2] == b"\xff\xd8"
+
+
+# --- GET /status ---
+
+
+def test_status_returns_documented_shape_with_camera_ok_true(client):
+    client.application.grabber.grab_once()
+    resp = client.get("/status")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    for key in ("frame_id", "ts", "motion", "bbox", "area", "camera_ok", "last_error"):
+        assert key in body
+    assert body["camera_ok"] is True
+    assert body["last_error"] is None
+    # A single grab can't meet the default persistence (2) — deterministic.
+    assert body["motion"] is False
+    assert body["bbox"] is None
+
+
+def test_status_reflects_failing_source(config_path):
+    app = create_app(source_factory=FailingCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
+    resp = app.test_client().get("/status")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["camera_ok"] is False
+    assert body["last_error"] is not None
+
+
+# --- motion detection (grabber, via a controllable synthetic source) ---
+
+
+def test_motion_true_on_sustained_blob_with_roughly_correct_bbox(motion_app):
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+
+    source.mode = "blob"
+    for _ in range(settings.DEFAULTS["persistence"]):
+        grabber.grab_once()
+
+    snap = grabber.snapshot()
+    assert snap.motion is True
+    assert snap.bbox is not None
+    bx, by, bw, bh = snap.bbox
+    x, y, w, h = ControllableCaptureSource.BLOB_RECT
+    width, height = ControllableCaptureSource.WIDTH, ControllableCaptureSource.HEIGHT
+    assert bx == pytest.approx(x / width, abs=0.05)
+    assert by == pytest.approx(y / height, abs=0.05)
+    assert bw == pytest.approx(w / width, abs=0.05)
+    assert bh == pytest.approx(h / height, abs=0.05)
+
+
+def test_motion_false_below_persistence(motion_app):
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+
+    source.mode = "blob"
+    grabber.grab_once()  # a single frame — below the default persistence of 2
+    assert grabber.snapshot().motion is False
+
+
+def test_motion_false_on_global_brightness_change(motion_app):
+    # A whole-ROI illumination change (a cloud) must be rejected by
+    # max_area_fraction, distinguishing it from a compact, cat-sized blob.
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+
+    source.mode = "bright"
+    for _ in range(settings.DEFAULTS["persistence"] + 1):
+        grabber.grab_once()
+    assert grabber.snapshot().motion is False
+
+
+# --- POST /api/motion/reset ---
+
+
+def test_motion_reset_allows_relearn_and_retrigger(motion_app):
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+
+    source.mode = "blob"
+    for _ in range(settings.DEFAULTS["persistence"]):
+        grabber.grab_once()
+    assert grabber.snapshot().motion is True
+
+    resp = app.test_client().post("/api/motion/reset")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+    # The reset drops the model entirely, so the (now-blob) scene must be
+    # relearned as background from scratch before motion means anything again.
+    source.mode = "background"
+    _warm_up(grabber)
+    assert grabber.snapshot().motion is False
+
+    # A fresh blob re-triggers motion, proving the old model was actually
+    # dropped rather than left in place with stale state.
+    source.mode = "blob"
+    for _ in range(settings.DEFAULTS["persistence"]):
+        grabber.grab_once()
+    assert grabber.snapshot().motion is True
+
+
+# --- review regressions: motion never gates delivery; config cross-check; reset clears signal ---
+
+
+class MonoCaptureSource(CaptureSource):
+    """Returns a single-channel (grayscale/IR) frame — models a night camera.
+
+    Regression guard for the delivery/motion split: previously _compute_motion
+    called cv2.cvtColor(BGR2GRAY) on this 2D frame, which raised and failed the
+    whole grab, so a perfectly working mono camera looked dead.
+    """
+
+    def __init__(self, device: "int | str" = 0) -> None:
+        del device
+
+    def read(self) -> np.ndarray:
+        return np.full((120, 160), 80, dtype=np.uint8)  # 2D, single-channel
+
+    def close(self) -> None:
+        pass
+
+
+def test_mono_camera_delivers_frame_and_motion_never_gates(config_path):
+    # A motion-compute quirk (here a 2D mono frame) must NOT suppress delivery.
+    app = create_app(source_factory=MonoCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
+    snap = app.grabber.snapshot()
+    assert snap.frame is not None      # frame published despite the mono ROI
+    assert snap.frame_id == 1
+    assert snap.last_error is None     # a good read is never marked failed by motion
+    resp = app.test_client().get("/frame")
+    assert resp.status_code == 200
+    assert resp.content_type == "image/jpeg"
+
+
+def test_post_config_min_area_ge_max_area_fraction_is_400(client):
+    # Both individually valid, but an inverted pair makes motion impossible.
+    resp = client.post("/api/config", json={"min_area": 0.7, "max_area_fraction": 0.6})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_post_config_partial_min_area_checked_against_live_max(client):
+    # A min_area-only POST is cross-checked against the persisted max (default 0.6).
+    assert client.post("/api/config", json={"min_area": 0.9}).status_code == 400
+    # A value that stays below the live max is accepted.
+    assert client.post("/api/config", json={"min_area": 0.05}).status_code == 200
+
+
+def test_reset_motion_clears_published_signal(motion_app):
+    # reset_motion must neutralize the last published motion/bbox so a config
+    # change can't serve a stale motion=true / old-ROI bbox until the next grab.
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+    source.mode = "blob"
+    for _ in range(settings.DEFAULTS["persistence"]):
+        grabber.grab_once()
+    assert grabber.snapshot().motion is True
+
+    grabber.reset_motion()
+    snap = grabber.snapshot()          # no new grab yet
+    assert snap.motion is False
+    assert snap.bbox is None
+    assert snap.area == 0.0

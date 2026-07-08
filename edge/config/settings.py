@@ -4,7 +4,22 @@ import json
 import os
 from pathlib import Path
 
-DEFAULTS = {"device": 0, "rotation": 0, "clip": None, "fps": 5}
+DEFAULTS = {
+    "device": 0,
+    "rotation": 0,
+    "clip": None,
+    "fps": 5,
+    "var_threshold": 16.0,
+    "learning_rate": 0.001,
+    "min_area": 0.01,
+    "max_area_fraction": 0.6,
+    "persistence": 2,
+    # ROI width (px) MOG2 runs on. 320 (not 160): the morphology OPEN kernel is a
+    # fixed 3x3, so a coarser ROI erodes a proportionally larger chunk of a
+    # cat-sized blob and drops it below min_area within seconds — 320 keeps the
+    # blob robust. Still cheap on a Pi 3 (~4x the motion pixels of 160, low ms).
+    "motion_downscale": 320,
+}
 
 
 def _config_path() -> Path:

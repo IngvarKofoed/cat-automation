@@ -3,8 +3,11 @@
 The integration hub that ties the capture backends, the background grabber, and
 settings together behind one HTTP server. ``/frame`` and ``/stream`` both serve
 from the grabber's latest-frame slot (never a direct source read). See
-docs/ARCHITECTURE.md (Camera source, Config UI) and
-docs/specs/2026-07-07-edge-stream-live-fps.md.
+Motion runs in the grabber and is published as a PULL signal (GET /status +
+X-Motion stream headers); it does NOT gate frame delivery — /frame and /stream
+serve every frame exactly as before. See docs/ARCHITECTURE.md (Camera source,
+Config UI), docs/specs/2026-07-07-edge-stream-live-fps.md, and
+docs/specs/2026-07-08-edge-motion-detection.md.
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.factory import create_source
 from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
-from edge.server.grabber import Grabber
+from edge.server.grabber import GrabConfig, Grabber, MotionConfig
 
 SourceFactory = Callable[["int | str"], CaptureSource]
 
@@ -74,19 +77,73 @@ def _valid_clip(clip) -> bool:
     return x >= 0 and y >= 0 and w > 0 and h > 0 and x + w <= 1 and y + h <= 1
 
 
+def _is_number(v) -> bool:
+    """True if `v` is a real int/float — bool (an int subclass) is rejected."""
+    return not isinstance(v, bool) and isinstance(v, (int, float))
+
+
+def _is_int(v) -> bool:
+    """True if `v` is a real int — bool (an int subclass) is rejected."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def _valid_fps(fps) -> bool:
     """True if `fps` is a real number (not a bool) in the inclusive range 1..30."""
-    if isinstance(fps, bool):  # bool is an int subclass; reject it explicitly
-        return False
-    if not isinstance(fps, (int, float)):
-        return False
-    return 1 <= fps <= 30
+    return _is_number(fps) and 1 <= fps <= 30
+
+
+# Motion-config keys: (validator, 400 message). One table drives load-time
+# defaulting, the POST presence check, per-key validation, and the state
+# snapshot, so the six motion keys are handled uniformly with fps/rotation/clip.
+# Ranges per docs/specs/2026-07-08-edge-motion-detection.md; bool is rejected
+# wherever a number/int is expected (mirrors _valid_fps).
+_MOTION_VALIDATORS = {
+    "var_threshold": (
+        lambda v: _is_number(v) and v > 0,
+        "var_threshold must be a number greater than 0",
+    ),
+    "learning_rate": (
+        lambda v: _is_number(v) and 0 <= v <= 1,
+        "learning_rate must be a number between 0 and 1",
+    ),
+    "min_area": (
+        lambda v: _is_number(v) and 0 <= v < 1,
+        "min_area must be a number in [0, 1)",
+    ),
+    "max_area_fraction": (
+        lambda v: _is_number(v) and 0 < v <= 1,
+        "max_area_fraction must be a number in (0, 1]",
+    ),
+    "persistence": (
+        lambda v: _is_int(v) and v >= 1,
+        "persistence must be an integer >= 1",
+    ),
+    "motion_downscale": (
+        lambda v: _is_int(v) and 32 <= v <= 640,
+        "motion_downscale must be an integer between 32 and 640",
+    ),
+}
+
+# Every settable config key (for the POST presence check + its error message).
+_CONFIG_KEYS = ("device", "rotation", "clip", "fps", *_MOTION_VALIDATORS)
 
 
 def _encode_jpeg(img) -> "tuple[bool, bytes]":
     """Encode a BGR frame as JPEG q90; return (ok, bytes) — bytes empty on failure."""
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return ok, (buf.tobytes() if ok else b"")
+
+
+def _frame_is_stale(snap, fps) -> bool:
+    """True if the slot's frame is older than the freshness budget for ``fps``.
+
+    Catches a silently-frozen frame from a wedged camera. The delta is monotonic
+    (the Pi has no RTC, so an NTP step after boot must not make a fresh frame read
+    as stale), and the 2 s floor keeps fast tests from flaking. Shared by /frame
+    and /status so both derive liveness from one rule.
+    """
+    stale_ms = max(2000, round(8000 / fps))
+    return (time.monotonic() - snap.mono) * 1000 > stale_ms
 
 
 def _list_v4l2_cameras() -> "list[dict]":
@@ -164,19 +221,37 @@ def create_app(
         "clip": settings["clip"],
         "fps": fps,
     }
+    # Motion params: like fps they flow into compute (MOG2/decision rule) with no
+    # fail-safe transform, so an invalid stored value falls back to the default.
+    for key, (validator, _msg) in _MOTION_VALIDATORS.items():
+        state[key] = settings[key] if validator(settings[key]) else DEFAULTS[key]
 
-    def read_config() -> "tuple[CaptureSource, float]":
-        # Hand the grabber the current source + fps under the lock; it releases
-        # the lock before calling source.read(), so grabs never block config.
+    def read_config() -> GrabConfig:
+        # Hand the grabber the current source + pacing + transform + motion params
+        # under the lock; it releases the lock before calling source.read(), so
+        # grabs never block config reads or a device swap.
         with lock:
-            return state["source"], state["fps"]
+            return GrabConfig(
+                source=state["source"],
+                fps=state["fps"],
+                rotation=state["rotation"],
+                clip=state["clip"],
+                motion=MotionConfig(
+                    var_threshold=state["var_threshold"],
+                    learning_rate=state["learning_rate"],
+                    min_area=state["min_area"],
+                    max_area_fraction=state["max_area_fraction"],
+                    persistence=state["persistence"],
+                    downscale=state["motion_downscale"],
+                ),
+            )
 
     grabber = Grabber(read_config)
     app.grabber = grabber
     if start_grabber:
         grabber.start()
 
-    def _render(snap, raw: bool = False) -> "tuple[bool, bytes]":
+    def _render(snap, raw: bool = False, overlay: bool = False) -> "tuple[bool, bytes]":
         # The single transform+encode boundary shared by /frame and /stream:
         # rotate, then crop unless raw, then JPEG-encode the raw slot frame with
         # the current config. One place so the still and the stream can't silently
@@ -186,22 +261,42 @@ def create_app(
         img = rotate(snap.frame, rotation)
         if not raw:
             img = crop(img, clip)
+        if overlay and not raw and snap.bbox is not None:
+            # Draw the motion bbox onto the served frame for the config UI (an
+            # <img> can't read multipart headers). Copy first: img may alias the
+            # shared slot frame (rotation 0 + no clip return the raw frame/a view
+            # of it), and cv2.rectangle mutates in place. bbox is normalized to
+            # the ROI, i.e. to exactly this rotated+cropped img.
+            img = img.copy()
+            h, w = img.shape[:2]
+            bx, by, bw, bh = snap.bbox
+            x0, y0 = int(round(bx * w)), int(round(by * h))
+            x1, y1 = int(round((bx + bw) * w)), int(round((by + bh) * h))
+            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 255, 0), 2)
         return _encode_jpeg(img)
 
-    def _build_part(snap) -> "bytes | None":
+    def _build_part(snap, overlay: bool = False) -> "bytes | None":
         # Encode the (cropped) slot frame and frame it as one multipart part.
-        # None if encoding fails.
-        ok, data = _render(snap)
+        # None if encoding fails. Motion rides the part headers so a stream client
+        # gets the pull signal inline (X-Motion always; X-Bbox/X-Area on motion).
+        ok, data = _render(snap, overlay=overlay)
         if not ok:
             return None
-        return (
+        part = (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n"
             b"Content-Length: " + str(len(data)).encode() + b"\r\n"
             b"X-Frame-Id: " + str(snap.frame_id).encode() + b"\r\n"
             b"X-Timestamp: " + str(snap.ts).encode() + b"\r\n"
-            b"\r\n" + data + b"\r\n"
+            b"X-Motion: " + (b"1" if snap.motion else b"0") + b"\r\n"
         )
+        if snap.motion and snap.bbox is not None:
+            bx, by, bw, bh = snap.bbox
+            part += (
+                b"X-Bbox: " + f"{bx},{by},{bw},{bh}".encode() + b"\r\n"
+                b"X-Area: " + str(snap.area).encode() + b"\r\n"
+            )
+        return part + b"\r\n" + data + b"\r\n"
 
     @app.get("/")
     def index():
@@ -212,6 +307,9 @@ def create_app(
         # raw is on when the param is present and truthy: raw preview skips the
         # crop (oriented but uncropped) so the UI can drag the ROI on it.
         raw = request.args.get("raw") not in (None, "", "0", "false")
+        # overlay draws the motion bbox onto the frame (ignored when raw). /frame
+        # carries NO motion headers — poll /status for the pull signal.
+        overlay = request.args.get("overlay") not in (None, "", "0", "false")
         # Serve the grabber's latest frame, not a fresh read. Wait only on a true
         # cold boot (no frame yet AND no error reported) to out-wait camera warmup
         # without hanging on a hard failure.
@@ -226,13 +324,11 @@ def create_app(
         # non-stale frame is.
         if snap.frame is None:
             return jsonify(error=snap.last_error or "no frame available"), 503
-        # Reject a silently-frozen frame: a wedged camera stops advancing. Delta is
-        # monotonic, not wall-clock (the Pi has no RTC, so an NTP step after boot
-        # could otherwise make a fresh frame read as stale).
-        stale_ms = max(2000, round(8000 / cur_fps))
-        if (time.monotonic() - snap.mono) * 1000 > stale_ms:
+        # Reject a silently-frozen frame: a wedged camera stops advancing (shared
+        # freshness rule with /status; monotonic, not wall-clock — see helper).
+        if _frame_is_stale(snap, cur_fps):
             return jsonify(error=snap.last_error or "frame stale"), 503
-        ok, data = _render(snap, raw=raw)
+        ok, data = _render(snap, raw=raw, overlay=overlay)
         if not ok:
             return jsonify(error="failed to encode frame"), 500
         resp = app.response_class(data, mimetype="image/jpeg")
@@ -246,20 +342,23 @@ def create_app(
     def stream():
         # Continuous MJPEG over HTTP. Pacing comes from the grabber: the
         # generator blocks until frame_id advances, so idle clients don't
-        # busy-loop and the cadence is the configured fps.
+        # busy-loop and the cadence is the configured fps. overlay is read here
+        # (in the request context) since the generator runs outside it.
+        overlay = request.args.get("overlay") not in (None, "", "0", "false")
+
         def gen():
             last_sent_id = 0
             try:
                 snap = grabber.snapshot()
                 if snap.frame_id > 0:
-                    part = _build_part(snap)
+                    part = _build_part(snap, overlay=overlay)
                     if part is not None:
                         last_sent_id = snap.frame_id
                         yield part
                 while True:
                     snap = grabber.wait_next(last_sent_id, timeout=_STREAM_WAIT_S)
                     if snap.frame_id > last_sent_id and snap.frame is not None:
-                        part = _build_part(snap)
+                        part = _build_part(snap, overlay=overlay)
                         if part is not None:
                             last_sent_id = snap.frame_id
                             yield part
@@ -272,6 +371,37 @@ def create_app(
 
         return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
+    @app.get("/status")
+    def status():
+        # The pullable motion + camera-health snapshot (see the motion spec). A
+        # plain snapshot, no waiting; a client correlates it to stream frames by
+        # frame_id. camera_ok = no error AND a fresh (non-stale) frame, using the
+        # same monotonic staleness rule as /frame (the Pi has no RTC).
+        snap = grabber.snapshot()
+        with lock:
+            cur_fps = state["fps"]
+        camera_ok = (
+            snap.last_error is None
+            and snap.frame is not None
+            and not _frame_is_stale(snap, cur_fps)
+        )
+        return jsonify(
+            frame_id=snap.frame_id,
+            ts=snap.ts,
+            motion=snap.motion,
+            bbox=list(snap.bbox) if snap.bbox is not None else None,
+            area=snap.area,
+            camera_ok=camera_ok,
+            last_error=snap.last_error,
+        )
+
+    @app.post("/api/motion/reset")
+    def motion_reset():
+        # Manual "Relearn background" from the config UI: drop the MOG2 model so
+        # the next grab relearns the scene from scratch.
+        grabber.reset_motion()
+        return jsonify(ok=True)
+
     @app.get("/api/config")
     def get_config():
         with lock:
@@ -280,6 +410,12 @@ def create_app(
                 rotation=state["rotation"],
                 clip=state["clip"],
                 fps=state["fps"],
+                var_threshold=state["var_threshold"],
+                learning_rate=state["learning_rate"],
+                min_area=state["min_area"],
+                max_area_fraction=state["max_area_fraction"],
+                persistence=state["persistence"],
+                motion_downscale=state["motion_downscale"],
             )
 
     @app.post("/api/config")
@@ -289,8 +425,10 @@ def create_app(
             # Missing, non-JSON, or valid-but-non-object body (5, "x", [] …):
             # treat as empty so it becomes a clean 400, not a 500.
             body = {}
-        if not any(k in body for k in ("device", "rotation", "clip", "fps")):
-            return jsonify(error="config must set at least one of device, rotation, clip, fps"), 400
+        if not any(k in body for k in _CONFIG_KEYS):
+            return jsonify(
+                error="config must set at least one of " + ", ".join(_CONFIG_KEYS)
+            ), 400
 
         # Validate every present field BEFORE any camera work; 400 on the first bad
         # one. device is now optional (the UI sends rotation-only / clip-only POSTs).
@@ -306,6 +444,23 @@ def create_app(
             return jsonify(error="clip must be null or a normalized rect within the frame"), 400
         if "fps" in body and not _valid_fps(body["fps"]):
             return jsonify(error="fps must be a number between 1 and 30"), 400
+        for key, (validator, msg) in _MOTION_VALIDATORS.items():
+            if key in body and not validator(body[key]):
+                return jsonify(error=msg), 400
+
+        # Cross-field: min_area must stay below max_area_fraction, or the locality
+        # gate (min <= area <= max) can never be satisfied and motion is silently
+        # impossible. Check the EFFECTIVE values (a partial POST merges with the
+        # live state) here — before any camera work — so a bad pair can't leak an
+        # opened candidate source.
+        eff_min = body["min_area"] if "min_area" in body else state["min_area"]
+        eff_max = (
+            body["max_area_fraction"]
+            if "max_area_fraction" in body
+            else state["max_area_fraction"]
+        )
+        if eff_min >= eff_max:
+            return jsonify(error="min_area must be less than max_area_fraction"), 400
 
         # Snapshot the current config to overlay the present fields onto and to
         # detect whether the device actually changes.
@@ -340,6 +495,8 @@ def create_app(
             "clip": body["clip"] if "clip" in body else cur_clip,
             "fps": body["fps"] if "fps" in body else cur_fps,
         }
+        for key in _MOTION_VALIDATORS:
+            next_config[key] = body[key] if key in body else state[key]
         try:
             save_settings(next_config)
         except OSError as e:
@@ -347,10 +504,19 @@ def create_app(
                 candidate.close()
             return jsonify(error=f"failed to persist config: {e}"), 500
 
+        # A device/rotation/clip change re-draws the ROI the MOG2 model is tied to,
+        # so relearn from scratch; else new pixels compare against a stale model and
+        # burst false motion. Computed before the swap; the reset itself runs after.
+        roi_changed = (
+            device_changed
+            or ("rotation" in body and body["rotation"] != cur_rotation)
+            or ("clip" in body and body["clip"] != cur_clip)
+        )
+
         # New-before-close: a fast pointer swap under the lock (only if the device
-        # changed), plus the transform/fps params; then close the old source
-        # outside it. fps and rotation/clip are picked up live by the grabber and
-        # the serving routes on their next lock-guarded read.
+        # changed), plus the transform/fps/motion params; then close the old source
+        # outside it. fps, rotation/clip, and the motion params are picked up live by
+        # the grabber and the serving routes on their next lock-guarded read.
         with lock:
             old = None
             if device_changed:
@@ -360,8 +526,14 @@ def create_app(
             state["rotation"] = next_config["rotation"]
             state["clip"] = next_config["clip"]
             state["fps"] = next_config["fps"]
+            for key in _MOTION_VALIDATORS:
+                state[key] = next_config[key]
         if old is not None:
             old.close()
+        if roi_changed:
+            # Relearn the background against the new ROI (safe before grab_once,
+            # which recomputes motion from the fresh model).
+            grabber.reset_motion()
         if device_changed:
             # Publish a frame from the NEW device now, so /frame (which serves the
             # slot) doesn't hand back the previous camera's cached frame until the

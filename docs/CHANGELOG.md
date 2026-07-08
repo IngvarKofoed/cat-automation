@@ -43,3 +43,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
    `POST /api/config` accepts any field subset (device now optional) and persists full config
    before swapping source, so bad values fail safe to defaults. Foundation for motion gate and `/stream`.
 
+9. Edge serves `/stream` as continuous MJPEG (multipart/x-mixed-replace) from a
+   background grabber thread reading at persisted fps (default 5); `/stream` and
+   `/frame` both serve the shared latest-frame slot with X-Frame-Id/X-Timestamp.
+   Config UI added Live toggle and fps control. CaptureSource.close() poisons
+   read-after-close to seal the device-swap race; motion gating is the next increment.
+

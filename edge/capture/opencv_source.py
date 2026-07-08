@@ -33,10 +33,13 @@ class OpenCVCaptureSource(CaptureSource):
         self._device = device
         self._lock = threading.Lock()
         self._cap: "cv2.VideoCapture | None" = None
+        self._closed = False
 
     def read(self) -> "np.ndarray":
         """Return one decoded BGR frame, reopening the handle if needed."""
         with self._lock:
+            if self._closed:
+                raise CaptureError(f"camera {self._device!r} is closed")
             if self._cap is None:
                 self._cap = cv2.VideoCapture(self._device)
             if not self._cap.isOpened():
@@ -51,8 +54,14 @@ class OpenCVCaptureSource(CaptureSource):
             return frame
 
     def close(self) -> None:
-        """Release the underlying handle. Safe to call more than once."""
+        """Release the underlying handle. Safe to call more than once.
+
+        Poisons the source: a subsequent read() raises CaptureError instead of
+        reopening, so a source swapped out from under the lock-free grabber can
+        never resurrect its handle.
+        """
         with self._lock:
+            self._closed = True
             self._release_locked()
 
     def _release_locked(self) -> None:

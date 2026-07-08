@@ -25,9 +25,15 @@ class CaptureSource(ABC):
     def read(self) -> "np.ndarray":
         """Return one decoded BGR frame as a numpy ndarray.
 
-        Raises CaptureError if a frame cannot be produced.
+        Raises CaptureError if a frame cannot be produced. Once close() has been
+        called the source is poisoned: read() must raise CaptureError and must
+        not reopen the underlying resource.
         """
 
     @abstractmethod
     def close(self) -> None:
-        """Release any underlying resources. Safe to call more than once."""
+        """Release any underlying resources. Safe to call more than once.
+
+        After close(), a later read() raises CaptureError rather than lazily
+        reopening — a swapped-out source can never resurrect its handle.
+        """

@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-DEFAULTS = {"device": 0, "rotation": 0, "clip": None}
+DEFAULTS = {"device": 0, "rotation": 0, "clip": None, "fps": 5}
 
 
 def _config_path() -> Path:

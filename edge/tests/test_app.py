@@ -14,6 +14,7 @@ import pytest
 
 from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.fake_source import FakeCaptureSource
+from edge.capture.opencv_source import OpenCVCaptureSource
 from edge.clip.transform import crop, rotate
 from edge.config import settings
 from edge.server.app import create_app
@@ -27,6 +28,23 @@ class FailingCaptureSource(CaptureSource):
 
     def read(self):
         raise CaptureError("cannot open device")
+
+    def close(self) -> None:
+        pass
+
+
+class FlakyCaptureSource(CaptureSource):
+    """Succeeds on the first read, then fails — models a transient dropped grab."""
+
+    def __init__(self, device: "int | str" = 0) -> None:
+        del device
+        self._reads = 0
+
+    def read(self):
+        self._reads += 1
+        if self._reads == 1:
+            return FakeCaptureSource().read()
+        raise CaptureError("transient read failure")
 
     def close(self) -> None:
         pass
@@ -56,8 +74,14 @@ def config_path(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(config_path):
-    """A test client for an app wired to the fake capture source."""
-    app = create_app(source_factory=FakeCaptureSource)
+    """A test client for an app wired to the fake capture source.
+
+    The grabber never auto-starts in tests: start_grabber=False plus one
+    grab_once() populates the latest-frame slot deterministically, so /frame
+    tests get a frame without a free-spinning background thread.
+    """
+    app = create_app(source_factory=FakeCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
     return app.test_client()
 
 
@@ -65,10 +89,88 @@ def client(config_path):
 
 
 def test_frame_returns_jpeg(client):
+    # Grab immediately before the request so the slot frame is fresh regardless
+    # of how slow the host is between fixture setup and here (the /frame staleness
+    # window is wall-clock-independent but time-based).
+    client.application.grabber.grab_once()
     resp = client.get("/frame")
     assert resp.status_code == 200
     assert resp.content_type == "image/jpeg"
     assert resp.data[:2] == b"\xff\xd8"
+
+
+# --- grabber determinism ---
+
+
+def test_grab_once_populates_slot_then_frame_returns_jpeg(config_path):
+    app = create_app(source_factory=FakeCaptureSource, start_grabber=False)
+    assert app.grabber.snapshot().frame_id == 0
+
+    app.grabber.grab_once()
+    snap = app.grabber.snapshot()
+    assert snap.frame_id == 1
+    assert snap.frame is not None
+    assert snap.last_error is None
+
+    resp = app.test_client().get("/frame")
+    assert resp.status_code == 200
+    assert resp.content_type == "image/jpeg"
+    assert resp.data[:2] == b"\xff\xd8"
+
+
+def test_frame_503_when_grab_fails(config_path):
+    app = create_app(source_factory=FailingCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
+    snap = app.grabber.snapshot()
+    assert snap.frame_id == 0
+    assert snap.last_error is not None
+
+    resp = app.test_client().get("/frame")
+    assert resp.status_code == 503
+    assert "error" in resp.get_json()
+
+
+def test_frame_serves_fresh_frame_despite_later_grab_error(config_path):
+    # A single dropped grab sets last_error but leaves a fresh frame in the slot;
+    # /frame must serve it, not 503 (USB cameras drop reads routinely).
+    app = create_app(source_factory=FlakyCaptureSource, start_grabber=False)
+    app.grabber.grab_once()  # success: frame in slot, frame_id 1
+    app.grabber.grab_once()  # failure: last_error set, frame retained
+    snap = app.grabber.snapshot()
+    assert snap.frame is not None and snap.last_error is not None
+
+    resp = app.test_client().get("/frame")
+    assert resp.status_code == 200
+    assert resp.content_type == "image/jpeg"
+
+
+def test_frame_carries_frame_identity_headers(client):
+    client.application.grabber.grab_once()
+    resp = client.get("/frame")
+    assert resp.status_code == 200
+    # Same identity headers as /stream parts, so a polling client can order/dedupe.
+    assert resp.headers.get("X-Frame-Id")
+    assert resp.headers.get("X-Timestamp")
+
+
+# --- GET /stream ---
+
+
+def test_stream_returns_multipart_with_first_frame(config_path):
+    app = create_app(source_factory=FakeCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
+    client = app.test_client()
+
+    resp = client.get("/stream", buffered=False)
+    assert resp.status_code == 200
+    assert resp.content_type.startswith("multipart/x-mixed-replace")
+
+    # Pull exactly one part off the endless stream; never touch resp.data.
+    part = next(resp.response)
+    assert b"\xff\xd8" in part
+    assert b"X-Frame-Id" in part
+    assert b"X-Timestamp" in part
+    resp.close()
 
 
 # --- GET /api/config ---
@@ -77,7 +179,7 @@ def test_frame_returns_jpeg(client):
 def test_get_config_returns_default_device(client):
     resp = client.get("/api/config")
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
 
 
 # --- POST /api/config: valid device ---
@@ -86,10 +188,10 @@ def test_get_config_returns_default_device(client):
 def test_post_config_valid_device_updates_and_persists(client, config_path):
     resp = client.post("/api/config", json={"device": 1})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None}
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None, "fps": 5}
 
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None}
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": None, "fps": 5}
 
     assert settings.load_settings()["device"] == 1
     saved = json.loads(config_path.read_text())
@@ -125,7 +227,9 @@ def test_post_config_non_object_body_is_400(client):
 
 
 def test_post_config_source_open_failure_keeps_previous(config_path):
-    app = create_app(source_factory=_factory_with_bad_device(bad_device=99))
+    app = create_app(
+        source_factory=_factory_with_bad_device(bad_device=99), start_grabber=False
+    )
     client = app.test_client()
 
     resp = client.post("/api/config", json={"device": 99})
@@ -133,7 +237,7 @@ def test_post_config_source_open_failure_keeps_previous(config_path):
 
     # Previous source/device is kept.
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
 
     # Nothing was ever persisted for the failed switch.
     assert not config_path.exists()
@@ -201,6 +305,41 @@ def test_picamera_read_without_picamera2_raises_captureerror():
         PicameraCaptureSource(0).read()
 
 
+# --- capture-source poisoned close ---
+
+
+def test_fake_source_read_after_close_raises_and_does_not_reopen():
+    source = FakeCaptureSource()
+    source.read()  # sanity: works before close
+    source.close()
+    with pytest.raises(CaptureError):
+        source.read()
+    source.close()  # still idempotent after poisoning
+
+
+def test_opencv_source_read_after_close_raises_and_does_not_reopen():
+    # close() poisons the source before any read() ever touches hardware, so
+    # this needs no real camera.
+    source = OpenCVCaptureSource(0)
+    source.close()
+    with pytest.raises(CaptureError):
+        source.read()
+    source.close()  # still idempotent after poisoning
+
+
+def test_picamera_source_read_after_close_raises_and_does_not_reopen():
+    # The CSI backend must honor the same contract: the _closed guard runs before
+    # _ensure_open, so read()-after-close raises without importing picamera2 or
+    # touching hardware (this is the swap race the poisoning seals for CSI).
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    source = PicameraCaptureSource(0)
+    source.close()
+    with pytest.raises(CaptureError):
+        source.read()
+    source.close()  # still idempotent after poisoning
+
+
 # --- / (config UI) ---
 
 
@@ -233,15 +372,22 @@ def test_load_settings_non_dict_json_returns_defaults(config_path):
 def test_create_app_bad_persisted_device_does_not_crash(config_path):
     # A hand-edited, parseable-but-invalid device must not wedge startup.
     config_path.write_text(json.dumps({"device": None}))
-    app = create_app(source_factory=FakeCaptureSource)  # must not raise
+    app = create_app(
+        source_factory=FakeCaptureSource, start_grabber=False
+    )  # must not raise
     resp = app.test_client().get("/api/config")
     assert resp.status_code == 200
-    # fell back to the default device; rotation/clip default too
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None}
+    # fell back to the default device; rotation/clip/fps default too
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": None, "fps": 5}
 
 
 def test_save_settings_then_load_settings_roundtrips(config_path):
-    full = {"device": "/dev/video0", "rotation": 90, "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}}
+    full = {
+        "device": "/dev/video0",
+        "rotation": 90,
+        "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
+        "fps": 5,
+    }
     settings.save_settings(full)
     assert settings.load_settings() == full
 
@@ -304,13 +450,13 @@ def test_crop_empty_region_returns_unchanged():
 def test_post_config_rotation_updates_without_device_change(client, config_path):
     resp = client.post("/api/config", json={"rotation": 90})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None}
+    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
 
     resp = client.get("/api/config")
-    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None}
+    assert resp.get_json() == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
 
     saved = json.loads(config_path.read_text())
-    assert saved == {"device": 0, "rotation": 90, "clip": None}
+    assert saved == {"device": 0, "rotation": 90, "clip": None, "fps": 5}
 
 
 # --- POST /api/config: clip-only ---
@@ -320,7 +466,7 @@ def test_post_config_clip_updates_and_persists(client, config_path):
     clip = {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
     resp = client.post("/api/config", json={"clip": clip})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": clip}
+    assert resp.get_json() == {"device": 0, "rotation": 0, "clip": clip, "fps": 5}
 
     resp = client.get("/api/config")
     assert resp.get_json()["clip"] == clip
@@ -363,6 +509,26 @@ def test_post_config_empty_body_is_400(client):
     assert "error" in resp.get_json()
 
 
+# --- POST /api/config: fps validation ---
+
+
+@pytest.mark.parametrize("fps", [5, 10, 30])
+def test_post_config_valid_fps_updates_and_round_trips(client, fps):
+    resp = client.post("/api/config", json={"fps": fps})
+    assert resp.status_code == 200
+    assert resp.get_json()["fps"] == fps
+
+    resp = client.get("/api/config")
+    assert resp.get_json()["fps"] == fps
+
+
+@pytest.mark.parametrize("fps", [0, 31, "x", True])
+def test_post_config_invalid_fps_is_400(client, fps):
+    resp = client.post("/api/config", json={"fps": fps})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
 # --- POST /api/config: a device change must not wipe rotation/clip ---
 
 
@@ -373,7 +539,7 @@ def test_post_config_device_change_preserves_clip(client, config_path):
 
     resp = client.post("/api/config", json={"device": 1})
     assert resp.status_code == 200
-    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": clip}
+    assert resp.get_json() == {"device": 1, "rotation": 0, "clip": clip, "fps": 5}
 
     saved = json.loads(config_path.read_text())
     assert saved["device"] == 1
@@ -391,6 +557,7 @@ def test_frame_applies_configured_rotation(client):
     resp = client.post("/api/config", json={"rotation": 90})
     assert resp.status_code == 200
 
+    client.application.grabber.grab_once()  # fresh slot frame before the GET
     resp = client.get("/frame")
     assert resp.status_code == 200
     img = _decode_jpeg(resp.data)
@@ -401,6 +568,7 @@ def test_frame_applies_configured_clip(client):
     resp = client.post("/api/config", json={"clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}})
     assert resp.status_code == 200
 
+    client.application.grabber.grab_once()  # fresh slot frame before the GET
     resp = client.get("/frame")
     assert resp.status_code == 200
     img = _decode_jpeg(resp.data)
@@ -414,6 +582,7 @@ def test_frame_raw_skips_crop_but_keeps_rotation(client):
     resp = client.post("/api/config", json={"clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}})
     assert resp.status_code == 200
 
+    client.application.grabber.grab_once()  # fresh slot frame before the GET
     resp = client.get("/frame?raw=1")
     assert resp.status_code == 200
     img = _decode_jpeg(resp.data)

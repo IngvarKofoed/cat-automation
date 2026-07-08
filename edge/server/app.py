@@ -28,6 +28,8 @@ from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 from edge.server.grabber import GrabConfig, Grabber, MotionConfig
 from edge.server.metrics import SystemMetrics
+from shared import wire
+from shared.wire import StreamFrameMeta
 
 SourceFactory = Callable[["int | str"], CaptureSource]
 
@@ -287,26 +289,21 @@ def create_app(
 
     def _build_part(snap, overlay: bool = False) -> "bytes | None":
         # Encode the (cropped) slot frame and frame it as one multipart part.
-        # None if encoding fails. Motion rides the part headers so a stream client
-        # gets the pull signal inline (X-Motion always; X-Bbox/X-Area on motion).
+        # None if encoding fails. The wire format — boundary, Content-*, and the
+        # X-* pull-signal headers — is serialized through shared.wire so the edge
+        # and the compute-side parser bind to one definition and cannot desync
+        # (X-Motion always; X-Bbox only while motion is active; X-Area always).
         ok, data = _render(snap, overlay=overlay)
         if not ok:
             return None
-        part = (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + str(len(data)).encode() + b"\r\n"
-            b"X-Frame-Id: " + str(snap.frame_id).encode() + b"\r\n"
-            b"X-Timestamp: " + str(snap.ts).encode() + b"\r\n"
-            b"X-Motion: " + (b"1" if snap.motion else b"0") + b"\r\n"
+        meta = StreamFrameMeta(
+            frame_id=snap.frame_id,
+            ts=snap.ts,
+            motion=snap.motion,
+            bbox=snap.bbox,
+            area=snap.area,
         )
-        if snap.motion and snap.bbox is not None:
-            bx, by, bw, bh = snap.bbox
-            part += (
-                b"X-Bbox: " + f"{bx},{by},{bw},{bh}".encode() + b"\r\n"
-                b"X-Area: " + str(snap.area).encode() + b"\r\n"
-            )
-        return part + b"\r\n" + data + b"\r\n"
+        return wire.format_part_headers(meta, len(data)) + data + b"\r\n"
 
     @app.get("/")
     def index():
@@ -379,7 +376,12 @@ def create_app(
                 # OSError subclasses; GeneratorExit fires when the response closes.
                 return
 
-        return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+        # Boundary token sourced from shared.wire so this mimetype declaration and
+        # the per-part "--<boundary>" separator can never desync.
+        return Response(
+            gen(),
+            mimetype=f"multipart/x-mixed-replace; boundary={wire.BOUNDARY}",
+        )
 
     @app.get("/status")
     def status():
@@ -395,19 +397,21 @@ def create_app(
             and snap.frame is not None
             and not _frame_is_stale(snap, cur_fps)
         )
-        return jsonify(
-            frame_id=snap.frame_id,
-            ts=snap.ts,
-            motion=snap.motion,
-            bbox=list(snap.bbox) if snap.bbox is not None else None,
-            area=snap.area,
-            camera_ok=camera_ok,
-            last_error=snap.last_error,
-            version=_VERSION,
+        # Key names come from shared.wire so /status and the compute-side parser
+        # bind to one field-name definition and cannot desync.
+        return jsonify({
+            wire.FIELD_FRAME_ID: snap.frame_id,
+            wire.FIELD_TS: snap.ts,
+            wire.FIELD_MOTION: snap.motion,
+            wire.FIELD_BBOX: list(snap.bbox) if snap.bbox is not None else None,
+            wire.FIELD_AREA: snap.area,
+            wire.FIELD_CAMERA_OK: camera_ok,
+            wire.FIELD_LAST_ERROR: snap.last_error,
+            wire.FIELD_VERSION: _VERSION,
             # Host CPU/mem load, or None if psutil is unavailable/read fails; owns
             # its own state so it needs no app lock (don't move inside `with lock`).
-            system=metrics.sample(),
-        )
+            wire.FIELD_SYSTEM: metrics.sample(),
+        })
 
     @app.post("/api/motion/reset")
     def motion_reset():

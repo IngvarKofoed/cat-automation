@@ -254,11 +254,82 @@ def test_stream_returns_multipart_with_first_frame(config_path):
     assert b"X-Frame-Id" in part
     assert b"X-Timestamp" in part
     # A single grab can't meet the default persistence (2 consecutive frames),
-    # so the first part's motion is deterministically off with no bbox/area.
+    # so the first part's motion is deterministically off with no bbox.
     assert b"X-Motion: 0" in part
     assert b"X-Bbox" not in part
-    assert b"X-Area" not in part
+    # X-Area is emitted on EVERY part now (the shared serializer always writes it,
+    # matching /status and the grabber's always-reported area), even when idle.
+    assert b"X-Area" in part
     resp.close()
+
+
+def _pull_one_part(app) -> "tuple[bytes, bytes]":
+    """Open /stream, pull exactly one multipart part, split header block/body.
+
+    Returns (header_block, jpeg_body): the header block through its terminating
+    blank line (ending CRLF CRLF), and the JPEG body with its trailing CRLF
+    stripped. Closes the endless stream so the test doesn't leak the connection.
+    """
+    resp = app.test_client().get("/stream", buffered=False)
+    try:
+        part = next(resp.response)
+    finally:
+        resp.close()
+    sep = part.index(b"\r\n\r\n") + 4
+    return part[:sep], part[sep:-2]  # -2 drops the part's trailing CRLF
+
+
+def test_stream_part_bytes_exact_when_motion_inactive(config_path):
+    # Byte-exact lock on the motion-INACTIVE part: it must spell out X-Motion: 0,
+    # carry NO X-Bbox, and — the intended contract change — DO carry X-Area even
+    # when idle. The expected block is hand-written (independent of shared.wire's
+    # construction) so a regression in the serializer is actually caught.
+    app = create_app(source_factory=FakeCaptureSource, start_grabber=False)
+    app.grabber.grab_once()
+    snap = app.grabber.snapshot()
+    assert snap.motion is False and snap.bbox is None
+
+    header_block, body = _pull_one_part(app)
+    expected = (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"X-Frame-Id: " + str(snap.frame_id).encode() + b"\r\n"
+        b"X-Timestamp: " + str(snap.ts).encode() + b"\r\n"
+        b"X-Motion: 0\r\n"
+        b"X-Area: " + str(snap.area).encode() + b"\r\n"
+        b"\r\n"
+    )
+    assert header_block == expected
+
+
+def test_stream_part_bytes_exact_when_motion_active(motion_app):
+    # Byte-exact lock on the motion-ACTIVE part: X-Bbox MUST appear (its four
+    # comma-joined floats) and MUST precede X-Area — the historical byte order the
+    # compute parser and this serializer both depend on.
+    app, source = motion_app
+    grabber = app.grabber
+    _warm_up(grabber)
+    source.mode = "blob"
+    for _ in range(settings.DEFAULTS["persistence"]):
+        grabber.grab_once()
+    snap = grabber.snapshot()
+    assert snap.motion is True and snap.bbox is not None
+
+    header_block, body = _pull_one_part(app)
+    bx, by, bw, bh = snap.bbox
+    expected = (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"X-Frame-Id: " + str(snap.frame_id).encode() + b"\r\n"
+        b"X-Timestamp: " + str(snap.ts).encode() + b"\r\n"
+        b"X-Motion: 1\r\n"
+        b"X-Bbox: " + f"{bx},{by},{bw},{bh}".encode() + b"\r\n"
+        b"X-Area: " + str(snap.area).encode() + b"\r\n"
+        b"\r\n"
+    )
+    assert header_block == expected
 
 
 # --- GET /api/config ---

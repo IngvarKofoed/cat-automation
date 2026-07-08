@@ -66,3 +66,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     and macOS. CPU% is host-wide (not per-process) and resampled at most once per ~2s.
     Fails soft: psutil missing or a read error → `system: null` and /status still 200.
 
+13. Edge↔compute wire contract now lives in `shared/wire.py` — single source of truth.
+    Edge serializes frames through it, compute ingest (`EdgeClient`) parses through it; format can't drift.
+    Round-trip test locks it. One wire change: `/stream` emits `X-Area` on every part (matching `/status`),
+    not just when motion. `/status` is the camera health and liveness oracle; stream is the data plane.
+

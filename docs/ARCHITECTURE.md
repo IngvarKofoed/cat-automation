@@ -106,7 +106,7 @@ the clients that connect to it.** The Pi never dials out.
 |---|---|
 | **Capture service** | Pull frames from the camera at the configured **fps** and **focus**, through a pluggable **capture-source interface** (CSI / USB / IP) so different cameras drop in without touching the rest of the edge. See *Camera source*. |
 | **Clipper** | Crop each frame to the configured **clipping rectangle** (region of interest) before anything else — the door area only. |
-| **Motion gate** | *Simple* motion detection (e.g. frame differencing / background subtraction) against a **dynamic reference (background)** that adapts to changing light. Motion does **not** gate frame delivery: `/stream` and `/frame` serve every frame continuously; the motion result is published as a *separate pulled signal* (`GET /status`, plus `X-Motion`/`X-Bbox`/`X-Area` headers on each `/stream` part) that the compute pulls to decide when to spend GPU. Motion decisions are logged, so missed or spurious triggers are auditable while tuning the background (see *Observability*). |
+| **Motion gate** | *Simple* motion detection (e.g. frame differencing / background subtraction) against a **dynamic reference (background)** that adapts to changing light. Motion does **not** gate frame delivery: `/stream` and `/frame` serve every frame continuously; the motion result is published as a *separate pulled signal* (`GET /status`, plus `X-Motion` and `X-Area` headers on every `/stream` part, plus `X-Bbox` when motion is detected) that the compute pulls to decide when to spend GPU. Motion decisions are logged, so missed or spurious triggers are auditable while tuning the background (see *Observability*). |
 | **Pi web server** | The Pi's single HTTP server. Hosts the **Video stream** (and single-frame **snapshots**), the **motion/health status signal** (`GET /status`), the **Control API**, and the **Config UI** (below). Purely inbound — the PC and browser connect to it. |
 | **Actuator drivers** *(optional)* | Hardware drivers behind the control API: door-lock (relay/servo over GPIO), speaker, and light. Present only if the hardware is installed. |
 | **Local clip buffer** *(optional)* | Retains recent clips when the compute tier is unreachable, for later review. |
@@ -173,7 +173,7 @@ decision: at ~5 fps on the small ROI over the LAN, bandwidth is trivial, so
 decoupling lets motion gate the compute's *GPU cost* — when to run detection —
 rather than frame delivery, keeping frames available for preview, enrollment, and
 audit regardless of motion.) Each part carries the frame's motion result in its
-headers (`X-Motion`, plus `X-Bbox`/`X-Area` when active), and the same signal is
+headers (`X-Motion` and `X-Area`, plus `X-Bbox` when motion is active), and the same signal is
 pullable via `GET /status`, so the compute reads motion inline while every frame
 keeps flowing. One request, one endless response, many frames — this is how
 streaming works over plain HTTP, and it puts the PC in the connection-initiating
@@ -392,8 +392,8 @@ when to connect. Four inbound surfaces:
     the small ROI, LAN bandwidth is trivial, so decoupling motion from frame
     delivery — letting motion gate the compute's *GPU cost*, not frame
     availability — is worth more than the saved bytes). Each part carries the
-    frame's motion result in its headers (`X-Motion`, plus `X-Bbox`/`X-Area` when
-    active) so a stream consumer reads motion inline.
+    frame's motion result in its headers (`X-Motion` and `X-Area`, plus `X-Bbox` when
+    motion is active) so a stream consumer reads motion inline.
   - **Single stills:** the Pi also serves `GET /frame` — one plain image per
     request (JPEG by default, PNG/WebP when a lossless copy is needed) — for
     previews, enrollment grabs, and debugging, or for a client that prefers to

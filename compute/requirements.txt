@@ -1,0 +1,10 @@
+# Runtime deps for the compute ingest client. Test-only deps (pytest, and
+# werkzeug for the in-process edge integration test) are intentionally omitted,
+# matching edge/requirements.txt's runtime-only convention; the dev venv installs
+# them separately.
+requests>=2.31
+# StreamFrame.image decodes JPEG bodies via cv2+numpy, imported lazily only on
+# that path — but they ARE needed to run that shipped code path, so they belong
+# here. Headless build matches the edge and is enough for imdecode.
+numpy
+opencv-python-headless

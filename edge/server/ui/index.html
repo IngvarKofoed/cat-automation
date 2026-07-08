@@ -8,10 +8,42 @@
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             max-width: 600px;
-            margin: 40px auto;
+            /* Extra top margin clears the fixed slim topbar (see #topbar). */
+            margin: 52px auto 40px;
             padding: 20px;
             background: #f5f5f5;
             color: #333;
+        }
+        /* Slim, full-width host-health strip pinned to the top of the viewport.
+           Holds the CPU/Mem badges (device load), kept separate from the
+           camera-pipeline badges in the Motion card. */
+        #topbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 6px 16px;
+            background: #fff;
+            border-bottom: 1px solid #e0e0e0;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+            font-size: 13px;
+        }
+        .topbar-title {
+            font-weight: 600;
+            color: #666;
+        }
+        .topbar-metrics {
+            display: flex;
+            gap: 8px;
+        }
+        #topbar .badge {
+            font-size: 12px;
+            padding: 3px 8px;
         }
         h1 {
             margin-top: 0;
@@ -201,6 +233,14 @@
     </style>
 </head>
 <body>
+    <div id="topbar">
+        <span class="topbar-title">Cat Door edge</span>
+        <span class="topbar-metrics">
+            <span id="cpuLoad" class="badge">CPU: —</span>
+            <span id="memLoad" class="badge">Mem: —</span>
+        </span>
+    </div>
+
     <h1>Cat Door — Camera Config</h1>
 
     <div class="controls">
@@ -328,6 +368,8 @@
         const motionStateEl = document.getElementById('motionState');
         const motionAreaEl = document.getElementById('motionArea');
         const cameraHealthEl = document.getElementById('cameraHealth');
+        const cpuLoadEl = document.getElementById('cpuLoad');
+        const memLoadEl = document.getElementById('memLoad');
         const relearnBtn = document.getElementById('relearnBtn');
         const varThresholdInput = document.getElementById('varThreshold');
         const learningRateInput = document.getElementById('learningRate');
@@ -988,12 +1030,23 @@
                     cameraHealthEl.textContent = `Camera: ${data.last_error || 'error'}`;
                     cameraHealthEl.classList.add('bad');
                 }
+
+                const sys = data.system;
+                if (sys) {
+                    cpuLoadEl.textContent = (typeof sys.cpu_percent === 'number') ? `CPU: ${sys.cpu_percent}%` : 'CPU: —';
+                    memLoadEl.textContent = `Mem: ${sys.mem_percent}% (${sys.mem_used_mb} MB)`;
+                } else {
+                    cpuLoadEl.textContent = 'CPU: —';
+                    memLoadEl.textContent = 'Mem: —';
+                }
             } catch (err) {
                 motionStateEl.textContent = 'Motion: —';
                 motionStateEl.classList.remove('active');
                 motionAreaEl.textContent = 'Area: —';
                 cameraHealthEl.textContent = `Camera: unreachable (${err.message})`;
                 cameraHealthEl.classList.add('bad');
+                cpuLoadEl.textContent = 'CPU: —';
+                memLoadEl.textContent = 'Mem: —';
             } finally {
                 statusInFlight = false;
             }

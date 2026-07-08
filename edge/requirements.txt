@@ -1,5 +1,6 @@
 flask
 opencv-python-headless
+psutil  # host CPU%/memory for /status — one portable path for Pi OS + macOS
 # Pi CSI camera (Picamera2) is NOT pip-installed: `sudo apt install python3-picamera2`
 # and build the venv with --system-site-packages (see edge.sh). USB cameras need
 # nothing beyond the two deps above.

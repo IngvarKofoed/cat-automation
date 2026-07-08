@@ -778,6 +778,118 @@ def test_status_reflects_failing_source(config_path):
     assert body["last_error"] is not None
 
 
+def test_status_includes_system_metrics(client, monkeypatch):
+    # /status must carry a `system` key (dict or None per SystemMetrics.sample()'s
+    # contract) alongside the existing camera/motion fields — see
+    # docs/specs/2026-07-08-edge-system-metrics.md. Mock psutil so this asserts a
+    # populated dict regardless of whether the real dependency is installed.
+    from edge.server import metrics as metrics_mod
+
+    total = 4 * 1024**3  # 4 GB, in bytes, so mem_total_mb rounds to a sane figure
+    stub = _StubPsutil(cpu_percent=5.0, vm=_StubVirtualMemory(total=total, available=total // 2, percent=75.0))
+    monkeypatch.setattr(metrics_mod, "psutil", stub)
+
+    client.application.grabber.grab_once()
+    resp = client.get("/status")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert "system" in body
+    system = body["system"]
+    assert isinstance(system, dict)
+    for key in ("cpu_percent", "mem_percent", "mem_used_mb", "mem_total_mb"):
+        assert key in system
+    assert system["mem_total_mb"] > 0
+    assert 0 <= system["mem_percent"] <= 100
+
+
+# --- edge/server/metrics.py: SystemMetrics ---
+
+
+class _StubVirtualMemory:
+    """Stand-in for psutil.virtual_memory()'s return value."""
+
+    def __init__(self, total: int, available: int, percent: float) -> None:
+        self.total = total
+        self.available = available
+        self.percent = percent
+
+
+class _StubPsutil:
+    """Minimal stand-in for the psutil module, controllable per test."""
+
+    def __init__(self, cpu_percent: float, vm: _StubVirtualMemory) -> None:
+        self._cpu_percent = cpu_percent
+        self._vm = vm
+
+    def cpu_percent(self, interval=None):
+        del interval  # SystemMetrics must call this non-blocking (interval=None)
+        return self._cpu_percent
+
+    def virtual_memory(self):
+        return self._vm
+
+
+def test_sample_returns_none_when_psutil_unavailable(monkeypatch):
+    from edge.server import metrics as metrics_mod
+
+    monkeypatch.setattr(metrics_mod, "psutil", None)
+    assert metrics_mod.SystemMetrics().sample() is None
+
+
+def test_sample_cpu_percent_none_until_first_window_elapses(monkeypatch):
+    # The first sample() must not trust psutil's first cpu_percent() reading
+    # (it's meaningless with no prior window), so cpu_percent starts None.
+    from edge.server import metrics as metrics_mod
+
+    stub = _StubPsutil(cpu_percent=42.0, vm=_StubVirtualMemory(total=1000, available=400, percent=60.0))
+    monkeypatch.setattr(metrics_mod, "psutil", stub)
+
+    sampler = metrics_mod.SystemMetrics()
+    first = sampler.sample()
+    assert first is not None
+    assert first["cpu_percent"] is None
+
+    # Advance the sampler past CPU_WINDOW_S without waiting in real time.
+    sampler._last_cpu_mono -= metrics_mod.CPU_WINDOW_S
+    second = sampler.sample()
+    assert second["cpu_percent"] == 42.0
+
+
+def test_sample_caches_cpu_percent_within_window(monkeypatch):
+    # Within the same CPU_WINDOW_S, a changed underlying reading must not show
+    # up yet — sample() reuses the cached value instead of re-reading psutil.
+    from edge.server import metrics as metrics_mod
+
+    stub = _StubPsutil(cpu_percent=10.0, vm=_StubVirtualMemory(total=1000, available=400, percent=60.0))
+    monkeypatch.setattr(metrics_mod, "psutil", stub)
+
+    sampler = metrics_mod.SystemMetrics()
+    sampler.sample()  # primes the window; cpu_percent still None here
+    sampler._last_cpu_mono -= metrics_mod.CPU_WINDOW_S
+    sampler.sample()  # crosses the window once, caches 10.0
+
+    stub._cpu_percent = 99.0  # would show up only on a fresh psutil read
+    still_cached = sampler.sample()
+    assert still_cached["cpu_percent"] == 10.0
+
+
+def test_sample_memory_derived_from_total_minus_available(monkeypatch):
+    # mem_used_mb/mem_percent must come from total-available, not psutil's
+    # platform-dependent .used, for Linux/macOS consistency.
+    from edge.server import metrics as metrics_mod
+
+    total = 8 * 1024**2  # 8 MB, in bytes, for round-number expectations
+    available = 3 * 1024**2  # 3 MB available -> 5 MB used
+    stub = _StubPsutil(cpu_percent=0.0, vm=_StubVirtualMemory(total=total, available=available, percent=62.5))
+    monkeypatch.setattr(metrics_mod, "psutil", stub)
+
+    result = metrics_mod.SystemMetrics().sample()
+    assert result is not None
+    assert result["mem_total_mb"] == 8
+    assert result["mem_used_mb"] == 5
+    assert result["mem_percent"] == 62.5
+
+
 # --- motion detection (grabber, via a controllable synthetic source) ---
 
 

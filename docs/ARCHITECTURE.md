@@ -404,9 +404,10 @@ when to connect. Four inbound surfaces:
     and keep event handling idempotent — rather than trusting arrival order alone.
 - **Status / motion (data plane).** The PC polls the Pi's `GET /status` for a
   JSON snapshot of the latest frame's motion and camera health (`{frame_id, ts,
-  motion, bbox, area, camera_ok, last_error}`) — the signal it uses to decide when
+  motion, bbox, area, camera_ok, last_error, system}`) — the signal it uses to decide when
   to spend GPU on detection, and (via `camera_ok`) how it learns the camera has
-  died. Inbound, one request per poll; it correlates to stream frames by
+  died. The `system` field is `{cpu_percent, mem_percent, mem_used_mb, mem_total_mb}` or `null` (the edge
+  host's CPU% and memory, measured via `psutil`). Inbound, one request per poll; it correlates to stream frames by
   `frame_id`.
 - **Control (control plane).** The decision engine's actuation hits the Pi's
   **control API** (`POST lock`/`unlock`/`sound`/`light`) — again the PC

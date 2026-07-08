@@ -27,6 +27,7 @@ from edge.capture.factory import create_source
 from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 from edge.server.grabber import GrabConfig, Grabber, MotionConfig
+from edge.server.metrics import SystemMetrics
 
 SourceFactory = Callable[["int | str"], CaptureSource]
 
@@ -256,6 +257,10 @@ def create_app(
     if start_grabber:
         grabber.start()
 
+    # One instance closed over by /status: it owns the CPU window/delta state, so
+    # a per-request instance would reset that state and never yield a CPU reading.
+    metrics = SystemMetrics()
+
     def _render(snap, raw: bool = False, overlay: bool = False) -> "tuple[bool, bytes]":
         # The single transform+encode boundary shared by /frame and /stream:
         # rotate, then crop unless raw, then JPEG-encode the raw slot frame with
@@ -399,6 +404,9 @@ def create_app(
             camera_ok=camera_ok,
             last_error=snap.last_error,
             version=_VERSION,
+            # Host CPU/mem load, or None if psutil is unavailable/read fails; owns
+            # its own state so it needs no app lock (don't move inside `with lock`).
+            system=metrics.sample(),
         )
 
     @app.post("/api/motion/reset")

@@ -100,6 +100,19 @@ def _valid_fps(fps) -> bool:
     return _is_number(fps) and 1 <= fps <= 30
 
 
+def _valid_focus(focus) -> bool:
+    """True if `focus` is None (autofocus) or a real number in [0, 100] dioptres.
+
+    None means continuous autofocus; a number is a manual lens position. The
+    camera clamps to its own lens range, so we don't hardcode the exact max —
+    the generous 100-dioptre cap only rejects the plainly-wrong (negative, NaN,
+    inf, bool, non-number) before it reaches libcamera.
+    """
+    if focus is None:
+        return True
+    return _is_number(focus) and 0 <= focus <= 100
+
+
 # Motion-config keys: (validator, 400 message). One table drives load-time
 # defaulting, the POST presence check, per-key validation, and the state
 # snapshot, so the six motion keys are handled uniformly with fps/rotation/clip.
@@ -133,7 +146,7 @@ _MOTION_VALIDATORS = {
 }
 
 # Every settable config key (for the POST presence check + its error message).
-_CONFIG_KEYS = ("device", "rotation", "clip", "fps", *_MOTION_VALIDATORS)
+_CONFIG_KEYS = ("device", "rotation", "clip", "fps", "focus", *_MOTION_VALIDATORS)
 
 
 def _encode_jpeg(img) -> "tuple[bool, bytes]":
@@ -220,6 +233,9 @@ def create_app(
     # check divides by it, so an invalid stored fps falls back to the default
     # rather than crashing a request or the grab loop.
     fps = settings["fps"] if _valid_fps(settings["fps"]) else DEFAULTS["fps"]
+    # focus flows straight to libcamera (no fail-safe transform), so an invalid
+    # stored value falls back to the default (None = continuous autofocus).
+    focus = settings["focus"] if _valid_focus(settings["focus"]) else DEFAULTS["focus"]
     # rotation/clip need no validation at load: the transform functions are
     # fail-safe, so a bad stored value degrades to 0°/full-frame at render time.
     state = {
@@ -228,11 +244,35 @@ def create_app(
         "rotation": settings["rotation"],
         "clip": settings["clip"],
         "fps": fps,
+        "focus": focus,
     }
     # Motion params: like fps they flow into compute (MOG2/decision rule) with no
     # fail-safe transform, so an invalid stored value falls back to the default.
     for key, (validator, _msg) in _MOTION_VALIDATORS.items():
         state[key] = settings[key] if validator(settings[key]) else DEFAULTS[key]
+    # Push the persisted focus onto the source. A no-op on non-focus backends;
+    # on the CSI backend it's applied when the camera opens (see set_focus).
+    state["source"].set_focus(focus)
+
+    def _config_snapshot_locked() -> dict:
+        """The COMPLETE persisted-config dict built from live state.
+
+        Caller must hold ``lock``. One assembly point for every path that emits or
+        persists the whole config (``GET /api/config``, the autofocus persist
+        path): ``save_settings`` overwrites the file wholesale, so a partial dict
+        would wipe keys — routing through one helper stops a future key from being
+        dropped by a stale hand-rolled copy.
+        """
+        cfg = {
+            "device": state["device"],
+            "rotation": state["rotation"],
+            "clip": state["clip"],
+            "fps": state["fps"],
+            "focus": state["focus"],
+        }
+        for key in _MOTION_VALIDATORS:
+            cfg[key] = state[key]
+        return cfg
 
     def read_config() -> GrabConfig:
         # Hand the grabber the current source + pacing + transform + motion params
@@ -420,21 +460,45 @@ def create_app(
         grabber.reset_motion()
         return jsonify(ok=True)
 
+    @app.get("/api/capabilities")
+    def capabilities():
+        # What the ACTIVE source can do, so the config UI shows only the controls
+        # that apply (per ARCHITECTURE.md's capability-driven UI). Today: focus —
+        # {"min","max"} dioptres on a Module 3, or null on a fixed-focus/USB cam.
+        with lock:
+            source = state["source"]
+        return jsonify(focus=source.focus_capabilities())
+
+    @app.post("/api/focus/autofocus")
+    def autofocus():
+        # "Autofocus once" from the config UI: run one AF cycle, lock manual focus
+        # at the result, and persist it as the new focus so it survives a restart
+        # (a fixed door scene wants a stable locked lens, not perpetual hunting).
+        with lock:
+            source = state["source"]
+        try:
+            lens = source.autofocus_once()
+        except CaptureError as e:
+            return jsonify(error=str(e)), 503
+        if lens is None:
+            return jsonify(error="active camera has no controllable focus"), 422
+        # Persist the full config with the found focus (save_settings overwrites
+        # the whole file, so it must get every key — one assembly point).
+        with lock:
+            next_config = _config_snapshot_locked()
+            next_config["focus"] = lens
+        try:
+            save_settings(next_config)
+        except OSError as e:
+            return jsonify(error=f"failed to persist focus: {e}"), 500
+        with lock:
+            state["focus"] = lens
+        return jsonify(focus=lens)
+
     @app.get("/api/config")
     def get_config():
         with lock:
-            return jsonify(
-                device=state["device"],
-                rotation=state["rotation"],
-                clip=state["clip"],
-                fps=state["fps"],
-                var_threshold=state["var_threshold"],
-                learning_rate=state["learning_rate"],
-                min_area=state["min_area"],
-                max_area_fraction=state["max_area_fraction"],
-                persistence=state["persistence"],
-                motion_downscale=state["motion_downscale"],
-            )
+            return jsonify(_config_snapshot_locked())
 
     @app.post("/api/config")
     def set_config():
@@ -462,6 +526,8 @@ def create_app(
             return jsonify(error="clip must be null or a normalized rect within the frame"), 400
         if "fps" in body and not _valid_fps(body["fps"]):
             return jsonify(error="fps must be a number between 1 and 30"), 400
+        if "focus" in body and not _valid_focus(body["focus"]):
+            return jsonify(error="focus must be null or a number in [0, 100] dioptres"), 400
         for key, (validator, msg) in _MOTION_VALIDATORS.items():
             if key in body and not validator(body[key]):
                 return jsonify(error=msg), 400
@@ -486,6 +552,7 @@ def create_app(
         cur_rotation = state["rotation"]
         cur_clip = state["clip"]
         cur_fps = state["fps"]
+        cur_focus = state["focus"]
 
         # Build+validate a new source only when the device changes (a real open is
         # slow, so do it OUTSIDE the lock).
@@ -512,6 +579,7 @@ def create_app(
             "rotation": body["rotation"] if "rotation" in body else cur_rotation,
             "clip": body["clip"] if "clip" in body else cur_clip,
             "fps": body["fps"] if "fps" in body else cur_fps,
+            "focus": body["focus"] if "focus" in body else cur_focus,
         }
         for key in _MOTION_VALIDATORS:
             next_config[key] = body[key] if key in body else state[key]
@@ -544,10 +612,18 @@ def create_app(
             state["rotation"] = next_config["rotation"]
             state["clip"] = next_config["clip"]
             state["fps"] = next_config["fps"]
+            state["focus"] = next_config["focus"]
             for key in _MOTION_VALIDATORS:
                 state[key] = next_config[key]
+            new_source = state["source"]
         if old is not None:
             old.close()
+        # Apply focus outside the lock (set_focus does live libcamera I/O). Needed
+        # when focus changed, and when the device changed (the new source hasn't
+        # had the persisted focus pushed to it yet). A no-op on non-focus backends.
+        focus_changed = "focus" in body and next_config["focus"] != cur_focus
+        if device_changed or focus_changed:
+            new_source.set_focus(next_config["focus"])
         if roi_changed:
             # Relearn the background against the new ROI (safe before grab_once,
             # which recomputes motion from the fresh model).

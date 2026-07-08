@@ -211,7 +211,12 @@ A simple web page for setting up the camera at install time and tuning it later:
   capture stage. The remaining controls adapt to the selected source.
 - **Clipping rectangle** — the region of interest to crop to (the door area).
 - **Focus** — lens focus; shown only when the active camera source reports focus
-  control (e.g. Pi Camera Module 3).
+  control (a `GET /api/capabilities` probe; e.g. Pi Camera Module 3). Persisted
+  `focus` is `null` for continuous autofocus or a number for a manual lens
+  position (dioptres, 0 = far) *locked* there — a fixed door scene is sharpest at
+  a stable lens rather than continuously hunting. An "autofocus once"
+  (`POST /api/focus/autofocus`) runs a single AF cycle and stores the found
+  position as the manual lock.
 - **FPS** — capture frame rate. The target is low — around **5 fps**, not the
   25–30 fps of video. A cat approaching and pausing at the flap is well captured
   at 5 fps, and it keeps bandwidth, GPU load, and per-frame cost tiny. The value

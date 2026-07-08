@@ -9,6 +9,14 @@ DEFAULTS = {
     "rotation": 0,
     "clip": None,
     "fps": 5,
+    # Lens focus. None = continuous autofocus (the camera keeps itself focused —
+    # a safe zero-config default, since a fresh install doesn't know the flap
+    # distance). A number = manual focus LOCKED at that many dioptres (1/metres;
+    # 0 = infinity, higher = nearer). A fixed door scene is sharpest and most
+    # predictable at a locked manual position, so the UI's "autofocus once"
+    # finds a value and stores it here. Inert on cameras without focus control
+    # (Module 1/2, USB) — see the CaptureSource focus contract in capture/base.py.
+    "focus": None,
     "var_threshold": 16.0,
     "learning_rate": 0.001,
     "min_area": 0.01,

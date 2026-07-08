@@ -92,6 +92,34 @@ class ControllableCaptureSource(CaptureSource):
         self._closed = True
 
 
+class FocusableCaptureSource(FakeCaptureSource):
+    """A fake source that also reports and accepts focus, for the focus endpoints.
+
+    Stands in for a Pi Camera Module 3 without hardware: it advertises a lens
+    range, records every set_focus() call so a test can assert the app pushed
+    focus to the active source, and returns a fixed lens position from
+    autofocus_once() so the autofocus endpoint is deterministic.
+    """
+
+    AF_RESULT = 3.5  # dioptres autofocus_once() "finds" and locks
+
+    def __init__(self, device: "int | str" = 0) -> None:
+        super().__init__(device)
+        self.focus_value = None
+        self.set_focus_calls: "list[float | None]" = []
+
+    def focus_capabilities(self) -> "dict":
+        return {"min": 0.0, "max": 10.0}
+
+    def set_focus(self, focus) -> None:
+        self.focus_value = focus
+        self.set_focus_calls.append(focus)
+
+    def autofocus_once(self):
+        self.focus_value = self.AF_RESULT
+        return self.AF_RESULT
+
+
 def _factory_with_bad_device(bad_device: "int | str"):
     """A source_factory where `bad_device` yields a source that fails to read.
 
@@ -150,6 +178,20 @@ def motion_app(config_path):
 
     def factory(device):
         created["source"] = ControllableCaptureSource(device)
+        return created["source"]
+
+    app = create_app(source_factory=factory, start_grabber=False)
+    return app, created["source"]
+
+
+@pytest.fixture
+def focus_app(config_path):
+    """An app wired to a FocusableCaptureSource. Returns (app, source) so a test
+    can inspect the focus calls the app made against the active source."""
+    created = {}
+
+    def factory(device):
+        created["source"] = FocusableCaptureSource(device)
         return created["source"]
 
     app = create_app(source_factory=factory, start_grabber=False)
@@ -546,6 +588,7 @@ def test_save_settings_then_load_settings_roundtrips(config_path):
         "rotation": 90,
         "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
         "fps": 5,
+        "focus": 2.5,  # non-default (a manual lens position) for the same reason
         # Non-default motion values, so a roundtrip bug (e.g. load_settings
         # silently falling back to DEFAULTS) can't hide behind equal values.
         "var_threshold": 20.0,
@@ -1103,3 +1146,168 @@ def test_reset_motion_clears_published_signal(motion_app):
     assert snap.motion is False
     assert snap.bbox is None
     assert snap.area == 0.0
+
+
+# --- focus: default + config ---
+
+
+def test_focus_defaults_to_null(client):
+    # A fresh install has no idea of the flap distance, so focus defaults to null
+    # (continuous autofocus). No-op push to a non-focus source must not error.
+    assert client.get("/api/config").get_json()["focus"] is None
+
+
+def test_startup_pushes_persisted_focus_to_source(config_path):
+    # A persisted manual focus must be handed to the source at boot, so the lens
+    # is locked to the saved position without waiting for a config POST.
+    config_path.write_text(json.dumps({**settings.DEFAULTS, "focus": 4.0}))
+    created = {}
+
+    def factory(device):
+        created["source"] = FocusableCaptureSource(device)
+        return created["source"]
+
+    create_app(source_factory=factory, start_grabber=False)
+    assert created["source"].set_focus_calls == [4.0]
+    assert created["source"].focus_value == 4.0
+
+
+# --- GET /api/capabilities ---
+
+
+def test_capabilities_null_focus_for_plain_source(client):
+    # FakeCaptureSource has no lens → focus capability is null, so the UI hides
+    # the focus control.
+    resp = client.get("/api/capabilities")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"focus": None}
+
+
+def test_capabilities_reports_focus_range_for_focusable_source(focus_app):
+    app, _source = focus_app
+    resp = app.test_client().get("/api/capabilities")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"focus": {"min": 0.0, "max": 10.0}}
+
+
+# --- POST /api/config: focus ---
+
+
+def test_post_config_focus_updates_persists_and_applies(focus_app, config_path):
+    app, source = focus_app
+    client = app.test_client()
+
+    resp = client.post("/api/config", json={"focus": 2.5})
+    assert resp.status_code == 200
+    assert resp.get_json() == _expected_config(focus=2.5)
+
+    assert client.get("/api/config").get_json()["focus"] == 2.5
+    assert json.loads(config_path.read_text())["focus"] == 2.5
+    # The app pushed the new focus onto the live source (startup None, then 2.5).
+    assert source.focus_value == 2.5
+    assert source.set_focus_calls == [None, 2.5]
+
+
+def test_post_config_focus_null_switches_back_to_autofocus(focus_app):
+    app, source = focus_app
+    client = app.test_client()
+
+    client.post("/api/config", json={"focus": 2.5})
+    resp = client.post("/api/config", json={"focus": None})
+    assert resp.status_code == 200
+    assert resp.get_json()["focus"] is None
+    assert source.focus_value is None
+    assert source.set_focus_calls == [None, 2.5, None]
+
+
+def test_post_config_unchanged_focus_does_not_reapply(focus_app):
+    # A POST that doesn't move focus (or omits it) must not re-push it to the
+    # source — set_focus stays at the single startup call.
+    app, source = focus_app
+    client = app.test_client()
+    client.post("/api/config", json={"rotation": 90})
+    client.post("/api/config", json={"focus": None})  # equals the current value
+    assert source.set_focus_calls == [None]
+
+
+@pytest.mark.parametrize("focus", ["x", -1, 101, True])
+def test_post_config_invalid_focus_is_400(focus_app, focus):
+    app, _source = focus_app
+    resp = app.test_client().post("/api/config", json={"focus": focus})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+# --- POST /api/focus/autofocus ---
+
+
+def test_autofocus_locks_result_and_persists(focus_app, config_path):
+    app, source = focus_app
+    client = app.test_client()
+
+    resp = client.post("/api/focus/autofocus")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"focus": FocusableCaptureSource.AF_RESULT}
+
+    # Locked on the source, reflected by GET, and persisted for next boot.
+    assert source.focus_value == FocusableCaptureSource.AF_RESULT
+    assert client.get("/api/config").get_json()["focus"] == FocusableCaptureSource.AF_RESULT
+    assert json.loads(config_path.read_text())["focus"] == FocusableCaptureSource.AF_RESULT
+
+
+def test_autofocus_on_source_without_focus_is_422(client):
+    # FakeCaptureSource's inherited autofocus_once() returns None → 422, not 500.
+    resp = client.post("/api/focus/autofocus")
+    assert resp.status_code == 422
+    assert "error" in resp.get_json()
+
+
+def test_autofocus_convergence_failure_is_503_not_422(config_path):
+    # An AF-capable camera that can't converge raises CaptureError → 503 (a
+    # retryable outage), distinct from the None → 422 "no focus hardware" case.
+    class AfFailSource(FocusableCaptureSource):
+        def autofocus_once(self):
+            raise CaptureError("autofocus did not converge")
+
+    app = create_app(source_factory=AfFailSource, start_grabber=False)
+    resp = app.test_client().post("/api/focus/autofocus")
+    assert resp.status_code == 503
+    assert "error" in resp.get_json()
+
+
+# --- PicameraCaptureSource focus, absent-dependency path ---
+
+
+def _skip_if_picamera2_installed() -> None:
+    try:
+        import picamera2  # noqa: F401
+    except ImportError:
+        return
+    pytest.skip("picamera2 is installed; this checks the absent-dependency path")
+
+
+def test_picamera_focus_capabilities_none_without_picamera2():
+    # Off a Pi, opening the camera fails, so focus capability must degrade to
+    # None (config UI hides focus) rather than raise.
+    _skip_if_picamera2_installed()
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    assert PicameraCaptureSource(0).focus_capabilities() is None
+
+
+def test_picamera_autofocus_raises_without_picamera2():
+    _skip_if_picamera2_installed()
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    with pytest.raises(CaptureError):
+        PicameraCaptureSource(0).autofocus_once()
+
+
+def test_picamera_set_focus_before_open_is_noop():
+    # set_focus() must be safe before the camera opens (no import, no raise): it
+    # just records the desired value to apply on the next open.
+    from edge.capture.picamera_source import PicameraCaptureSource
+
+    source = PicameraCaptureSource(0)
+    source.set_focus(2.0)  # must not raise even though picamera2 may be absent
+    assert source._focus == 2.0

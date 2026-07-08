@@ -175,6 +175,11 @@
             font-size: 16px;
             box-sizing: border-box;
         }
+        /* Focus slider grows to fill the row between the Auto / Autofocus buttons. */
+        #focusSlider {
+            flex: 1;
+            min-width: 140px;
+        }
         #error {
             background: #ffebee;
             color: #c62828;
@@ -270,6 +275,18 @@
                 <option value="10">10</option>
                 <option value="15">15</option>
             </select>
+        </div>
+
+        <!-- Focus: hidden unless GET /api/capabilities reports the active
+             camera has a movable lens (e.g. Pi Camera Module 3). Dioptres:
+             0 = far/infinity, higher = nearer. -->
+        <div id="focusGroup" class="control-group hidden">
+            <label for="focusSlider">Focus (<span id="focusValue">auto</span>)</label>
+            <div class="btn-row">
+                <button type="button" id="focusAutoBtn" class="rot-btn">Auto</button>
+                <input type="range" id="focusSlider" min="0" max="10" step="0.1">
+                <button type="button" id="autofocusBtn" class="btn-secondary">Autofocus once</button>
+            </div>
         </div>
 
         <div class="control-group">
@@ -371,6 +388,11 @@
         const cpuLoadEl = document.getElementById('cpuLoad');
         const memLoadEl = document.getElementById('memLoad');
         const relearnBtn = document.getElementById('relearnBtn');
+        const focusGroup = document.getElementById('focusGroup');
+        const focusSlider = document.getElementById('focusSlider');
+        const focusValueEl = document.getElementById('focusValue');
+        const focusAutoBtn = document.getElementById('focusAutoBtn');
+        const autofocusBtn = document.getElementById('autofocusBtn');
         const varThresholdInput = document.getElementById('varThreshold');
         const learningRateInput = document.getElementById('learningRate');
         const minAreaInput = document.getElementById('minArea');
@@ -385,6 +407,8 @@
         let currentRotation = 0;
         let currentClip = null;    // {x, y, w, h} normalized, or null
         let currentFps = 5;
+        let currentFocus = null;   // null = continuous autofocus, number = manual dioptres
+        let focusCaps = null;      // {min, max} dioptres, or null if the camera has no focus
 
         // ROI editing state.
         let roiMode = false;       // true while the raw preview + box editor is active
@@ -491,6 +515,12 @@
                     fpsSelect.insertBefore(opt, fpsSelect.firstChild);
                 }
                 fpsSelect.value = fpsStr;
+
+                // Focus: null = autofocus, a number = manual dioptres. Kept as
+                // the server sent it (0 is a valid position — infinity — so a
+                // truthiness test would wrongly coerce it to "auto").
+                currentFocus = (typeof data.focus === 'number') ? data.focus : null;
+                applyFocusUi();
 
                 // Motion tuning fields: reflect whatever is persisted,
                 // unusual or not — the server is the source of truth, the
@@ -908,6 +938,9 @@
                 }
 
                 clearError();
+                // Focus support differs per camera (Module 3 has a lens, USB
+                // typically doesn't), so re-probe capabilities after a switch.
+                await loadCapabilities();
                 // Auto-capture on successful device switch, unless live —
                 // /stream already picks up the new source with no reconnect.
                 if (!live) captureFrame();
@@ -999,6 +1032,102 @@
             }
         });
 
+        // ---- Focus controls ----
+
+        // Ask the active source what it can do and show/hide the focus control
+        // accordingly (capability-driven UI). Called on load and after a camera
+        // switch, since focus support differs per camera (Module 3 vs USB).
+        async function loadCapabilities() {
+            try {
+                const res = await fetch('/api/capabilities');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                focusCaps = data.focus || null;
+            } catch {
+                focusCaps = null;  // probe failed → treat as no focus, hide the control
+            }
+            applyFocusUi();
+        }
+
+        // Reflect currentFocus/focusCaps into the focus control. Hidden entirely
+        // when the camera has no movable lens; otherwise the slider is live only
+        // in manual mode (a number), disabled while on continuous autofocus.
+        function applyFocusUi() {
+            if (!focusCaps) {
+                focusGroup.classList.add('hidden');
+                return;
+            }
+            focusGroup.classList.remove('hidden');
+            focusSlider.min = focusCaps.min;
+            focusSlider.max = focusCaps.max;
+            const manual = typeof currentFocus === 'number';
+            focusAutoBtn.classList.toggle('active', !manual);
+            if (manual) {
+                focusSlider.value = currentFocus;
+                focusValueEl.textContent = `${Number(currentFocus).toFixed(1)} dpt`;
+            } else {
+                // Auto (continuous AF): the slider stays live, parked at the
+                // far/infinity end (min). Dragging it hands over to a manual lock
+                // (postFocus on 'change') — so manual focus is reachable by hand,
+                // not only via "Autofocus once" (which can fail to converge).
+                focusSlider.value = focusCaps.min;
+                focusValueEl.textContent = 'auto';
+            }
+        }
+
+        // POST a focus value (null = autofocus, number = manual dioptres) and
+        // refresh the preview so the sharpness change is visible immediately.
+        async function postFocus(value) {
+            try {
+                clearError();
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ focus: value })
+                });
+                if (!res.ok) {
+                    showError(`Focus error: ${await errorFromResponse(res)}`);
+                    await loadCurrentConfig();  // restore the control to the live value
+                    return;
+                }
+                currentFocus = value;
+                applyFocusUi();
+                clearError();
+                await refreshPreview();
+            } catch (err) {
+                showError(`Focus error: ${err.message}`);
+            }
+        }
+
+        focusAutoBtn.addEventListener('click', () => postFocus(null));
+        // 'change' (not 'input'): POST on release, not on every drag tick.
+        focusSlider.addEventListener('change', () => postFocus(Number(focusSlider.value)));
+
+        // Run one autofocus cycle on the Pi; it locks manual focus at the result
+        // and the server persists it. Reflect the returned position and refresh.
+        autofocusBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                autofocusBtn.disabled = true;
+                autofocusBtn.textContent = 'Focusing…';
+                const res = await fetch('/api/focus/autofocus', { method: 'POST' });
+                if (!res.ok) {
+                    showError(`Autofocus error: ${await errorFromResponse(res)}`);
+                    return;
+                }
+                const data = await res.json();
+                currentFocus = (typeof data.focus === 'number') ? data.focus : null;
+                applyFocusUi();
+                clearError();
+                await refreshPreview();
+            } catch (err) {
+                showError(`Autofocus error: ${err.message}`);
+            } finally {
+                autofocusBtn.disabled = false;
+                autofocusBtn.textContent = 'Autofocus once';
+            }
+        });
+
         // ---- Motion status polling ----
 
         // Poll GET /status a few times a second for the motion indicator,
@@ -1078,7 +1207,8 @@
         // (the page is visible at load, so no visibilitychange event fires
         // for this first transition).
         window.addEventListener('load', () => {
-            loadCameras();
+            // Capabilities after cameras+config, so applyFocusUi sees currentFocus.
+            loadCameras().then(loadCapabilities);
             startStatusPolling();
         });
     </script>

@@ -32,6 +32,11 @@ SourceFactory = Callable[["int | str"], CaptureSource]
 
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 
+# App version, baked in by edge.sh (which resolves `git describe` once at launch)
+# and read here — the server never shells out to git. "unknown" when the bake
+# step didn't run (e.g. launched directly, or outside a git checkout).
+_VERSION = os.environ.get("CAT_EDGE_VERSION", "unknown")
+
 # How long /frame blocks for the very first frame on a cold boot (out-waiting
 # camera warmup) and how long a /stream generator waits between frame checks.
 _FIRST_FRAME_WAIT_S = 5.0
@@ -393,6 +398,7 @@ def create_app(
             area=snap.area,
             camera_ok=camera_ok,
             last_error=snap.last_error,
+            version=_VERSION,
         )
 
     @app.post("/api/motion/reset")

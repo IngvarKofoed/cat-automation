@@ -7,6 +7,7 @@ Contents: `capture/` (capture-source interface + backends: CSI/USB/IP), `clip/` 
 ## Required tools
 
 - **`LSP`** — Python symbol navigation, references, and hover across the edge code. Load if deferred: `ToolSearch select:LSP`. (Python support is provided by the installed `pyright-lsp` plugin — Pyright.)
+- **Browser automation (`claude-in-chrome`)** — for verifying the **config UI** (`server/ui/`) in a real browser: the live/overlay preview and the tuning controls. Load the core set via `ToolSearch` per the claude-in-chrome guidance. Not needed for capture/motion/backend work.
 
 ## Testing
 
@@ -19,7 +20,7 @@ Unit tests live alongside the edge packages using **pytest**. The edge is I/O- a
 - **Verification workflow (on-device / against fakes).** The camera and GPIO can't be meaningfully unit-tested, so verify edge changes by running the service (on the Pi, or against a fake capture source) and:
   1. Hit `/frame` and `/stream`; confirm frames flow continuously, and that motion is reported via `GET /status` and the `X-Motion` stream headers (not by gating frame delivery).
   2. Exercise the control API endpoints; confirm the actuator (or its no-op stub) responds.
-  3. Confirm the config UI reflects and persists settings (clip, focus, fps, background).
+  3. For **config-UI changes**, drive the page in a real browser with the `claude-in-chrome` tools: confirm it reflects and persists settings (clip, rotation, fps, motion tuning), the Live/overlay preview renders, and check the console + network for errors.
   4. Only then report the change complete. Keep it light — this is a prototype.
 
 ## Required skills

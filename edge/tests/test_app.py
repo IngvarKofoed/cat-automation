@@ -758,8 +758,9 @@ def test_status_returns_documented_shape_with_camera_ok_true(client):
     resp = client.get("/status")
     assert resp.status_code == 200
     body = resp.get_json()
-    for key in ("frame_id", "ts", "motion", "bbox", "area", "camera_ok", "last_error"):
+    for key in ("frame_id", "ts", "motion", "bbox", "area", "camera_ok", "last_error", "version"):
         assert key in body
+    assert isinstance(body["version"], str) and body["version"]  # baked value, or "unknown"
     assert body["camera_ok"] is True
     assert body["last_error"] is None
     # A single grab can't meet the default persistence (2) — deterministic.

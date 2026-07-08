@@ -48,7 +48,14 @@ if [ ! -x "$PY" ]; then
   "$VENV/bin/pip" install -r "$ROOT/edge/requirements.txt"
 fi
 
+# App version: resolve `git describe` ONCE here — we run from the checkout, so
+# this is the one place git is touched — and bake it into an env var the server
+# reads (the server never shells out to git itself). Falls back to "unknown"
+# outside a git checkout, and honors a pre-set CAT_EDGE_VERSION (e.g. from CI).
+CAT_EDGE_VERSION="${CAT_EDGE_VERSION:-$(git -C "$ROOT" describe --tags --long --always --dirty 2>/dev/null || echo unknown)}"
+export CAT_EDGE_VERSION
+
 PORT="${CAT_EDGE_PORT:-8000}"
-echo "[edge] starting on http://localhost:${PORT}  (Ctrl-C to stop)"
+echo "[edge] starting ${CAT_EDGE_VERSION} on http://localhost:${PORT}  (Ctrl-C to stop)"
 # exec so Ctrl-C / SIGTERM go straight to the server process.
 exec "$PY" -m edge.server.app

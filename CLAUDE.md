@@ -66,7 +66,7 @@ This section is inert unless you actually run a multi-agent workflow.
 
 ## Git workflow
 
-**Direct to `main`** — when you commit, commit straight to `main`; don't open branches or PRs unless asked. Commits are local; leave pushing to the user (no remote is configured yet). `main` is created on the first commit.
+**Direct to `main`** — when you commit, commit straight to `main`; don't open branches or PRs unless asked. A remote (`origin`) is configured; **push only when the user asks** (e.g. via `/git`), never automatically.
 
 **This setting only chooses *where* commits go — not *when* to make them.** Commit only when the user asks; finishing a change is not a cue to commit it. When you do commit, each commit is one complete change including its `docs/CHANGELOG.md` entry — never leave the tree half-committed.
 

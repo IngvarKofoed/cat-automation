@@ -8,3 +8,7 @@ requests>=2.31
 # here. Headless build matches the edge and is enough for imdecode.
 numpy
 opencv-python-headless
+# Frame-collection browser: FastAPI app + ASGI server. [standard] pulls uvicorn's
+# httptools/websockets extras so the served page and media perform well.
+fastapi
+uvicorn[standard]

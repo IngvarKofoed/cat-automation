@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cat Door — Frame Collection Browser</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1100px;
+            margin: 20px auto 60px;
+            padding: 0 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            font-size: 26px;
+            margin: 10px 0 20px;
+        }
+        .panel {
+            background: white;
+            padding: 16px 20px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            margin-bottom: 16px;
+        }
+        /* Stats header: a row of badges summarizing the store, refreshed by
+           polling /api/stats so it stays live while the collector runs. */
+        #stats {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            background: #e0e0e0;
+            color: #333;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .badge.warn {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .controls-row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        label {
+            font-weight: 600;
+            font-size: 13px;
+        }
+        select {
+            padding: 8px 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+            background: white;
+        }
+        button {
+            background: #0066cc;
+            color: white;
+            border: none;
+            padding: 9px 16px;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #0052a3;
+        }
+        button:active {
+            background: #003d7a;
+        }
+        button:disabled {
+            background: #aaa;
+            cursor: default;
+        }
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .btn-preset {
+            background: #2e7d32;
+        }
+        .btn-preset:hover {
+            background: #256428;
+        }
+        .btn-danger {
+            background: #c62828;
+        }
+        .btn-danger:hover {
+            background: #a02020;
+        }
+        .btn-secondary {
+            background: #888;
+        }
+        .btn-secondary:hover {
+            background: #666;
+        }
+        #error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ef5350;
+            padding: 10px 14px;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            display: none;
+            font-size: 14px;
+        }
+        #error.show {
+            display: block;
+        }
+        /* The frame grid: newest-first (or area-ordered) tiles. A motion frame
+           gets a colored border so false triggers/missed cats are spottable at
+           a glance without reading captions — the whole point of the tool. */
+        #grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+        }
+        .tile {
+            background: white;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+            border: 3px solid transparent;
+        }
+        .tile.motion {
+            border-color: #2e7d32;
+        }
+        .tile img {
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            object-fit: cover;
+            display: block;
+            background: #e0e0e0;
+        }
+        .tile .caption {
+            padding: 6px 8px;
+            font-size: 12px;
+            color: #555;
+            display: flex;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .tile .caption .area {
+            font-weight: 600;
+        }
+        #pager {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+            margin: 20px 0;
+        }
+        #pager .badge {
+            min-width: 72px;
+            text-align: center;
+        }
+        #empty {
+            text-align: center;
+            color: #888;
+            padding: 40px 0;
+            font-size: 14px;
+        }
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <h1>Cat Door — Frame Collection Browser</h1>
+
+    <div id="error"></div>
+
+    <div class="panel">
+        <div id="stats">
+            <span id="statCount" class="badge">Frames: —</span>
+            <span id="statSize" class="badge">Size: —</span>
+            <span id="statMotion" class="badge">Motion: —</span>
+            <span id="statSpan" class="badge">Span: —</span>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="controls-row">
+            <div class="control-group">
+                <label for="motionFilter">Motion filter</label>
+                <select id="motionFilter">
+                    <option value="all">All</option>
+                    <option value="motion">Motion</option>
+                    <option value="still">Still</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="orderSelect">Sort</label>
+                <select id="orderSelect">
+                    <option value="time">Time (newest first)</option>
+                    <option value="area_desc">Area high → low</option>
+                    <option value="area_asc">Area low → high</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <div class="btn-row">
+                    <button type="button" id="presetMissedBtn" class="btn-preset"
+                        title="Still frames (motion NOT flagged) with the most movement — likely detections the gate MISSED (false negatives). If you see cats in here, the motion gate is too strict → loosen it.">Missed?</button>
+                    <button type="button" id="presetFalseBtn" class="btn-preset"
+                        title="Motion frames with the least movement — likely fired on noise, shadows or light (false positives). If you see empty frames in here, the motion gate is too twitchy → tighten it.">False triggers</button>
+                </div>
+            </div>
+            <div class="control-group" style="margin-left: auto;">
+                <button type="button" id="clearBtn" class="btn-danger">Clear all</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="empty" class="hidden">No frames match the current filter.</div>
+    <div id="grid"></div>
+    <div id="pager">
+        <button type="button" id="prevBtn" class="btn-secondary">← Prev</button>
+        <span id="pageLabel" class="badge">Page 1</span>
+        <button type="button" id="nextBtn" class="btn-secondary">Next →</button>
+    </div>
+
+    <script>
+        const errorDiv = document.getElementById('error');
+        const statCountEl = document.getElementById('statCount');
+        const statSizeEl = document.getElementById('statSize');
+        const statMotionEl = document.getElementById('statMotion');
+        const statSpanEl = document.getElementById('statSpan');
+        const motionFilterSelect = document.getElementById('motionFilter');
+        const orderSelect = document.getElementById('orderSelect');
+        const presetMissedBtn = document.getElementById('presetMissedBtn');
+        const presetFalseBtn = document.getElementById('presetFalseBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const gridEl = document.getElementById('grid');
+        const emptyEl = document.getElementById('empty');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const pageLabel = document.getElementById('pageLabel');
+
+        // View state. Every order is keyset-paginated. pageCursors[i] is the
+        // opaque token that fetches page i (pageCursors[0] === null = first
+        // page); each page's returned next_cursor is stored as the following
+        // page's token, so Prev just re-fetches an earlier one — stable even as
+        // the collector inserts newer frames.
+        const PAGE_SIZE = 500;   // big pages; <img loading="lazy"> defers off-screen fetches so a large grid stays cheap. Grid is REPLACED per page, not appended.
+        let motion = 'all';
+        let order = 'time';
+        let pageCursors = [null];
+        let pageIndex = 0;
+        let loading = false;
+
+        function showError(message) {
+            errorDiv.textContent = message;
+            errorDiv.classList.add('show');
+        }
+
+        function clearError() {
+            errorDiv.classList.remove('show');
+            errorDiv.textContent = '';
+        }
+
+        // Turn a non-ok response into a display message: prefer its JSON
+        // {error}/{detail}, else fall back to the HTTP status.
+        async function errorFromResponse(res) {
+            try {
+                const data = await res.json();
+                return data.error || data.detail || `HTTP ${res.status}`;
+            } catch {
+                return `HTTP ${res.status}`;
+            }
+        }
+
+        // ---- formatting helpers ----
+
+        function formatBytes(bytes) {
+            if (typeof bytes !== 'number') return '—';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let value = bytes;
+            let i = 0;
+            while (value >= 1024 && i < units.length - 1) {
+                value /= 1024;
+                i++;
+            }
+            return `${value.toFixed(1)} ${units[i]}`;
+        }
+
+        function formatTime(ts) {
+            if (typeof ts !== 'number') return '—';
+            return new Date(ts).toLocaleString();
+        }
+
+        function formatSpan(oldest, newest) {
+            if (typeof oldest !== 'number' || typeof newest !== 'number') return '—';
+            let secs = Math.max(0, Math.round((newest - oldest) / 1000));
+            const h = Math.floor(secs / 3600);
+            secs -= h * 3600;
+            const m = Math.floor(secs / 60);
+            secs -= m * 60;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${secs}s`;
+            return `${secs}s`;
+        }
+
+        // ---- stats header ----
+
+        async function pollStats() {
+            try {
+                const res = await fetch('/api/stats');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+
+                statCountEl.textContent = `Frames: ${data.count}`;
+                statSizeEl.textContent = `Size: ${formatBytes(data.bytes)} / ${formatBytes(data.cap_bytes)}`;
+                statSizeEl.classList.toggle('warn', data.cap_bytes > 0 && data.bytes / data.cap_bytes > 0.9);
+                statMotionEl.textContent = `Motion: ${data.motion_count}`;
+                statSpanEl.textContent = `Span: ${formatSpan(data.oldest_ts, data.newest_ts)}`;
+            } catch (err) {
+                // A background 4s poll must not commandeer the shared error banner:
+                // it would linger after recovery and clobber a real frame-load
+                // error. Leave the last-known badges (frozen numbers are the
+                // signal), and any true outage still surfaces on a frame load/clear.
+                console.warn('stats poll failed:', err);
+            }
+        }
+
+        // ---- frame grid ----
+
+        function frameTile(frame) {
+            const tile = document.createElement('div');
+            tile.className = 'tile' + (frame.motion ? ' motion' : '');
+
+            const img = document.createElement('img');
+            img.src = frame.url;
+            img.loading = 'lazy';
+            img.alt = frame.motion ? 'Motion frame' : 'Frame';
+            tile.appendChild(img);
+
+            const caption = document.createElement('div');
+            caption.className = 'caption';
+            const timeSpan = document.createElement('span');
+            timeSpan.textContent = formatTime(frame.recv_ts);
+            const areaSpan = document.createElement('span');
+            areaSpan.className = 'area';
+            const areaPct = typeof frame.area === 'number' ? (frame.area * 100).toFixed(1) + '%' : '—';
+            areaSpan.textContent = areaPct;
+            caption.appendChild(timeSpan);
+            caption.appendChild(areaSpan);
+            tile.appendChild(caption);
+
+            return tile;
+        }
+
+        // Fetch page `targetIndex` and REPLACE the grid. pageIndex is committed
+        // ONLY on a successful response, so a failed Prev/Next never mislabels
+        // the page it's still showing. Each fetch tags itself with reqSeq; a
+        // slower stale response (e.g. the user switched filter/sort mid-fetch)
+        // is discarded rather than writing the wrong rows or a wrong-format
+        // cursor into pageCursors.
+        let reqSeq = 0;
+        async function loadPage(targetIndex = pageIndex) {
+            const seq = ++reqSeq;
+            loading = true;
+            updatePager();  // disable both buttons while a fetch is in flight
+            try {
+                clearError();
+                const params = new URLSearchParams({ motion, order, limit: String(PAGE_SIZE) });
+                const cursor = pageCursors[targetIndex];
+                if (cursor != null) params.set('cursor', String(cursor));
+                const res = await fetch('/api/frames?' + params.toString());
+                if (seq !== reqSeq) return;   // superseded by a newer request — discard
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== reqSeq) return;   // superseded
+
+                gridEl.innerHTML = '';
+                const frames = data.frames || [];
+                frames.forEach(frame => gridEl.appendChild(frameTile(frame)));
+                emptyEl.classList.toggle('hidden', frames.length > 0);
+
+                pageIndex = targetIndex;      // commit the page only now, on success
+                // next_cursor (null = no further pages) is the next page's token.
+                pageCursors[pageIndex + 1] = data.next_cursor ?? null;
+                window.scrollTo(0, 0);
+            } catch (err) {
+                if (seq === reqSeq) showError(`Failed to load frames: ${err.message}`);
+            } finally {
+                if (seq === reqSeq) {
+                    loading = false;
+                    updatePager();
+                }
+            }
+        }
+
+        // Reflect the pager: page number, and which directions are available.
+        function updatePager() {
+            pageLabel.textContent = `Page ${pageIndex + 1}`;
+            prevBtn.disabled = loading || pageIndex === 0;
+            // Next only when the CURRENT page returned a token (a full page → more).
+            nextBtn.disabled = loading || pageCursors[pageIndex + 1] == null;
+        }
+
+        function reloadView() {
+            pageCursors = [null];
+            pageIndex = 0;
+            loadPage(0);
+        }
+
+        // ---- controls ----
+
+        motionFilterSelect.addEventListener('change', () => {
+            motion = motionFilterSelect.value;
+            reloadView();
+        });
+
+        orderSelect.addEventListener('change', () => {
+            order = orderSelect.value;
+            reloadView();
+        });
+
+        prevBtn.addEventListener('click', () => {
+            if (loading || pageIndex === 0) return;
+            loadPage(pageIndex - 1);  // pageIndex commits inside loadPage on success
+        });
+        nextBtn.addEventListener('click', () => {
+            if (loading || pageCursors[pageIndex + 1] == null) return;
+            loadPage(pageIndex + 1);
+        });
+
+        // Triage presets: one click each to the two motion-tuning failure
+        // modes this tool exists to surface (see spec) — sync the selects so
+        // the UI reflects what's actually loaded.
+        function applyPreset(presetMotion, presetOrder) {
+            motion = presetMotion;
+            order = presetOrder;
+            motionFilterSelect.value = motion;
+            orderSelect.value = order;
+            reloadView();
+        }
+
+        presetMissedBtn.addEventListener('click', () => applyPreset('still', 'area_desc'));
+        presetFalseBtn.addEventListener('click', () => applyPreset('motion', 'area_asc'));
+
+        clearBtn.addEventListener('click', async () => {
+            if (!confirm('Clear all collected frames? This cannot be undone.')) return;
+            try {
+                clearError();
+                clearBtn.disabled = true;
+                const res = await fetch('/api/clear', { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                reloadView();
+                pollStats();
+            } catch (err) {
+                showError(`Clear failed: ${err.message}`);
+            } finally {
+                clearBtn.disabled = false;
+            }
+        });
+
+        // ---- polling ----
+
+        const STATS_POLL_MS = 4000;
+        setInterval(pollStats, STATS_POLL_MS);
+
+        window.addEventListener('load', () => {
+            pollStats();
+            reloadView();
+        });
+    </script>
+</body>
+</html>

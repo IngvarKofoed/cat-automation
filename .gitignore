@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-compute/
 venv/
 *.egg-info/
 
@@ -16,3 +17,4 @@ edge/config/settings.json
 
 # Model artifacts and captured media are not committed (see docs/ARCHITECTURE.md).
 # Add scoped ignores under compute/models and compute/dataset once they hold artifacts.
+/data/

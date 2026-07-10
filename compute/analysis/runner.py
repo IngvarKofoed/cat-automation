@@ -180,35 +180,54 @@ class AnalysisManager:
         self._thread: "threading.Thread | None" = None
 
     def start(self, store: "Store", name: str, reanalyze: bool = False) -> None:
-        """Resolve ``name``, verify its deps, and launch a sweep; refuse if one runs.
+        """Resolve a registered oracle by ``name`` and launch a sweep; refuse if one runs.
 
-        Two things happen SYNCHRONOUSLY here — before the thread is spawned, while the
-        caller (an HTTP handler) is still on the stack — so they reach the caller as an
-        error response rather than vanishing into the worker thread (where only
-        ``status().error`` would surface them):
+        The name-based entry point for the fixed oracles (yolo/bsuv): it resolves the
+        backend through ``self._resolver`` (a bad name raises ``ValueError`` → 400, and
+        an ``ImportError`` from a backend whose optional deps are absent propagates → 503
+        with the install hint), then delegates to ``start_analyzer``, which does the
+        launch under the lock. Resolution is a pure construction with no heavy import
+        (see ``get_analyzer``) and no manager side effects, so doing it before the lock
+        is harmless — the atomicity that matters (dep check + counter reset + the
+        ``running`` flip) lives in ``start_analyzer``.
 
-        - ``self._resolver(name)`` — a bad name raises ``ValueError`` (→ 400).
-        - ``analyzer.ensure_available()`` — a backend whose optional deps/hardware are
-          absent raises ``ImportError`` (→ 503 with the install hint). This is the fix
-          for the resolver-only check missing it: ``get_analyzer`` just constructs the
-          class (no heavy import), so without this call a missing ``torch`` would only
-          fail later in ``prepare`` on the worker.
+        ``reanalyze`` rides through to the worker unchanged (see ``start_analyzer`` /
+        ``run_analysis``). Behavior for the registered oracles is exactly as before —
+        this method is now a thin wrapper so that ``start_analyzer`` can also run a
+        *pre-constructed* analyzer the registry can't build (a parameterized
+        ``MogAnalyzer`` tuning run).
+        """
+        analyzer = self._resolver(name)
+        self.start_analyzer(store, analyzer, reanalyze=reanalyze)
 
-        ``reanalyze`` rides along to the worker, where the clear happens only after a
-        successful ``prepare`` (see ``run_analysis``), so a deps-missing run can't wipe
-        verdicts here. Raising ``RuntimeError`` when one already runs is what the API
-        maps to a 409. Resolution + the dep check + the counter reset all happen under
-        the lock and before ``running`` flips: if any raises, no job started and
-        ``running`` stays False. The dep check is imports-only (no weights load), so
-        holding the lock across it is negligible and buys atomicity against a racing
-        second ``start``.
+    def start_analyzer(self, store: "Store", analyzer: "Analyzer", reanalyze: bool = False) -> None:
+        """Launch a sweep for an ALREADY-CONSTRUCTED analyzer instance; refuse if one runs.
+
+        The instance-based core ``start`` delegates to, and the seam the tuning path uses
+        directly: a ``MogAnalyzer(params, slot)`` needs params from the run request, which
+        the name→instance registry can't supply, so it is constructed by the caller and
+        handed here without any ``ANALYZER_NAMES`` entry.
+
+        ``analyzer.ensure_available()`` runs SYNCHRONOUSLY here — before the thread is
+        spawned, while the HTTP handler is still on the stack — so a backend whose optional
+        deps/hardware are absent surfaces to the caller as ``ImportError`` (→ 503) rather
+        than vanishing into the worker as a delayed ``status().error``. ``status()['analyzer']``
+        is set to ``analyzer.name`` (e.g. ``'mog2:candidate'``), the instance's own id, so
+        the poll reports which run is live.
+
+        ``reanalyze`` rides along to the worker, where the verdict clear happens only after
+        a successful ``prepare`` (see ``run_analysis``), so a deps-missing run can't wipe
+        verdicts here. Raising ``RuntimeError`` when one already runs is what the API maps to
+        a 409. The dep check + counter reset + the ``running`` flip all happen under the lock:
+        if any raises, no job started and ``running`` stays False. The dep check is
+        imports-only (no weights load), so holding the lock across it is negligible and buys
+        atomicity against a racing second start.
         """
         with self._lock:
             if self._running:
                 raise RuntimeError("analysis already running")
-            analyzer = self._resolver(name)
             analyzer.ensure_available()
-            self._analyzer = name
+            self._analyzer = analyzer.name
             self._done = 0
             self._total = 0
             self._present = 0

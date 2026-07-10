@@ -37,9 +37,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from compute.analysis import ANALYZER_NAMES
+from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.collection.collector import CollectorManager
 from compute.collection.store import Store
+from shared.motion import MotionParams
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 _INDEX_HTML = _WEB_DIR / "index.html"
@@ -68,6 +70,148 @@ class AnalysisRunRequest(BaseModel):
 
     analyzer: str
     reanalyze: bool = False
+
+
+# The six motion-gate params, in the edge's own vocabulary — the exact keys the Pi
+# persists and that ``EdgeClient.get_config`` returns (``max_area_fraction`` /
+# ``motion_downscale``, not the ``MotionParams`` field names). Every /api/edge/config
+# and /api/tuning/* body speaks THIS vocabulary so the UI round-trips a config
+# straight from the Pi into a re-run without renaming; only ``_motion_params_from``
+# translates ``motion_downscale`` -> ``MotionParams.downscale`` at the boundary.
+_MOTION_PARAM_KEYS = (
+    "var_threshold",
+    "learning_rate",
+    "min_area",
+    "max_area_fraction",
+    "persistence",
+    "motion_downscale",
+)
+
+# Fallback params when the edge is unreachable (or the collector holds no client).
+# Mirrors edge/config/settings.py's motion-gate DEFAULTS BY HAND — the compute tier
+# must NOT import from edge/ (that would invert the thin-edge/smart-core layering),
+# so these are copied and kept in sync manually. Tagged source="defaults" so the UI
+# shows the user they are not the Pi's live settings.
+_EDGE_MOTION_DEFAULTS = {
+    "var_threshold": 16.0,
+    "learning_rate": 0.001,
+    "min_area": 0.01,
+    "max_area_fraction": 0.6,
+    "persistence": 2,
+    "motion_downscale": 320,
+}
+
+# The two re-run slots a tuning compare diffs; also the valid ``slot`` values a
+# rerun request may name. ``MogAnalyzer`` re-validates on construction (its
+# ValueError -> 400), so this is only the analysis-table analyzer names.
+_BASELINE_SLOT = "mog2:baseline"
+_CANDIDATE_SLOT = "mog2:candidate"
+
+
+class TuningRerunRequest(BaseModel):
+    """Body of ``POST /api/tuning/rerun``: which slot to (re)run and its params.
+
+    ``params`` is a plain dict validated by ``_motion_params_from`` rather than a
+    typed model, so a missing/ill-typed field surfaces as a 400 with a clear
+    message (not FastAPI's 422 field-error blob) and the param vocabulary lives in
+    one place (``_MOTION_PARAM_KEYS``).
+    """
+
+    slot: str
+    params: dict
+
+
+def _motion_params_from(params: dict) -> MotionParams:
+    """Build a ``MotionParams`` from an edge-vocabulary param dict; raise on bad input.
+
+    Translates the edge key ``motion_downscale`` to ``MotionParams.downscale`` (the
+    only name that differs). A missing key or a non-numeric value raises
+    ``ValueError`` so the route maps it to a 400.
+    """
+    missing = [k for k in _MOTION_PARAM_KEYS if k not in params]
+    if missing:
+        raise ValueError(f"missing motion params: {missing}")
+    try:
+        return MotionParams(
+            var_threshold=float(params["var_threshold"]),
+            learning_rate=float(params["learning_rate"]),
+            min_area=float(params["min_area"]),
+            max_area_fraction=float(params["max_area_fraction"]),
+            persistence=int(params["persistence"]),
+            downscale=int(params["motion_downscale"]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid motion params: {exc}") from exc
+
+
+def _edge_config_params(client) -> "tuple[str, dict]":
+    """Fetch the Pi's six motion params, or fall back to the hardcoded defaults.
+
+    Returns ``(source, params)`` where ``source`` is ``"edge"`` when
+    ``client.get_config()`` succeeded and ``"defaults"`` on ANY failure or a
+    ``None`` client. A partial/older Pi config (a key absent) keeps ``source ==
+    "edge"`` but fills the missing key from the defaults, so the proxy never
+    crashes on a thin config. ``params`` is always the full six-key edge-vocabulary
+    dict.
+    """
+    if client is not None:
+        try:
+            cfg = client.get_config()
+            if not isinstance(cfg, dict):
+                raise ValueError("edge config is not a JSON object")
+            return "edge", {k: cfg.get(k, _EDGE_MOTION_DEFAULTS[k]) for k in _MOTION_PARAM_KEYS}
+        except Exception:
+            # Edge unreachable / bad body / a client with no get_config — degrade to
+            # the defaults rather than 500. The user still gets a usable, labelled seed.
+            pass
+    return "defaults", dict(_EDGE_MOTION_DEFAULTS)
+
+
+def _read_slot_params(store: Store, slot: str) -> "dict | None":
+    """Best-effort read of the ``MotionParams`` a slot's re-run recorded.
+
+    Each ``MogAnalyzer`` verdict stores ``detail = {"bbox": ..., "params":
+    params._asdict()}`` (see ``compute/analysis/mog2.py``), so the slot's latest
+    detail recovers the params it ran with. Returns that params sub-dict, or ``None``
+    when the slot has no row, no detail, or an unparseable one.
+    """
+    detail = store.latest_analysis_detail(slot)
+    if not detail:
+        return None
+    params = detail.get("params")
+    return params if isinstance(params, dict) else None
+
+
+def _slot_thresholds(store: Store, slot: str, fallback: dict) -> "tuple[float, float, int]":
+    """The ``(min_area, max_area, persistence)`` a slot's re-run used, for area bucketing.
+
+    Reads the slot's stored params (``_read_slot_params``); any that are missing
+    fall back to ``fallback`` (the edge config), so a slot that hasn't run yet — or
+    a detail row missing a key — still yields usable bucket thresholds. These only
+    label the missed-frame area buckets; they don't change recall/false counts.
+    """
+    params = _read_slot_params(store, slot) or {}
+
+    def pick(key: str):
+        val = params.get(key)
+        return val if val is not None else fallback[key]
+
+    return float(pick("min_area")), float(pick("max_area_fraction")), int(pick("persistence"))
+
+
+def _compare_deltas(baseline: dict, candidate: dict) -> "dict | None":
+    """Baseline→candidate change in the two headline metrics, or ``None``.
+
+    ``None`` when either scorecard is ``{needs_rerun: True}`` (a slot not yet run —
+    nothing to diff). Otherwise negative ``missed``/``false`` mean the candidate
+    improved (fewer misses / fewer false triggers).
+    """
+    if baseline.get("needs_rerun") or candidate.get("needs_rerun"):
+        return None
+    return {
+        "missed": candidate["recall"]["missed"] - baseline["recall"]["missed"],
+        "false": candidate["false_triggers"]["count"] - baseline["false_triggers"]["count"],
+    }
 
 
 def _store_from_env() -> Store:
@@ -255,6 +399,92 @@ def create_app(
         return {
             **analysis_manager.status(),
             "summaries": {name: store.analysis_summary(name) for name in ANALYZER_NAMES},
+        }
+
+    # --- Edge-config proxy + offline MOG2 tuning (motion-gate-diagnostic spec) ------
+    #
+    # Kept SIBLING to /api/analysis/* on purpose: the /api/analysis oracles are fixed
+    # ground-truth references, while these run the Pi's own (parameterized, slotted)
+    # MOG2 gate offline for tuning. A separate surface keeps the oracle machinery clean
+    # (see the spec's "The tuning flow & endpoints"). ``client`` here is the collector's
+    # edge client (the same handle the collector streams from); a None client — a test
+    # app with no edge — degrades to the hardcoded defaults.
+
+    @app.get("/api/edge/config")
+    def api_edge_config():
+        # Read-only proxy of the Pi's six motion params, so the UI can seed a baseline
+        # re-run from the live settings. Never writes to the Pi. Unreachable edge /
+        # no client -> the defaults, tagged so the UI shows they aren't the Pi's.
+        source, params = _edge_config_params(client)
+        return {"source": source, "params": params}
+
+    @app.post("/api/tuning/rerun")
+    def api_tuning_rerun(req: TuningRerunRequest):
+        # Validate slot + params FIRST (400) — a client mistake, before touching the
+        # manager — mirroring /api/analysis/run's name-before-busy ordering. Bad params
+        # (missing/ill-typed) and a bad slot both surface as ValueError -> 400.
+        try:
+            params = _motion_params_from(req.params)
+            analyzer = MogAnalyzer(params, req.slot)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if analysis_manager.running:
+            raise HTTPException(status_code=409, detail="analysis already running")
+        try:
+            # reanalyze=True: a re-run always re-verdicts its whole slot with the new
+            # params (the clear happens in the worker only after a successful prepare,
+            # so a cv2-missing run can't wipe a prior slot). start_analyzer runs
+            # ensure_available() synchronously, so a missing/broken OpenCV surfaces HERE
+            # as ImportError (-> 503) instead of a delayed status().error; a race past
+            # the busy check above -> RuntimeError (-> 409).
+            analysis_manager.start_analyzer(store, analyzer, reanalyze=True)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        return analysis_manager.status()
+
+    @app.get("/api/tuning/compare")
+    def api_tuning_compare(oracle: str = Query(default="yolo")):
+        # The oracle is the fixed ground truth both scorecards score against; only a
+        # registered one is valid (400 otherwise — the same gate /api/frames uses).
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        # Area-bucket thresholds are per-source: each scorecard buckets its misses by
+        # the params THAT source ran with. Live -> the Pi's current config; a slot ->
+        # the params stored in its analysis.detail, falling back to the edge config.
+        _source, edge_params = _edge_config_params(client)
+
+        live = store.gate_scorecard(
+            "live",
+            oracle,
+            min_area=float(edge_params["min_area"]),
+            max_area=float(edge_params["max_area_fraction"]),
+            persistence=int(edge_params["persistence"]),
+        )
+        b_min, b_max, b_pers = _slot_thresholds(store, _BASELINE_SLOT, edge_params)
+        baseline = store.gate_scorecard(
+            _BASELINE_SLOT, oracle, min_area=b_min, max_area=b_max, persistence=b_pers
+        )
+        c_min, c_max, c_pers = _slot_thresholds(store, _CANDIDATE_SLOT, edge_params)
+        candidate = store.gate_scorecard(
+            _CANDIDATE_SLOT, oracle, min_area=c_min, max_area=c_max, persistence=c_pers
+        )
+
+        # Fidelity is the baseline re-run vs. stored frames.motion — only meaningful
+        # once baseline has run; null until then. Deltas need both slots (null if either
+        # is unrun).
+        fidelity = None if baseline.get("needs_rerun") else store.gate_fidelity(_BASELINE_SLOT)
+        return {
+            "oracle": oracle,
+            "live": live,
+            "baseline": baseline,
+            "candidate": candidate,
+            "fidelity": fidelity,
+            "deltas": _compare_deltas(baseline, candidate),
         }
 
     return app

@@ -21,6 +21,7 @@ so the coarse lock costs nothing in practice.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import sqlite3
@@ -53,6 +54,21 @@ _ALLOWED_DISAGREE = ("missed", "false")
 # score, so _row_to_dict adds the "score" key only for disagreement rows and
 # leaves the plain browse feed's row shape exactly as it was.
 _NO_SCORE = object()
+
+# Oracles gate_scorecard scores a motion source against — the ground-truth
+# analyzers (see the motion-gate-oracles layer). A `source` is either the live
+# gate ("live") or an analysis slot name (e.g. "mog2:candidate").
+_SCORECARD_ORACLES = ("yolo", "bsuv")
+
+# Visit clustering (gate_scorecard): consecutive oracle-present frames whose
+# recv_ts gap is within _VISIT_GAP_MS belong to the same visit; a visit counts
+# as caught if any source-motion frame falls inside its recv_ts span expanded by
+# _VISIT_WINDOW_MS on each side (the gate may fire just before/after the oracle
+# sees the cat — on approach, or in the tail — so an exact-frame match is too
+# strict for "did this visit cost a GPU trigger?"). Both are in milliseconds,
+# matching recv_ts.
+_VISIT_GAP_MS = 2000
+_VISIT_WINDOW_MS = 3000
 
 
 def _parse_id_cursor(cursor: str) -> int:
@@ -623,3 +639,245 @@ class Store:
         rows = [self._row_to_dict(r[:-1], score=r[-1]) for r in fetched]
         next_cursor = str(rows[-1]["id"]) if len(rows) == limit else None
         return rows, next_cursor
+
+    # --- Gate tuning scorecards --------------------------------------------
+    #
+    # The offline motion-gate compare (see the motion-gate-diagnostic spec):
+    # score a motion *source* — the live gate (`frames.motion`/`frames.area`) or
+    # a re-run slot (`mog2:candidate`, motion=`analysis.verdict`,
+    # area=`analysis.score`) — against a ground-truth *oracle* (`yolo`/`bsuv`).
+    # Everything runs under the single store lock: these are on-demand,
+    # human-paced reads, so serializing them against the collector costs nothing,
+    # and it keeps the connection discipline identical to the rest of the store.
+
+    def gate_scorecard(
+        self,
+        source: str,
+        oracle: str,
+        *,
+        warmup: int = 500,
+        min_area: float,
+        max_area: float,
+        persistence: int,
+    ) -> dict:
+        """Recall / false-trigger / miss-breakdown scorecard for one (source, oracle).
+
+        ``source`` is ``"live"`` (motion = ``frames.motion``, area =
+        ``frames.area``) or an analysis slot name such as ``"mog2:candidate"``
+        (motion = ``analysis.verdict``, area = ``analysis.score`` for that
+        analyzer, JOINed in). ``oracle`` ∈ ``{yolo, bsuv}`` supplies ground truth
+        (its ``verdict`` = subject present, ``score`` = detection confidence /
+        foreground fraction).
+
+        Scoring is restricted to the frames **past the warmup prefix**: the
+        scored set (frames carrying an oracle verdict — and, for a slot source, a
+        source verdict too) is ordered by ``id`` ASC and its oldest ``warmup``
+        rows are dropped, since a cold-started MOG2 re-run hasn't stabilized its
+        background over that prefix.
+
+        ``min_area``/``max_area`` bucket the *missed* frames by their source area
+        (which knob would recover them); ``persistence`` names the knob for the
+        in-band bucket (misses with adequate area that the debounce dropped) and
+        is not otherwise used in the computation — the source's motion flag
+        already reflects the persistence it was produced with.
+
+        Returns a dict of the shape::
+
+            {source, oracle, warmup, analyzed, present,
+             recall: {caught, missed, rate},
+             false_triggers: {count},
+             confidence: {high, medium, low},
+             area_buckets: {below_min, near_zero, above_max, in_band},
+             visits: {total, caught, wholly_missed}}
+
+        except that a slot ``source`` with **zero** analysis rows short-circuits
+        to ``{source, oracle, needs_rerun: True}`` — nothing to score until the
+        re-run has populated the slot. ``near_zero`` (area < ``min_area``/10, MOG2
+        saw ~nothing) is a subset of ``below_min``, so ``below_min + above_max +
+        in_band`` equals the total missed count.
+        """
+        if oracle not in _SCORECARD_ORACLES:
+            raise ValueError(f"oracle must be one of {_SCORECARD_ORACLES}, got {oracle!r}")
+        warmup = max(0, int(warmup))
+        is_live = source == "live"
+
+        # Source column expressions + the optional source-slot JOIN. These are
+        # fixed identifiers (never user input), so interpolating them is safe; the
+        # analyzer/oracle names and thresholds all bind through ``?`` params.
+        if is_live:
+            src_motion, src_area = "f.motion", "f.area"
+            src_join, src_params = "", []
+        else:
+            src_motion, src_area = "s.verdict", "s.score"
+            src_join, src_params = " JOIN analysis s ON s.frame_id = f.id AND s.analyzer = ?", [source]
+
+        # FROM + oracle JOIN (its analyzer param leads) + optional source JOIN.
+        base_from = " FROM frames f JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?" + src_join
+        join_params = [oracle] + src_params
+        near_zero_area = min_area / 10.0
+        missed = f"({src_motion} = 0 AND o.verdict = 1)"
+
+        with self._lock:
+            if not is_live:
+                (slot_rows,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM analysis WHERE analyzer = ?", (source,)
+                ).fetchone()
+                if slot_rows == 0:
+                    return {"source": source, "oracle": oracle, "needs_rerun": True}
+
+            # Warmup threshold: the id at rank ``warmup`` (0-indexed) in the scored
+            # set ordered id ASC — rows with id >= it are scored. None when the
+            # scored set has <= warmup rows (nothing past the cold-start prefix).
+            threshold_row = self._conn.execute(
+                "SELECT f.id" + base_from + " ORDER BY f.id ASC LIMIT 1 OFFSET ?",
+                join_params + [warmup],
+            ).fetchone()
+
+            if threshold_row is None:
+                counts = [0] * 11
+                interesting: list = []
+            else:
+                threshold_id = threshold_row[0]
+                # One aggregate pass over the scored set (id >= threshold). Every
+                # SUM(CASE ...) returns an int over the >= 1 scored rows, so the
+                # int(x or 0) coercion is belt-and-braces, not load-bearing.
+                counts = list(
+                    self._conn.execute(
+                        "SELECT COUNT(*),"
+                        " COALESCE(SUM(o.verdict), 0),"
+                        f" SUM(CASE WHEN {src_motion} = 1 AND o.verdict = 1 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {src_motion} = 1 AND o.verdict = 0 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND o.score >= 0.5 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND o.score >= 0.3 AND o.score < 0.5 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND {src_area} < ? THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND {src_area} < ? THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND {src_area} > ? THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {missed} AND {src_area} >= ? AND {src_area} <= ? THEN 1 ELSE 0 END)"
+                        + base_from + " WHERE f.id >= ?",
+                        [min_area, near_zero_area, max_area, min_area, max_area]
+                        + join_params + [threshold_id],
+                    ).fetchone()
+                )
+                # Visit clustering needs only the "interesting" rows — oracle-present
+                # (to cluster into visits) or source-motion (to test each visit's
+                # window) — in time order, not the whole scored set.
+                interesting = self._conn.execute(
+                    f"SELECT f.recv_ts, {src_motion}, o.verdict" + base_from
+                    + f" WHERE f.id >= ? AND (o.verdict = 1 OR {src_motion} = 1)"
+                    " ORDER BY f.recv_ts ASC, f.id ASC",
+                    join_params + [threshold_id],
+                ).fetchall()
+
+        (analyzed, present, caught, missed_n, false_n, conf_high, conf_med,
+         below_min, near_zero, above_max, in_band) = (int(x or 0) for x in counts)
+        # low = every miss not already high/medium, i.e. oracle score < 0.3 OR NULL.
+        conf_low = missed_n - conf_high - conf_med
+
+        total_visits, caught_visits = self._cluster_visits(interesting)
+
+        return {
+            "source": source,
+            "oracle": oracle,
+            "warmup": warmup,
+            "analyzed": analyzed,
+            "present": present,
+            "recall": {
+                "caught": caught,
+                "missed": missed_n,
+                "rate": (caught / present) if present else 0.0,
+            },
+            "false_triggers": {"count": false_n},
+            "confidence": {"high": conf_high, "medium": conf_med, "low": conf_low},
+            "area_buckets": {
+                "below_min": below_min,
+                "near_zero": near_zero,
+                "above_max": above_max,
+                "in_band": in_band,
+            },
+            "visits": {
+                "total": total_visits,
+                "caught": caught_visits,
+                "wholly_missed": total_visits - caught_visits,
+            },
+        }
+
+    @staticmethod
+    def _cluster_visits(interesting: "list") -> "tuple[int, int]":
+        """Cluster oracle-present frames into visits and count how many were caught.
+
+        ``interesting`` is ``(recv_ts, source_motion, oracle_verdict)`` rows in
+        recv_ts order (only present-or-motion rows). Present frames split into a
+        new visit wherever the recv_ts gap exceeds ``_VISIT_GAP_MS``; a visit is
+        caught when any source-motion frame lands in its span ±``_VISIT_WINDOW_MS``
+        (binary-searched over the sorted motion timestamps). Returns
+        ``(total_visits, caught_visits)``.
+        """
+        present_ts = sorted(ts for ts, _motion, verdict in interesting if verdict == 1)
+        if not present_ts:
+            return 0, 0
+        motion_ts = sorted(ts for ts, motion, _verdict in interesting if motion == 1)
+
+        # Split present_ts into visits at gaps > _VISIT_GAP_MS; each visit is its
+        # (start, end) recv_ts span (present_ts is sorted, so first/last bound it).
+        visits: "list[tuple[int, int]]" = []
+        start = prev = present_ts[0]
+        for ts in present_ts[1:]:
+            if ts - prev > _VISIT_GAP_MS:
+                visits.append((start, prev))
+                start = ts
+            prev = ts
+        visits.append((start, prev))
+
+        caught = 0
+        for lo_ts, hi_ts in visits:
+            lo, hi = lo_ts - _VISIT_WINDOW_MS, hi_ts + _VISIT_WINDOW_MS
+            i = bisect.bisect_left(motion_ts, lo)
+            if i < len(motion_ts) and motion_ts[i] <= hi:
+                caught += 1
+        return len(visits), caught
+
+    def gate_fidelity(self, slot: str) -> dict:
+        """How faithfully a re-run slot reproduces the live gate it was seeded from.
+
+        Over the frames that carry a verdict for ``slot`` (INNER JOIN, so only
+        frames still present), returns ``{compared, agree, rate}`` where ``agree``
+        counts the frames whose ``analysis.verdict`` equals the stored
+        ``frames.motion`` and ``rate`` is ``agree / compared`` (0.0 when nothing is
+        compared). High agreement empirically validates the offline method; low
+        agreement quantifies the transfer gap. No warmup exclusion — this is the
+        raw reproduction check across the whole slot.
+        """
+        with self._lock:
+            compared, agree = self._conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(CASE WHEN a.verdict = f.motion THEN 1 ELSE 0 END), 0)"
+                " FROM analysis a JOIN frames f ON f.id = a.frame_id"
+                " WHERE a.analyzer = ?",
+                (slot,),
+            ).fetchone()
+        compared, agree = int(compared), int(agree)
+        return {"compared": compared, "agree": agree, "rate": (agree / compared) if compared else 0.0}
+
+    def latest_analysis_detail(self, analyzer: str) -> "dict | None":
+        """The parsed ``detail`` of ``analyzer``'s most recent verdict, or ``None``.
+
+        The newest (highest ``frame_id``) row carrying a non-NULL ``detail``,
+        JSON-decoded to a dict — or ``None`` when the analyzer has no such row or the
+        stored detail isn't a JSON object. Lets a caller recover, e.g., the
+        ``MotionParams`` a re-run slot recorded (``detail['params']``) without reaching
+        into the connection. Read-only, under the store lock like every other accessor.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT detail FROM analysis WHERE analyzer = ? AND detail IS NOT NULL"
+                " ORDER BY frame_id DESC LIMIT 1",
+                (analyzer,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            detail = json.loads(row[0])
+        except (ValueError, TypeError):
+            return None
+        return detail if isinstance(detail, dict) else None

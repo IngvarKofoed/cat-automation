@@ -253,6 +253,40 @@ class EdgeClient:
         # contract violation, not a liveness event, so it propagates unwrapped.
         return parse_status(obj)
 
+    def get_config(self) -> dict:
+        """Fetch and parse ``GET /api/config`` — the Pi's persisted settings.
+
+        Returns the response body as a plain ``dict``: the persisted motion-gate
+        params (``var_threshold``, ``learning_rate``, ``min_area``,
+        ``max_area_fraction``, ``persistence``, ``motion_downscale``) alongside
+        the camera/capture config (``device``, ``rotation``, ``clip``, ``fps``,
+        ``focus``). Unlike ``get_status()`` this has no ``shared.wire`` parser —
+        config is a Pi-owned settings blob, not a data-plane wire contract — so
+        the JSON is returned as-is rather than into a typed snapshot.
+
+        Raises ``EdgeUnavailable`` on a connection error, a non-200 response, or
+        a non-JSON body — the same liveness contract as ``get_status()``.
+        """
+        url = f"{self._base_url}/api/config"
+        try:
+            resp = requests.get(
+                url, timeout=(self._connect_timeout, self._read_timeout)
+            )
+        except _TRANSPORT_ERRORS as exc:
+            raise EdgeUnavailable(f"failed to fetch {url!r}: {exc}") from exc
+        try:
+            if resp.status_code != 200:
+                raise EdgeUnavailable(f"{url!r} returned HTTP {resp.status_code}")
+            try:
+                obj = resp.json()
+            except ValueError as exc:
+                raise EdgeUnavailable(f"{url!r} returned a non-JSON body") from exc
+        finally:
+            resp.close()
+        if not isinstance(obj, dict):
+            raise EdgeUnavailable(f"{url!r} returned a non-object JSON body")
+        return obj
+
     def iter_stream_reconnecting(
         self,
         *,

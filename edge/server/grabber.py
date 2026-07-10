@@ -26,9 +26,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
-import cv2
-
 from edge.clip.transform import crop, rotate
+from shared.motion import MotionGate, MotionParams
 
 if TYPE_CHECKING:  # only for annotations — keep runtime imports light
     import numpy as np
@@ -41,26 +40,11 @@ if TYPE_CHECKING:  # only for annotations — keep runtime imports light
 # settings.py) — it never overrides a valid configured fps.
 _DEFAULT_FPS = 5.0
 
-# Fixed small structuring element for the morphological OPEN that despeckles the
-# foreground mask before connected components. 3x3 removes isolated pixels/noise
-# without eroding a cat-sized blob at the downscaled resolution.
-_MOTION_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-
-
-class MotionConfig(NamedTuple):
-    """The motion-detection parameters, snapshotted per iteration by the app.
-
-    Fields mirror the persisted settings keys (see settings.py). ``downscale``
-    is the target ROI width in px before MOG2; the others tune MOG2 and the
-    locality/persistence decision rule.
-    """
-
-    var_threshold: float
-    learning_rate: float
-    min_area: float
-    max_area_fraction: float
-    persistence: int
-    downscale: int
+# The motion params (var_threshold/learning_rate/min_area/max_area_fraction/
+# persistence/downscale) now live in shared.motion, imported by both tiers so
+# the offline tuning re-run matches the live gate by construction. Re-exported
+# under the historical name so app.py and existing imports are unaffected.
+MotionConfig = MotionParams
 
 
 class GrabConfig(NamedTuple):
@@ -142,15 +126,13 @@ class Grabber:
         self._bbox: "tuple | None" = None
         self._area = 0.0
 
-        # Motion-detection state, shared between the grab thread (which computes
-        # motion) and reset_motion() callers (config changes / manual relearn),
-        # so both live under _motion_lock. The MOG2 model is reused across
-        # iterations — its learned background is its whole value; only a reset
-        # drops it. The debounce counter tracks consecutive raw-motion frames.
+        # The shared MOG2 motion gate (learned background + debounce streak). It
+        # is not internally locked, so the grab thread (which calls process) and
+        # reset_motion() callers (config changes / manual relearn) serialize on
+        # _motion_lock — the gate's learned background is its whole value; only a
+        # reset drops it.
         self._motion_lock = threading.Lock()
-        self._mog2 = None
-        self._mog2_var_threshold: "float | None" = None
-        self._motion_streak = 0
+        self._gate = MotionGate()
 
         # Pacing fallback; owned by the grab path.
         self._fps_fallback = _DEFAULT_FPS
@@ -268,94 +250,25 @@ class Grabber:
     ) -> "tuple[bool, tuple | None, float]":
         """Compute the debounced motion decision for one raw frame.
 
-        Runs MOG2 over the rotate+crop-derived, downscaled grayscale ROI (the
-        same transform the serving routes apply, so motion tracks exactly the
-        door region the client sees), then a locality/persistence rule. Returns
-        ``(motion, bbox, area)`` where ``area`` is the largest foreground blob
-        as a fraction of the ROI (always reported, for tuning) and ``bbox`` is
-        that blob normalized to the ROI (0..1) when motion is active, else None.
+        Applies this edge's rotate+crop (so motion tracks exactly the door
+        region the serving routes show), then hands the ROI to the shared
+        ``MotionGate`` — the downscale → gray → MOG2 → threshold → morph →
+        largest-blob → locality/persistence core lives there, identical to the
+        compute tier's offline re-run. Returns ``(motion, bbox, area)`` where
+        ``area`` is the largest foreground blob as a fraction of the ROI (always
+        reported, for tuning) and ``bbox`` is that blob normalized to the ROI
+        (0..1) when motion is active, else None.
 
-        The MOG2 apply/decision runs under ``self._motion_lock`` so a concurrent
-        ``reset_motion()`` can't swap the model or the debounce counter
-        mid-computation. Any OpenCV/transform error propagates to the caller,
-        which treats it as a failed grab.
+        The gate is not internally locked, so ``process`` runs under
+        ``self._motion_lock`` — a concurrent ``reset_motion()`` can't swap the
+        model or the debounce streak mid-computation. Any OpenCV/transform error
+        propagates to the caller, which treats it as a failed grab.
         """
         # Transform is stateless and touches no shared state — do it outside the
-        # lock to keep the model lock held only for MOG2 + post-processing.
+        # lock so _motion_lock is held only around the gate's MOG2 + post-processing.
         roi = crop(rotate(frame, rotation), clip)
-        height, width = roi.shape[:2]
-        # Downscale to the target width (never upscale a small ROI), keep aspect.
-        target_w = max(1, min(int(cfg.downscale), int(width)))
-        target_h = max(1, round(height * (target_w / float(width))))
-        small = cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        # Accept mono/IR sources too, not just 3-channel BGR: cvtColor(BGR2GRAY)
-        # on an already-single-channel frame raises, which would otherwise make a
-        # perfectly good grayscale night camera error out every iteration.
-        if small.ndim == 2:
-            gray = small
-        elif small.shape[2] == 1:
-            gray = small[:, :, 0]
-        else:
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
         with self._motion_lock:
-            mog2 = self._ensure_mog2(cfg)
-            mask = mog2.apply(gray, learningRate=cfg.learning_rate)
-            # Keep only hard foreground: with detectShadows=True MOG2 marks
-            # shadows as gray 127, so threshold at 254 drops both shadow and bg.
-            _, fg = cv2.threshold(mask, 254, 255, cv2.THRESH_BINARY)
-            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, _MOTION_KERNEL)
-            count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
-                fg, connectivity=8
-            )
-            # Largest NON-background component (label 0 is background).
-            best_i, best_px = 0, 0
-            for i in range(1, count):
-                px = int(stats[i, cv2.CC_STAT_AREA])
-                if px > best_px:
-                    best_i, best_px = i, px
-
-            total = target_w * target_h
-            area = best_px / total if total else 0.0
-            # Locality gate: reject nothing-there and whole-ROI (illumination)
-            # blobs; only a compact, cat-sized blob counts as raw motion.
-            raw_motion = best_i > 0 and cfg.min_area <= area <= cfg.max_area_fraction
-            if raw_motion:
-                self._motion_streak += 1
-            else:
-                self._motion_streak = 0
-            motion = self._motion_streak >= cfg.persistence
-
-            if motion:
-                x = int(stats[best_i, cv2.CC_STAT_LEFT])
-                y = int(stats[best_i, cv2.CC_STAT_TOP])
-                bw = int(stats[best_i, cv2.CC_STAT_WIDTH])
-                bh = int(stats[best_i, cv2.CC_STAT_HEIGHT])
-                bbox = (x / target_w, y / target_h, bw / target_w, bh / target_h)
-            else:
-                bbox = None
-
-        return motion, bbox, area
-
-    def _ensure_mog2(self, cfg: MotionConfig):
-        """Return the MOG2 instance, creating it lazily and applying live tuning.
-
-        Caller must hold ``self._motion_lock``. The instance is reused across
-        iterations (its learned background is its whole value); only
-        ``reset_motion()`` drops it. ``var_threshold`` is applied live via
-        ``setVarThreshold`` so tuning takes effect without a relearn (which would
-        burst false motion while the model re-adapts).
-        """
-        var_threshold = float(cfg.var_threshold)
-        if self._mog2 is None:
-            self._mog2 = cv2.createBackgroundSubtractorMOG2(
-                varThreshold=var_threshold, detectShadows=True
-            )
-            self._mog2_var_threshold = var_threshold
-        elif var_threshold != self._mog2_var_threshold:
-            self._mog2.setVarThreshold(var_threshold)
-            self._mog2_var_threshold = var_threshold
-        return self._mog2
+            return self._gate.process(roi, cfg)
 
     def reset_motion(self) -> None:
         """Drop the MOG2 model and zero the debounce counter (relearn next grab).
@@ -373,9 +286,7 @@ class Grabber:
         current frame. Cleared here so no stale motion signal survives a reset.
         """
         with self._motion_lock:
-            self._mog2 = None
-            self._mog2_var_threshold = None
-            self._motion_streak = 0
+            self._gate.reset()
         # Separate acquire (never nested with _motion_lock — matches the grab
         # path, which holds only one of the two at a time), so no lock-order risk.
         with self._cond:

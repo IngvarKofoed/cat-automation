@@ -112,3 +112,33 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     5060 Ti, sm_120) need cu128+ wheels — older CUDA wheels lack Blackwell kernels. `torchvision`
     is now listed explicitly alongside torch.
 
+21. Added `compute/tools/diagnose_misses.py`, a read-only tuning diagnostic: given the YOLO
+    oracle's verdicts, it classifies MOG2 *misses* (motion=0 but cat present) so a raw miss
+    count becomes an actionable one. It reports gate recall on cat-present frames, splits
+    misses by YOLO confidence (recall-first YOLO over-calls at conf 0.15 — borderline misses
+    may be oracle noise, not gate faults), buckets each miss by stored blob `area` vs the
+    thresholds to name the knob (min_area / learning_rate / max_area / persistence), and —
+    the load-bearing part — clusters misses into visits to separate harmless per-frame drops
+    from wholly-missed visits (the only misses that cost a real GPU trigger). Thresholds are
+    flags, not read from the Pi, so they must be confirmed against the edge's live settings.
+
+22. Single source of truth — edge and compute instantiate shared `MotionGate` (post-transform MOG2 core:
+    downscale → gray → threshold → morph → largest blob → area gate → debounce). Edge's refactor is
+    behavior-preserving; kills the "second MOG2 drifts" risk.
+
+23. Compute's `MogAnalyzer` re-runs the gate offline with adjustable params over stored frames.
+    Baseline from Pi's live settings (new `GET /api/edge/config`), candidate from edited knobs.
+    Windowed/stateful (MOG2 background builds frame-by-frame); results persist to analysis table.
+    Tunes all six params offline — including var_threshold/learning_rate (stored area alone can't recover).
+
+24. Gate scorecard generalized across motion sources (live or offline re-run) and oracles.
+    Computes recall, missed frames (source-still ∧ oracle-present), false triggers (source-motion ∧
+    oracle-absent), misses split by oracle confidence, area-vs-knob buckets (diagnoses which param),
+    visit clustering (wholly-missed visits cost GPU). Fidelity check (baseline vs frames.motion) validates
+    method transfer. Subsumes diagnose_misses.py into Store.gate_scorecard.
+
+25. Tuning panel (vanilla JS): six param fields prefilled from edge, baseline/candidate buttons.
+    `/api/tuning/compare?oracle=yolo` returns scorecards for live + baseline + candidate with
+    per-metric deltas highlighted (green = fewer misses, red = more false triggers). Fidelity
+    agreement shown. Winning params for copy-paste to edge config UI.
+

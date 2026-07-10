@@ -611,9 +611,10 @@ cat-automation/
 
 - `edge/`, `compute/`, and `shared/` are the natural top-level areas, each a home
   for its own focused ownership (and a subtree `CLAUDE.md`) as the code grows.
-- `shared/` is deliberately small — only the contracts both tiers must agree on —
-  so the edge and compute sides can evolve independently without drifting on the
-  wire format.
+- `shared/` holds both the contracts both tiers must agree on (data model, event/intent schemas,
+  wire formats) and cross-tier logic: the MotionGate motion-gate core, so the compute tier can re-run
+  the edge's exact motion gate offline for tuning without implementation drift between edge live and
+  compute offline versions.
 - **Not committed to git:** model artifacts (`compute/models/`, kept via a model
   store or LFS) and captured media/clips (they live on the compute filesystem per
   *Storage*, referenced by path).

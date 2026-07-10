@@ -215,6 +215,104 @@
             border-radius: 4px;
             font-size: 13px;
         }
+        /* MOG2 tuning panel. See docs/specs/2026-07-10-motion-gate-diagnostic.md. */
+        .panel h2 {
+            font-size: 16px;
+            margin: 0 0 12px;
+        }
+        .param-input {
+            padding: 8px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 14px;
+            width: 110px;
+        }
+        .tuning-empty-note {
+            color: #888;
+            font-size: 13px;
+            margin-top: 8px;
+        }
+        .tuning-cards {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+        .tuning-card {
+            flex: 1 1 220px;
+            min-width: 220px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 10px 14px;
+        }
+        .tuning-card h3 {
+            font-size: 14px;
+            margin: 0 0 8px;
+        }
+        .tuning-card .tuning-empty {
+            color: #999;
+            font-size: 13px;
+            margin: 0;
+        }
+        .tuning-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 12px;
+            padding: 3px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .tuning-row:last-child {
+            border-bottom: none;
+        }
+        .tuning-row span:first-child {
+            color: #777;
+        }
+        .tuning-line {
+            margin-top: 10px;
+            font-size: 13px;
+        }
+        .tuning-note {
+            color: #777;
+            font-size: 12px;
+        }
+        /* Delta coloring convention (both metrics): negative = fewer = improvement
+           = green; positive = more = regression = red; zero = neutral. */
+        .delta-good {
+            color: #2e7d32;
+            font-weight: 700;
+        }
+        .delta-bad {
+            color: #c62828;
+            font-weight: 700;
+        }
+        .delta-neutral {
+            color: #555;
+            font-weight: 600;
+        }
+        .tuning-copy-row {
+            margin-top: 12px;
+        }
+        .tuning-copy-row label {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 600;
+            font-size: 13px;
+        }
+        .tuning-copy-controls {
+            display: flex;
+            gap: 8px;
+        }
+        #tuningCopyText {
+            flex: 1;
+            padding: 8px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #f5f5f5;
+        }
     </style>
 </head>
 <body>
@@ -309,6 +407,71 @@
         <div id="analysisError" class="hidden analysis-error"></div>
     </div>
 
+    <!-- Offline MOG2 tuning: re-run the shared motion gate over stored frames
+         with adjustable params (a "baseline" seeded from the Pi's live settings
+         and an edited "candidate"), then diff both against the Oracle selected
+         above. Reuses the analysis panel's job/progress machinery — a tuning
+         rerun and an oracle sweep share the same one-job-at-a-time slot. See
+         docs/specs/2026-07-10-motion-gate-diagnostic.md. -->
+    <div class="panel" id="tuningPanel">
+        <h2>MOG2 Tuning</h2>
+        <div class="controls-row">
+            <div class="control-group">
+                <label for="param_var_threshold">var_threshold</label>
+                <input type="number" id="param_var_threshold" step="0.5" class="param-input">
+            </div>
+            <div class="control-group">
+                <label for="param_learning_rate">learning_rate</label>
+                <input type="number" id="param_learning_rate" step="0.001" class="param-input">
+            </div>
+            <div class="control-group">
+                <label for="param_min_area">min_area</label>
+                <input type="number" id="param_min_area" step="0.0001" class="param-input">
+            </div>
+            <div class="control-group">
+                <label for="param_max_area_fraction">max_area_fraction</label>
+                <input type="number" id="param_max_area_fraction" step="0.01" class="param-input">
+            </div>
+            <div class="control-group">
+                <label for="param_persistence">persistence</label>
+                <input type="number" id="param_persistence" step="1" class="param-input">
+            </div>
+            <div class="control-group">
+                <label for="param_motion_downscale">motion_downscale</label>
+                <input type="number" id="param_motion_downscale" step="1" class="param-input">
+            </div>
+            <div class="control-group" style="margin-left: auto;">
+                <span id="tuningParamSource" class="badge">Params: —</span>
+            </div>
+        </div>
+        <div class="controls-row" style="margin-top: 12px;">
+            <div class="control-group">
+                <div class="btn-row">
+                    <button type="button" id="tuningRunBaselineBtn">Run baseline</button>
+                    <button type="button" id="tuningRunCandidateBtn">Run candidate</button>
+                    <button type="button" id="tuningRefreshBtn" class="btn-secondary">Refresh compare</button>
+                </div>
+            </div>
+            <div class="control-group" style="margin-left: auto;">
+                <span id="tuningProgressBadge" class="badge">Tuning: —</span>
+            </div>
+        </div>
+        <div id="tuningError" class="hidden analysis-error"></div>
+
+        <div id="tuningCompareEmpty" class="tuning-empty-note">Run a baseline and a candidate, then compare against the Oracle selected above.</div>
+        <div id="tuningCards" class="tuning-cards"></div>
+        <div id="tuningFidelity" class="tuning-line"></div>
+        <div id="tuningDeltas" class="tuning-line"></div>
+        <div id="tuningWarmupNote" class="tuning-line tuning-note"></div>
+        <div id="tuningCopyRow" class="tuning-copy-row hidden">
+            <label for="tuningCopyText">Candidate params (paste into the edge Config UI):</label>
+            <div class="tuning-copy-controls">
+                <input type="text" id="tuningCopyText" readonly>
+                <button type="button" id="tuningCopyBtn" class="btn-secondary">Copy</button>
+            </div>
+        </div>
+    </div>
+
     <div id="empty" class="hidden">No frames match the current filter.</div>
     <div id="grid"></div>
     <div id="pager">
@@ -343,6 +506,20 @@
         const analysisErrorEl = document.getElementById('analysisError');
         const presetOracleMissedBtn = document.getElementById('presetOracleMissedBtn');
         const presetOracleFalseBtn = document.getElementById('presetOracleFalseBtn');
+        const tuningParamSourceEl = document.getElementById('tuningParamSource');
+        const tuningRunBaselineBtn = document.getElementById('tuningRunBaselineBtn');
+        const tuningRunCandidateBtn = document.getElementById('tuningRunCandidateBtn');
+        const tuningRefreshBtn = document.getElementById('tuningRefreshBtn');
+        const tuningProgressBadge = document.getElementById('tuningProgressBadge');
+        const tuningErrorEl = document.getElementById('tuningError');
+        const tuningCompareEmptyEl = document.getElementById('tuningCompareEmpty');
+        const tuningCardsEl = document.getElementById('tuningCards');
+        const tuningFidelityEl = document.getElementById('tuningFidelity');
+        const tuningDeltasEl = document.getElementById('tuningDeltas');
+        const tuningWarmupNoteEl = document.getElementById('tuningWarmupNote');
+        const tuningCopyRowEl = document.getElementById('tuningCopyRow');
+        const tuningCopyTextEl = document.getElementById('tuningCopyText');
+        const tuningCopyBtn = document.getElementById('tuningCopyBtn');
 
         // View state. Every order is keyset-paginated. pageCursors[i] is the
         // opaque token that fetches page i (pageCursors[0] === null = first
@@ -365,6 +542,8 @@
         let collectorRunning = null;   // last known /api/stats collector_running, drives the toggle button's label
         let analysisRunning = false;   // last known /api/analysis/status running, drives Run/Cancel disabling
         let lastStoreCount = null;     // last known /api/stats count — the analysis coverage denominator (see pollAnalysisStatus)
+        let tuningPrevRunning = false;  // edge-detects analysisRunning true->false to auto-refresh the compare view when a rerun finishes
+        let lastCandidateParams = null; // params actually submitted on the last successful "Run candidate" — the copy-paste line reflects THIS, not whatever is currently typed (which may have been edited since)
 
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart). The <select> options AND
@@ -498,6 +677,27 @@
                 // into its own inline slot rather than the shared #error banner.
                 analysisErrorEl.textContent = data.error ? `Last analysis run failed: ${data.error}` : '';
                 analysisErrorEl.classList.toggle('hidden', !data.error);
+
+                // Tuning reruns share this SAME job slot (one analysis-or-tuning
+                // run at a time — see POST /api/tuning/rerun's 409), so its Run
+                // buttons ride the same `running` flag rather than a separate poll.
+                tuningRunBaselineBtn.disabled = analysisRunning;
+                tuningRunCandidateBtn.disabled = analysisRunning;
+                if (analysisRunning && typeof data.analyzer === 'string' && data.analyzer.startsWith('mog2:')) {
+                    tuningProgressBadge.textContent = `Tuning: running ${data.analyzer} — ${data.done}/${data.total}`;
+                } else if (analysisRunning) {
+                    const runningLabel = ANALYZER_LABELS[data.analyzer] || data.analyzer;
+                    tuningProgressBadge.textContent = `Tuning: blocked — ${runningLabel} sweep running`;
+                } else {
+                    tuningProgressBadge.textContent = 'Tuning: idle';
+                }
+                // A run (tuning or oracle) just finished — refresh the compare
+                // view so a completed baseline/candidate rerun shows up without
+                // requiring a manual "Refresh compare" click.
+                if (tuningPrevRunning && !analysisRunning) {
+                    loadTuningCompare();
+                }
+                tuningPrevRunning = analysisRunning;
             } catch (err) {
                 // Same discipline as pollStats: a failed background poll leaves
                 // the last-known badge/button state rather than clobbering the
@@ -505,6 +705,243 @@
                 console.warn('analysis status poll failed:', err);
             }
         }
+
+        // ---- MOG2 tuning panel ----
+        // Re-runs the shared MotionGate offline with adjustable params
+        // (baseline vs. candidate) and diffs both against the oracle picked in
+        // the Oracle select above. See
+        // docs/specs/2026-07-10-motion-gate-diagnostic.md.
+
+        // The six params speak the edge's OWN vocabulary end to end — the same
+        // keys GET /api/edge/config returns and POST /api/tuning/rerun expects —
+        // so a config fetched from the Pi round-trips straight into a rerun body
+        // with no renaming.
+        const TUNING_PARAM_KEYS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
+
+        function showTuningError(message) {
+            tuningErrorEl.textContent = message;
+            tuningErrorEl.classList.remove('hidden');
+        }
+
+        function clearTuningError() {
+            tuningErrorEl.classList.add('hidden');
+            tuningErrorEl.textContent = '';
+        }
+
+        // Throws (rather than silently coercing) on a blank/non-numeric field so
+        // runTuning can show a clear message before ever hitting the network —
+        // the server validates too, but failing fast here avoids a round trip.
+        function getTuningParams() {
+            const params = {};
+            for (const key of TUNING_PARAM_KEYS) {
+                const el = document.getElementById('param_' + key);
+                const value = Number(el.value);
+                if (el.value.trim() === '' || Number.isNaN(value)) {
+                    throw new Error(`${key} must be a number`);
+                }
+                params[key] = value;
+            }
+            return params;
+        }
+
+        function setTuningParams(params) {
+            if (!params) return;
+            for (const key of TUNING_PARAM_KEYS) {
+                if (typeof params[key] === 'number') {
+                    document.getElementById('param_' + key).value = params[key];
+                }
+            }
+        }
+
+        // Prefill the six fields from the Pi's live settings. GET /api/edge/config
+        // always answers 200 with a `source` tag ("edge" or "defaults") rather
+        // than erroring when the Pi is unreachable, so a thrown error here means
+        // the compute API itself didn't answer, not just the edge.
+        async function loadTuningDefaults() {
+            try {
+                const res = await fetch('/api/edge/config');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                tuningParamSourceEl.textContent = data.source === 'edge' ? 'Params: from Pi' : 'Params: defaults — edge unreachable';
+                tuningParamSourceEl.classList.toggle('warn', data.source !== 'edge');
+                setTuningParams(data.params);
+            } catch (err) {
+                tuningParamSourceEl.textContent = 'Params: unavailable';
+                tuningParamSourceEl.classList.add('warn');
+                console.warn('edge config fetch failed:', err);
+            }
+        }
+
+        async function runTuning(slot) {
+            let params;
+            try {
+                params = getTuningParams();
+            } catch (err) {
+                showTuningError(err.message);
+                return;
+            }
+            try {
+                clearTuningError();
+                tuningRunBaselineBtn.disabled = true;
+                tuningRunCandidateBtn.disabled = true;
+                const res = await fetch('/api/tuning/rerun', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ slot, params }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                // Remember exactly what was submitted, for the copy-paste line —
+                // NOT whatever is currently in the fields, which may since have
+                // been edited again before the run finishes.
+                if (slot === 'candidate') lastCandidateParams = params;
+            } catch (err) {
+                showTuningError(`Run ${slot} failed: ${err.message}`);
+            } finally {
+                await pollAnalysisStatus();   // re-derives button disabled state from the true (shared) running flag
+            }
+        }
+
+        tuningRunBaselineBtn.addEventListener('click', () => runTuning('baseline'));
+        tuningRunCandidateBtn.addEventListener('click', () => runTuning('candidate'));
+        tuningRefreshBtn.addEventListener('click', () => loadTuningCompare());
+
+        function formatPct(x) {
+            return typeof x === 'number' ? (x * 100).toFixed(1) + '%' : '—';
+        }
+
+        function tuningRow(label, value) {
+            const row = document.createElement('div');
+            row.className = 'tuning-row';
+            const l = document.createElement('span');
+            l.textContent = label;
+            const v = document.createElement('span');
+            v.textContent = value;
+            row.append(l, v);
+            return row;
+        }
+
+        // Renders one scorecard column. `sc` is either a full scorecard, the
+        // `{needs_rerun: true}` placeholder (that slot hasn't been run yet), or
+        // absent (shouldn't happen for `live`, but stay defensive).
+        function tuningCard(label, sc) {
+            const card = document.createElement('div');
+            card.className = 'tuning-card';
+            const h3 = document.createElement('h3');
+            h3.textContent = label;
+            card.appendChild(h3);
+
+            if (!sc) {
+                const p = document.createElement('p');
+                p.className = 'tuning-empty';
+                p.textContent = '—';
+                card.appendChild(p);
+                return card;
+            }
+            if (sc.needs_rerun) {
+                const p = document.createElement('p');
+                p.className = 'tuning-empty';
+                p.textContent = 'Not yet run';
+                card.appendChild(p);
+                return card;
+            }
+
+            const recall = sc.recall || {};
+            const falseT = sc.false_triggers || {};
+            const conf = sc.confidence || {};
+            const buckets = sc.area_buckets || {};
+            const visits = sc.visits || {};
+
+            card.appendChild(tuningRow('Analyzed', `${sc.analyzed ?? '—'} (${sc.present ?? '—'} present)`));
+            card.appendChild(tuningRow('Recall', `${recall.caught ?? '—'}/${sc.present ?? '—'} (${formatPct(recall.rate)})`));
+            card.appendChild(tuningRow('Missed', `${recall.missed ?? '—'}`));
+            card.appendChild(tuningRow('False triggers', `${falseT.count ?? '—'}`));
+            card.appendChild(tuningRow('Miss confidence', `hi ${conf.high ?? 0} / med ${conf.medium ?? 0} / lo ${conf.low ?? 0}`));
+            card.appendChild(tuningRow('Area buckets', `<min ${buckets.below_min ?? 0} · ~0 ${buckets.near_zero ?? 0} · >max ${buckets.above_max ?? 0} · in-band ${buckets.in_band ?? 0}`));
+            card.appendChild(tuningRow('Visits', `${visits.caught ?? '—'}/${visits.total ?? '—'} caught (${visits.wholly_missed ?? '—'} wholly missed)`));
+            return card;
+        }
+
+        // value < 0 → improvement (fewer misses / fewer false triggers) → green;
+        // value > 0 → regression → red; 0 → neutral. Same convention for both
+        // metrics, per the spec ("green = fewer misses, red = more false triggers").
+        function deltaSpan(value) {
+            const span = document.createElement('span');
+            if (typeof value !== 'number') {
+                span.textContent = '—';
+                span.className = 'delta-neutral';
+                return span;
+            }
+            const sign = value > 0 ? '+' : '';
+            span.textContent = `${sign}${value}`;
+            span.className = value < 0 ? 'delta-good' : (value > 0 ? 'delta-bad' : 'delta-neutral');
+            return span;
+        }
+
+        function renderTuningCompare(data) {
+            tuningCompareEmptyEl.classList.add('hidden');
+            tuningCardsEl.innerHTML = '';
+            tuningCardsEl.appendChild(tuningCard('Live gate', data.live));
+            tuningCardsEl.appendChild(tuningCard('Baseline', data.baseline));
+            tuningCardsEl.appendChild(tuningCard('Candidate', data.candidate));
+
+            if (data.fidelity) {
+                tuningFidelityEl.textContent = `Fidelity (baseline re-run vs. stored live motion): ${data.fidelity.agree}/${data.fidelity.compared} agree (${formatPct(data.fidelity.rate)})`;
+            } else {
+                tuningFidelityEl.textContent = 'Fidelity: run a baseline to check how faithfully the offline re-run reproduces the live gate.';
+            }
+
+            tuningDeltasEl.innerHTML = '';
+            if (data.deltas) {
+                const label = document.createElement('span');
+                label.textContent = 'Baseline → candidate: missed ';
+                tuningDeltasEl.appendChild(label);
+                tuningDeltasEl.appendChild(deltaSpan(data.deltas.missed));
+                const mid = document.createElement('span');
+                mid.textContent = ', false triggers ';
+                tuningDeltasEl.appendChild(mid);
+                tuningDeltasEl.appendChild(deltaSpan(data.deltas['false']));
+            } else {
+                tuningDeltasEl.textContent = 'Deltas: run both baseline and candidate to see the change.';
+            }
+
+            const warmup = data.live && typeof data.live.warmup === 'number' ? data.live.warmup : null;
+            tuningWarmupNoteEl.textContent = warmup !== null
+                ? `First ${warmup} frames of the store are excluded from every scorecard above (MOG2 warm-up).`
+                : '';
+
+            if (lastCandidateParams) {
+                tuningCopyRowEl.classList.remove('hidden');
+                tuningCopyTextEl.value = TUNING_PARAM_KEYS.map(k => `${k}=${lastCandidateParams[k]}`).join(', ');
+            } else {
+                tuningCopyRowEl.classList.add('hidden');
+            }
+        }
+
+        async function loadTuningCompare() {
+            try {
+                clearTuningError();
+                const oracle = analyzerSelect.value;
+                const res = await fetch('/api/tuning/compare?oracle=' + encodeURIComponent(oracle));
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                renderTuningCompare(data);
+            } catch (err) {
+                showTuningError(`Compare failed: ${err.message}`);
+            }
+        }
+
+        tuningCopyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(tuningCopyTextEl.value);
+                const original = tuningCopyBtn.textContent;
+                tuningCopyBtn.textContent = 'Copied';
+                setTimeout(() => { tuningCopyBtn.textContent = original; }, 1500);
+            } catch {
+                // Clipboard API unavailable (e.g. a non-secure-context LAN page) —
+                // fall back to select-then-manual-copy.
+                tuningCopyTextEl.select();
+            }
+        });
 
         // ---- frame grid ----
 
@@ -716,6 +1153,7 @@
                 disagreeAnalyzer = analyzerSelect.value;
                 reloadView();
             }
+            loadTuningCompare();   // the compare view reads whichever oracle is now selected
         });
 
         analysisRunBtn.addEventListener('click', async () => {
@@ -761,6 +1199,8 @@
             pollStats();
             pollAnalysisStatus();
             reloadView();
+            loadTuningDefaults();
+            loadTuningCompare();
         });
     </script>
 </body>

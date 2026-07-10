@@ -7,14 +7,16 @@ missed (non-motion, high area) as well as what it wrongly flagged (motion, low
 area). Non-motion frames are kept on purpose: they are exactly where missed cats
 hide. See ``docs/specs/2026-07-09-frame-collection-browser.md``.
 
-The public surface is two pieces: ``Store`` (the SQLite index + media dir +
-retention + clear) and ``run_collector`` (the background loop that pulls the
-existing ``EdgeClient.iter_stream_reconnecting()`` feed into the store). The web
-app that browses the result lives in ``compute/api``.
+The public surface is three pieces: ``Store`` (the SQLite index + media dir +
+retention + clear), ``run_collector`` (the background loop that pulls the existing
+``EdgeClient.iter_stream_reconnecting()`` feed into the store), and
+``CollectorManager`` (runtime start/stop around that loop, so the store can be
+frozen for a clean offline analysis pass). The web app that browses the result
+lives in ``compute/api``.
 """
 from __future__ import annotations
 
-from compute.collection.collector import run_collector
+from compute.collection.collector import CollectorManager, run_collector
 from compute.collection.store import Store
 
-__all__ = ["Store", "run_collector"]
+__all__ = ["CollectorManager", "Store", "run_collector"]

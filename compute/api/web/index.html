@@ -141,6 +141,15 @@
         .tile.motion {
             border-color: #2e7d32;
         }
+        /* Disagreement-view tiles (MOG2 vs. oracle) get their OWN border color,
+           distinct from plain-feed motion (green): every tile in that view is a
+           disagreement by construction (see query_disagreements), so recoloring
+           rather than reusing .motion avoids a misleading all-or-nothing tint
+           (e.g. "false" mode would otherwise render identically to a plain
+           motion page). */
+        .tile.disagree {
+            border-color: #6a1b9a;
+        }
         .tile img {
             width: 100%;
             aspect-ratio: 4 / 3;
@@ -157,6 +166,9 @@
             gap: 6px;
         }
         .tile .caption .area {
+            font-weight: 600;
+        }
+        .tile .caption .score {
             font-weight: 600;
         }
         #pager {
@@ -179,6 +191,30 @@
         .hidden {
             display: none !important;
         }
+        /* Wraps the reanalyze checkbox + its text as one clickable label, sized
+           to sit level with the selects/buttons in the same controls-row. */
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 400;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        /* Surfaces a fatal sweep error (AnalysisManager.status().error) inline in
+           the analysis panel — deliberately NOT the shared #error banner, which
+           is reserved for this-request failures (see clearError/showError); a
+           background status poll finding a past job's error is application
+           state, not a fetch failure. */
+        .analysis-error {
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ef5350;
+            border-radius: 4px;
+            font-size: 13px;
+        }
     </style>
 </head>
 <body>
@@ -192,6 +228,9 @@
             <span id="statSize" class="badge">Size: —</span>
             <span id="statMotion" class="badge">Motion: —</span>
             <span id="statSpan" class="badge">Span: —</span>
+            <span id="collectorBadge" class="badge">Collecting: —</span>
+            <button type="button" id="collectorToggleBtn"
+                title="Start or stop the always-on collector. Stop it to freeze the store for a clean offline analysis pass.">Start</button>
         </div>
     </div>
 
@@ -227,6 +266,49 @@
         </div>
     </div>
 
+    <!-- Offline analysis: sweep a stronger oracle (YOLO / BSUV) over the stored
+         frames to validate MOG2, and browse where they disagree. See
+         docs/specs/2026-07-09-motion-gate-oracles.md. The analyzer select below
+         is dual-purpose: it picks Run's target AND which oracle the disagreement
+         presets read from — one selection, two consumers. -->
+    <div class="panel">
+        <div class="controls-row">
+            <div class="control-group">
+                <label for="analyzerSelect">Oracle</label>
+                <!-- Options are populated in JS from the single ANALYZERS source
+                     (see below), so the oracle id/label set lives in one place. -->
+                <select id="analyzerSelect"></select>
+            </div>
+            <div class="control-group">
+                <div class="btn-row">
+                    <button type="button" id="analysisRunBtn">Run</button>
+                    <button type="button" id="analysisCancelBtn" class="btn-secondary">Cancel</button>
+                </div>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-label"
+                    title="Clear this oracle's prior verdicts first, so the sweep re-verdicts the whole store (e.g. after changing the model or its threshold) instead of skipping already-analyzed frames.">
+                    <input type="checkbox" id="reanalyzeCheckbox">
+                    Re-analyze
+                </label>
+            </div>
+            <div class="control-group" style="margin-left: auto;">
+                <span id="analysisProgressBadge" class="badge">Oracle: —</span>
+            </div>
+        </div>
+        <div class="controls-row" style="margin-top: 12px;">
+            <div class="control-group">
+                <div class="btn-row">
+                    <button type="button" id="presetOracleMissedBtn" class="btn-preset"
+                        title="Frames the motion gate left still but the selected oracle sees the subject — a genuine miss.">Missed (oracle sees subject)</button>
+                    <button type="button" id="presetOracleFalseBtn" class="btn-preset"
+                        title="Frames the motion gate fired on but the selected oracle sees nothing — a false trigger.">False trigger (oracle sees nothing)</button>
+                </div>
+            </div>
+        </div>
+        <div id="analysisError" class="hidden analysis-error"></div>
+    </div>
+
     <div id="empty" class="hidden">No frames match the current filter.</div>
     <div id="grid"></div>
     <div id="pager">
@@ -251,6 +333,16 @@
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
         const pageLabel = document.getElementById('pageLabel');
+        const collectorBadge = document.getElementById('collectorBadge');
+        const collectorToggleBtn = document.getElementById('collectorToggleBtn');
+        const analyzerSelect = document.getElementById('analyzerSelect');
+        const analysisRunBtn = document.getElementById('analysisRunBtn');
+        const analysisCancelBtn = document.getElementById('analysisCancelBtn');
+        const reanalyzeCheckbox = document.getElementById('reanalyzeCheckbox');
+        const analysisProgressBadge = document.getElementById('analysisProgressBadge');
+        const analysisErrorEl = document.getElementById('analysisError');
+        const presetOracleMissedBtn = document.getElementById('presetOracleMissedBtn');
+        const presetOracleFalseBtn = document.getElementById('presetOracleFalseBtn');
 
         // View state. Every order is keyset-paginated. pageCursors[i] is the
         // opaque token that fetches page i (pageCursors[0] === null = first
@@ -260,9 +352,35 @@
         const PAGE_SIZE = 500;   // big pages; <img loading="lazy"> defers off-screen fetches so a large grid stays cheap. Grid is REPLACED per page, not appended.
         let motion = 'all';
         let order = 'time';
+        // Disagreement view (MOG2 vs. a chosen oracle): non-null disagreeMode
+        // routes loadPage through analyzer+disagree instead of motion+order,
+        // mirroring the plain feed's own keyset contract. Set by the
+        // disagreement presets below; cleared by any plain motion/order control
+        // so the two views never mix mid-page.
+        let disagreeAnalyzer = null;   // analyzer the active disagreement view reads from
+        let disagreeMode = null;       // 'missed' | 'false' | null (plain feed)
         let pageCursors = [null];
         let pageIndex = 0;
         let loading = false;
+        let collectorRunning = null;   // last known /api/stats collector_running, drives the toggle button's label
+        let analysisRunning = false;   // last known /api/analysis/status running, drives Run/Cancel disabling
+        let lastStoreCount = null;     // last known /api/stats count — the analysis coverage denominator (see pollAnalysisStatus)
+
+        // The single frontend source for the oracle id/label set (the backend's
+        // ANALYZER_NAMES is its server-side counterpart). The <select> options AND
+        // the id->label map both derive from THIS list, so adding an oracle is a
+        // one-line edit here — no separate <option> markup to keep in sync.
+        const ANALYZERS = [
+            { id: 'yolo', label: 'YOLO' },
+            { id: 'bsuv', label: 'BSUV' },
+        ];
+        const ANALYZER_LABELS = Object.fromEntries(ANALYZERS.map(a => [a.id, a.label]));
+        for (const a of ANALYZERS) {
+            const opt = document.createElement('option');
+            opt.value = a.id;
+            opt.textContent = a.label;
+            analyzerSelect.appendChild(opt);
+        }
 
         function showError(message) {
             errorDiv.textContent = message;
@@ -325,10 +443,18 @@
                 const data = await res.json();
 
                 statCountEl.textContent = `Frames: ${data.count}`;
+                // Stash the frame count as the analysis coverage denominator so
+                // /api/analysis/status needn't recompute it (see pollAnalysisStatus).
+                if (typeof data.count === 'number') lastStoreCount = data.count;
                 statSizeEl.textContent = `Size: ${formatBytes(data.bytes)} / ${formatBytes(data.cap_bytes)}`;
                 statSizeEl.classList.toggle('warn', data.cap_bytes > 0 && data.bytes / data.cap_bytes > 0.9);
                 statMotionEl.textContent = `Motion: ${data.motion_count}`;
                 statSpanEl.textContent = `Span: ${formatSpan(data.oldest_ts, data.newest_ts)}`;
+
+                collectorRunning = !!data.collector_running;
+                collectorBadge.textContent = `Collecting: ${collectorRunning ? 'on' : 'off'}`;
+                collectorBadge.classList.toggle('warn', !collectorRunning);
+                collectorToggleBtn.textContent = collectorRunning ? 'Stop' : 'Start';
             } catch (err) {
                 // A background 4s poll must not commandeer the shared error banner:
                 // it would linger after recovery and clobber a real frame-load
@@ -338,11 +464,58 @@
             }
         }
 
+        // ---- analysis status (offline oracle sweep) ----
+
+        // Polled on the same cadence as pollStats (see the shared setInterval
+        // below). The progress badge always reflects the SELECTED analyzer's
+        // persisted coverage (summaries[selected] / lastStoreCount from the stats
+        // poll) — not the running job's own total, which for a stateless oracle
+        // like YOLO is just its shrinking TODO count, not a stable denominator —
+        // plus an inline note when a sweep (for any analyzer) is actually running.
+        async function pollAnalysisStatus() {
+            try {
+                const res = await fetch('/api/analysis/status');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+
+                analysisRunning = !!data.running;
+                analysisRunBtn.disabled = analysisRunning;
+                analysisCancelBtn.disabled = !analysisRunning;
+
+                const selected = analyzerSelect.value;
+                const summary = (data.summaries && data.summaries[selected]) || { analyzed: 0, present: 0 };
+                const label = ANALYZER_LABELS[selected] || selected;
+                const storeCount = typeof lastStoreCount === 'number' ? lastStoreCount : '—';
+                let text = `${label}: ${summary.analyzed}/${storeCount} analyzed · ${summary.present} present`;
+                if (analysisRunning) {
+                    const runningLabel = ANALYZER_LABELS[data.analyzer] || data.analyzer;
+                    text += ` — running ${runningLabel} ${data.done}/${data.total}`;
+                }
+                analysisProgressBadge.textContent = text;
+
+                // A fatal sweep error is real application state (not a fetch
+                // failure), so — unlike the catch below — it DOES surface, but
+                // into its own inline slot rather than the shared #error banner.
+                analysisErrorEl.textContent = data.error ? `Last analysis run failed: ${data.error}` : '';
+                analysisErrorEl.classList.toggle('hidden', !data.error);
+            } catch (err) {
+                // Same discipline as pollStats: a failed background poll leaves
+                // the last-known badge/button state rather than clobbering the
+                // shared error banner.
+                console.warn('analysis status poll failed:', err);
+            }
+        }
+
         // ---- frame grid ----
 
-        function frameTile(frame) {
+        // `disagreement` (true in the MOG2-vs-oracle view) overrides the plain
+        // motion border with .disagree — every tile there is a disagreement by
+        // construction, so recoloring all of them (rather than keying off
+        // frame.motion, which is misleadingly uniform within one disagreement
+        // mode) is what makes the view visually distinct at a glance.
+        function frameTile(frame, disagreement) {
             const tile = document.createElement('div');
-            tile.className = 'tile' + (frame.motion ? ' motion' : '');
+            tile.className = 'tile' + (disagreement ? ' disagree' : (frame.motion ? ' motion' : ''));
 
             const img = document.createElement('img');
             img.src = frame.url;
@@ -354,11 +527,22 @@
             caption.className = 'caption';
             const timeSpan = document.createElement('span');
             timeSpan.textContent = formatTime(frame.recv_ts);
+            caption.appendChild(timeSpan);
+
+            // 'score' is only present on disagreement rows (query_disagreements);
+            // the plain feed's rows never carry it, so check for the key rather
+            // than the value (a verdict can legitimately have a null score).
+            if ('score' in frame) {
+                const scoreSpan = document.createElement('span');
+                scoreSpan.className = 'score';
+                scoreSpan.textContent = typeof frame.score === 'number' ? `score ${frame.score.toFixed(2)}` : 'score —';
+                caption.appendChild(scoreSpan);
+            }
+
             const areaSpan = document.createElement('span');
             areaSpan.className = 'area';
             const areaPct = typeof frame.area === 'number' ? (frame.area * 100).toFixed(1) + '%' : '—';
             areaSpan.textContent = areaPct;
-            caption.appendChild(timeSpan);
             caption.appendChild(areaSpan);
             tile.appendChild(caption);
 
@@ -376,9 +560,21 @@
             const seq = ++reqSeq;
             loading = true;
             updatePager();  // disable both buttons while a fetch is in flight
+            // Captured once up front so the params built for the request and the
+            // tiles built from its response agree on which view this is — a
+            // later state change (another click) bumps reqSeq and gets discarded
+            // below, so this can't drift mid-flight.
+            const disagreementView = disagreeMode !== null;
             try {
                 clearError();
-                const params = new URLSearchParams({ motion, order, limit: String(PAGE_SIZE) });
+                const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+                if (disagreementView) {
+                    params.set('analyzer', disagreeAnalyzer);
+                    params.set('disagree', disagreeMode);
+                } else {
+                    params.set('motion', motion);
+                    params.set('order', order);
+                }
                 const cursor = pageCursors[targetIndex];
                 if (cursor != null) params.set('cursor', String(cursor));
                 const res = await fetch('/api/frames?' + params.toString());
@@ -389,7 +585,7 @@
 
                 gridEl.innerHTML = '';
                 const frames = data.frames || [];
-                frames.forEach(frame => gridEl.appendChild(frameTile(frame)));
+                frames.forEach(frame => gridEl.appendChild(frameTile(frame, disagreementView)));
                 emptyEl.classList.toggle('hidden', frames.length > 0);
 
                 pageIndex = targetIndex;      // commit the page only now, on success
@@ -424,11 +620,15 @@
 
         motionFilterSelect.addEventListener('change', () => {
             motion = motionFilterSelect.value;
+            disagreeAnalyzer = null;   // back to the plain feed — see loadPage's view routing
+            disagreeMode = null;
             reloadView();
         });
 
         orderSelect.addEventListener('change', () => {
             order = orderSelect.value;
+            disagreeAnalyzer = null;
+            disagreeMode = null;
             reloadView();
         });
 
@@ -447,6 +647,8 @@
         function applyPreset(presetMotion, presetOrder) {
             motion = presetMotion;
             order = presetOrder;
+            disagreeAnalyzer = null;   // a plain-feed preset always leaves the disagreement view
+            disagreeMode = null;
             motionFilterSelect.value = motion;
             orderSelect.value = order;
             reloadView();
@@ -454,6 +656,19 @@
 
         presetMissedBtn.addEventListener('click', () => applyPreset('still', 'area_desc'));
         presetFalseBtn.addEventListener('click', () => applyPreset('motion', 'area_asc'));
+
+        // Disagreement presets — the analysis-layer analogue of the two above,
+        // operating on whichever oracle is currently selected. motion/order are
+        // left untouched (irrelevant while disagreeMode is set) so flipping back
+        // to the plain feed later restores the last plain filter/sort.
+        function applyDisagreementPreset(mode) {
+            disagreeAnalyzer = analyzerSelect.value;
+            disagreeMode = mode;
+            reloadView();
+        }
+
+        presetOracleMissedBtn.addEventListener('click', () => applyDisagreementPreset('missed'));
+        presetOracleFalseBtn.addEventListener('click', () => applyDisagreementPreset('false'));
 
         clearBtn.addEventListener('click', async () => {
             if (!confirm('Clear all collected frames? This cannot be undone.')) return;
@@ -471,13 +686,80 @@
             }
         });
 
+        // ---- collector toggle ----
+
+        collectorToggleBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                collectorToggleBtn.disabled = true;
+                const endpoint = collectorRunning ? '/api/collector/stop' : '/api/collector/start';
+                const res = await fetch(endpoint, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Collector toggle failed: ${err.message}`);
+            } finally {
+                await pollStats();   // authoritative running state re-labels the button from here
+                collectorToggleBtn.disabled = false;
+            }
+        });
+
+        // ---- offline analysis (Run / Cancel) ----
+
+        // Refresh the badge immediately on selection change too — otherwise it
+        // would show the PREVIOUS analyzer's coverage until the next 4s poll.
+        // AND, if a disagreement view is active, retarget it to the newly-selected
+        // oracle and reload the grid — otherwise the badge (new oracle) and the
+        // frames on screen (old oracle) would disagree until a preset is re-clicked.
+        analyzerSelect.addEventListener('change', () => {
+            pollAnalysisStatus();
+            if (disagreeMode !== null) {
+                disagreeAnalyzer = analyzerSelect.value;
+                reloadView();
+            }
+        });
+
+        analysisRunBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                analysisRunBtn.disabled = true;
+                const body = { analyzer: analyzerSelect.value, reanalyze: reanalyzeCheckbox.checked };
+                const res = await fetch('/api/analysis/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Run failed: ${err.message}`);
+            } finally {
+                await pollAnalysisStatus();   // sets Run/Cancel disabled state from the true running flag
+            }
+        });
+
+        analysisCancelBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                analysisCancelBtn.disabled = true;
+                const res = await fetch('/api/analysis/cancel', { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Cancel failed: ${err.message}`);
+            } finally {
+                await pollAnalysisStatus();
+            }
+        });
+
         // ---- polling ----
 
         const STATS_POLL_MS = 4000;
-        setInterval(pollStats, STATS_POLL_MS);
+        setInterval(() => {
+            pollStats();
+            pollAnalysisStatus();
+        }, STATS_POLL_MS);
 
         window.addEventListener('load', () => {
             pollStats();
+            pollAnalysisStatus();
             reloadView();
         });
     </script>

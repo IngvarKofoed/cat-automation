@@ -88,3 +88,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     False triggers = motion by area) make motion-gate tuning findable. Reuses EdgeClient, writes raw JPEG bytes
     (no re-encode) — purpose is *seeing* where the edge motion gate is wrong (missed cats + false triggers).
 
+17. Compute-tier offline oracles validate the edge MOG2 gate: YOLO (cat detector) and
+    BSUV-Net (background subtraction) run over stored frames, verdicts persisted to SQLite.
+    Background sweep job—YOLO iterates un-analyzed frames (resumable), BSUV the full time-ordered
+    set. Browse-UI shows disagreements (missed cats / false triggers). Heavy ML deps opt-in
+    (compute/requirements-analysis.txt, lazily imported); BSUV is CUDA-bound.
+

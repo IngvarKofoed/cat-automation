@@ -1,0 +1,18 @@
+# Heavy ML deps for offline analysis (motion-gate validation oracles).
+# **Install manually into .venv-compute:** `pip install -r compute/requirements-analysis.txt`
+# The always-on collector (ingest, frame storage) runs without these; import only inside
+# analysis backends (analysis/yolo.py, analysis/bsuv.py) so the hot ingest path stays lean.
+
+# PyTorch: used by both YoloAnalyzer and BsuvAnalyzer for inference.
+# Device selection is automatic (cuda > mps > cpu); CUDA for BSUV on the real NVIDIA box.
+torch
+
+# Ultralytics YOLO for cat detection (COCO 'cat' class, low conf, recall-first).
+# Large model (yoloX/yolov8x, ~640MB weights); imgsz ≈ 1280 at inference.
+ultralytics
+
+# BSUV-Net (deep background subtraction) for foreground/motion oracle.
+# Framework (TF/PyTorch) and exact package TBD at CUDA integration on the compute box.
+# Pinned when implemented; do not guess a fragile dependency here — leave as a note
+# until the real BSUV variant is tested on the NVIDIA hardware.
+# bsuv-net  # [pinned on integration]

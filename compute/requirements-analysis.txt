@@ -2,10 +2,23 @@
 # **Install manually into .venv-compute:** `pip install -r compute/requirements-analysis.txt`
 # The always-on collector (ingest, frame storage) runs without these; import only inside
 # analysis backends (analysis/yolo.py, analysis/bsuv.py) so the hot ingest path stays lean.
+#
+# GPU (Windows / NVIDIA) — READ FIRST, there is a footgun:
+#   A plain `pip install -r ...` pulls the CPU-only torch from PyPI, and it stays CPU-only:
+#   ultralytics -> torchvision, and PyPI's torchvision pins the CPU torch, so it will
+#   silently clobber any CUDA torch you installed. It must be a MATCHED pair from the CUDA
+#   index, installed together. On Blackwell cards (e.g. RTX 5060 Ti, sm_120) the wheel must
+#   be cu128 or newer — older CUDA wheels lack Blackwell kernels. Recipe:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#     pip install ultralytics
+#   Verify: python -c "import torch; print(torch.cuda.is_available())"  # must be True
+#   (bump cu128 -> cu129/cu130 as newer CUDA wheels land).
 
-# PyTorch: used by both YoloAnalyzer and BsuvAnalyzer for inference.
+# PyTorch (+ torchvision, an ultralytics dep pinned to it): inference for both oracles.
 # Device selection is automatic (cuda > mps > cpu); CUDA for BSUV on the real NVIDIA box.
+# On the NVIDIA box install these from the CUDA index per the note above, NOT plain PyPI.
 torch
+torchvision
 
 # Ultralytics YOLO for cat detection (COCO 'cat' class, low conf, recall-first).
 # Large model (yoloX/yolov8x, ~640MB weights); imgsz ≈ 1280 at inference.

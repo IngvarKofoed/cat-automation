@@ -94,3 +94,21 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     set. Browse-UI shows disagreements (missed cats / false triggers). Heavy ML deps opt-in
     (compute/requirements-analysis.txt, lazily imported); BSUV is CUDA-bound.
 
+18. Added `compute.ps1`, a Windows PowerShell port of `compute.sh` — the compute tier's
+    real home is the NVIDIA PC, which here runs Windows. Same behavior: bootstraps
+    `.venv-compute`, resolves the edge URL (arg > CAT_PI_URL > localhost:8000, scheme
+    auto-prepended), launches the collector UI via uvicorn. Probes for a Python >= 3.10
+    interpreter (the compute code uses `str | None` unions) rather than trusting the
+    `py` launcher's default, which can be an older 3.8.
+
+19. `compute.ps1` now sets and exports `CAT_COLLECT_MAX_BYTES`, defaulting the frame-store
+    retention cap to 1 TiB (the Windows PC has ample disk) vs. the app's 5 GiB default.
+    Prior scripts only echoed the cap without exporting it, so the app silently used 5 GiB;
+    a caller-set env var still wins.
+
+20. Documented the GPU-install footgun in `compute/requirements-analysis.txt`: `ultralytics`
+    pulls `torchvision`, which pins PyPI's CPU torch and silently clobbers a CUDA build, so
+    torch+torchvision must be installed together from the CUDA index. Blackwell GPUs (RTX
+    5060 Ti, sm_120) need cu128+ wheels — older CUDA wheels lack Blackwell kernels. `torchvision`
+    is now listed explicitly alongside torch.
+

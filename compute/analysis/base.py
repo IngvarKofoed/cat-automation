@@ -77,6 +77,27 @@ class Analyzer(Protocol):
       background window), so the runner drives it over the *full* time-ordered set
       and it maintains its own window across calls. It always revisits every
       frame — the price of order-correctness.
+
+    Two OPTIONAL members let a *stateless* backend opt into the runner's batched
+    fast path (see ``runner.py``); every existing backend omits both and is still a
+    fully valid ``Analyzer``, because the runner probes for them rather than
+    assuming them:
+
+    - ``analyze_batch(images) -> list[AnalysisResult]`` — verdicts order-aligned to
+      ``images`` (element ``i`` is the verdict for ``images[i]``), each semantically
+      identical to ``analyze(images[i])``. When present, the runner hands it a whole
+      batch of frames per GPU call so decode overlaps inference; when absent it falls
+      back to a per-frame ``analyze`` loop, so the batched path is pure throughput and
+      never changes a verdict. Deliberately NOT declared as a Protocol method: doing
+      so would make it *structurally required*, so every windowed backend that omits
+      it (BSUV/MOG2) would stop satisfying ``Analyzer`` under a type checker. It is a
+      documented, ``getattr``-probed optional member instead.
+    - ``batch_size: int`` — how many frames such a backend wants per
+      ``analyze_batch`` call. The runner reads it with ``getattr(analyzer,
+      "batch_size", 1)`` to size both the batch and its bounded prefetch queue, so
+      an analyzer that never sets it simply runs unbatched (size 1). Meaningful
+      only alongside ``analyze_batch`` and only on ``windowed = False`` backends —
+      a windowed analyzer's strict time order forbids batching.
     """
 
     name: str  # stable oracle id; also the ``analysis.analyzer`` column value ('yolo' | 'bsuv')
@@ -120,3 +141,4 @@ class Analyzer(Protocol):
         analyzer treats each call independently.
         """
         ...
+

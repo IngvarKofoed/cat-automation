@@ -391,16 +391,28 @@ def create_app(
         if autostart:
             collector_manager.start()
 
-        @app.on_event("shutdown")
-        def _stop_collector() -> None:
-            # Wind the collector down between frames on process exit — whether it was
-            # autostarted or started later from the UI; the manager's thread is a
-            # daemon so this is best-effort tidiness, not a hard join. Idempotent when
-            # already stopped.
-            collector_manager.stop()
-
     analysis_manager = analysis_manager if analysis_manager is not None else AnalysisManager()
     app.state.analysis_manager = analysis_manager
+
+    @app.on_event("shutdown")
+    def _shutdown() -> None:
+        # Wind everything down between frames/batches on process exit, THEN close the
+        # store. Order is load-bearing: BOTH the collector and the analysis worker write
+        # through the store's single shared connection, so both must be stopped AND joined
+        # before close() checkpoints+closes it — otherwise an in-flight write (a collector
+        # add, or a sweep's write_analysis_batch / iter_unanalyzed fetch) races a closed DB.
+        # stop() only signals; the bounded join() waits for the thread to actually leave its
+        # write path. Threads are daemons, so the timeouts just bound how long exit blocks —
+        # a still-running sweep's verdicts are resumable via iter_unanalyzed, and its write
+        # is itself log-and-skip, so the residual race is a no-op, not a lost/failed job.
+        # Registered UNCONDITIONALLY (not gated on start_collector) so the WAL
+        # checkpoint-on-close always runs — otherwise an analysis-only / test app would
+        # never checkpoint.
+        collector_manager.stop()
+        collector_manager.join(timeout=5.0)
+        analysis_manager.stop_all()
+        analysis_manager.join(timeout=10.0)
+        store.close()
 
     @app.get("/")
     def index():

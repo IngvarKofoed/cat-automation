@@ -470,6 +470,14 @@
         .film-tile.film-motion {
             border-color: #2e7d32;
         }
+        /* A visit frame the gate stayed silent on: within a visit (a cluster of
+           oracle-present frames) a still gate is a genuine miss — the thing this
+           view exists to surface — so mark it red, matching the timeline legend's
+           "Missed" swatch. Mutually exclusive with .film-motion (motion true/false)
+           and never applied to the rep or context frames (see filmTile). */
+        .film-tile.film-miss {
+            border-color: #c62828;
+        }
         .film-tile.film-rep {
             border-color: #6a1b9a;
             box-shadow: 0 0 0 2px #6a1b9a;
@@ -2198,6 +2206,7 @@
             tile.className = 'film-tile'
                 + (isContext ? ' film-context' : '')
                 + (frame.motion ? ' film-motion' : '')
+                + (!isContext && !frame.motion && frame.id !== repId ? ' film-miss' : '')
                 + (frame.id === repId ? ' film-rep' : '');
             const img = document.createElement('img');
             img.src = frame.url;

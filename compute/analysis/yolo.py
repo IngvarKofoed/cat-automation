@@ -23,6 +23,7 @@ sweep actually starts, and only if the opt-in
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     import numpy as np
 
     from compute.collection.store import Store
+
+logger = logging.getLogger(__name__)
 
 # COCO's fixed 80-class label order (the set both COCO-pretrained YOLO releases
 # and ultralytics ship) puts "cat" at index 15 — 0 person, 1 bicycle, ... 14
@@ -45,13 +48,20 @@ _COCO_CAT_CLASS_ID = 15
 # RECALL: the biggest stock COCO model, a high inference resolution (small/
 # partial cats keep more pixels at 1280 than the usual 640), and a low
 # confidence floor — a hard-mode miss we want surfaced, not filtered out here.
+# HALF/BATCH are the throughput levers (see the sweep-throughput spec): FP16 is
+# off by default (the one knob that can move a verdict near the conf floor), and
+# BATCH sizes the batched/prefetched stateless sweep the runner drives.
 _ENV_WEIGHTS = "CAT_YOLO_WEIGHTS"
 _ENV_IMGSZ = "CAT_YOLO_IMGSZ"
 _ENV_CONF = "CAT_YOLO_CONF"
+_ENV_HALF = "CAT_YOLO_HALF"
+_ENV_BATCH = "CAT_YOLO_BATCH"
 
 _DEFAULT_WEIGHTS = "yolo11x.pt"
 _DEFAULT_IMGSZ = 1280
 _DEFAULT_CONF = 0.15
+_DEFAULT_HALF = False
+_DEFAULT_BATCH = 8
 
 
 class YoloAnalyzer:
@@ -72,14 +82,26 @@ class YoloAnalyzer:
         weights: "str | None" = None,
         imgsz: "int | None" = None,
         conf: "float | None" = None,
+        half: "bool | None" = None,
+        batch_size: "int | None" = None,
     ) -> None:
         # Explicit arg wins, then the env var, then the recall-first default —
         # the same precedence EdgeClient uses for its base URL.
         self._weights = weights if weights is not None else os.environ.get(_ENV_WEIGHTS, _DEFAULT_WEIGHTS)
         self._imgsz = int(imgsz if imgsz is not None else os.environ.get(_ENV_IMGSZ, _DEFAULT_IMGSZ))
         self._conf = float(conf if conf is not None else os.environ.get(_ENV_CONF, _DEFAULT_CONF))
-        # Populated by prepare(); analyze() before prepare() is a caller bug, not
-        # a runtime condition to design around, so it fails loud (see analyze()).
+        # FP16 default OFF — only "1"/"true" (any case) turns it on; "0"/""/"false"
+        # and anything else stay off, so a malformed value fails safe to FP32.
+        if half is not None:
+            self._half = bool(half)
+        else:
+            raw_half = os.environ.get(_ENV_HALF)
+            self._half = _DEFAULT_HALF if raw_half is None else raw_half.strip().lower() in ("1", "true")
+        # Batch size the runner reads to size its batches + prefetch queue; clamp
+        # to >= 1 so a stray 0/negative can't break the queue bound.
+        self.batch_size = max(1, int(batch_size if batch_size is not None else os.environ.get(_ENV_BATCH, _DEFAULT_BATCH)))
+        # Populated by prepare(); analyze()/analyze_batch() before prepare() is a
+        # caller bug, not a runtime condition to design around, so it fails loud.
         self._model = None
         self._device: "str | None" = None
 
@@ -127,37 +149,65 @@ class YoloAnalyzer:
         else:
             self._device = "cpu"
 
+        # FP16 pays off only on CUDA; MPS/CPU ignore it, so drop it here (once,
+        # at load) rather than passing a no-op half=True down every predict call.
+        if self._half and self._device != "cuda":
+            logger.warning("CAT_YOLO_HALF ignored on device %s; FP16 benefits only CUDA", self._device)
+            self._half = False
+
         self._model = YOLO(self._weights)
 
-    def analyze(self, image: "np.ndarray") -> AnalysisResult:
-        """Run inference on one BGR frame; return the uniform cat-present verdict.
+    def _predict(self, images: "list"):
+        """The single model-call site: one predict over a list of BGR frames.
 
-        Restricts detection to the COCO 'cat' class up front (``classes=``) so the
-        model does the minimum work needed for this oracle's question, then keeps
-        every surviving box (ultralytics already applied ``conf`` internally).
-        Zero detections is the common, expected case (most frames have no cat) —
-        it falls straight through to an empty ``boxes`` list, ``verdict=False``,
-        ``score=0.0``, no special-casing.
+        Both ``analyze()`` and ``analyze_batch()`` route through here, so the
+        ``half`` regime (and every other inference param) is identical whether the
+        runner batches frames or a failed batch's per-image retry runs them one at a
+        time — an FP16 batch can never silently retry in FP32. Restricts detection to
+        the COCO 'cat' class up front
+        (``classes=``) so the model does the minimum work this oracle needs.
+        Ultralytics returns one ``Results`` per input image, in order.
         """
-        if self._model is None:
-            raise RuntimeError("YoloAnalyzer.analyze() called before prepare()")
-
-        results = self._model.predict(
-            image,
+        return self._model.predict(
+            images,
             imgsz=self._imgsz,
             conf=self._conf,
             classes=[_COCO_CAT_CLASS_ID],
             device=self._device,
+            half=self._half,
             verbose=False,
         )
 
+    def _result_from(self, result) -> AnalysisResult:
+        """Reduce one ultralytics ``Results`` to the uniform cat-present verdict.
+
+        Keeps every surviving box (ultralytics already applied ``conf``
+        internally). Zero detections is the common, expected case (most frames
+        have no cat) — it falls straight through to an empty ``boxes`` list,
+        ``verdict=False``, ``score=0.0``, no special-casing.
+        """
         boxes: "list[list[float]]" = []
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-                boxes.append([x1, y1, x2, y2, float(box.conf[0])])
+        for box in result.boxes:
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            boxes.append([x1, y1, x2, y2, float(box.conf[0])])
 
         verdict = bool(boxes)
         score = max((b[4] for b in boxes), default=0.0)
-        detail = {"boxes": boxes, "model": self._weights, "device": self._device}
+        detail = {"boxes": boxes, "model": self._weights, "device": self._device, "half": self._half}
         return AnalysisResult(verdict=verdict, score=score, detail=detail)
+
+    def analyze_batch(self, images: "list[np.ndarray]") -> "list[AnalysisResult]":
+        """Run inference on N BGR frames; return N verdicts order-aligned to ``images``.
+
+        The batched contract the runner's stateless sweep drives — semantically
+        identical to calling ``analyze()`` on each frame, just in one GPU call.
+        The pre-``prepare()`` guard lives here (not only in ``analyze()``) because
+        this is the shared entry both paths funnel through.
+        """
+        if self._model is None:
+            raise RuntimeError("YoloAnalyzer.analyze_batch() called before prepare()")
+        return [self._result_from(r) for r in self._predict(images)]
+
+    def analyze(self, image: "np.ndarray") -> AnalysisResult:
+        """Run inference on one BGR frame; return the uniform cat-present verdict."""
+        return self.analyze_batch([image])[0]

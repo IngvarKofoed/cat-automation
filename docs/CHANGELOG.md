@@ -216,3 +216,21 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     extrapolated from progress across polls, re-anchored per job (total is in the anchor key, so
     it re-anchors when the denominator resolves), dropped when idle. No server change.
 
+40. Visit-inbox filmstrip now red-borders the frames the gate missed (a visit frame with
+    motion=false, not the rep, not warm-up context) — matching the timeline's "Missed" swatch.
+    A visit is a cluster of oracle-present frames, so a still gate inside one is a true miss;
+    the strip now reads caught (green) vs missed (red) at a glance. The rep keeps its purple even
+    when it is itself a miss. Client-only; keys on the stored motion flag, not a per-frame oracle join.
+
+41. Offline stateless (YOLO) sweep now batches + prefetches — a decode-ahead thread feeds the GPU
+    one predict() per batch, de-starving it (was ~35% util, batch=1 FP32) for ~2–4× throughput.
+    Windowed BSUV/MOG2 path unchanged: batching would break its rolling background.
+    Batching is verdict-preserving — shape-boundary chunking prevents letterbox drift, FP16/FP32 single-sourced.
+    New knobs: CAT_YOLO_BATCH (default 8), CAT_YOLO_HALF (FP16, off by default, cuda-only — the only lever that can move a verdict).
+
+42. Store opened WAL + synchronous=NORMAL store-wide — commits get cheap (fsync deferred to checkpoint).
+    Accepted consequence: a hard power loss may orphan a JPEG (row lost, file kept) that is never
+    counted/evicted — a small non-self-healing disk leak, never corruption.
+    New batched write_analysis_batch and Store.close() (checkpoints on exit). Shutdown now stops AND JOINS both the
+    collector and the analysis worker before store.close() — both write the one shared connection, so closing under a live writer races a closed DB.
+

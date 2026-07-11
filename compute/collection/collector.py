@@ -206,6 +206,23 @@ class CollectorManager:
                 self._stop_event.set()
             self._running = False
 
+    def join(self, timeout: "float | None" = None) -> None:
+        """Best-effort wait for the collector thread to exit — for shutdown only.
+
+        ``stop()`` deliberately doesn't join (it must not stall an HTTP handler for a
+        frame interval). At process exit, though, the store's connection is about to be
+        closed, and the collector writes ``store.add()`` through it: pair ``stop()`` with
+        this ``join`` so a frame already mid-flight finishes before ``store.close()`` runs,
+        rather than racing a closed DB. The thread parks in a blocking stream read and only
+        notices the stop flag at the next frame, so pass a ``timeout`` to bound how long
+        exit waits; the thread is a daemon and dies with the process regardless. Snapshot
+        the reference under the lock, join OUTSIDE it.
+        """
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
     @property
     def running(self) -> bool:
         """Whether collection is currently on (lock-guarded read of the intent flag)."""

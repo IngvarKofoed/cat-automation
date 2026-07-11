@@ -145,6 +145,17 @@ class Store:
         # check. A short busy_timeout is belt-and-braces against any stray lock.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA busy_timeout = 5000")
+        # WAL + synchronous=NORMAL make each commit cheap — fsync is deferred to
+        # the next checkpoint instead of running on every commit. Because a single
+        # connection under one lock serializes ALL access, the win is commit COST,
+        # not reader/writer concurrency (there is none to gain). Accepted
+        # consequence: a hard power loss may lose the last few un-checkpointed
+        # commits, which can leave an orphan JPEG on the collector (file written,
+        # its row lost) that _total_bytes never counts and so never evicts — a
+        # small, non-self-healing leak, NOT corruption. WAL persists on the DB
+        # file (adds -wal/-shm sidecars); `close` bounds the exposure.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
         self._init_schema()
         # Recompute the running byte total once from the DB rather than tracking
@@ -907,6 +918,62 @@ class Store:
                 ),
             )
             self._conn.commit()
+
+    def write_analysis_batch(self, rows: "list[tuple[int, str, bool, float | None, dict | None]]") -> None:
+        """Record many oracle verdicts at once; one lock hold, one commit.
+
+        The batched sibling of ``write_analysis`` for the stateless sweep's
+        prefetch/batch path (see the yolo-sweep-throughput spec). ``rows`` is a
+        list of ``(frame_id, analyzer, verdict, score, detail)`` tuples — the exact
+        argument order of ``write_analysis``, and a CONTRACT the runner builds to.
+        Each ``detail`` is JSON-serialized (NULL when None); ``ran_at`` is the
+        compute wall clock in epoch ms (same axis as ``write_analysis`` and
+        ``recv_ts``). Under a SINGLE lock hold it runs ONE ``executemany`` of the
+        IDENTICAL INSERT OR REPLACE guard ``write_analysis`` uses, then ONE
+        ``commit`` — so it preserves both idempotency (INSERT OR REPLACE on the
+        (frame_id, analyzer) key) and the eviction guard (WHERE EXISTS on the
+        frames row, so a verdict can never outlive its frame). Empty ``rows`` is a
+        no-op — no commit, no error.
+        """
+        if not rows:
+            return
+        ran_at = int(time.time() * 1000)
+        params = [
+            (
+                int(frame_id),
+                analyzer,
+                1 if verdict else 0,
+                float(score) if score is not None else None,
+                json.dumps(detail) if detail is not None else None,
+                ran_at,
+                int(frame_id),
+            )
+            for frame_id, analyzer, verdict, score, detail in rows
+        ]
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO analysis (frame_id, analyzer, verdict, score, detail, ran_at)"
+                " SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM frames WHERE id = ?)",
+                params,
+            )
+            self._conn.commit()
+
+    def close(self) -> None:
+        """Checkpoint the WAL and close the connection; safe to call once at shutdown.
+
+        ``PRAGMA wal_checkpoint(TRUNCATE)`` flushes the WAL back into the main DB
+        file and truncates the ``-wal`` sidecar, bounding the orphan-file exposure
+        the ``__init__`` PRAGMA note describes (only frames committed since the
+        last checkpoint are at risk on a hard power loss). Idempotent: a second
+        call after the connection is closed swallows the resulting error, so wiring
+        it to the app's shutdown hook can never itself raise.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.close()
+            except sqlite3.Error:
+                pass
 
     def iter_unanalyzed(
         self, analyzer: str, batch: int = 512, since_id: "int | None" = None, until_id: "int | None" = None

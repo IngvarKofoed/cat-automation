@@ -33,7 +33,9 @@ stack even though a sweep obviously needs it.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -56,6 +58,31 @@ _LOG_EVERY = 500
 # history is in-memory diagnostics for a returning operator, not a durable audit log — a
 # restart drops it (the verdicts it summarizes persist, and a re-enqueue resumes cheaply).
 _HISTORY_LIMIT = 20
+
+# Sentinel the stateless prefetch producer enqueues exactly once, from its ``finally``, to
+# tell the consumer the stream is finished (or the producer has bailed). It is what lets the
+# consumer's blocking ``get()`` always terminate instead of hanging on an empty queue.
+_SENTINEL = object()
+
+
+def _abort_put(q: "queue.Queue", item, abort: "threading.Event", timeout: float = 0.1) -> bool:
+    """Put ``item`` on ``q``, but give up the instant ``abort`` is set. Returns whether it landed.
+
+    A plain blocking ``put`` on a bounded queue deadlocks if the consumer has stopped
+    draining (an operator cancel, or a consumer-side fatal such as ``write_analysis_batch``
+    raising): the producer parks on the full queue forever and its ``join()`` never
+    returns, wedging the whole one-at-a-time job queue. Looping a *timed* put and
+    re-checking ``abort`` each turn lets the consumer's teardown unblock the producer by
+    setting ``abort``. Returns True if the item was enqueued, False if it bailed because
+    ``abort`` fired — this is the load-bearing anti-wedge primitive.
+    """
+    while not abort.is_set():
+        try:
+            q.put(item, timeout=timeout)
+            return True
+        except queue.Full:
+            continue
+    return False
 
 
 def run_analysis(
@@ -88,17 +115,29 @@ def run_analysis(
          scoped set in time order, because its verdict depends on temporal neighbours and
          it must revisit every frame; ``total`` is the count of frames in ``[since,
          until]``.
-    4. For each ``(frame_id, abs_path)``: read the JPEG bytes off disk, ``cv2.imdecode`` to
-       a BGR ndarray, ``analyzer.analyze`` it, and ``store.write_analysis`` the verdict;
-       then advance the manager's ``done`` (and ``present`` when the verdict is True).
+    4. Drive the frames, by statefulness:
+       - windowed (BSUV/MOG2) → the strict-time-order serial loop: read the JPEG off disk,
+         ``cv2.imdecode`` to a BGR ndarray, ``analyzer.analyze`` it, ``store.write_analysis``
+         the verdict. Order matters (rolling background), so no batching or prefetch.
+       - stateless (YOLO) → a decode-ahead **producer** thread reads+decodes frames onto a
+         bounded queue while THIS thread runs inference a batch at a time
+         (``analyzer.batch_size`` per call, ``store.write_analysis_batch`` per flush), so
+         decode overlaps the GPU instead of starving it. Batches never mix frame dimensions
+         (a shape boundary flushes early), so each letterboxes exactly as the single-image
+         path would — the batched path is pure throughput, not a verdict change.
+       Either way, advance the manager's ``done`` (and ``present`` when the verdict is True).
     5. A read/decode/inference error on ONE frame is logged (throttled) and skipped — just
        like the collector's per-frame ``store.add`` failure handling — so a single corrupt
-       or just-evicted frame can never abort a long sweep. A *fatal* error (``prepare``
-       failed, the iterator itself broke) propagates to the worker (``_run``), which
-       records it into ``status().error``.
+       or just-evicted frame can never abort a long sweep. On the stateless path a whole
+       *batch* failing (most likely a CUDA OOM) falls back to per-image inference so one bad
+       frame can't drop a batch of good verdicts, logged distinctly so a mis-sized batch is
+       visible. A *fatal* error (``prepare`` failed, the iterator itself broke) propagates to
+       the worker (``_run``), which records it into ``status().error`` — on the stateless
+       path an iterator fault is captured in the producer and re-raised after its ``join``.
 
-    ``manager.stop_event`` is checked between frames, so a cancel takes effect promptly at
-    the next frame boundary rather than mid-inference. The frame count that drives that
+    ``manager.stop_event`` is checked between frames (windowed) or between batches
+    (stateless), so a cancel takes effect promptly at the next boundary rather than
+    mid-inference. The frame count that drives that
     verdict is stable for the job's lifetime: only one sweep runs at a time, so the store's
     concurrent inserts/evictions never reshuffle a stateless run's cursor (see the store
     iterators' keyset discipline).
@@ -108,6 +147,21 @@ def run_analysis(
     # the loop, not per frame.
     import cv2
     import numpy as np
+
+    def _read_decode(abs_path: str):
+        """Read a stored JPEG off disk and decode it to a BGR ndarray, raising on failure.
+
+        Shared by the windowed loop and the stateless producer so their decode / corrupt-
+        frame handling can never diverge. ``imdecode`` returns ``None`` (not an exception)
+        on a truncated/corrupt JPEG, so this raises ``ValueError`` to funnel that into the
+        same log-and-skip path a read error takes.
+        """
+        with open(abs_path, "rb") as fh:
+            buf = fh.read()
+        image = cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"failed to decode JPEG at {abs_path!r}")
+        return image
 
     # Resolve the scope BEFORE prepare, so a windowed analyzer's warm-start (which reads
     # the store) primes for the same window the sweep will run over. ``until`` is clamped
@@ -155,32 +209,198 @@ def run_analysis(
 
     done = 0
     errors = 0
-    for frame_id, abs_path in iterator:
-        if manager.stop_event.is_set():
-            logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
-            break
+
+    if analyzer.windowed:
+        # Windowed oracle: the strict-time-order per-frame loop, unchanged. Its rolling
+        # background depends on seeing every frame in order, so it can be neither batched nor
+        # prefetched-with-reordering — decode → analyze → write, one at a time, with a cancel
+        # check and throttled log-and-skip between frames.
+        for frame_id, abs_path in iterator:
+            if manager.stop_event.is_set():
+                logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
+                break
+            try:
+                image = _read_decode(abs_path)
+                result = analyzer.analyze(image)
+                store.write_analysis(frame_id, analyzer.name, result.verdict, result.score, result.detail)
+            except Exception:
+                # One bad frame — evicted between listing and read, corrupt bytes, a transient
+                # inference error — must not abort the sweep. Log throttled (first, then every
+                # _LOG_EVERY) so a systematic fault can't flood at frame rate, and move on.
+                errors += 1
+                if errors == 1 or errors % _LOG_EVERY == 0:
+                    logger.exception("analysis: frame %s failed (%d skipped this run)", frame_id, errors)
+                continue
+            manager.record(bool(result.verdict))
+            done += 1
+            if done % _LOG_EVERY == 0:
+                logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+    else:
+        # Stateless oracle: decode-ahead producer + batched GPU consumer (see the
+        # yolo-sweep-throughput spec). One daemon thread reads+decodes frames onto a bounded
+        # queue while THIS thread runs inference a batch at a time, so decode (which releases
+        # the GIL in OpenCV) overlaps the GPU instead of starving it between per-frame reads.
+        batch_size = getattr(analyzer, "batch_size", 1)
+        q: "queue.Queue" = queue.Queue(maxsize=2 * batch_size)
+        # Internal abort, DISTINCT from the user-facing stop_event: it couples the two threads
+        # so no error path can wedge the job — the consumer's teardown sets it to unblock a
+        # producer parked on a full queue before joining. stop_event is the operator cancel;
+        # abort is the plumbing that guarantees the join always returns.
+        abort = threading.Event()
+        producer_fatal: dict = {}
+        batch_errors = 0
+
+        batch_ids: "list[int]" = []
+        batch_images: list = []
+        batch_shape = None
+
+        def _producer() -> None:
+            # Read+decode ahead of the GPU. A per-frame read/decode failure becomes a
+            # skip-marker on the queue (counted+logged by the consumer, single-owner); an
+            # iterator-level fault is fatal — captured and re-raised by the consumer after the
+            # join, exactly as the old serial iterator error reached _run. The finally ALWAYS
+            # enqueues the sentinel so the consumer's get() can never block forever.
+            try:
+                for frame_id, abs_path in iterator:
+                    if abort.is_set() or manager.stop_event.is_set():
+                        break
+                    try:
+                        image = _read_decode(abs_path)
+                    except Exception:
+                        # The producer can't own the skip counter (it must stay single-
+                        # threaded), and the live exception context can't cross the queue, so
+                        # it ships the formatted traceback for the consumer to log and count.
+                        if not _abort_put(q, (frame_id, None, traceback.format_exc()), abort):
+                            return
+                        continue
+                    if not _abort_put(q, (frame_id, image, None), abort):
+                        return
+            except Exception as exc:  # fatal: the iterator itself broke (sqlite, keyset bug)
+                producer_fatal["exc"] = exc
+            finally:
+                _abort_put(q, _SENTINEL, abort)
+
+        def _flush() -> None:
+            # Persist one batch's verdicts. The path depends on whether the analyzer offers a
+            # batched call: WITH analyze_batch we make ONE GPU call and fall back to per-image
+            # only if it fails wholesale (most likely a CUDA OOM from too large a
+            # CAT_YOLO_BATCH), logging that batch failure DISTINCTLY so a size silently
+            # degrading to batch-1 throughput is visible. WITHOUT analyze_batch we go STRAIGHT
+            # to the per-image loop — no doomed batch attempt to re-run (which would re-analyze
+            # every already-done frame in the batch). The verdict write is fail-fast (see the
+            # note at the write below). Empty batch → no-op.
+            nonlocal done, errors, batch_errors
+            if not batch_images:
+                return
+
+            batch_fn = getattr(analyzer, "analyze_batch", None)
+            results = None
+            if batch_fn is not None:
+                try:
+                    results = batch_fn(batch_images)
+                except Exception:
+                    batch_errors += 1
+                    logger.exception(
+                        "analysis: batch of %d failed (%d batch failures this run; likely CUDA "
+                        "OOM) — retrying per-image",
+                        len(batch_images),
+                        batch_errors,
+                    )
+                    results = None
+
+            rows: "list[tuple]" = []
+            verdicts: "list[bool]" = []
+            if results is not None:
+                for fid, res in zip(batch_ids, results):
+                    rows.append((fid, analyzer.name, res.verdict, res.score, res.detail))
+                    verdicts.append(bool(res.verdict))
+            else:
+                # No batched call (backend lacks analyze_batch), or the batch failed: run each
+                # frame alone so one bad frame can't drop the rest — and, for the no-batch
+                # backend, so frames before a failure aren't analyzed a second time.
+                for fid, img in zip(batch_ids, batch_images):
+                    try:
+                        res = analyzer.analyze(img)
+                    except Exception:
+                        errors += 1
+                        if errors == 1 or errors % _LOG_EVERY == 0:
+                            logger.exception("analysis: frame %s failed (%d skipped this run)", fid, errors)
+                        continue
+                    rows.append((fid, analyzer.name, res.verdict, res.score, res.detail))
+                    verdicts.append(bool(res.verdict))
+
+            # A verdict-write error is intentionally NOT caught here: the store is one
+            # connection under one lock (+ WAL + busy_timeout), so the classic transient
+            # SQLITE_BUSY can't arise from the concurrent collector; a real write failure
+            # (disk full / I/O error) is persistent, and failing the job fast — data-safe,
+            # since the batch's frames stay un-verdicted and resume via iter_unanalyzed —
+            # surfaces it far better than silently skipping every batch to a green sweep.
+            store.write_analysis_batch(rows)
+            for v in verdicts:
+                manager.record(v)
+                done += 1
+                if done % _LOG_EVERY == 0:
+                    logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+            batch_ids.clear()
+            batch_images.clear()
+
+        producer = threading.Thread(target=_producer, name="analysis-producer", daemon=True)
+        producer.start()
         try:
-            with open(abs_path, "rb") as fh:
-                buf = fh.read()
-            image = cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                # imdecode returns None (not an exception) on a truncated/corrupt JPEG;
-                # raise so it lands in the same log-and-skip path as a read/inference error.
-                raise ValueError(f"failed to decode JPEG at {abs_path!r}")
-            result = analyzer.analyze(image)
-            store.write_analysis(frame_id, analyzer.name, result.verdict, result.score, result.detail)
-        except Exception:
-            # One bad frame — evicted between listing and read, corrupt bytes, a transient
-            # inference error — must not abort the sweep. Log throttled (first, then every
-            # _LOG_EVERY) so a systematic fault can't flood at frame rate, and move on.
-            errors += 1
-            if errors == 1 or errors % _LOG_EVERY == 0:
-                logger.exception("analysis: frame %s failed (%d skipped this run)", frame_id, errors)
-            continue
-        manager.record(bool(result.verdict))
-        done += 1
-        if done % _LOG_EVERY == 0:
-            logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+            while True:
+                item = q.get()
+                if item is _SENTINEL:
+                    _flush()
+                    break
+                frame_id, image, exc_text = item
+                if image is None:
+                    # Skip-marker: the producer hit a read/decode failure. The consumer is the
+                    # single owner of the skip counter + throttled logging, so the per-frame
+                    # log-and-skip cadence stays exact across the thread hand-off (logger.error
+                    # with the carried text — the producer's exception context can't cross).
+                    errors += 1
+                    if errors == 1 or errors % _LOG_EVERY == 0:
+                        logger.error(
+                            "analysis: frame %s failed (%d skipped this run)\n%s", frame_id, errors, exc_text
+                        )
+                    continue
+                # Shape-boundary chunk: never mix frame dimensions in one predict() call, so
+                # every batch letterboxes exactly as the single-image path would (kills the
+                # letterbox verdict-drift risk from an operator clip-rect change mid-collection).
+                shape = image.shape
+                if batch_images and shape != batch_shape:
+                    _flush()
+                if not batch_images:
+                    batch_shape = shape
+                batch_ids.append(frame_id)
+                batch_images.append(image)
+                if len(batch_images) >= batch_size:
+                    _flush()
+                    # Cancel is checked between batches: on stop, arm abort so the producer
+                    # unblocks and stop draining new frames into batches.
+                    if manager.stop_event.is_set():
+                        logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
+                        abort.set()
+                        break
+        finally:
+            # Runs on EVERY consumer exit — normal sentinel, cancel, or a consumer-side fatal
+            # like write_analysis_batch raising. Set abort and DRAIN so a producer parked on a
+            # full queue unblocks, then join it: no path may leave a running producer or block
+            # forever (the load-bearing anti-wedge invariant).
+            abort.set()
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+            producer.join()
+
+        # After the join: if the producer captured a fatal iterator error, re-raise it here so
+        # _run records it into status().error exactly as the old serial loop did. (A consumer-
+        # side fatal already propagated out of the try/finally above and never reaches this
+        # line, so it surfaces as the job's error too.)
+        if producer_fatal.get("exc") is not None:
+            raise producer_fatal["exc"]
 
     logger.info("analysis sweep finished: analyzer=%s %d verdicts, %d skipped", analyzer.name, done, errors)
 
@@ -438,6 +658,22 @@ class AnalysisManager:
             self._pending.clear()
             if self._running:
                 self.stop_event.set()
+
+    def join(self, timeout: "float | None" = None) -> None:
+        """Best-effort wait for the active worker thread to finish — for shutdown only.
+
+        Pair with ``stop_all()`` at process exit: ``stop_all`` signals the worker to
+        stop at the next batch boundary, then ``join`` waits for ``run_analysis`` to
+        actually return so the app can safely ``store.close()`` the shared connection
+        without racing an in-flight ``write_analysis_batch`` / iterator fetch. The
+        thread reference is snapshotted under the lock but joined OUTSIDE it (never
+        hold the lock across a join). A ``None``/already-finished thread returns at
+        once; the worker is a daemon, so the ``timeout`` bounds how long exit blocks.
+        """
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
 
     # --- Worker + promotion --------------------------------------------------------------
 

@@ -117,7 +117,7 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 
 | Component | Responsibility |
 |---|---|
-| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped frames off the open response as they arrive (delivered continuously; motion is a separate signal, read from `X-Motion` part headers or `GET /status`). Always-on frame collection stores every frame (motion + non-motion) with motion flag + area to a bounded local store for motion-gate tuning via a browse UI. |
+| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped frames off the open response as they arrive (delivered continuously; motion is a separate signal, read from `X-Motion` part headers or `GET /status`). Always-on frame collection stores every frame (motion + non-motion) with motion flag + area to a bounded local store for motion-gate tuning via a browse UI. **Opt-in:** motion-only capture mode (default off) drops non-motion frames to save disk; caveat — misses become unmeasurable in that store. |
 | **Detection + inference** | Detect that a cat is present, track it, crop, embed, and match against the resident gallery → identity + confidence. GPU-accelerated. |
 | **Tracker / direction resolver** | Associate detections across frames into tracks; resolve a track's path across the door zone into *enter* vs *leave*. |
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |

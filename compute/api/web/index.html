@@ -3,12 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cat Door — Frame Collection Browser</title>
+    <title>Cat Door — Motion Detection Workbench</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             max-width: 1100px;
-            margin: 20px auto 60px;
+            margin: 0 auto 60px;
             padding: 0 20px;
             background: #f5f5f5;
             color: #333;
@@ -23,6 +23,50 @@
             border-radius: 8px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
             margin-bottom: 16px;
+        }
+        .panel h2 {
+            font-size: 16px;
+            margin: 0 0 12px;
+        }
+        /* Top nav: a sticky bar that switches the three hash-routed views. The
+           active link is highlighted so the current task surface is always
+           obvious (Start = collect, Buckets = define windows, Motion = validate). */
+        #nav {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: #263238;
+            margin: 0 -20px 16px;
+            padding: 10px 20px;
+            flex-wrap: wrap;
+        }
+        #nav .nav-brand {
+            font-weight: 700;
+            color: #fff;
+            margin-right: 12px;
+            font-size: 15px;
+        }
+        .nav-link {
+            color: #cfd8dc;
+            text-decoration: none;
+            padding: 6px 14px;
+            border-radius: 16px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .nav-link:hover {
+            background: #37474f;
+            color: #fff;
+        }
+        .nav-link.active {
+            background: #0066cc;
+            color: #fff;
+        }
+        .view {
+            /* Each view is a plain container; the router toggles .hidden. */
         }
         /* Stats header: a row of badges summarizing the store, refreshed by
            polling /api/stats so it stays live while the collector runs. */
@@ -60,7 +104,7 @@
             font-weight: 600;
             font-size: 13px;
         }
-        select {
+        select, input[type="date"] {
             padding: 8px 12px;
             border: 1px solid #ccc;
             border-radius: 4px;
@@ -110,26 +154,48 @@
         .btn-secondary:hover {
             background: #666;
         }
+        .btn-tiny {
+            padding: 4px 8px;
+            font-size: 11px;
+        }
         #error {
             background: #ffebee;
             color: #c62828;
             border: 1px solid #ef5350;
             padding: 10px 14px;
             border-radius: 4px;
-            margin-bottom: 16px;
+            margin: 16px 0;
             display: none;
             font-size: 14px;
         }
         #error.show {
             display: block;
         }
-        /* The frame grid: newest-first (or area-ordered) tiles. A motion frame
-           gets a colored border so false triggers/missed cats are spottable at
-           a glance without reading captions — the whole point of the tool. */
-        #grid {
+        .caveat {
+            color: #856404;
+            font-size: 12px;
+            max-width: 520px;
+            line-height: 1.4;
+        }
+        /* A soft "heads up" banner (motion-only spans, misses-unmeasurable). Distinct
+           from #error (a red request failure): this is application state, not a fetch
+           error. */
+        .banner-warn {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffe08a;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            margin-top: 10px;
+        }
+        /* The thumbnail grid (bucket viewer + inbox filmstrip use their own). A motion
+           frame gets a colored border so activity is spottable at a glance. */
+        .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-            gap: 12px;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+            margin-top: 12px;
         }
         .tile {
             background: white;
@@ -140,15 +206,6 @@
         }
         .tile.motion {
             border-color: #2e7d32;
-        }
-        /* Disagreement-view tiles (MOG2 vs. oracle) get their OWN border color,
-           distinct from plain-feed motion (green): every tile in that view is a
-           disagreement by construction (see query_disagreements), so recoloring
-           rather than reusing .motion avoids a misleading all-or-nothing tint
-           (e.g. "false" mode would otherwise render identically to a plain
-           motion page). */
-        .tile.disagree {
-            border-color: #6a1b9a;
         }
         .tile img {
             width: 100%;
@@ -165,24 +222,34 @@
             justify-content: space-between;
             gap: 6px;
         }
-        .tile .caption .area {
-            font-weight: 600;
+        /* Bucket-viewer endpoint selection: clicking a thumb marks it start/end and
+           shades the frames between the two picks, so the chosen window is visible. */
+        .viewer-tile {
+            cursor: pointer;
         }
-        .tile .caption .score {
-            font-weight: 600;
+        .viewer-tile.pick-start {
+            border-color: #2e7d32;
+            box-shadow: 0 0 0 2px #2e7d32;
         }
-        #pager {
+        .viewer-tile.pick-end {
+            border-color: #c62828;
+            box-shadow: 0 0 0 2px #c62828;
+        }
+        .viewer-tile.in-range {
+            background: #e3f2fd;
+        }
+        .pager {
             display: flex;
             justify-content: center;
             align-items: center;
             gap: 12px;
             margin: 20px 0;
         }
-        #pager .badge {
+        .pager .badge {
             min-width: 72px;
             text-align: center;
         }
-        #empty {
+        .empty {
             text-align: center;
             color: #888;
             padding: 40px 0;
@@ -191,8 +258,6 @@
         .hidden {
             display: none !important;
         }
-        /* Wraps the reanalyze checkbox + its text as one clickable label, sized
-           to sit level with the selects/buttons in the same controls-row. */
         .checkbox-label {
             display: flex;
             align-items: center;
@@ -201,11 +266,6 @@
             font-size: 13px;
             cursor: pointer;
         }
-        /* Surfaces a fatal sweep error (AnalysisManager.status().error) inline in
-           the analysis panel — deliberately NOT the shared #error banner, which
-           is reserved for this-request failures (see clearError/showError); a
-           background status poll finding a past job's error is application
-           state, not a fetch failure. */
         .analysis-error {
             margin-top: 10px;
             padding: 8px 12px;
@@ -215,11 +275,6 @@
             border-radius: 4px;
             font-size: 13px;
         }
-        /* MOG2 tuning panel. See docs/specs/2026-07-10-motion-gate-diagnostic.md. */
-        .panel h2 {
-            font-size: 16px;
-            margin: 0 0 12px;
-        }
         .param-input {
             padding: 8px 10px;
             border: 1px solid #ccc;
@@ -227,6 +282,199 @@
             font-size: 14px;
             width: 110px;
         }
+        /* Saved-buckets / groups list rows. */
+        .groups-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 12px;
+        }
+        .group-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            padding: 6px 10px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+        }
+        .group-row .group-actions {
+            display: flex;
+            gap: 6px;
+        }
+        .groups-empty {
+            color: #888;
+            font-size: 13px;
+            margin-top: 8px;
+        }
+        /* Oracle coverage rows on the Motion view: coverage text + an enqueue button. */
+        .coverage-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+        /* Job queue panel lines. */
+        .queue-line {
+            font-size: 13px;
+            padding: 4px 0;
+        }
+        .queue-list {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-top: 8px;
+        }
+        .queue-item {
+            font-size: 12px;
+            padding: 5px 10px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .queue-heading {
+            font-weight: 600;
+            font-size: 12px;
+            color: #777;
+            margin-top: 12px;
+        }
+        .state-done { color: #2e7d32; font-weight: 700; }
+        .state-failed { color: #c62828; font-weight: 700; }
+        .state-canceled { color: #888; font-weight: 700; }
+        /* Density timeline: a horizontal strip of bins, one cell per bin, colored by
+           disagreement (missed = red, false = amber, else neutral) with intensity by
+           count. Clicking a bin narrows the drill-down. */
+        .timeline-strip {
+            display: flex;
+            gap: 1px;
+            height: 52px;
+            margin-top: 12px;
+            overflow-x: auto;
+            background: #eceff1;
+            border-radius: 4px;
+            padding: 2px;
+        }
+        .timeline-cell {
+            flex: 1 0 3px;
+            min-width: 3px;
+            border-radius: 2px;
+            cursor: pointer;
+            background: #eceff1;
+        }
+        .timeline-cell:hover {
+            outline: 2px solid #0066cc;
+            outline-offset: -1px;
+        }
+        /* When any part of the window was captured motion-only, misses are
+           unmeasurable there — hatch the whole strip to signal it (bin-precise
+           shading isn't possible from id-space spans, so the strip-level cue plus
+           the banner carry the warning). */
+        .timeline-strip.has-motion-only {
+            background-image: repeating-linear-gradient(45deg, #eceff1, #eceff1 6px, #e0d3a8 6px, #e0d3a8 12px);
+        }
+        .timeline-legend {
+            font-size: 12px;
+            color: #777;
+            margin-top: 8px;
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+        .legend-swatch {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        /* Visit inbox: one visit at a time — a large representative frame + a
+           horizontal filmstrip of the visit's frames and preceding context. */
+        .tabs {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        .tab {
+            background: #eceff1;
+            color: #37474f;
+        }
+        .tab:hover {
+            background: #cfd8dc;
+        }
+        .tab.active {
+            background: #6a1b9a;
+            color: #fff;
+        }
+        #inboxRep {
+            text-align: center;
+            margin: 10px 0;
+        }
+        #inboxRep img {
+            max-width: 100%;
+            max-height: 420px;
+            border-radius: 6px;
+            border: 3px solid #6a1b9a;
+            background: #e0e0e0;
+        }
+        .inbox-meta {
+            font-size: 13px;
+            color: #555;
+            margin-top: 8px;
+        }
+        .inbox-meta .wholly-missed {
+            color: #c62828;
+            font-weight: 700;
+        }
+        .filmstrip {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            padding: 8px 0;
+        }
+        .film-tile {
+            flex: 0 0 auto;
+            width: 96px;
+            border-radius: 4px;
+            overflow: hidden;
+            border: 2px solid transparent;
+            background: white;
+        }
+        .film-tile img {
+            width: 96px;
+            height: 72px;
+            object-fit: cover;
+            display: block;
+            background: #e0e0e0;
+        }
+        .film-tile .film-cap {
+            font-size: 10px;
+            color: #777;
+            padding: 2px 4px;
+            text-align: center;
+        }
+        .film-tile.film-context {
+            opacity: 0.55;
+        }
+        .film-tile.film-motion {
+            border-color: #2e7d32;
+        }
+        .film-tile.film-rep {
+            border-color: #6a1b9a;
+            box-shadow: 0 0 0 2px #6a1b9a;
+        }
+        /* MOG2 tuning panel (relocated from the old single page, unchanged behavior). */
         .tuning-empty-note {
             color: #888;
             font-size: 13px;
@@ -277,20 +525,11 @@
             color: #777;
             font-size: 12px;
         }
-        /* Delta coloring convention (both metrics): negative = fewer = improvement
-           = green; positive = more = regression = red; zero = neutral. */
-        .delta-good {
-            color: #2e7d32;
-            font-weight: 700;
-        }
-        .delta-bad {
-            color: #c62828;
-            font-weight: 700;
-        }
-        .delta-neutral {
-            color: #555;
-            font-weight: 600;
-        }
+        /* Delta coloring: negative = fewer = improvement = green; positive = more =
+           regression = red; zero = neutral. */
+        .delta-good { color: #2e7d32; font-weight: 700; }
+        .delta-bad { color: #c62828; font-weight: 700; }
+        .delta-neutral { color: #555; font-weight: 600; }
         .tuning-copy-row {
             margin-top: 12px;
         }
@@ -313,302 +552,401 @@
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             background: #f5f5f5;
         }
-        /* Scope & groups panel. A group is a saved (name, [start_id, end_id])
-           window; picking two endpoint frames in the grid builds a pending range
-           which, once named and saved, becomes a reusable scope applied to every
-           feed/run. See docs/specs/2026-07-10-frame-range-groups.md. */
-        #groupNameInput {
-            width: 180px;
-        }
-        .groups-list {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-top: 12px;
-        }
-        .group-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 8px;
-            font-size: 13px;
-            padding: 6px 10px;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-        }
-        .groups-empty {
-            color: #888;
-            font-size: 13px;
-            margin-top: 8px;
-        }
-        /* Per-tile range affordance: one "Set start" + one "Set end" click define a
-           contiguous id window across thousands of frames — ids are monotonic in
-           time, so the range holds from any sort. */
-        .range-btns {
-            display: flex;
-            gap: 6px;
-            padding: 0 8px 8px;
-        }
-        .btn-tiny {
-            padding: 4px 8px;
-            font-size: 11px;
-        }
-        .range-btns .btn-tiny {
-            flex: 1;
-            background: #607d8b;
-        }
-        .range-btns .btn-tiny:hover {
-            background: #4f6875;
-        }
     </style>
 </head>
 <body>
-    <h1>Cat Door — Frame Collection Browser</h1>
+    <nav id="nav">
+        <span class="nav-brand">Cat Door</span>
+        <a href="#start" data-route="start" class="nav-link">Start</a>
+        <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
+        <a href="#motion" data-route="motion" class="nav-link">Motion Detection</a>
+    </nav>
 
     <div id="error"></div>
 
-    <div class="panel">
-        <div id="stats">
-            <span id="statCount" class="badge">Frames: —</span>
-            <span id="statSize" class="badge">Size: —</span>
-            <span id="statMotion" class="badge">Motion: —</span>
-            <span id="statSpan" class="badge">Span: —</span>
-            <span id="collectorBadge" class="badge">Collecting: —</span>
-            <button type="button" id="collectorToggleBtn"
-                title="Start or stop the always-on collector. Stop it to freeze the store for a clean offline analysis pass.">Start</button>
-        </div>
-    </div>
-
-    <!-- Scope & groups: a group is a saved, named [start_id, end_id] window. The
-         Scope select applies the selected group's window UNIFORMLY to every feed
-         view AND to every Run / Compare, so "scope" means one thing everywhere;
-         "All frames" restores today's whole-store behavior. A pending range is
-         built by picking two endpoint frames in the grid below (per-tile "Set
-         start" / "Set end"), previewed as a live count, then named and saved. See
-         docs/specs/2026-07-10-frame-range-groups.md. -->
-    <div class="panel" id="scopePanel">
-        <h2>Scope &amp; groups</h2>
-        <div class="controls-row">
-            <div class="control-group">
-                <label for="scopeSelect">Frames</label>
-                <select id="scopeSelect">
-                    <option value="">All frames</option>
-                </select>
+    <!-- ================= START VIEW ================= -->
+    <section id="view-start" class="view">
+        <div class="panel">
+            <h2>Collection</h2>
+            <div id="stats">
+                <span id="statCount" class="badge">Frames: —</span>
+                <span id="statSize" class="badge">Size: —</span>
+                <span id="statMotion" class="badge">Motion: —</span>
+                <span id="statSpan" class="badge">Span: —</span>
+                <span id="collectorBadge" class="badge">Collecting: —</span>
             </div>
-            <div class="control-group" style="margin-left: auto;">
-                <span id="scopeBadge" class="badge">Scope: All frames</span>
-            </div>
-        </div>
-        <div class="controls-row" style="margin-top: 12px;">
-            <div class="control-group">
-                <label>Start frame</label>
-                <span id="pendingStartTs" class="badge">—</span>
-            </div>
-            <div class="control-group">
-                <label>End frame</label>
-                <span id="pendingEndTs" class="badge">—</span>
-            </div>
-            <div class="control-group">
-                <label for="groupNameInput">Group name</label>
-                <input type="text" id="groupNameInput" class="param-input" placeholder="e.g. dusk visit">
-            </div>
-            <span id="rangeCount" class="badge">Frames in range: —</span>
-            <div class="control-group" style="margin-left: auto;">
-                <div class="btn-row">
-                    <button type="button" id="groupSaveBtn" disabled>Save group</button>
-                    <button type="button" id="groupClearBtn" class="btn-secondary">Clear selection</button>
-                </div>
-            </div>
-        </div>
-        <div id="groupsList" class="groups-list"></div>
-    </div>
-
-    <div class="panel">
-        <div class="controls-row">
-            <div class="control-group">
-                <label for="motionFilter">Motion filter</label>
-                <select id="motionFilter">
-                    <option value="all">All</option>
-                    <option value="motion">Motion</option>
-                    <option value="still">Still</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <label for="orderSelect">Sort</label>
-                <select id="orderSelect">
-                    <option value="time">Time (newest first)</option>
-                    <option value="area_desc">Area high → low</option>
-                    <option value="area_asc">Area low → high</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <div class="btn-row">
-                    <button type="button" id="presetMissedBtn" class="btn-preset"
-                        title="Still frames (motion NOT flagged) with the most movement — likely detections the gate MISSED (false negatives). If you see cats in here, the motion gate is too strict → loosen it.">Missed?</button>
-                    <button type="button" id="presetFalseBtn" class="btn-preset"
-                        title="Motion frames with the least movement — likely fired on noise, shadows or light (false positives). If you see empty frames in here, the motion gate is too twitchy → tighten it.">False triggers</button>
-                </div>
-            </div>
-            <div class="control-group" style="margin-left: auto;">
-                <button type="button" id="clearBtn" class="btn-danger">Clear all</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Offline analysis: sweep a stronger oracle (YOLO / BSUV) over the stored
-         frames to validate MOG2, and browse where they disagree. See
-         docs/specs/2026-07-09-motion-gate-oracles.md. The analyzer select below
-         is dual-purpose: it picks Run's target AND which oracle the disagreement
-         presets read from — one selection, two consumers. -->
-    <div class="panel">
-        <div class="controls-row">
-            <div class="control-group">
-                <label for="analyzerSelect">Oracle</label>
-                <!-- Options are populated in JS from the single ANALYZERS source
-                     (see below), so the oracle id/label set lives in one place. -->
-                <select id="analyzerSelect"></select>
-            </div>
-            <div class="control-group">
-                <div class="btn-row">
-                    <button type="button" id="analysisRunBtn">Run</button>
-                    <button type="button" id="analysisCancelBtn" class="btn-secondary">Cancel</button>
-                </div>
-            </div>
-            <div class="control-group">
-                <label class="checkbox-label"
-                    title="Clear this oracle's prior verdicts first, so the sweep re-verdicts the whole store (e.g. after changing the model or its threshold) instead of skipping already-analyzed frames.">
-                    <input type="checkbox" id="reanalyzeCheckbox">
-                    Re-analyze
+            <div class="controls-row" style="margin-top: 14px;">
+                <button type="button" id="collectorToggleBtn"
+                    title="Start or stop the always-on collector. Stop it to freeze the store for a clean offline analysis pass.">Start</button>
+                <label class="checkbox-label" style="align-self: center;"
+                    title="Only persist frames the edge flagged as motion. Compact false-triggers-only / cat-crop capture.">
+                    <input type="checkbox" id="motionOnlyToggle">
+                    Only save motion frames
                 </label>
             </div>
-            <div class="control-group" style="margin-left: auto;">
-                <span id="analysisProgressBadge" class="badge">Oracle: —</span>
+            <p class="caveat" style="margin-top: 10px;">
+                Heads up: a <em>miss</em> is a still frame that actually held a cat, so dropping
+                non-motion frames discards exactly those — recall / misses become
+                <strong>unmeasurable</strong> in the frames captured while this is on. Default off;
+                use it only for compact false-trigger / crop capture.
+            </p>
+        </div>
+
+        <div class="panel hidden" id="resumePanel">
+            <h2>Resume collection</h2>
+            <p style="font-size: 14px; margin: 0 0 12px;">
+                Collection was running before the last restart. It is currently stopped — a bare
+                launch never silently writes to the store. Resume it to continue collecting.
+            </p>
+            <button type="button" id="resumeBtn" class="btn-preset">Resume collection</button>
+        </div>
+
+        <div class="panel">
+            <h2>Danger zone</h2>
+            <button type="button" id="clearBtn" class="btn-danger">Clear all frames</button>
+            <p class="caveat" style="margin-top: 10px; color: #888;">
+                Deletes every stored frame, oracle verdict, saved bucket, and mode history. Cannot be undone.
+            </p>
+        </div>
+    </section>
+
+    <!-- ================= BUCKETS VIEW ================= -->
+    <section id="view-buckets" class="view hidden">
+        <div class="panel">
+            <h2>Define a bucket</h2>
+            <p class="caveat" style="color: #777; margin: 0 0 12px;">
+                Pick a rough era with the clock pickers, load it at a chosen image density, then
+                click one frame for the start endpoint and one for the end, name it, and Save. A
+                bucket is a contiguous <code>[start_id, end_id]</code> window — the only selection
+                primitive the oracle sweeps and scorecards use.
+            </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="startDate">Start date</label>
+                    <input type="date" id="startDate">
+                </div>
+                <div class="control-group">
+                    <label for="startTime">Start time</label>
+                    <select id="startTime"></select>
+                </div>
+                <div class="control-group">
+                    <label for="endDate">End date</label>
+                    <input type="date" id="endDate">
+                </div>
+                <div class="control-group">
+                    <label for="endTime">End time</label>
+                    <select id="endTime"></select>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="loadWindowBtn">Load window</button>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="clearWindowBtn" class="btn-secondary">Clear window</button>
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="storeRangeBadge" class="badge">Store: —</span>
+                </div>
+            </div>
+            <div class="controls-row" style="margin-top: 12px;">
+                <div class="control-group">
+                    <label for="densityMode">Density</label>
+                    <select id="densityMode">
+                        <option value="all">All frames</option>
+                        <option value="sample">Per minute</option>
+                        <option value="hour">Per hour</option>
+                    </select>
+                </div>
+                <div class="control-group hidden" id="perMinGroup">
+                    <label for="perMin" id="perMinLabel">Frames / min</label>
+                    <input type="number" id="perMin" class="param-input" value="2" min="1" step="1">
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="viewerInfoBadge" class="badge">—</span>
+                </div>
+            </div>
+
+            <div class="controls-row" id="pickToolbar" style="margin-top: 12px;">
+                <div class="control-group">
+                    <label>Start frame</label>
+                    <span id="pickStartTs" class="badge">—</span>
+                </div>
+                <div class="control-group">
+                    <label>End frame</label>
+                    <span id="pickEndTs" class="badge">—</span>
+                </div>
+                <span id="viewerRangeCount" class="badge">Frames in range: —</span>
+                <div class="control-group">
+                    <label for="bucketNameInput">Bucket name</label>
+                    <input type="text" id="bucketNameInput" class="param-input" placeholder="e.g. dusk rain">
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <div class="btn-row">
+                        <button type="button" id="bucketSaveBtn" disabled>Save bucket</button>
+                        <button type="button" id="pickClearBtn" class="btn-secondary">Clear selection</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="viewerReadonlyNote" class="banner-warn hidden"></div>
+            <div id="viewerEmpty" class="empty">Load a window to see frames.</div>
+            <div id="viewerGrid" class="grid"></div>
+            <div id="viewerPager" class="pager hidden">
+                <button type="button" id="viewerPrevBtn" class="btn-secondary">← Prev</button>
+                <span id="viewerPageLabel" class="badge">Page 1</span>
+                <button type="button" id="viewerNextBtn" class="btn-secondary">Next →</button>
             </div>
         </div>
-        <div class="controls-row" style="margin-top: 12px;">
-            <div class="control-group">
-                <div class="btn-row">
-                    <button type="button" id="presetOracleMissedBtn" class="btn-preset"
-                        title="Frames the motion gate left still but the selected oracle sees the subject — a genuine miss.">Missed (oracle sees subject)</button>
-                    <button type="button" id="presetOracleFalseBtn" class="btn-preset"
-                        title="Frames the motion gate fired on but the selected oracle sees nothing — a false trigger.">False trigger (oracle sees nothing)</button>
+
+        <div class="panel">
+            <h2>Saved buckets</h2>
+            <div id="bucketsList" class="groups-list"></div>
+        </div>
+    </section>
+
+    <!-- ================= MOTION DETECTION VIEW ================= -->
+    <section id="view-motion" class="view hidden">
+        <div class="panel">
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="motionScopeSelect">Bucket</label>
+                    <select id="motionScopeSelect">
+                        <option value="">All frames</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="motionOracleSelect">Oracle</label>
+                    <select id="motionOracleSelect"></select>
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="motionScopeBadge" class="badge">Scope: All frames</span>
+                </div>
+            </div>
+            <div id="motionOnlyBanner" class="banner-warn hidden"></div>
+        </div>
+
+        <!-- Oracle coverage + enqueue (walk-away sweeps). -->
+        <div class="panel">
+            <h2>Oracle sweeps</h2>
+            <label class="checkbox-label"
+                title="Clear this oracle's prior verdicts in the selected window first, so the sweep re-verdicts it (e.g. after changing the model or its threshold).">
+                <input type="checkbox" id="reanalyzeCheckbox">
+                Re-analyze (clear prior verdicts in the window first)
+            </label>
+            <div id="coverageList"></div>
+            <div id="enqueueWarn" class="hidden banner-warn"></div>
+        </div>
+
+        <!-- The walk-away queue. -->
+        <div class="panel">
+            <h2>Job queue</h2>
+            <div class="btn-row">
+                <button type="button" id="queueCancelBtn" class="btn-secondary">Cancel current</button>
+                <button type="button" id="queueClearBtn" class="btn-secondary">Clear pending</button>
+                <button type="button" id="queueStopAllBtn" class="btn-danger">Stop all</button>
+            </div>
+            <div id="queueRunning" class="queue-line" style="margin-top: 10px;">Idle.</div>
+            <div id="queuePending"></div>
+            <div id="queueHistory"></div>
+            <div id="analysisError" class="hidden analysis-error"></div>
+        </div>
+
+        <!-- Density timeline overview. -->
+        <div class="panel">
+            <h2>Density timeline</h2>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="timelineBins">Bins</label>
+                    <input type="number" id="timelineBins" class="param-input" value="120" min="1" step="10">
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <div class="btn-row">
+                        <button type="button" id="timelineReloadBtn" class="btn-secondary">Reload</button>
+                        <button type="button" id="timelineResetBtn" class="btn-secondary hidden">Reset drill</button>
+                    </div>
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="timelineScopeBadge" class="badge">—</span>
+                </div>
+            </div>
+            <div id="timelineStrip" class="timeline-strip"></div>
+            <div id="timelineEmpty" class="empty hidden">No frames in this window.</div>
+            <div class="timeline-legend">
+                <span><span class="legend-swatch" style="background:#c62828;"></span>Missed (gate still, oracle sees subject)</span>
+                <span><span class="legend-swatch" style="background:#f9a825;"></span>False (gate fired, oracle sees nothing)</span>
+                <span><span class="legend-swatch" style="background:#b0bec5;"></span>Frame density</span>
+            </div>
+        </div>
+
+        <!-- Visit inbox. -->
+        <div class="panel">
+            <h2>Visit inbox</h2>
+            <div class="tabs">
+                <button type="button" class="tab" data-mode="missed">Missed</button>
+                <button type="button" class="tab" data-mode="false">False</button>
+                <button type="button" class="tab" data-mode="conflict">Conflict</button>
+            </div>
+            <div id="inboxMissesNote" class="banner-warn hidden"></div>
+            <div class="controls-row" style="align-items: center;">
+                <span id="inboxProgress" class="badge">— / —</span>
+                <div class="btn-row" style="margin-left: auto;">
+                    <button type="button" id="inboxPrevBtn" class="btn-secondary">← Prev (k)</button>
+                    <button type="button" id="inboxNextBtn" class="btn-secondary">Next (j) →</button>
+                </div>
+            </div>
+            <div id="inboxEmpty" class="empty hidden">No visits for this mode in the window.</div>
+            <div id="inboxRep"></div>
+            <div id="inboxMeta" class="inbox-meta"></div>
+            <div id="inboxFilmstrip" class="filmstrip"></div>
+        </div>
+
+        <!-- MOG2 tuning (relocated, window-scoped). -->
+        <div class="panel" id="tuningPanel">
+            <h2>MOG2 Tuning</h2>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="param_var_threshold">var_threshold</label>
+                    <input type="number" id="param_var_threshold" step="0.5" class="param-input">
+                </div>
+                <div class="control-group">
+                    <label for="param_learning_rate">learning_rate</label>
+                    <input type="number" id="param_learning_rate" step="0.001" class="param-input">
+                </div>
+                <div class="control-group">
+                    <label for="param_min_area">min_area</label>
+                    <input type="number" id="param_min_area" step="0.0001" class="param-input">
+                </div>
+                <div class="control-group">
+                    <label for="param_max_area_fraction">max_area_fraction</label>
+                    <input type="number" id="param_max_area_fraction" step="0.01" class="param-input">
+                </div>
+                <div class="control-group">
+                    <label for="param_persistence">persistence</label>
+                    <input type="number" id="param_persistence" step="1" class="param-input">
+                </div>
+                <div class="control-group">
+                    <label for="param_motion_downscale">motion_downscale</label>
+                    <input type="number" id="param_motion_downscale" step="1" class="param-input">
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="tuningParamSource" class="badge">Params: —</span>
+                </div>
+            </div>
+            <div class="controls-row" style="margin-top: 12px;">
+                <div class="control-group">
+                    <div class="btn-row">
+                        <button type="button" id="tuningRunBaselineBtn">Queue baseline</button>
+                        <button type="button" id="tuningRunCandidateBtn">Queue candidate</button>
+                        <button type="button" id="tuningRefreshBtn" class="btn-secondary">Refresh compare</button>
+                    </div>
+                </div>
+                <div class="control-group" style="margin-left: auto;">
+                    <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
+                </div>
+                <div class="control-group">
+                    <span id="tuningProgressBadge" class="badge">Tuning: —</span>
+                </div>
+            </div>
+            <div id="tuningError" class="hidden analysis-error"></div>
+            <div id="tuningOverlapNote" class="banner-warn hidden"></div>
+
+            <div id="tuningCompareEmpty" class="tuning-empty-note">Queue a baseline and a candidate, then compare against the Oracle selected above.</div>
+            <div id="tuningCards" class="tuning-cards"></div>
+            <div id="tuningFidelity" class="tuning-line"></div>
+            <div id="tuningDeltas" class="tuning-line"></div>
+            <div id="tuningWarmupNote" class="tuning-line tuning-note"></div>
+            <div id="tuningCopyRow" class="tuning-copy-row hidden">
+                <label for="tuningCopyText">Candidate params (paste into the edge Config UI):</label>
+                <div class="tuning-copy-controls">
+                    <input type="text" id="tuningCopyText" readonly>
+                    <button type="button" id="tuningCopyBtn" class="btn-secondary">Copy</button>
                 </div>
             </div>
         </div>
-        <div id="analysisError" class="hidden analysis-error"></div>
-    </div>
-
-    <!-- Offline MOG2 tuning: re-run the shared motion gate over stored frames
-         with adjustable params (a "baseline" seeded from the Pi's live settings
-         and an edited "candidate"), then diff both against the Oracle selected
-         above. Reuses the analysis panel's job/progress machinery — a tuning
-         rerun and an oracle sweep share the same one-job-at-a-time slot. See
-         docs/specs/2026-07-10-motion-gate-diagnostic.md. -->
-    <div class="panel" id="tuningPanel">
-        <h2>MOG2 Tuning</h2>
-        <div class="controls-row">
-            <div class="control-group">
-                <label for="param_var_threshold">var_threshold</label>
-                <input type="number" id="param_var_threshold" step="0.5" class="param-input">
-            </div>
-            <div class="control-group">
-                <label for="param_learning_rate">learning_rate</label>
-                <input type="number" id="param_learning_rate" step="0.001" class="param-input">
-            </div>
-            <div class="control-group">
-                <label for="param_min_area">min_area</label>
-                <input type="number" id="param_min_area" step="0.0001" class="param-input">
-            </div>
-            <div class="control-group">
-                <label for="param_max_area_fraction">max_area_fraction</label>
-                <input type="number" id="param_max_area_fraction" step="0.01" class="param-input">
-            </div>
-            <div class="control-group">
-                <label for="param_persistence">persistence</label>
-                <input type="number" id="param_persistence" step="1" class="param-input">
-            </div>
-            <div class="control-group">
-                <label for="param_motion_downscale">motion_downscale</label>
-                <input type="number" id="param_motion_downscale" step="1" class="param-input">
-            </div>
-            <div class="control-group" style="margin-left: auto;">
-                <span id="tuningParamSource" class="badge">Params: —</span>
-            </div>
-        </div>
-        <div class="controls-row" style="margin-top: 12px;">
-            <div class="control-group">
-                <div class="btn-row">
-                    <button type="button" id="tuningRunBaselineBtn">Run baseline</button>
-                    <button type="button" id="tuningRunCandidateBtn">Run candidate</button>
-                    <button type="button" id="tuningRefreshBtn" class="btn-secondary">Refresh compare</button>
-                </div>
-            </div>
-            <div class="control-group" style="margin-left: auto;">
-                <!-- The active scope, mirrored from the panel above so a re-run or
-                     compare is never silently whole-store when a window was intended. -->
-                <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
-            </div>
-            <div class="control-group">
-                <span id="tuningProgressBadge" class="badge">Tuning: —</span>
-            </div>
-        </div>
-        <div id="tuningError" class="hidden analysis-error"></div>
-
-        <div id="tuningCompareEmpty" class="tuning-empty-note">Run a baseline and a candidate, then compare against the Oracle selected above.</div>
-        <div id="tuningCards" class="tuning-cards"></div>
-        <div id="tuningFidelity" class="tuning-line"></div>
-        <div id="tuningDeltas" class="tuning-line"></div>
-        <div id="tuningWarmupNote" class="tuning-line tuning-note"></div>
-        <div id="tuningCopyRow" class="tuning-copy-row hidden">
-            <label for="tuningCopyText">Candidate params (paste into the edge Config UI):</label>
-            <div class="tuning-copy-controls">
-                <input type="text" id="tuningCopyText" readonly>
-                <button type="button" id="tuningCopyBtn" class="btn-secondary">Copy</button>
-            </div>
-        </div>
-    </div>
-
-    <div id="empty" class="hidden">No frames match the current filter.</div>
-    <div id="grid"></div>
-    <div id="pager">
-        <button type="button" id="prevBtn" class="btn-secondary">← Prev</button>
-        <span id="pageLabel" class="badge">Page 1</span>
-        <button type="button" id="nextBtn" class="btn-secondary">Next →</button>
-    </div>
+    </section>
 
     <script>
+        // ================= element handles =================
         const errorDiv = document.getElementById('error');
+        // Start view
         const statCountEl = document.getElementById('statCount');
         const statSizeEl = document.getElementById('statSize');
         const statMotionEl = document.getElementById('statMotion');
         const statSpanEl = document.getElementById('statSpan');
-        const motionFilterSelect = document.getElementById('motionFilter');
-        const orderSelect = document.getElementById('orderSelect');
-        const presetMissedBtn = document.getElementById('presetMissedBtn');
-        const presetFalseBtn = document.getElementById('presetFalseBtn');
-        const clearBtn = document.getElementById('clearBtn');
-        const gridEl = document.getElementById('grid');
-        const emptyEl = document.getElementById('empty');
-        const prevBtn = document.getElementById('prevBtn');
-        const nextBtn = document.getElementById('nextBtn');
-        const pageLabel = document.getElementById('pageLabel');
         const collectorBadge = document.getElementById('collectorBadge');
         const collectorToggleBtn = document.getElementById('collectorToggleBtn');
-        const analyzerSelect = document.getElementById('analyzerSelect');
-        const analysisRunBtn = document.getElementById('analysisRunBtn');
-        const analysisCancelBtn = document.getElementById('analysisCancelBtn');
+        const motionOnlyToggle = document.getElementById('motionOnlyToggle');
+        const resumePanel = document.getElementById('resumePanel');
+        const resumeBtn = document.getElementById('resumeBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        // Buckets view
+        const startDateEl = document.getElementById('startDate');
+        const startTimeEl = document.getElementById('startTime');
+        const endDateEl = document.getElementById('endDate');
+        const endTimeEl = document.getElementById('endTime');
+        const loadWindowBtn = document.getElementById('loadWindowBtn');
+        const storeRangeBadge = document.getElementById('storeRangeBadge');
+        const clearWindowBtn = document.getElementById('clearWindowBtn');
+        const densityModeEl = document.getElementById('densityMode');
+        const perMinGroup = document.getElementById('perMinGroup');
+        const perMinLabel = document.getElementById('perMinLabel');
+        const perMinEl = document.getElementById('perMin');
+        const viewerInfoBadge = document.getElementById('viewerInfoBadge');
+        const pickToolbar = document.getElementById('pickToolbar');
+        const pickStartTsEl = document.getElementById('pickStartTs');
+        const pickEndTsEl = document.getElementById('pickEndTs');
+        const viewerRangeCountEl = document.getElementById('viewerRangeCount');
+        const bucketNameInput = document.getElementById('bucketNameInput');
+        const bucketSaveBtn = document.getElementById('bucketSaveBtn');
+        const pickClearBtn = document.getElementById('pickClearBtn');
+        const viewerReadonlyNote = document.getElementById('viewerReadonlyNote');
+        const viewerEmpty = document.getElementById('viewerEmpty');
+        const viewerGrid = document.getElementById('viewerGrid');
+        const viewerPager = document.getElementById('viewerPager');
+        const viewerPrevBtn = document.getElementById('viewerPrevBtn');
+        const viewerPageLabel = document.getElementById('viewerPageLabel');
+        const viewerNextBtn = document.getElementById('viewerNextBtn');
+        const bucketsListEl = document.getElementById('bucketsList');
+        // Motion view
+        const motionScopeSelect = document.getElementById('motionScopeSelect');
+        const motionOracleSelect = document.getElementById('motionOracleSelect');
+        const motionScopeBadge = document.getElementById('motionScopeBadge');
+        const motionOnlyBanner = document.getElementById('motionOnlyBanner');
         const reanalyzeCheckbox = document.getElementById('reanalyzeCheckbox');
-        const analysisProgressBadge = document.getElementById('analysisProgressBadge');
+        const coverageListEl = document.getElementById('coverageList');
+        const enqueueWarnEl = document.getElementById('enqueueWarn');
+        const queueCancelBtn = document.getElementById('queueCancelBtn');
+        const queueClearBtn = document.getElementById('queueClearBtn');
+        const queueStopAllBtn = document.getElementById('queueStopAllBtn');
+        const queueRunningEl = document.getElementById('queueRunning');
+        const queuePendingEl = document.getElementById('queuePending');
+        const queueHistoryEl = document.getElementById('queueHistory');
         const analysisErrorEl = document.getElementById('analysisError');
-        const presetOracleMissedBtn = document.getElementById('presetOracleMissedBtn');
-        const presetOracleFalseBtn = document.getElementById('presetOracleFalseBtn');
+        const timelineBinsEl = document.getElementById('timelineBins');
+        const timelineReloadBtn = document.getElementById('timelineReloadBtn');
+        const timelineResetBtn = document.getElementById('timelineResetBtn');
+        const timelineScopeBadge = document.getElementById('timelineScopeBadge');
+        const timelineStripEl = document.getElementById('timelineStrip');
+        const timelineEmptyEl = document.getElementById('timelineEmpty');
+        const inboxMissesNote = document.getElementById('inboxMissesNote');
+        const inboxProgressEl = document.getElementById('inboxProgress');
+        const inboxPrevBtn = document.getElementById('inboxPrevBtn');
+        const inboxNextBtn = document.getElementById('inboxNextBtn');
+        const inboxEmptyEl = document.getElementById('inboxEmpty');
+        const inboxRepEl = document.getElementById('inboxRep');
+        const inboxMetaEl = document.getElementById('inboxMeta');
+        const inboxFilmstripEl = document.getElementById('inboxFilmstrip');
+        // Tuning
         const tuningParamSourceEl = document.getElementById('tuningParamSource');
         const tuningRunBaselineBtn = document.getElementById('tuningRunBaselineBtn');
         const tuningRunCandidateBtn = document.getElementById('tuningRunCandidateBtn');
         const tuningRefreshBtn = document.getElementById('tuningRefreshBtn');
+        const tuningScopeBadgeEl = document.getElementById('tuningScopeBadge');
         const tuningProgressBadge = document.getElementById('tuningProgressBadge');
         const tuningErrorEl = document.getElementById('tuningError');
+        const tuningOverlapNoteEl = document.getElementById('tuningOverlapNote');
         const tuningCompareEmptyEl = document.getElementById('tuningCompareEmpty');
         const tuningCardsEl = document.getElementById('tuningCards');
         const tuningFidelityEl = document.getElementById('tuningFidelity');
@@ -617,78 +955,116 @@
         const tuningCopyRowEl = document.getElementById('tuningCopyRow');
         const tuningCopyTextEl = document.getElementById('tuningCopyText');
         const tuningCopyBtn = document.getElementById('tuningCopyBtn');
-        const scopeSelect = document.getElementById('scopeSelect');
-        const scopeBadge = document.getElementById('scopeBadge');
-        const pendingStartTsEl = document.getElementById('pendingStartTs');
-        const pendingEndTsEl = document.getElementById('pendingEndTs');
-        const rangeCountEl = document.getElementById('rangeCount');
-        const groupNameInput = document.getElementById('groupNameInput');
-        const groupSaveBtn = document.getElementById('groupSaveBtn');
-        const groupClearBtn = document.getElementById('groupClearBtn');
-        const groupsListEl = document.getElementById('groupsList');
-        const tuningScopeBadgeEl = document.getElementById('tuningScopeBadge');
 
-        // View state. Every order is keyset-paginated. pageCursors[i] is the
-        // opaque token that fetches page i (pageCursors[0] === null = first
-        // page); each page's returned next_cursor is stored as the following
-        // page's token, so Prev just re-fetches an earlier one — stable even as
-        // the collector inserts newer frames.
-        const PAGE_SIZE = 500;   // big pages; <img loading="lazy"> defers off-screen fetches so a large grid stays cheap. Grid is REPLACED per page, not appended.
-        let motion = 'all';
-        let order = 'time';
-        // Disagreement view (MOG2 vs. a chosen oracle): non-null disagreeMode
-        // routes loadPage through analyzer+disagree instead of motion+order,
-        // mirroring the plain feed's own keyset contract. Set by the
-        // disagreement presets below; cleared by any plain motion/order control
-        // so the two views never mix mid-page.
-        let disagreeAnalyzer = null;   // analyzer the active disagreement view reads from
-        let disagreeMode = null;       // 'missed' | 'false' | null (plain feed)
-        let pageCursors = [null];
-        let pageIndex = 0;
-        let loading = false;
-        let collectorRunning = null;   // last known /api/stats collector_running, drives the toggle button's label
-        let analysisRunning = false;   // last known /api/analysis/status running, drives Run/Cancel disabling
-        let lastStoreCount = null;     // last known /api/stats count — the analysis coverage denominator (see pollAnalysisStatus)
-        let tuningPrevRunning = false;  // edge-detects analysisRunning true->false to auto-refresh the compare view when a rerun finishes
-        let lastCandidateParams = null; // params actually submitted on the last successful "Run candidate" — the copy-paste line reflects THIS, not whatever is currently typed (which may have been edited since)
-
-        // Frame-range scope (docs/specs/2026-07-10-frame-range-groups.md). A
-        // "pending range" is the two endpoints picked in the grid but not yet
-        // saved; `activeScope` is the currently-selected group's inclusive id
-        // window (or null = whole store) that EVERY feed/run threads through.
-        let pendingStartId = null, pendingStartTs = null;
-        let pendingEndId = null, pendingEndTs = null;
-        let activeScope = null;   // {since_id, until_id} | null (null = All frames)
-        let groups = [];          // last GET /api/groups payload, for select + list rendering
-
+        // ================= shared constants + state =================
+        const ROUTES = ['start', 'buckets', 'motion'];
         // The single frontend source for the oracle id/label set (the backend's
-        // ANALYZER_NAMES is its server-side counterpart). The <select> options AND
-        // the id->label map both derive from THIS list, so adding an oracle is a
-        // one-line edit here — no separate <option> markup to keep in sync.
+        // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
             { id: 'yolo', label: 'YOLO' },
             { id: 'bsuv', label: 'BSUV' },
         ];
         const ANALYZER_LABELS = Object.fromEntries(ANALYZERS.map(a => [a.id, a.label]));
-        for (const a of ANALYZERS) {
-            const opt = document.createElement('option');
-            opt.value = a.id;
-            opt.textContent = a.label;
-            analyzerSelect.appendChild(opt);
+        const TUNING_PARAM_KEYS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
+        const CLOCK_STEP_HOURS = 3;            // clock-picker time-of-day granularity
+        const VIEWER_PAGE_SIZE = 500;          // "All" density paged feed
+        const CONTEXT_FRAMES = 8;              // preceding frames shown in the inbox filmstrip
+        const STATS_POLL_MS = 4000;
+
+        let route = 'start';
+
+        // Store state (from /api/stats), shared across views.
+        let collectorRunning = null;
+        let storeOldestTs = null;
+        let storeNewestTs = null;
+        let lastStoreCount = null;
+
+        // Analysis status (from /api/analysis/status), rendered on the Motion view.
+        let analysisStatus = { running: false, queue: [], history: [], summaries: {} };
+        // Track the top history entry (most-recent finished job) so we can detect a
+        // job COMPLETING even after the bounded (20) list stops growing — a length
+        // comparison would stop working once it is capped.
+        let lastHistoryTop; // undefined until first poll
+
+        // Groups / buckets (from /api/groups), shared by both views.
+        let groups = [];
+
+        // Motion-view scope: activeScope = the picked bucket; drillScope = a narrower
+        // window from clicking a timeline bin (null = the whole bucket).
+        let activeScope = null;   // {since_id, until_id} | null
+        let drillScope = null;    // {since_id, until_id} | null
+
+        // Inbox state.
+        let inboxMode = 'missed';
+        let visits = [];
+        let visitIndex = 0;
+        let inboxMotionOnlySpans = [];
+        let filmSeq = 0;
+
+        // Tuning state.
+        let lastCandidateParams = null;
+        let tuningDefaultsLoaded = false;
+
+        // Bucket viewer state.
+        let viewerScope = null;       // {since_id, until_id} of the loaded window
+        let viewerTotalCount = null;  // total frames in the loaded window (for the "All frames" badge)
+        let viewerReadOnly = false;
+        let viewerTiles = new Map();  // id -> tile element, for selection highlighting
+        let pickStartId = null, pickStartTs = null;
+        let pickEndId = null, pickEndTs = null;
+        let viewerCursors = [null];
+        let viewerPageIndex = 0;
+        let viewerLoading = false;
+        let viewerSeq = 0;
+
+        // ================= build selects / static rows =================
+        function buildOracleSelect() {
+            for (const a of ANALYZERS) {
+                const opt = document.createElement('option');
+                opt.value = a.id;
+                opt.textContent = a.label;
+                motionOracleSelect.appendChild(opt);
+            }
         }
 
+        function buildTimeOptions() {
+            for (const sel of [startTimeEl, endTimeEl]) {
+                sel.innerHTML = '';
+                for (let h = 0; h < 24; h += CLOCK_STEP_HOURS) {
+                    const opt = document.createElement('option');
+                    opt.value = String(h);
+                    opt.textContent = pad2(h) + ':00';
+                    sel.appendChild(opt);
+                }
+            }
+        }
+
+        function buildCoverageRows() {
+            coverageListEl.innerHTML = '';
+            for (const a of ANALYZERS) {
+                const row = document.createElement('div');
+                row.className = 'coverage-row';
+                const span = document.createElement('span');
+                span.id = 'cov-' + a.id;
+                span.textContent = `${a.label}: —`;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = 'Enqueue ' + a.label;
+                btn.addEventListener('click', () => enqueueOracle(a.id));
+                row.append(span, btn);
+                coverageListEl.appendChild(row);
+            }
+        }
+
+        // ================= generic helpers =================
         function showError(message) {
             errorDiv.textContent = message;
             errorDiv.classList.add('show');
         }
-
         function clearError() {
             errorDiv.classList.remove('show');
             errorDiv.textContent = '';
         }
-
-        // Turn a non-ok response into a display message: prefer its JSON
-        // {error}/{detail}, else fall back to the HTTP status.
         async function errorFromResponse(res) {
             try {
                 const data = await res.json();
@@ -697,40 +1073,76 @@
                 return `HTTP ${res.status}`;
             }
         }
-
-        // ---- formatting helpers ----
+        function pad2(n) { return String(n).padStart(2, '0'); }
 
         function formatBytes(bytes) {
             if (typeof bytes !== 'number') return '—';
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-            let value = bytes;
-            let i = 0;
-            while (value >= 1024 && i < units.length - 1) {
-                value /= 1024;
-                i++;
-            }
+            let value = bytes, i = 0;
+            while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
             return `${value.toFixed(1)} ${units[i]}`;
         }
-
         function formatTime(ts) {
             if (typeof ts !== 'number') return '—';
             return new Date(ts).toLocaleString();
         }
-
         function formatSpan(oldest, newest) {
             if (typeof oldest !== 'number' || typeof newest !== 'number') return '—';
             let secs = Math.max(0, Math.round((newest - oldest) / 1000));
-            const h = Math.floor(secs / 3600);
-            secs -= h * 3600;
-            const m = Math.floor(secs / 60);
-            secs -= m * 60;
+            const h = Math.floor(secs / 3600); secs -= h * 3600;
+            const m = Math.floor(secs / 60); secs -= m * 60;
             if (h > 0) return `${h}h ${m}m`;
             if (m > 0) return `${m}m ${secs}s`;
             return `${secs}s`;
         }
+        function kindLabel(kind) { return ANALYZER_LABELS[kind] || kind; }
+        // A window description for queue/history/scope readouts: match a saved bucket
+        // by its exact bounds, else show the raw ids, else "whole store".
+        function windowLabel(sinceId, untilId) {
+            if (sinceId == null && untilId == null) return 'whole store';
+            const g = groups.find(x => x.start_id === sinceId && x.end_id === untilId);
+            if (g) return g.name;
+            return `ids ${sinceId != null ? sinceId : '…'}–${untilId != null ? untilId : '…'}`;
+        }
+        function addBounds(params, sinceId, untilId) {
+            if (sinceId != null) params.set('since_id', String(sinceId));
+            if (untilId != null) params.set('until_id', String(untilId));
+        }
+        function dateInputValue(ts) {
+            const d = new Date(ts);
+            return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+        }
+        function tsFromControls(dateStr, hour) {
+            if (!dateStr) return null;
+            const parts = dateStr.split('-').map(Number);
+            if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+            return new Date(parts[0], parts[1] - 1, parts[2], hour, 0, 0, 0).getTime();
+        }
 
-        // ---- stats header ----
+        // ================= router =================
+        function setRoute(r) {
+            route = ROUTES.includes(r) ? r : 'start';
+            for (const v of document.querySelectorAll('.view')) v.classList.add('hidden');
+            document.getElementById('view-' + route).classList.remove('hidden');
+            for (const a of document.querySelectorAll('.nav-link')) {
+                a.classList.toggle('active', a.dataset.route === route);
+            }
+            onRouteEnter(route);
+        }
+        function onRouteEnter(r) {
+            if (r === 'buckets') {
+                loadGroups();
+                populateClockDefaults();
+            } else if (r === 'motion') {
+                loadGroups().then(() => {
+                    if (!tuningDefaultsLoaded) { loadTuningDefaults(); tuningDefaultsLoaded = true; }
+                    reloadMotionView();
+                });
+            }
+        }
+        window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
 
+        // ================= stats poll (shared) =================
         async function pollStats() {
             try {
                 const res = await fetch('/api/stats');
@@ -738,8 +1150,6 @@
                 const data = await res.json();
 
                 statCountEl.textContent = `Frames: ${data.count}`;
-                // Stash the frame count as the analysis coverage denominator so
-                // /api/analysis/status needn't recompute it (see pollAnalysisStatus).
                 if (typeof data.count === 'number') lastStoreCount = data.count;
                 statSizeEl.textContent = `Size: ${formatBytes(data.bytes)} / ${formatBytes(data.cap_bytes)}`;
                 statSizeEl.classList.toggle('warn', data.cap_bytes > 0 && data.bytes / data.cap_bytes > 0.9);
@@ -750,103 +1160,975 @@
                 collectorBadge.textContent = `Collecting: ${collectorRunning ? 'on' : 'off'}`;
                 collectorBadge.classList.toggle('warn', !collectorRunning);
                 collectorToggleBtn.textContent = collectorRunning ? 'Stop' : 'Start';
+
+                // Reflect the persisted collection mode + resume prompt.
+                motionOnlyToggle.checked = !!data.motion_only;
+                resumePanel.classList.toggle('hidden', !data.resume_available);
+
+                storeOldestTs = data.oldest_ts;
+                storeNewestTs = data.newest_ts;
+                // Keep the Buckets clock badge/limits live without clobbering edits
+                // (populateClockDefaults only fills empty fields).
+                populateClockDefaults();
             } catch (err) {
-                // A background 4s poll must not commandeer the shared error banner:
-                // it would linger after recovery and clobber a real frame-load
-                // error. Leave the last-known badges (frozen numbers are the
-                // signal), and any true outage still surfaces on a frame load/clear.
                 console.warn('stats poll failed:', err);
             }
         }
 
-        // ---- analysis status (offline oracle sweep) ----
-
-        // Polled on the same cadence as pollStats (see the shared setInterval
-        // below). The progress badge always reflects the SELECTED analyzer's
-        // persisted coverage (summaries[selected] / lastStoreCount from the stats
-        // poll) — not the running job's own total, which for a stateless oracle
-        // like YOLO is just its shrinking TODO count, not a stable denominator —
-        // plus an inline note when a sweep (for any analyzer) is actually running.
+        // ================= analysis status poll (shared) =================
         async function pollAnalysisStatus() {
             try {
                 const res = await fetch('/api/analysis/status');
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
+                analysisStatus = data;
 
-                analysisRunning = !!data.running;
-                analysisRunBtn.disabled = analysisRunning;
-                analysisCancelBtn.disabled = !analysisRunning;
+                renderQueuePanel(data);
+                renderCoverage(data);
+                updateTuningStatusBadges(data);
 
-                const selected = analyzerSelect.value;
-                const summary = (data.summaries && data.summaries[selected]) || { analyzed: 0, present: 0 };
-                const label = ANALYZER_LABELS[selected] || selected;
-                const storeCount = typeof lastStoreCount === 'number' ? lastStoreCount : '—';
-                let text = `${label}: ${summary.analyzed}/${storeCount} analyzed · ${summary.present} present`;
-                if (analysisRunning) {
-                    const runningLabel = ANALYZER_LABELS[data.analyzer] || data.analyzer;
-                    text += ` — running ${runningLabel} ${data.done}/${data.total}`;
-                }
-                analysisProgressBadge.textContent = text;
-
-                // A fatal sweep error is real application state (not a fetch
-                // failure), so — unlike the catch below — it DOES surface, but
-                // into its own inline slot rather than the shared #error banner.
                 analysisErrorEl.textContent = data.error ? `Last analysis run failed: ${data.error}` : '';
                 analysisErrorEl.classList.toggle('hidden', !data.error);
 
-                // Tuning reruns share this SAME job slot (one analysis-or-tuning
-                // run at a time — see POST /api/tuning/rerun's 409), so its Run
-                // buttons ride the same `running` flag rather than a separate poll.
-                tuningRunBaselineBtn.disabled = analysisRunning;
-                tuningRunCandidateBtn.disabled = analysisRunning;
-                if (analysisRunning && typeof data.analyzer === 'string' && data.analyzer.startsWith('mog2:')) {
-                    tuningProgressBadge.textContent = `Tuning: running ${data.analyzer} — ${data.done}/${data.total}`;
-                } else if (analysisRunning) {
-                    const runningLabel = ANALYZER_LABELS[data.analyzer] || data.analyzer;
-                    tuningProgressBadge.textContent = `Tuning: blocked — ${runningLabel} sweep running`;
-                } else {
-                    tuningProgressBadge.textContent = 'Tuning: idle';
+                // A job just FINISHED (the most-recent history record changed) — refresh
+                // the window-scoped views so a drained sweep's verdicts show up without a
+                // manual click. Skip the very first poll (nothing changed yet).
+                const top = (data.history && data.history[0]) ? JSON.stringify(data.history[0]) : null;
+                if (top !== lastHistoryTop) {
+                    const first = lastHistoryTop === undefined;
+                    lastHistoryTop = top;
+                    if (!first && top !== null && route === 'motion') {
+                        loadTuningCompare();
+                        loadTimeline();
+                        loadVisits();
+                    }
                 }
-                // A run (tuning or oracle) just finished — refresh the compare
-                // view so a completed baseline/candidate rerun shows up without
-                // requiring a manual "Refresh compare" click.
-                if (tuningPrevRunning && !analysisRunning) {
-                    loadTuningCompare();
-                }
-                tuningPrevRunning = analysisRunning;
             } catch (err) {
-                // Same discipline as pollStats: a failed background poll leaves
-                // the last-known badge/button state rather than clobbering the
-                // shared error banner.
                 console.warn('analysis status poll failed:', err);
             }
         }
 
-        // ---- MOG2 tuning panel ----
-        // Re-runs the shared MotionGate offline with adjustable params
-        // (baseline vs. candidate) and diffs both against the oracle picked in
-        // the Oracle select above. See
-        // docs/specs/2026-07-10-motion-gate-diagnostic.md.
+        // ================= START view =================
+        collectorToggleBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                collectorToggleBtn.disabled = true;
+                const endpoint = collectorRunning ? '/api/collector/stop' : '/api/collector/start';
+                const res = await fetch(endpoint, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Collector toggle failed: ${err.message}`);
+            } finally {
+                await pollStats();
+                collectorToggleBtn.disabled = false;
+            }
+        });
 
-        // The six params speak the edge's OWN vocabulary end to end — the same
-        // keys GET /api/edge/config returns and POST /api/tuning/rerun expects —
-        // so a config fetched from the Pi round-trips straight into a rerun body
-        // with no renaming.
-        const TUNING_PARAM_KEYS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
+        motionOnlyToggle.addEventListener('change', async () => {
+            const wanted = motionOnlyToggle.checked;
+            try {
+                clearError();
+                const res = await fetch('/api/collector/motion-only', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ motion_only: wanted }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                motionOnlyToggle.checked = !wanted;   // revert on failure
+                showError(`Set motion-only failed: ${err.message}`);
+            } finally {
+                await pollStats();
+            }
+        });
 
+        resumeBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                resumeBtn.disabled = true;
+                const res = await fetch('/api/collector/start', { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Resume failed: ${err.message}`);
+            } finally {
+                await pollStats();
+                resumeBtn.disabled = false;
+            }
+        });
+
+        clearBtn.addEventListener('click', async () => {
+            if (!confirm('Clear all collected frames, verdicts, and buckets? This cannot be undone.')) return;
+            try {
+                clearError();
+                clearBtn.disabled = true;
+                const res = await fetch('/api/clear', { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                // A full clear reuses rowids from 1, so any stale scope/selection would
+                // re-apply an old id window to brand-new frames. Reset every id-keyed bit.
+                activeScope = null;
+                drillScope = null;
+                motionScopeSelect.value = '';
+                viewerScope = null;
+                clearPendingSelection();
+                viewerGrid.innerHTML = '';
+                viewerTiles.clear();
+                viewerEmpty.classList.remove('hidden');
+                await loadGroups();
+                if (route === 'motion') reloadMotionView();
+                await pollStats();
+            } catch (err) {
+                showError(`Clear failed: ${err.message}`);
+            } finally {
+                clearBtn.disabled = false;
+            }
+        });
+
+        // ================= BUCKETS view: clock pickers =================
+        function populateClockDefaults() {
+            const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
+            storeRangeBadge.textContent = hasRange
+                ? `Store: ${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
+                : 'Store: empty';
+            loadWindowBtn.disabled = !hasRange;
+            if (!hasRange) return;
+            const minD = dateInputValue(storeOldestTs);
+            const maxD = dateInputValue(storeNewestTs);
+            startDateEl.min = minD; startDateEl.max = maxD;
+            endDateEl.min = minD; endDateEl.max = maxD;
+            if (!startDateEl.value) {
+                startDateEl.value = minD;
+                startTimeEl.value = String(Math.floor(new Date(storeOldestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS);
+            }
+            if (!endDateEl.value) {
+                endDateEl.value = maxD;
+                // Default to the 3 h block CONTAINING the newest frame (floor, like the
+                // start). The end bound is inclusive-through-end-of-block (see the load
+                // handler's + CLOCK_STEP_HOURS), so this block covers the newest frame
+                // even when it lands late in the block (e.g. newest 23:43 → 21:00 block
+                // → end_ts 24:00). ceil could round to an invalid "24:00" option and,
+                // once clamped to 21:00 as an exact instant, silently exclude the last
+                // hours of the store — the most recent frames you usually want to bucket.
+                const eh = Math.floor(new Date(storeNewestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS;
+                endTimeEl.value = String(eh);
+            }
+        }
+
+        loadWindowBtn.addEventListener('click', async () => {
+            // The clock is a coarse 3 h-block era selector: the start bound is the block
+            // start, the end bound is the END of the selected block (+ CLOCK_STEP_HOURS),
+            // so a window "through the 21:00 block" reaches 24:00 and includes frames
+            // after 21:00 that no 3 h option could otherwise select (resolve clamps the
+            // id to the actual last frame ≤ that instant). hour+3 = 24 correctly rolls to
+            // next-day 00:00 via the Date constructor.
+            const s = tsFromControls(startDateEl.value, Number(startTimeEl.value));
+            const e = tsFromControls(endDateEl.value, Number(endTimeEl.value) + CLOCK_STEP_HOURS);
+            if (s == null || e == null) { showError('Pick a start and end date.'); return; }
+            const lo = Math.min(s, e), hi = Math.max(s, e);
+            try {
+                clearError();
+                const params = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi) });
+                const res = await fetch('/api/frames/resolve?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (data.since_id == null || data.until_id == null) {
+                    showError('No frames in that time window — widen the clock range.');
+                    return;
+                }
+                viewerScope = { since_id: data.since_id, until_id: data.until_id };
+                viewerTotalCount = null;
+                viewerReadOnly = false;
+                clearPendingSelection();
+                setViewerMode();
+                loadViewer(true);
+                refreshViewerTotal();  // window's total, for the "All frames" badge
+            } catch (err) {
+                showError(`Resolve window failed: ${err.message}`);
+            }
+        });
+
+        // ================= BUCKETS view: density + grid =================
+        densityModeEl.addEventListener('change', () => {
+            // The rate input drives both decimation modes ("Per minute"/"Per hour"); hide
+            // it only for "All frames", and relabel it to match the selected unit.
+            perMinGroup.classList.toggle('hidden', densityModeEl.value === 'all');
+            perMinLabel.textContent = densityModeEl.value === 'hour' ? 'Frames / hour' : 'Frames / min';
+            loadViewer(true);
+        });
+        // Reload on `input` (fires while typing AND on the spinner), not `change` (which
+        // only fires on blur/Enter — so a typed rate looked like it did nothing). Debounced
+        // so a multi-digit value doesn't fetch + re-render the whole grid on every keystroke.
+        let sampleReloadTimer = null;
+        perMinEl.addEventListener('input', () => {
+            if (densityModeEl.value === 'all') return;
+            clearTimeout(sampleReloadTimer);
+            sampleReloadTimer = setTimeout(() => loadViewer(true), 250);
+        });
+
+        function setViewerMode() {
+            pickToolbar.classList.toggle('hidden', viewerReadOnly);
+            viewerReadonlyNote.classList.toggle('hidden', !viewerReadOnly);
+        }
+
+        // "All frames" badge: the window's TOTAL frame count (paging shows a subset) plus
+        // the page number — so it carries a count like the decimation modes do. The total
+        // is unknown until refreshViewerTotal resolves, so show just the page until then.
+        function updateAllFramesBadge() {
+            if (!viewerScope || densityModeEl.value !== 'all') return;
+            const total = viewerTotalCount != null ? `${viewerTotalCount} frames · ` : '';
+            viewerInfoBadge.textContent = `${total}page ${viewerPageIndex + 1}`;
+        }
+
+        // Fetch the loaded window's total frame count (for the "All frames" badge). A
+        // saved-bucket View already knows its count, so it seeds viewerTotalCount directly
+        // and skips this; the clock-loaded window fetches once via /api/range/count.
+        async function refreshViewerTotal() {
+            if (!viewerScope) { viewerTotalCount = null; return; }
+            const scope = viewerScope;
+            try {
+                const params = new URLSearchParams();
+                addBounds(params, scope.since_id, scope.until_id);
+                const res = await fetch('/api/range/count?' + params.toString());
+                if (!res.ok) return;
+                const data = await res.json();
+                if (viewerScope !== scope) return;  // window changed while in flight
+                viewerTotalCount = data.count;
+                updateAllFramesBadge();
+            } catch (err) { /* leave the count off the badge on failure */ }
+        }
+
+        // Clear the loaded window: reset the viewer to its empty state so the tall image
+        // grid stops pushing the saved-buckets list down. Leaves the clock pickers as-is.
+        function clearViewer() {
+            viewerScope = null;
+            viewerTotalCount = null;
+            viewerReadOnly = false;
+            clearPendingSelection();
+            setViewerMode();
+            loadViewer(true);   // null scope → empty state, clears the grid, hides the pager
+            viewerInfoBadge.textContent = '—';
+            window.scrollTo(0, 0);
+        }
+        clearWindowBtn.addEventListener('click', clearViewer);
+
+        function loadViewer(reset) {
+            if (!viewerScope) {
+                viewerEmpty.classList.remove('hidden');
+                viewerGrid.innerHTML = '';
+                viewerTiles.clear();
+                viewerPager.classList.add('hidden');
+                return;
+            }
+            if (densityModeEl.value !== 'all') {
+                viewerPager.classList.add('hidden');
+                loadViewerSample();
+            } else {
+                viewerPager.classList.remove('hidden');
+                if (reset) { viewerCursors = [null]; viewerPageIndex = 0; }
+                loadViewerPage(viewerPageIndex);
+            }
+        }
+
+        async function loadViewerSample() {
+            const seq = ++viewerSeq;
+            // "Per hour" and "Per minute" share this path and the rate input; they differ
+            // only in the unit. "x per unit" is a TRUE time rate: ask the server for one
+            // frame every unitMs/x of recv_ts. Time-bucketing (not index decimation)
+            // means the spacing holds regardless of the capture fps, how wide the
+            // (mostly-empty) clock window is, or collector gaps.
+            const perHour = densityModeEl.value === 'hour';
+            const unitMs = perHour ? 3600000 : 60000;
+            const unit = perHour ? 'hr' : 'min';
+            const x = Math.max(1, Number(perMinEl.value) || 1);
+            const perMs = Math.max(1, Math.round(unitMs / x));
+            try {
+                clearError();
+                const params = new URLSearchParams({ per_ms: String(perMs) });
+                addBounds(params, viewerScope.since_id, viewerScope.until_id);
+                const res = await fetch('/api/frames/sample?' + params.toString());
+                if (seq !== viewerSeq) return;
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== viewerSeq) return;
+                const frames = data.frames || [];
+                renderViewerFrames(frames);
+                viewerInfoBadge.textContent = `${frames.length} frames shown (~${x}/${unit})`;
+            } catch (err) {
+                if (seq === viewerSeq) showError(`Load sample failed: ${err.message}`);
+            }
+        }
+
+        async function loadViewerPage(targetIndex) {
+            const seq = ++viewerSeq;
+            viewerLoading = true;
+            updateViewerPager();
+            try {
+                clearError();
+                const params = new URLSearchParams({ limit: String(VIEWER_PAGE_SIZE), motion: 'all', order: 'time' });
+                addBounds(params, viewerScope.since_id, viewerScope.until_id);
+                const cursor = viewerCursors[targetIndex];
+                if (cursor != null) params.set('cursor', String(cursor));
+                const res = await fetch('/api/frames?' + params.toString());
+                if (seq !== viewerSeq) return;
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== viewerSeq) return;
+                const frames = data.frames || [];
+                renderViewerFrames(frames);
+                viewerPageIndex = targetIndex;
+                viewerCursors[viewerPageIndex + 1] = data.next_cursor != null ? data.next_cursor : null;
+                updateAllFramesBadge();
+                window.scrollTo(0, 0);
+            } catch (err) {
+                if (seq === viewerSeq) showError(`Load frames failed: ${err.message}`);
+            } finally {
+                if (seq === viewerSeq) { viewerLoading = false; updateViewerPager(); }
+            }
+        }
+
+        function updateViewerPager() {
+            viewerPageLabel.textContent = `Page ${viewerPageIndex + 1}`;
+            viewerPrevBtn.disabled = viewerLoading || viewerPageIndex === 0;
+            viewerNextBtn.disabled = viewerLoading || viewerCursors[viewerPageIndex + 1] == null;
+        }
+        viewerPrevBtn.addEventListener('click', () => {
+            if (viewerLoading || viewerPageIndex === 0) return;
+            loadViewerPage(viewerPageIndex - 1);
+        });
+        viewerNextBtn.addEventListener('click', () => {
+            if (viewerLoading || viewerCursors[viewerPageIndex + 1] == null) return;
+            loadViewerPage(viewerPageIndex + 1);
+        });
+
+        function renderViewerFrames(frames) {
+            viewerTiles.clear();
+            viewerGrid.innerHTML = '';
+            viewerEmpty.classList.toggle('hidden', frames.length > 0);
+            for (const f of frames) viewerGrid.appendChild(viewerThumb(f));
+            applyViewerHighlights();
+        }
+
+        function viewerThumb(frame) {
+            const tile = document.createElement('div');
+            tile.className = 'tile viewer-tile' + (frame.motion ? ' motion' : '');
+            tile.dataset.id = String(frame.id);
+
+            const img = document.createElement('img');
+            img.src = frame.url;
+            img.loading = 'lazy';
+            img.alt = 'Frame';
+            tile.appendChild(img);
+
+            const cap = document.createElement('div');
+            cap.className = 'caption';
+            const t = document.createElement('span');
+            t.textContent = formatTime(frame.recv_ts);
+            cap.appendChild(t);
+            tile.appendChild(cap);
+
+            if (!viewerReadOnly) tile.addEventListener('click', () => selectViewerFrame(frame));
+            viewerTiles.set(Number(frame.id), tile);
+            return tile;
+        }
+
+        // Click-to-pick: first click sets the start; second sets the end; a third
+        // (both already set) restarts from the newly-clicked frame.
+        function selectViewerFrame(frame) {
+            if (viewerReadOnly) return;
+            if (pickStartId == null || (pickStartId != null && pickEndId != null)) {
+                pickStartId = frame.id; pickStartTs = frame.recv_ts;
+                pickEndId = null; pickEndTs = null;
+            } else {
+                pickEndId = frame.id; pickEndTs = frame.recv_ts;
+            }
+            updatePickReadout();
+            applyViewerHighlights();
+        }
+
+        function applyViewerHighlights() {
+            let lo = null, hi = null;
+            if (pickStartId != null && pickEndId != null) {
+                lo = Math.min(pickStartId, pickEndId);
+                hi = Math.max(pickStartId, pickEndId);
+            }
+            for (const [id, tile] of viewerTiles) {
+                tile.classList.toggle('pick-start', id === pickStartId);
+                tile.classList.toggle('pick-end', id === pickEndId);
+                tile.classList.toggle('in-range', lo != null && id >= lo && id <= hi);
+            }
+        }
+
+        function updatePickReadout() {
+            pickStartTsEl.textContent = pickStartTs != null ? formatTime(pickStartTs) : '—';
+            pickEndTsEl.textContent = pickEndTs != null ? formatTime(pickEndTs) : '—';
+            bucketSaveBtn.disabled = !(pickStartId != null && pickEndId != null && bucketNameInput.value.trim() !== '');
+            refreshViewerRangeCount();
+        }
+
+        let rangeCountSeq = 0;
+        async function refreshViewerRangeCount() {
+            if (pickStartId == null && pickEndId == null) {
+                viewerRangeCountEl.textContent = 'Frames in range: —';
+                return;
+            }
+            const seq = ++rangeCountSeq;
+            const lo = pickStartId != null && pickEndId != null ? Math.min(pickStartId, pickEndId)
+                     : (pickStartId != null ? pickStartId : null);
+            const hi = pickStartId != null && pickEndId != null ? Math.max(pickStartId, pickEndId)
+                     : (pickEndId != null ? pickEndId : null);
+            try {
+                const params = new URLSearchParams();
+                addBounds(params, lo, hi);
+                const res = await fetch('/api/range/count?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== rangeCountSeq) return;
+                viewerRangeCountEl.textContent = `Frames in range: ${data.count}`;
+            } catch (err) {
+                if (seq !== rangeCountSeq) return;
+                viewerRangeCountEl.textContent = 'Frames in range: —';
+            }
+        }
+
+        function clearPendingSelection() {
+            pickStartId = pickStartTs = pickEndId = pickEndTs = null;
+            bucketNameInput.value = '';
+            updatePickReadout();
+            applyViewerHighlights();
+        }
+
+        bucketNameInput.addEventListener('input', () => {
+            bucketSaveBtn.disabled = !(pickStartId != null && pickEndId != null && bucketNameInput.value.trim() !== '');
+        });
+        pickClearBtn.addEventListener('click', clearPendingSelection);
+
+        bucketSaveBtn.addEventListener('click', async () => {
+            const name = bucketNameInput.value.trim();
+            if (!name || pickStartId == null || pickEndId == null) return;
+            try {
+                clearError();
+                bucketSaveBtn.disabled = true;
+                const res = await fetch('/api/groups', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, start_id: pickStartId, end_id: pickEndId }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                await loadGroups();
+                clearPendingSelection();
+            } catch (err) {
+                showError(`Save bucket failed: ${err.message}`);
+            } finally {
+                updatePickReadout();
+            }
+        });
+
+        // View a saved bucket read-only over its stored ids.
+        function viewSavedBucket(g) {
+            viewerScope = { since_id: g.start_id, until_id: g.end_id };
+            viewerTotalCount = g.count;  // known from the group; skips the /api/range/count fetch
+            viewerReadOnly = true;
+            clearPendingSelection();
+            viewerReadonlyNote.innerHTML = '';
+            const label = document.createElement('span');
+            label.textContent = `Viewing bucket "${g.name}" · ${g.count} frames · ${formatSpan(g.start_ts, g.end_ts)} (read-only). `;
+            const exit = document.createElement('button');
+            exit.type = 'button';
+            exit.className = 'btn-secondary btn-tiny';
+            exit.textContent = 'Exit view';
+            exit.addEventListener('click', () => { viewerReadOnly = false; setViewerMode(); loadViewer(true); });
+            viewerReadonlyNote.append(label, exit);
+            setViewerMode();
+            loadViewer(true);
+            if (location.hash.slice(1) !== 'buckets') location.hash = 'buckets';
+            window.scrollTo(0, 0);
+        }
+
+        // ================= groups / buckets list =================
+        async function loadGroups() {
+            try {
+                const res = await fetch('/api/groups');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                groups = data.groups || [];
+                renderBucketsList();
+                renderMotionScopeSelect();
+                updateMotionScopeBadge();
+            } catch (err) {
+                showError(`Failed to load buckets: ${err.message}`);
+            }
+        }
+
+        function renderBucketsList() {
+            bucketsListEl.innerHTML = '';
+            if (groups.length === 0) {
+                const note = document.createElement('div');
+                note.className = 'groups-empty';
+                note.textContent = 'No saved buckets yet — load a window above, click a start and end frame, name it, and Save.';
+                bucketsListEl.appendChild(note);
+                return;
+            }
+            for (const g of groups) {
+                const row = document.createElement('div');
+                row.className = 'group-row';
+                const info = document.createElement('span');
+                info.textContent = `${g.name} · ${g.count} frames · ${formatSpan(g.start_ts, g.end_ts)} · ids ${g.start_id}–${g.end_id}`;
+                const actions = document.createElement('div');
+                actions.className = 'group-actions';
+                const viewBtn = document.createElement('button');
+                viewBtn.type = 'button';
+                viewBtn.className = 'btn-secondary btn-tiny';
+                viewBtn.textContent = 'View';
+                viewBtn.addEventListener('click', () => viewSavedBucket(g));
+                const del = document.createElement('button');
+                del.type = 'button';
+                del.className = 'btn-danger btn-tiny';
+                del.textContent = 'Delete';
+                del.addEventListener('click', () => deleteBucket(g.id));
+                actions.append(viewBtn, del);
+                row.append(info, actions);
+                bucketsListEl.appendChild(row);
+            }
+        }
+
+        async function deleteBucket(groupId) {
+            try {
+                clearError();
+                const wasActive = motionScopeSelect.value === String(groupId);
+                const res = await fetch('/api/groups/' + encodeURIComponent(groupId), { method: 'DELETE' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                await loadGroups();
+                if (wasActive) {
+                    motionScopeSelect.value = '';
+                    onMotionScopeChange();
+                }
+            } catch (err) {
+                showError(`Delete bucket failed: ${err.message}`);
+            }
+        }
+
+        // ================= MOTION view: scope picker =================
+        function renderMotionScopeSelect() {
+            const prev = motionScopeSelect.value;
+            motionScopeSelect.innerHTML = '';
+            const allOpt = document.createElement('option');
+            allOpt.value = '';
+            allOpt.textContent = 'All frames';
+            motionScopeSelect.appendChild(allOpt);
+            for (const g of groups) {
+                const opt = document.createElement('option');
+                opt.value = String(g.id);
+                opt.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames`;
+                motionScopeSelect.appendChild(opt);
+            }
+            motionScopeSelect.value = [...motionScopeSelect.options].some(o => o.value === prev) ? prev : '';
+            // Keep activeScope consistent with the (possibly reset) selection.
+            const g = motionScopeSelect.value ? groups.find(x => String(x.id) === motionScopeSelect.value) : null;
+            activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
+        }
+
+        function updateMotionScopeBadge() {
+            let label = 'All frames';
+            if (activeScope) {
+                const g = groups.find(x => String(x.id) === motionScopeSelect.value);
+                label = g ? g.name : `ids ${activeScope.since_id}–${activeScope.until_id}`;
+            }
+            const text = `Scope: ${label}`;
+            motionScopeBadge.textContent = text;
+            motionScopeBadge.classList.toggle('warn', !!activeScope);
+            tuningScopeBadgeEl.textContent = text;
+            tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
+        }
+
+        function effectiveWindow() {
+            const w = drillScope || activeScope;
+            return w ? { since_id: w.since_id, until_id: w.until_id } : { since_id: null, until_id: null };
+        }
+
+        function onMotionScopeChange() {
+            const val = motionScopeSelect.value;
+            const g = val ? groups.find(x => String(x.id) === val) : null;
+            activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
+            drillScope = null;
+            timelineResetBtn.classList.add('hidden');
+            updateMotionScopeBadge();
+            reloadMotionView();
+        }
+        motionScopeSelect.addEventListener('change', onMotionScopeChange);
+
+        motionOracleSelect.addEventListener('change', () => {
+            loadTimeline();
+            loadVisits();
+            loadTuningCompare();
+        });
+
+        function reloadMotionView() {
+            updateMotionScopeBadge();
+            renderCoverage(analysisStatus);
+            loadTimeline();
+            loadVisits();
+            loadTuningCompare();
+        }
+
+        // ================= MOTION view: coverage + enqueue =================
+        function renderCoverage(status) {
+            const summaries = (status && status.summaries) || {};
+            for (const a of ANALYZERS) {
+                const s = summaries[a.id] || { analyzed: 0, present: 0 };
+                const N = typeof lastStoreCount === 'number' ? lastStoreCount : '—';
+                const el = document.getElementById('cov-' + a.id);
+                if (el) el.textContent = `${a.label}: ${s.analyzed}/${N} analyzed · ${s.present} present (whole store)`;
+            }
+        }
+
+        async function enqueueOracle(oracle) {
+            try {
+                clearError();
+                enqueueWarnEl.classList.add('hidden');
+                const body = { analyzer: oracle, reanalyze: reanalyzeCheckbox.checked };
+                if (activeScope) { body.since_id = activeScope.since_id; body.until_id = activeScope.until_id; }
+                const res = await fetch('/api/analysis/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                let msg = data.deduped
+                    ? `${kindLabel(oracle)} already queued (position ${data.position}).`
+                    : `${kindLabel(oracle)} enqueued (position ${data.position}).`;
+                if (data.motion_only_overlap) {
+                    msg += ' Window overlaps a motion-only span — BSUV/MOG2 verdicts across it are unreliable (arbitrary time gaps break the windowed sweep).';
+                }
+                enqueueWarnEl.textContent = msg;
+                enqueueWarnEl.classList.remove('hidden');
+            } catch (err) {
+                showError(`Enqueue failed: ${err.message}`);
+            } finally {
+                await pollAnalysisStatus();
+            }
+        }
+
+        // ================= MOTION view: queue panel =================
+        function renderQueuePanel(status) {
+            const running = !!status.running;
+            const queue = status.queue || [];
+            const history = status.history || [];
+
+            queueCancelBtn.disabled = !running;
+            queueClearBtn.disabled = queue.length === 0;
+            queueStopAllBtn.disabled = !running && queue.length === 0;
+
+            if (running) {
+                queueRunningEl.textContent = `Running ${kindLabel(status.analyzer)} — ${status.done}/${status.total} · ${windowLabel(status.since_id, status.until_id)}`;
+            } else {
+                queueRunningEl.textContent = 'Idle.';
+            }
+
+            queuePendingEl.innerHTML = '';
+            if (queue.length) {
+                const h = document.createElement('div');
+                h.className = 'queue-heading';
+                h.textContent = `Pending (${queue.length})`;
+                queuePendingEl.appendChild(h);
+                const list = document.createElement('div');
+                list.className = 'queue-list';
+                queue.forEach((job, i) => {
+                    const item = document.createElement('div');
+                    item.className = 'queue-item';
+                    const left = document.createElement('span');
+                    left.textContent = `${i + 1}. ${kindLabel(job.kind)}${job.reanalyze ? ' (re-analyze)' : ''}`;
+                    const right = document.createElement('span');
+                    right.textContent = windowLabel(job.since_id, job.until_id);
+                    item.append(left, right);
+                    list.appendChild(item);
+                });
+                queuePendingEl.appendChild(list);
+            }
+
+            queueHistoryEl.innerHTML = '';
+            if (history.length) {
+                const h = document.createElement('div');
+                h.className = 'queue-heading';
+                h.textContent = 'History (most recent first)';
+                queueHistoryEl.appendChild(h);
+                const list = document.createElement('div');
+                list.className = 'queue-list';
+                for (const rec of history) {
+                    const item = document.createElement('div');
+                    item.className = 'queue-item';
+                    const left = document.createElement('span');
+                    left.textContent = `${kindLabel(rec.kind)} · ${windowLabel(rec.since_id, rec.until_id)}`;
+                    const right = document.createElement('span');
+                    const stateClass = rec.state === 'done' ? 'state-done' : (rec.state === 'failed' ? 'state-failed' : 'state-canceled');
+                    let stateText = rec.state;
+                    if (rec.state === 'done') stateText = `done (${rec.done} verdicts, ${rec.present} present)`;
+                    else if (rec.state === 'canceled') stateText = `canceled (${rec.done} done)`;
+                    else if (rec.state === 'failed') stateText = `failed: ${rec.error || 'error'}`;
+                    right.innerHTML = `<span class="${stateClass}">${escapeHtml(stateText)}</span>`;
+                    item.append(left, right);
+                    list.appendChild(item);
+                }
+                queueHistoryEl.appendChild(list);
+            }
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        async function queueControl(endpoint, label) {
+            try {
+                clearError();
+                const res = await fetch(endpoint, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const status = await res.json();
+                renderQueuePanel(status);
+            } catch (err) {
+                showError(`${label} failed: ${err.message}`);
+            } finally {
+                await pollAnalysisStatus();
+            }
+        }
+        queueCancelBtn.addEventListener('click', () => queueControl('/api/analysis/cancel', 'Cancel'));
+        queueClearBtn.addEventListener('click', () => queueControl('/api/analysis/queue/clear', 'Clear pending'));
+        queueStopAllBtn.addEventListener('click', () => queueControl('/api/analysis/queue/stop-all', 'Stop all'));
+
+        // ================= MOTION view: density timeline =================
+        async function loadTimeline() {
+            const win = effectiveWindow();
+            const oracle = motionOracleSelect.value;
+            const bins = Math.max(1, parseInt(timelineBinsEl.value, 10) || 120);
+            timelineScopeBadge.textContent = `Window: ${windowLabel(win.since_id, win.until_id)}${drillScope ? ' (drilled)' : ''}`;
+            try {
+                const params = new URLSearchParams({ oracle, bins: String(bins) });
+                addBounds(params, win.since_id, win.until_id);
+                const res = await fetch('/api/timeline?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                renderTimeline(data.bins || [], data.motion_only_spans || []);
+                renderMotionOnlyBanner(data.motion_only_spans || []);
+            } catch (err) {
+                showError(`Timeline failed: ${err.message}`);
+            }
+        }
+
+        function renderTimeline(bins, spans) {
+            timelineStripEl.innerHTML = '';
+            timelineStripEl.classList.toggle('has-motion-only', spans.length > 0);
+            timelineEmptyEl.classList.toggle('hidden', bins.length > 0);
+            if (!bins.length) return;
+
+            let maxMissed = 0, maxFalse = 0, maxTotal = 0;
+            for (const b of bins) {
+                if (b.missed > maxMissed) maxMissed = b.missed;
+                if (b.false > maxFalse) maxFalse = b.false;
+                if (b.total > maxTotal) maxTotal = b.total;
+            }
+            for (const b of bins) {
+                const cell = document.createElement('div');
+                cell.className = 'timeline-cell';
+                let bg;
+                if (b.missed > 0) {
+                    bg = `rgba(198,40,40,${0.25 + 0.75 * (maxMissed ? b.missed / maxMissed : 1)})`;
+                } else if (b.false > 0) {
+                    bg = `rgba(249,168,37,${0.25 + 0.75 * (maxFalse ? b.false / maxFalse : 1)})`;
+                } else if (b.total > 0) {
+                    bg = `rgba(120,144,156,${0.15 + 0.55 * (maxTotal ? b.total / maxTotal : 1)})`;
+                } else {
+                    bg = 'transparent';
+                }
+                cell.style.background = bg;
+                cell.title = `${formatTime(b.t0)} → ${formatTime(b.t1)}\n${b.total} frames · ${b.motion} motion\nmissed ${b.missed} · false ${b.false} · present ${b.present}`;
+                cell.addEventListener('click', () => drillToBin(b));
+                timelineStripEl.appendChild(cell);
+            }
+        }
+
+        async function drillToBin(bin) {
+            try {
+                const params = new URLSearchParams({ start_ts: String(bin.t0), end_ts: String(bin.t1) });
+                const res = await fetch('/api/frames/resolve?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (data.since_id == null || data.until_id == null) return;
+                drillScope = { since_id: data.since_id, until_id: data.until_id };
+                timelineResetBtn.classList.remove('hidden');
+                loadTimeline();
+                loadVisits();
+            } catch (err) {
+                showError(`Drill failed: ${err.message}`);
+            }
+        }
+
+        timelineReloadBtn.addEventListener('click', loadTimeline);
+        timelineResetBtn.addEventListener('click', () => {
+            drillScope = null;
+            timelineResetBtn.classList.add('hidden');
+            loadTimeline();
+            loadVisits();
+        });
+
+        function renderMotionOnlyBanner(spans) {
+            if (spans.length) {
+                motionOnlyBanner.textContent = 'Misses unmeasurable across part of this window — some of it was captured motion-only. The "Missed" tab reads as empty there whether or not a cat was present, and BSUV/MOG2 verdicts across those spans are unreliable.';
+                motionOnlyBanner.classList.remove('hidden');
+            } else {
+                motionOnlyBanner.classList.add('hidden');
+            }
+        }
+
+        // ================= MOTION view: visit inbox =================
+        function setInboxMode(mode) {
+            inboxMode = mode;
+            for (const t of document.querySelectorAll('.tab')) {
+                t.classList.toggle('active', t.dataset.mode === mode);
+            }
+            loadVisits();
+        }
+        for (const t of document.querySelectorAll('.tab')) {
+            t.addEventListener('click', () => setInboxMode(t.dataset.mode));
+        }
+
+        async function loadVisits() {
+            const win = effectiveWindow();
+            const oracle = motionOracleSelect.value;
+            try {
+                const params = new URLSearchParams({ oracle, mode: inboxMode });
+                addBounds(params, win.since_id, win.until_id);
+                const res = await fetch('/api/visits?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                visits = data.visits || [];
+                inboxMotionOnlySpans = data.motion_only_spans || [];
+                visitIndex = 0;
+                renderVisit();
+            } catch (err) {
+                showError(`Visits failed: ${err.message}`);
+            }
+        }
+
+        function renderVisit() {
+            // Misses can read as a reassuring empty when part of the window was
+            // motion-only — flag it so an empty "Missed" tab isn't mistaken for "no misses".
+            const missesUnreliable = inboxMode === 'missed' && inboxMotionOnlySpans.length > 0;
+            inboxMissesNote.classList.toggle('hidden', !missesUnreliable);
+            if (missesUnreliable) {
+                inboxMissesNote.textContent = 'This window includes a motion-only span, so genuine misses there were never saved — treat an empty or short list as unmeasurable, not clean.';
+            }
+
+            if (!visits.length) {
+                inboxEmptyEl.classList.remove('hidden');
+                inboxRepEl.innerHTML = '';
+                inboxMetaEl.textContent = '';
+                inboxFilmstripEl.innerHTML = '';
+                inboxProgressEl.textContent = '0 / 0';
+                inboxPrevBtn.disabled = true;
+                inboxNextBtn.disabled = true;
+                return;
+            }
+            inboxEmptyEl.classList.add('hidden');
+            visitIndex = Math.max(0, Math.min(visitIndex, visits.length - 1));
+            const v = visits[visitIndex];
+            inboxProgressEl.textContent = `${visitIndex + 1} / ${visits.length}`;
+            inboxPrevBtn.disabled = visitIndex === 0;
+            inboxNextBtn.disabled = visitIndex >= visits.length - 1;
+
+            inboxRepEl.innerHTML = '';
+            const img = document.createElement('img');
+            img.src = `/media/${v.rep_frame_id}`;
+            img.alt = 'Representative frame';
+            inboxRepEl.appendChild(img);
+
+            let meta = `${formatTime(v.start_ts)} · span ${formatSpan(v.start_ts, v.end_ts)} · ${v.n_frames} frames · present ${v.present_count}`;
+            if (inboxMode === 'missed') {
+                meta += v.caught ? ' · gate caught it (partial)' : ' · WHOLLY MISSED';
+            }
+            inboxMetaEl.innerHTML = (inboxMode === 'missed' && !v.caught)
+                ? escapeHtml(meta).replace('WHOLLY MISSED', '<span class="wholly-missed">WHOLLY MISSED</span>')
+                : escapeHtml(meta);
+
+            loadFilmstrip(v);
+        }
+
+        async function fetchFramesRows(opts) {
+            const p = new URLSearchParams({ order: 'time', motion: 'all', limit: String(opts.limit || 200) });
+            if (opts.since_id != null) p.set('since_id', String(opts.since_id));
+            if (opts.until_id != null) p.set('until_id', String(opts.until_id));
+            const res = await fetch('/api/frames?' + p.toString());
+            if (!res.ok) throw new Error(await errorFromResponse(res));
+            const data = await res.json();
+            return data.frames || [];
+        }
+
+        async function loadFilmstrip(v) {
+            const seq = ++filmSeq;
+            inboxFilmstripEl.innerHTML = '<div class="empty" style="padding:12px;">Loading filmstrip…</div>';
+            try {
+                // Preceding context (warm-up) then the visit's own frames. /api/frames is
+                // newest-first, so reverse each into chronological order.
+                let context = [];
+                if (v.start_id > 1) {
+                    context = await fetchFramesRows({ until_id: v.start_id - 1, limit: CONTEXT_FRAMES });
+                    context.reverse();
+                }
+                const own = (await fetchFramesRows({ since_id: v.start_id, until_id: v.end_id, limit: 500 }));
+                own.reverse();
+                if (seq !== filmSeq) return;
+                inboxFilmstripEl.innerHTML = '';
+                for (const f of context) inboxFilmstripEl.appendChild(filmTile(f, true, v.rep_frame_id));
+                for (const f of own) inboxFilmstripEl.appendChild(filmTile(f, false, v.rep_frame_id));
+            } catch (err) {
+                if (seq === filmSeq) inboxFilmstripEl.innerHTML = '<div class="empty" style="padding:12px;">Filmstrip unavailable.</div>';
+            }
+        }
+
+        function filmTile(frame, isContext, repId) {
+            const tile = document.createElement('div');
+            tile.className = 'film-tile'
+                + (isContext ? ' film-context' : '')
+                + (frame.motion ? ' film-motion' : '')
+                + (frame.id === repId ? ' film-rep' : '');
+            const img = document.createElement('img');
+            img.src = frame.url;
+            img.loading = 'lazy';
+            img.alt = 'Frame';
+            const cap = document.createElement('div');
+            cap.className = 'film-cap';
+            const d = new Date(frame.recv_ts);
+            cap.textContent = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+            tile.append(img, cap);
+            return tile;
+        }
+
+        function moveVisit(delta) {
+            if (!visits.length) return;
+            const next = visitIndex + delta;
+            if (next < 0 || next >= visits.length) return;
+            visitIndex = next;
+            renderVisit();
+        }
+        inboxPrevBtn.addEventListener('click', () => moveVisit(-1));
+        inboxNextBtn.addEventListener('click', () => moveVisit(1));
+
+        // Keyboard-first navigation, only on the Motion view and never while typing.
+        document.addEventListener('keydown', (e) => {
+            if (route !== 'motion') return;
+            const tag = (e.target && e.target.tagName) || '';
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            if (e.key === 'ArrowRight' || e.key === 'j') { moveVisit(1); e.preventDefault(); }
+            else if (e.key === 'ArrowLeft' || e.key === 'k') { moveVisit(-1); e.preventDefault(); }
+        });
+
+        // ================= MOTION view: MOG2 tuning (relocated) =================
         function showTuningError(message) {
             tuningErrorEl.textContent = message;
             tuningErrorEl.classList.remove('hidden');
         }
-
         function clearTuningError() {
             tuningErrorEl.classList.add('hidden');
             tuningErrorEl.textContent = '';
         }
 
-        // Throws (rather than silently coercing) on a blank/non-numeric field so
-        // runTuning can show a clear message before ever hitting the network —
-        // the server validates too, but failing fast here avoids a round trip.
         function getTuningParams() {
             const params = {};
             for (const key of TUNING_PARAM_KEYS) {
@@ -859,7 +2141,6 @@
             }
             return params;
         }
-
         function setTuningParams(params) {
             if (!params) return;
             for (const key of TUNING_PARAM_KEYS) {
@@ -869,10 +2150,6 @@
             }
         }
 
-        // Prefill the six fields from the Pi's live settings. GET /api/edge/config
-        // always answers 200 with a `source` tag ("edge" or "defaults") rather
-        // than erroring when the Pi is unreachable, so a thrown error here means
-        // the compute API itself didn't answer, not just the edge.
         async function loadTuningDefaults() {
             try {
                 const res = await fetch('/api/edge/config');
@@ -898,38 +2175,50 @@
             }
             try {
                 clearTuningError();
-                tuningRunBaselineBtn.disabled = true;
-                tuningRunCandidateBtn.disabled = true;
+                tuningOverlapNoteEl.classList.add('hidden');
                 const body = { slot, params };
-                if (activeScope) {
-                    body.since_id = activeScope.since_id;
-                    body.until_id = activeScope.until_id;
-                }
+                if (activeScope) { body.since_id = activeScope.since_id; body.until_id = activeScope.until_id; }
                 const res = await fetch('/api/tuning/rerun', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body),
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
-                // Remember exactly what was submitted, for the copy-paste line —
-                // NOT whatever is currently in the fields, which may since have
-                // been edited again before the run finishes.
+                const data = await res.json();
                 if (slot === 'candidate') lastCandidateParams = params;
+                let msg = data.deduped ? `${slot} already queued (position ${data.position}).`
+                                       : `${slot} enqueued (position ${data.position}).`;
+                if (data.motion_only_overlap) {
+                    msg += ' Window overlaps a motion-only span — the offline MOG2 re-run assumes contiguous frames, so its verdicts (and the scorecard) are unreliable across it.';
+                }
+                tuningOverlapNoteEl.textContent = msg;
+                tuningOverlapNoteEl.classList.remove('hidden');
             } catch (err) {
-                showTuningError(`Run ${slot} failed: ${err.message}`);
+                showTuningError(`Queue ${slot} failed: ${err.message}`);
             } finally {
-                await pollAnalysisStatus();   // re-derives button disabled state from the true (shared) running flag
+                await pollAnalysisStatus();
             }
         }
-
         tuningRunBaselineBtn.addEventListener('click', () => runTuning('baseline'));
         tuningRunCandidateBtn.addEventListener('click', () => runTuning('candidate'));
         tuningRefreshBtn.addEventListener('click', () => loadTuningCompare());
 
+        function updateTuningStatusBadges(status) {
+            // With the walk-away queue, enqueuing more work while a job runs is allowed,
+            // so the Queue buttons stay enabled — a second request just waits in line.
+            const running = !!status.running;
+            if (running && typeof status.analyzer === 'string' && status.analyzer.startsWith('mog2:')) {
+                tuningProgressBadge.textContent = `Tuning: running ${status.analyzer} — ${status.done}/${status.total}`;
+            } else if (running) {
+                tuningProgressBadge.textContent = `Tuning: ${kindLabel(status.analyzer)} sweep running (a rerun will queue)`;
+            } else {
+                tuningProgressBadge.textContent = 'Tuning: idle';
+            }
+        }
+
         function formatPct(x) {
             return typeof x === 'number' ? (x * 100).toFixed(1) + '%' : '—';
         }
-
         function tuningRow(label, value) {
             const row = document.createElement('div');
             row.className = 'tuning-row';
@@ -940,17 +2229,12 @@
             row.append(l, v);
             return row;
         }
-
-        // Renders one scorecard column. `sc` is either a full scorecard, the
-        // `{needs_rerun: true}` placeholder (that slot hasn't been run yet), or
-        // absent (shouldn't happen for `live`, but stay defensive).
         function tuningCard(label, sc) {
             const card = document.createElement('div');
             card.className = 'tuning-card';
             const h3 = document.createElement('h3');
             h3.textContent = label;
             card.appendChild(h3);
-
             if (!sc) {
                 const p = document.createElement('p');
                 p.className = 'tuning-empty';
@@ -965,26 +2249,20 @@
                 card.appendChild(p);
                 return card;
             }
-
             const recall = sc.recall || {};
             const falseT = sc.false_triggers || {};
             const conf = sc.confidence || {};
             const buckets = sc.area_buckets || {};
-            const visits = sc.visits || {};
-
+            const visitsSc = sc.visits || {};
             card.appendChild(tuningRow('Analyzed', `${sc.analyzed ?? '—'} (${sc.present ?? '—'} present)`));
             card.appendChild(tuningRow('Recall', `${recall.caught ?? '—'}/${sc.present ?? '—'} (${formatPct(recall.rate)})`));
             card.appendChild(tuningRow('Missed', `${recall.missed ?? '—'}`));
             card.appendChild(tuningRow('False triggers', `${falseT.count ?? '—'}`));
             card.appendChild(tuningRow('Miss confidence', `hi ${conf.high ?? 0} / med ${conf.medium ?? 0} / lo ${conf.low ?? 0}`));
             card.appendChild(tuningRow('Area buckets', `<min ${buckets.below_min ?? 0} · ~0 ${buckets.near_zero ?? 0} · >max ${buckets.above_max ?? 0} · in-band ${buckets.in_band ?? 0}`));
-            card.appendChild(tuningRow('Visits', `${visits.caught ?? '—'}/${visits.total ?? '—'} caught (${visits.wholly_missed ?? '—'} wholly missed)`));
+            card.appendChild(tuningRow('Visits', `${visitsSc.caught ?? '—'}/${visitsSc.total ?? '—'} caught (${visitsSc.wholly_missed ?? '—'} wholly missed)`));
             return card;
         }
-
-        // value < 0 → improvement (fewer misses / fewer false triggers) → green;
-        // value > 0 → regression → red; 0 → neutral. Same convention for both
-        // metrics, per the spec ("green = fewer misses, red = more false triggers").
         function deltaSpan(value) {
             const span = document.createElement('span');
             if (typeof value !== 'number') {
@@ -997,7 +2275,6 @@
             span.className = value < 0 ? 'delta-good' : (value > 0 ? 'delta-bad' : 'delta-neutral');
             return span;
         }
-
         function renderTuningCompare(data) {
             tuningCompareEmptyEl.classList.add('hidden');
             tuningCardsEl.innerHTML = '';
@@ -1008,7 +2285,7 @@
             if (data.fidelity) {
                 tuningFidelityEl.textContent = `Fidelity (baseline re-run vs. stored live motion): ${data.fidelity.agree}/${data.fidelity.compared} agree (${formatPct(data.fidelity.rate)})`;
             } else {
-                tuningFidelityEl.textContent = 'Fidelity: run a baseline to check how faithfully the offline re-run reproduces the live gate.';
+                tuningFidelityEl.textContent = 'Fidelity: queue a baseline to check how faithfully the offline re-run reproduces the live gate.';
             }
 
             tuningDeltasEl.innerHTML = '';
@@ -1022,13 +2299,9 @@
                 tuningDeltasEl.appendChild(mid);
                 tuningDeltasEl.appendChild(deltaSpan(data.deltas['false']));
             } else {
-                tuningDeltasEl.textContent = 'Deltas: run both baseline and candidate to see the change.';
+                tuningDeltasEl.textContent = 'Deltas: queue both baseline and candidate to see the change.';
             }
 
-            // Only meaningful when the scorecards actually dropped a warm-up prefix.
-            // A scoped compare passes warmup=0 (the slots were warm-started before
-            // the window), so there's nothing to note — suppress it rather than
-            // claim "First 0 frames excluded".
             const warmup = data.live && typeof data.live.warmup === 'number' ? data.live.warmup : null;
             tuningWarmupNoteEl.textContent = warmup
                 ? `First ${warmup} frames of the store are excluded from every scorecard above (MOG2 warm-up).`
@@ -1041,13 +2314,15 @@
                 tuningCopyRowEl.classList.add('hidden');
             }
         }
-
         async function loadTuningCompare() {
             try {
                 clearTuningError();
-                const oracle = analyzerSelect.value;
+                const oracle = motionOracleSelect.value;
                 const params = new URLSearchParams({ oracle });
-                applyScopeParams(params);   // scoped: all four columns score the same window (warmup 0)
+                if (activeScope) {
+                    if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
+                    if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
+                }
                 const res = await fetch('/api/tuning/compare?' + params.toString());
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
@@ -1056,7 +2331,6 @@
                 showTuningError(`Compare failed: ${err.message}`);
             }
         }
-
         tuningCopyBtn.addEventListener('click', async () => {
             try {
                 await navigator.clipboard.writeText(tuningCopyTextEl.value);
@@ -1064,539 +2338,20 @@
                 tuningCopyBtn.textContent = 'Copied';
                 setTimeout(() => { tuningCopyBtn.textContent = original; }, 1500);
             } catch {
-                // Clipboard API unavailable (e.g. a non-secure-context LAN page) —
-                // fall back to select-then-manual-copy.
                 tuningCopyTextEl.select();
             }
         });
 
-        // ---- frame-range scope & groups ----
-        // A group is a saved (name, [start_id, end_id]) window; the frontend
-        // expands the selected one into since_id/until_id before every scoped call,
-        // so the backend stays group-agnostic. See
-        // docs/specs/2026-07-10-frame-range-groups.md.
-
-        // Add the active scope's inclusive id bounds to a URLSearchParams. No active
-        // scope leaves the params untouched, so an unscoped call is byte-for-byte
-        // today's whole-store request.
-        function applyScopeParams(params) {
-            if (!activeScope) return;
-            if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
-            if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
-        }
-
-        // The pending range's effective inclusive bounds, or null when neither
-        // endpoint is picked. Both picked → since=min/until=max (the two clicks may
-        // arrive in either id order; the backend normalizes too); only one picked →
-        // that side bounds and the other stays unbounded, so the preview count still
-        // works while a range is half-built.
-        function pendingBounds() {
-            if (pendingStartId == null && pendingEndId == null) return null;
-            if (pendingStartId != null && pendingEndId != null) {
-                return {
-                    since_id: Math.min(pendingStartId, pendingEndId),
-                    until_id: Math.max(pendingStartId, pendingEndId),
-                };
-            }
-            return pendingStartId != null
-                ? { since_id: pendingStartId, until_id: null }
-                : { since_id: null, until_id: pendingEndId };
-        }
-
-        // Save is armed only with BOTH endpoints and a name — a group is a full
-        // window, and the backend rejects an endpoint that isn't a live frame id.
-        function updateSaveButton() {
-            const ready = pendingStartId != null && pendingEndId != null && groupNameInput.value.trim() !== '';
-            groupSaveBtn.disabled = !ready;
-        }
-
-        // Refresh the "Frames in range: N" readout from /api/range/count. Tagged
-        // with a seq so a slower stale count (the user picked again mid-fetch) is
-        // discarded rather than overwriting the newer one — the same guard loadPage
-        // uses.
-        let rangeCountSeq = 0;
-        async function refreshRangeCount() {
-            const bounds = pendingBounds();
-            if (!bounds) {
-                rangeCountEl.textContent = 'Frames in range: —';
-                return;
-            }
-            const seq = ++rangeCountSeq;
-            try {
-                const params = new URLSearchParams();
-                if (bounds.since_id != null) params.set('since_id', String(bounds.since_id));
-                if (bounds.until_id != null) params.set('until_id', String(bounds.until_id));
-                const res = await fetch('/api/range/count?' + params.toString());
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const data = await res.json();
-                if (seq !== rangeCountSeq) return;   // superseded by a newer pick
-                rangeCountEl.textContent = `Frames in range: ${data.count}`;
-            } catch (err) {
-                if (seq !== rangeCountSeq) return;
-                rangeCountEl.textContent = 'Frames in range: —';
-                showError(`Range count failed: ${err.message}`);
-            }
-        }
-
-        // Reflect the pending endpoints' timestamps, re-arm Save, and re-count.
-        function updatePendingReadout() {
-            pendingStartTsEl.textContent = pendingStartTs != null ? formatTime(pendingStartTs) : '—';
-            pendingEndTsEl.textContent = pendingEndTs != null ? formatTime(pendingEndTs) : '—';
-            updateSaveButton();
-            refreshRangeCount();
-        }
-
-        // Full reset of the pending builder — used by "Clear selection" and after a
-        // successful save (the endpoints are then captured in the saved group).
-        function clearPendingSelection() {
-            pendingStartId = pendingStartTs = pendingEndId = pendingEndTs = null;
-            groupNameInput.value = '';
-            updatePendingReadout();
-        }
-
-        // Show the active scope in the scope panel AND the MOG2 tuning panel,
-        // highlighted (warn) when it's a real window so a scoped run/compare can't be
-        // mistaken for a whole-store one.
-        function updateScopeBadge() {
-            let label = 'All frames';
-            if (activeScope) {
-                const g = groups.find(x => String(x.id) === scopeSelect.value);
-                label = g ? g.name : `ids ${activeScope.since_id ?? ''}–${activeScope.until_id ?? ''}`;
-            }
-            const text = `Scope: ${label}`;
-            scopeBadge.textContent = text;
-            scopeBadge.classList.toggle('warn', !!activeScope);
-            tuningScopeBadgeEl.textContent = text;
-            tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
-        }
-
-        // Derive activeScope from the current scopeSelect value, then re-issue every
-        // scoped view: the grid (pager cursors reset via reloadView) and the tuning
-        // compare. Called on a scope change and after save/delete move the selection
-        // programmatically (a programmatic .value change fires no 'change' event).
-        function applyScope() {
-            const val = scopeSelect.value;
-            const g = val ? groups.find(x => String(x.id) === val) : null;
-            activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
-            updateScopeBadge();
-            reloadView();
-            loadTuningCompare();
-        }
-
-        // Rebuild the scope <select>, preserving the current selection when its
-        // group still exists (a deleted/absent group falls back to All frames).
-        // This never touches activeScope — that moves only through applyScope, so
-        // repopulating the options can't silently change the effective window.
-        function renderScopeSelect() {
-            const prev = scopeSelect.value;
-            scopeSelect.innerHTML = '';
-            const allOpt = document.createElement('option');
-            allOpt.value = '';
-            allOpt.textContent = 'All frames';
-            scopeSelect.appendChild(allOpt);
-            for (const g of groups) {
-                const opt = document.createElement('option');
-                opt.value = String(g.id);
-                opt.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames`;
-                scopeSelect.appendChild(opt);
-            }
-            scopeSelect.value = [...scopeSelect.options].some(o => o.value === prev) ? prev : '';
-        }
-
-        // The saved-groups list, each with a delete button. Counts are live from the
-        // store, so a wholly-evicted group reads 0 frames rather than vanishing.
-        function renderGroupsList() {
-            groupsListEl.innerHTML = '';
-            if (groups.length === 0) {
-                const note = document.createElement('div');
-                note.className = 'groups-empty';
-                note.textContent = 'No saved groups yet — pick a Start and End frame below, name it, and Save group.';
-                groupsListEl.appendChild(note);
-                return;
-            }
-            for (const g of groups) {
-                const row = document.createElement('div');
-                row.className = 'group-row';
-                const info = document.createElement('span');
-                info.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames · ids ${g.start_id}–${g.end_id}`;
-                const del = document.createElement('button');
-                del.type = 'button';
-                del.className = 'btn-danger btn-tiny';
-                del.textContent = 'Delete';
-                del.addEventListener('click', () => deleteGroup(g.id));
-                row.append(info, del);
-                groupsListEl.appendChild(row);
-            }
-        }
-
-        // Load groups and repaint both the select and the list. A failed call uses
-        // the shared error banner — this IS a user-triggered fetch, unlike the 4s polls.
-        async function loadGroups() {
-            try {
-                clearError();
-                const res = await fetch('/api/groups');
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const data = await res.json();
-                groups = data.groups || [];
-                renderScopeSelect();
-                renderGroupsList();
-                updateScopeBadge();   // a still-selected group's count/label may have changed
-            } catch (err) {
-                showError(`Failed to load groups: ${err.message}`);
-            }
-        }
-
-        async function saveGroup() {
-            const name = groupNameInput.value.trim();
-            if (!name || pendingStartId == null || pendingEndId == null) return;
-            try {
-                clearError();
-                groupSaveBtn.disabled = true;
-                const res = await fetch('/api/groups', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, start_id: pendingStartId, end_id: pendingEndId }),
-                });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const group = await res.json();
-                await loadGroups();
-                // Select the freshly-saved group as the active scope, then reset the
-                // pending builder.
-                scopeSelect.value = String(group.id);
-                applyScope();
-                clearPendingSelection();
-            } catch (err) {
-                showError(`Save group failed: ${err.message}`);
-            } finally {
-                updateSaveButton();   // re-derive from the (now-cleared) fields
-            }
-        }
-
-        async function deleteGroup(groupId) {
-            try {
-                clearError();
-                const wasActive = scopeSelect.value === String(groupId);
-                const res = await fetch('/api/groups/' + encodeURIComponent(groupId), { method: 'DELETE' });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                await loadGroups();
-                // If the deleted group was the active scope its option is now gone;
-                // fall back to All frames and re-issue the views on the whole store.
-                if (wasActive) {
-                    scopeSelect.value = '';
-                    applyScope();
-                }
-            } catch (err) {
-                showError(`Delete group failed: ${err.message}`);
-            }
-        }
-
-        scopeSelect.addEventListener('change', applyScope);
-        groupNameInput.addEventListener('input', updateSaveButton);
-        groupSaveBtn.addEventListener('click', saveGroup);
-        groupClearBtn.addEventListener('click', clearPendingSelection);
-
-        // ---- frame grid ----
-
-        // `disagreement` (true in the MOG2-vs-oracle view) overrides the plain
-        // motion border with .disagree — every tile there is a disagreement by
-        // construction, so recoloring all of them (rather than keying off
-        // frame.motion, which is misleadingly uniform within one disagreement
-        // mode) is what makes the view visually distinct at a glance.
-        function frameTile(frame, disagreement) {
-            const tile = document.createElement('div');
-            tile.className = 'tile' + (disagreement ? ' disagree' : (frame.motion ? ' motion' : ''));
-
-            const img = document.createElement('img');
-            img.src = frame.url;
-            img.loading = 'lazy';
-            img.alt = frame.motion ? 'Motion frame' : 'Frame';
-            tile.appendChild(img);
-
-            const caption = document.createElement('div');
-            caption.className = 'caption';
-            const timeSpan = document.createElement('span');
-            timeSpan.textContent = formatTime(frame.recv_ts);
-            caption.appendChild(timeSpan);
-
-            // 'score' is only present on disagreement rows (query_disagreements);
-            // the plain feed's rows never carry it, so check for the key rather
-            // than the value (a verdict can legitimately have a null score).
-            if ('score' in frame) {
-                const scoreSpan = document.createElement('span');
-                scoreSpan.className = 'score';
-                scoreSpan.textContent = typeof frame.score === 'number' ? `score ${frame.score.toFixed(2)}` : 'score —';
-                caption.appendChild(scoreSpan);
-            }
-
-            const areaSpan = document.createElement('span');
-            areaSpan.className = 'area';
-            const areaPct = typeof frame.area === 'number' ? (frame.area * 100).toFixed(1) + '%' : '—';
-            areaSpan.textContent = areaPct;
-            caption.appendChild(areaSpan);
-            tile.appendChild(caption);
-
-            // Per-tile range affordance: make this frame the pending range's start
-            // or end endpoint (stores its id + recv_ts). Two clicks anywhere in the
-            // grid define a contiguous id window — ids are monotonic in time.
-            const rangeBtns = document.createElement('div');
-            rangeBtns.className = 'range-btns';
-            const setStartBtn = document.createElement('button');
-            setStartBtn.type = 'button';
-            setStartBtn.className = 'btn-tiny';
-            setStartBtn.textContent = 'Set start';
-            setStartBtn.addEventListener('click', () => {
-                pendingStartId = frame.id;
-                pendingStartTs = frame.recv_ts;
-                updatePendingReadout();
-            });
-            const setEndBtn = document.createElement('button');
-            setEndBtn.type = 'button';
-            setEndBtn.className = 'btn-tiny';
-            setEndBtn.textContent = 'Set end';
-            setEndBtn.addEventListener('click', () => {
-                pendingEndId = frame.id;
-                pendingEndTs = frame.recv_ts;
-                updatePendingReadout();
-            });
-            rangeBtns.append(setStartBtn, setEndBtn);
-            tile.appendChild(rangeBtns);
-
-            return tile;
-        }
-
-        // Fetch page `targetIndex` and REPLACE the grid. pageIndex is committed
-        // ONLY on a successful response, so a failed Prev/Next never mislabels
-        // the page it's still showing. Each fetch tags itself with reqSeq; a
-        // slower stale response (e.g. the user switched filter/sort mid-fetch)
-        // is discarded rather than writing the wrong rows or a wrong-format
-        // cursor into pageCursors.
-        let reqSeq = 0;
-        async function loadPage(targetIndex = pageIndex) {
-            const seq = ++reqSeq;
-            loading = true;
-            updatePager();  // disable both buttons while a fetch is in flight
-            // Captured once up front so the params built for the request and the
-            // tiles built from its response agree on which view this is — a
-            // later state change (another click) bumps reqSeq and gets discarded
-            // below, so this can't drift mid-flight.
-            const disagreementView = disagreeMode !== null;
-            try {
-                clearError();
-                const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
-                if (disagreementView) {
-                    params.set('analyzer', disagreeAnalyzer);
-                    params.set('disagree', disagreeMode);
-                } else {
-                    params.set('motion', motion);
-                    params.set('order', order);
-                }
-                // Apply the active group's inclusive id window (if any) to whichever
-                // view this is: the plain feed, both motion presets, and the
-                // disagreement view all funnel through here, so scope means one
-                // consistent thing across every feed.
-                applyScopeParams(params);
-                const cursor = pageCursors[targetIndex];
-                if (cursor != null) params.set('cursor', String(cursor));
-                const res = await fetch('/api/frames?' + params.toString());
-                if (seq !== reqSeq) return;   // superseded by a newer request — discard
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const data = await res.json();
-                if (seq !== reqSeq) return;   // superseded
-
-                gridEl.innerHTML = '';
-                const frames = data.frames || [];
-                frames.forEach(frame => gridEl.appendChild(frameTile(frame, disagreementView)));
-                emptyEl.classList.toggle('hidden', frames.length > 0);
-
-                pageIndex = targetIndex;      // commit the page only now, on success
-                // next_cursor (null = no further pages) is the next page's token.
-                pageCursors[pageIndex + 1] = data.next_cursor ?? null;
-                window.scrollTo(0, 0);
-            } catch (err) {
-                if (seq === reqSeq) showError(`Failed to load frames: ${err.message}`);
-            } finally {
-                if (seq === reqSeq) {
-                    loading = false;
-                    updatePager();
-                }
-            }
-        }
-
-        // Reflect the pager: page number, and which directions are available.
-        function updatePager() {
-            pageLabel.textContent = `Page ${pageIndex + 1}`;
-            prevBtn.disabled = loading || pageIndex === 0;
-            // Next only when the CURRENT page returned a token (a full page → more).
-            nextBtn.disabled = loading || pageCursors[pageIndex + 1] == null;
-        }
-
-        function reloadView() {
-            pageCursors = [null];
-            pageIndex = 0;
-            loadPage(0);
-        }
-
-        // ---- controls ----
-
-        motionFilterSelect.addEventListener('change', () => {
-            motion = motionFilterSelect.value;
-            disagreeAnalyzer = null;   // back to the plain feed — see loadPage's view routing
-            disagreeMode = null;
-            reloadView();
-        });
-
-        orderSelect.addEventListener('change', () => {
-            order = orderSelect.value;
-            disagreeAnalyzer = null;
-            disagreeMode = null;
-            reloadView();
-        });
-
-        prevBtn.addEventListener('click', () => {
-            if (loading || pageIndex === 0) return;
-            loadPage(pageIndex - 1);  // pageIndex commits inside loadPage on success
-        });
-        nextBtn.addEventListener('click', () => {
-            if (loading || pageCursors[pageIndex + 1] == null) return;
-            loadPage(pageIndex + 1);
-        });
-
-        // Triage presets: one click each to the two motion-tuning failure
-        // modes this tool exists to surface (see spec) — sync the selects so
-        // the UI reflects what's actually loaded.
-        function applyPreset(presetMotion, presetOrder) {
-            motion = presetMotion;
-            order = presetOrder;
-            disagreeAnalyzer = null;   // a plain-feed preset always leaves the disagreement view
-            disagreeMode = null;
-            motionFilterSelect.value = motion;
-            orderSelect.value = order;
-            reloadView();
-        }
-
-        presetMissedBtn.addEventListener('click', () => applyPreset('still', 'area_desc'));
-        presetFalseBtn.addEventListener('click', () => applyPreset('motion', 'area_asc'));
-
-        // Disagreement presets — the analysis-layer analogue of the two above,
-        // operating on whichever oracle is currently selected. motion/order are
-        // left untouched (irrelevant while disagreeMode is set) so flipping back
-        // to the plain feed later restores the last plain filter/sort.
-        function applyDisagreementPreset(mode) {
-            disagreeAnalyzer = analyzerSelect.value;
-            disagreeMode = mode;
-            reloadView();
-        }
-
-        presetOracleMissedBtn.addEventListener('click', () => applyDisagreementPreset('missed'));
-        presetOracleFalseBtn.addEventListener('click', () => applyDisagreementPreset('false'));
-
-        clearBtn.addEventListener('click', async () => {
-            if (!confirm('Clear all collected frames? This cannot be undone.')) return;
-            try {
-                clearError();
-                clearBtn.disabled = true;
-                const res = await fetch('/api/clear', { method: 'POST' });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                // A full clear drops every saved group server-side AND SQLite reuses
-                // rowids from 1, so a stale activeScope (or a deleted group left selected)
-                // would re-apply an old id window to brand-new, unrelated frames — the exact
-                // rowid-reuse hazard clear()-drops-groups guards against on the backend. Reset
-                // the scope + pending builder and reload the (now empty) group list first.
-                scopeSelect.value = '';
-                clearPendingSelection();
-                await loadGroups();
-                applyScope();   // '' -> activeScope=null, resets the pager, reloads grid + compare
-                pollStats();
-            } catch (err) {
-                showError(`Clear failed: ${err.message}`);
-            } finally {
-                clearBtn.disabled = false;
-            }
-        });
-
-        // ---- collector toggle ----
-
-        collectorToggleBtn.addEventListener('click', async () => {
-            try {
-                clearError();
-                collectorToggleBtn.disabled = true;
-                const endpoint = collectorRunning ? '/api/collector/stop' : '/api/collector/start';
-                const res = await fetch(endpoint, { method: 'POST' });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-            } catch (err) {
-                showError(`Collector toggle failed: ${err.message}`);
-            } finally {
-                await pollStats();   // authoritative running state re-labels the button from here
-                collectorToggleBtn.disabled = false;
-            }
-        });
-
-        // ---- offline analysis (Run / Cancel) ----
-
-        // Refresh the badge immediately on selection change too — otherwise it
-        // would show the PREVIOUS analyzer's coverage until the next 4s poll.
-        // AND, if a disagreement view is active, retarget it to the newly-selected
-        // oracle and reload the grid — otherwise the badge (new oracle) and the
-        // frames on screen (old oracle) would disagree until a preset is re-clicked.
-        analyzerSelect.addEventListener('change', () => {
-            pollAnalysisStatus();
-            if (disagreeMode !== null) {
-                disagreeAnalyzer = analyzerSelect.value;
-                reloadView();
-            }
-            loadTuningCompare();   // the compare view reads whichever oracle is now selected
-        });
-
-        analysisRunBtn.addEventListener('click', async () => {
-            try {
-                clearError();
-                analysisRunBtn.disabled = true;
-                const body = { analyzer: analyzerSelect.value, reanalyze: reanalyzeCheckbox.checked };
-                if (activeScope) {
-                    body.since_id = activeScope.since_id;
-                    body.until_id = activeScope.until_id;
-                }
-                const res = await fetch('/api/analysis/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body),
-                });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-            } catch (err) {
-                showError(`Run failed: ${err.message}`);
-            } finally {
-                await pollAnalysisStatus();   // sets Run/Cancel disabled state from the true running flag
-            }
-        });
-
-        analysisCancelBtn.addEventListener('click', async () => {
-            try {
-                clearError();
-                analysisCancelBtn.disabled = true;
-                const res = await fetch('/api/analysis/cancel', { method: 'POST' });
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-            } catch (err) {
-                showError(`Cancel failed: ${err.message}`);
-            } finally {
-                await pollAnalysisStatus();
-            }
-        });
-
-        // ---- polling ----
-
-        const STATS_POLL_MS = 4000;
-        setInterval(() => {
-            pollStats();
-            pollAnalysisStatus();
-        }, STATS_POLL_MS);
-
+        // ================= init =================
         window.addEventListener('load', () => {
+            buildOracleSelect();
+            buildTimeOptions();
+            buildCoverageRows();
+            setInboxMode('missed');
             pollStats();
             pollAnalysisStatus();
-            loadGroups();
-            reloadView();
-            loadTuningDefaults();
-            loadTuningCompare();
+            setInterval(() => { pollStats(); pollAnalysisStatus(); }, STATS_POLL_MS);
+            setRoute(location.hash ? location.hash.slice(1) : 'start');
         });
     </script>
 </body>

@@ -5,10 +5,12 @@
 ``Store``'s analysis methods, ``run_analysis``, and ``AnalysisManager`` — with no
 HTTP involved. This file is the layer above that: it drives the same machinery
 *through* ``create_app`` + ``fastapi.testclient.TestClient``, so what's actually
-under test is the routing/validation ``app.py`` adds on top — the 400/409/503
-mapping, the ``reanalyze`` clear-then-resweep sequencing, the disagreement query
-wired to ``GET /api/frames``, and the collector start/stop toggle — none of which
-the lower-layer tests can see.
+under test is the routing/validation ``app.py`` adds on top — the 400/503 mapping,
+the enqueue-while-running queue behavior (a second run no longer 409s — it waits),
+the ``reanalyze`` clear-then-resweep sequencing, the disagreement query wired to
+``GET /api/frames``, the collector start/stop/motion-only toggles + persisted
+resume, the clear re-seed, and the density-timeline / visit-inbox read endpoints —
+none of which the lower-layer tests can see.
 
 No real edge, no real model: ``create_app(store=..., client=FakeClient(),
 start_collector=False, analysis_manager=AnalysisManager(resolver=...))`` is the
@@ -146,31 +148,33 @@ class FakeClient:
 
 
 class SpyAnalysisManager(AnalysisManager):
-    """A real ``AnalysisManager`` that also records each ``start()`` call's args.
+    """A real ``AnalysisManager`` that also records each ``enqueue_named()`` call's args.
 
     Used only by the frame-range-groups scoping tests below, to verify that
     ``POST /api/analysis/run`` forwards its ``since_id``/``until_id`` straight
-    through to the manager, unmodified. Delegates to ``super().start()`` so the
-    job still actually runs — every other assertion (status, written verdicts)
+    through to the manager, unmodified. Delegates to ``super().enqueue_named()`` so
+    the job still actually runs — every other assertion (status, written verdicts)
     behaves exactly as the non-spy tests above; only the call args are captured.
     """
 
     def __init__(self, resolver) -> None:
         super().__init__(resolver=resolver)
-        self.start_calls: "list[dict]" = []
+        self.enqueue_calls: "list[dict]" = []
 
-    def start(
+    def enqueue_named(
         self,
         store,
         name: str,
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
-    ) -> None:
-        self.start_calls.append(
+    ) -> dict:
+        self.enqueue_calls.append(
             {"name": name, "reanalyze": reanalyze, "since_id": since_id, "until_id": until_id}
         )
-        super().start(store, name, reanalyze=reanalyze, since_id=since_id, until_id=until_id)
+        return super().enqueue_named(
+            store, name, reanalyze=reanalyze, since_id=since_id, until_id=until_id
+        )
 
 
 def _make_app_with_manager(tmp_path, manager, client=None) -> "tuple[TestClient, Store]":
@@ -327,22 +331,33 @@ def test_analysis_disagreement_views_return_expected_ids(make_app):
 
 
 @_requires_cv
-def test_analysis_run_while_running_is_409(make_app):
-    gate = threading.Event()  # cleared: the one frame blocks until we release it
+def test_analysis_run_while_running_enqueues(make_app):
+    # The 409 refusal is gone: a second run while one is active ENQUEUES behind it and
+    # both drain serially. Two DISTINCT windows keep the jobs from deduping.
+    gate = threading.Event()  # cleared: the first frame blocks until we release it
     fake = FakeAnalyzer(name="yolo", gate=gate)
     client, store = make_app(analyzers={"yolo": fake})
-    store.add(_frame(frame_id=1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(2)
+    ]
 
-    resp = client.post("/api/analysis/run", json={"analyzer": "yolo"})
-    assert resp.status_code == 200
-    assert resp.json()["running"] is True  # the only frame is stuck in flight on the gate
+    r1 = client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[0], "until_id": ids[0]})
+    assert r1.status_code == 200
+    assert r1.json()["running"] is True  # its one frame is stuck in flight on the gate
+    assert r1.json()["position"] == 0
 
-    resp2 = client.post("/api/analysis/run", json={"analyzer": "yolo"})
-    assert resp2.status_code == 409
+    # Second request no longer 409s — it enqueues at position 1.
+    r2 = client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[1], "until_id": ids[1]})
+    assert r2.status_code == 200
+    assert r2.json()["position"] == 1
+    assert r2.json()["deduped"] is False
 
     gate.set()
     status = _poll_until_done(client)
-    assert status["done"] == 1
+    # Both windows verdicted, and both jobs recorded "done" (most-recent first).
+    assert store.analysis_summary("yolo")["analyzed"] == 2
+    assert [h["state"] for h in status["history"][:2]] == ["done", "done"]
 
 
 def test_analysis_run_unknown_analyzer_is_400(make_app):
@@ -689,7 +704,7 @@ def test_analysis_run_forwards_since_id_until_id_to_manager(tmp_path):
         json={"analyzer": "yolo", "since_id": ids[0], "until_id": ids[1]},
     )
     assert resp.status_code == 200
-    assert manager.start_calls == [
+    assert manager.enqueue_calls == [
         {"name": "yolo", "reanalyze": False, "since_id": ids[0], "until_id": ids[1]}
     ]
     body = resp.json()
@@ -714,7 +729,7 @@ def test_analysis_run_absent_scope_forwards_none(tmp_path):
 
     resp = client.post("/api/analysis/run", json={"analyzer": "yolo"})
     assert resp.status_code == 200
-    assert manager.start_calls == [
+    assert manager.enqueue_calls == [
         {"name": "yolo", "reanalyze": False, "since_id": None, "until_id": None}
     ]
     body = resp.json()
@@ -723,3 +738,236 @@ def test_analysis_run_absent_scope_forwards_none(tmp_path):
 
     _poll_until_done(client)
     assert store.analysis_summary("yolo")["analyzed"] == 1
+
+
+# --- Queue control routes: cancel / clear / stop-all ----------------------------
+
+
+@_requires_cv
+def test_analysis_queue_clear_route_drops_pending(make_app):
+    # POST /api/analysis/queue/clear empties the pending deque; the running job finishes.
+    gate = threading.Event()  # cleared: head job blocks
+    fake = FakeAnalyzer(name="yolo", gate=gate)
+    client, store = make_app(analyzers={"yolo": fake})
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(3)
+    ]
+
+    client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[0], "until_id": ids[0]})
+    client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[1], "until_id": ids[1]})
+    client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[2], "until_id": ids[2]})
+    assert len(client.get("/api/analysis/status").json()["queue"]) == 2
+
+    resp = client.post("/api/analysis/queue/clear")
+    assert resp.status_code == 200
+    assert resp.json()["queue"] == []      # pending dropped
+    assert resp.json()["running"] is True  # running job untouched
+
+    gate.set()
+    _poll_until_done(client)
+    assert store.analysis_summary("yolo")["analyzed"] == 1  # only the running job ran
+
+
+@_requires_cv
+def test_analysis_queue_stop_all_route_clears_and_cancels(make_app):
+    # POST /api/analysis/queue/stop-all clears pending AND cancels the running job.
+    gate = threading.Event()
+    fake = FakeAnalyzer(name="yolo", gate=gate)
+    client, store = make_app(analyzers={"yolo": fake})
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(3)
+    ]
+
+    client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[0], "until_id": ids[2]})
+    client.post("/api/analysis/run", json={"analyzer": "yolo", "since_id": ids[1], "until_id": ids[1]})
+    assert len(client.get("/api/analysis/status").json()["queue"]) == 1
+
+    resp = client.post("/api/analysis/queue/stop-all")
+    assert resp.status_code == 200
+    assert resp.json()["queue"] == []
+
+    gate.set()
+    status = _poll_until_done(client)
+    assert status["history"][0]["state"] == "canceled"
+
+
+# --- Collector motion-only route + /api/stats fields ----------------------------
+
+
+def test_collector_motion_only_route_toggles_and_persists(make_app):
+    client, store = make_app()
+    assert client.get("/api/stats").json()["motion_only"] is False
+
+    resp = client.post("/api/collector/motion-only", json={"motion_only": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"motion_only": True}
+    assert client.get("/api/stats").json()["motion_only"] is True
+    assert store.get_setting("motion_only") == "1"  # persisted for restore across restart
+
+    resp = client.post("/api/collector/motion-only", json={"motion_only": False})
+    assert resp.json() == {"motion_only": False}
+    assert store.get_setting("motion_only") == "0"
+
+
+def _fresh_app(tmp_path, name: str = "") -> "tuple[TestClient, Store]":
+    """A TestClient + Store over ``tmp_path[/name]``, wired like ``make_app`` but built
+    directly so two apps can share ONE db file (to test persistence across a restart)."""
+    from compute.api.app import create_app
+
+    root = tmp_path / name if name else tmp_path
+    store = Store(
+        db_path=str(root / "index.db"),
+        media_root=str(root / "media"),
+        max_bytes=10_000_000,
+    )
+    app = create_app(store=store, client=FakeClient(), start_collector=False)
+    return TestClient(app), store
+
+
+def test_motion_only_persists_and_restores_across_create_app(tmp_path):
+    # A first app flips motion-only on (persisted to the store's settings KV). A fresh
+    # app over the SAME db restores that flag into memory at launch — but leaves the
+    # collector STOPPED (a bare launch never auto-starts; changelog 28's safety property).
+    c1, _s1 = _fresh_app(tmp_path)
+    c1.post("/api/collector/motion-only", json={"motion_only": True})
+    assert c1.get("/api/stats").json()["motion_only"] is True
+
+    c2, _s2 = _fresh_app(tmp_path)  # "restart" over the same db
+    stats = c2.get("/api/stats").json()
+    assert stats["motion_only"] is True          # restored from settings
+    assert stats["collector_running"] is False   # still stopped, not auto-started
+
+
+def test_resume_available_reflects_persisted_collector_intent(tmp_path):
+    # resume_available is (persisted collector_running == "1") AND (collector stopped).
+    # It is False while actually running, True after a mid-run "restart", and cleared by
+    # a one-click resume or by an operator stop.
+    c1, _s1 = _fresh_app(tmp_path)
+    c1.post("/api/collector/start")  # persists collector_running=1
+    assert c1.get("/api/stats").json()["resume_available"] is False  # running now → not "resume"
+
+    c2, _s2 = _fresh_app(tmp_path)  # restart: intent was on, collector starts stopped
+    stats = c2.get("/api/stats").json()
+    assert stats["collector_running"] is False
+    assert stats["resume_available"] is True
+
+    # One-click resume clears the prompt.
+    assert c2.post("/api/collector/start").json()["running"] is True
+    assert c2.get("/api/stats").json()["resume_available"] is False
+
+    # An operator stop clears the persisted intent, so a later launch won't offer Resume.
+    c2.post("/api/collector/stop")
+    assert c2.get("/api/stats").json()["resume_available"] is False
+
+
+def test_clear_reseeds_mode_when_collector_running(make_app):
+    # clear() drops mode_changes (keyed to frame ids), but the /api/clear route re-seeds
+    # the CURRENT mode when collection is live — otherwise a motion-only run after a clear
+    # would sit in an empty log and read as reliable full capture. The re-seed leaves
+    # exactly one ON boundary (stamped at the post-wipe latest id 0).
+    client, store = make_app()
+    client.post("/api/collector/start")  # running (FakeClient → empty stream, flag stays on)
+    client.post("/api/collector/motion-only", json={"motion_only": True})
+
+    resp = client.post("/api/clear")
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    # Re-seeded: a single motion-only ON span at the store start (id 0), not an empty log.
+    assert store.motion_only_spans() == [{"start_id": 0, "end_id": 0}]
+    client.post("/api/collector/stop")
+
+
+def test_clear_does_not_reseed_when_collector_stopped(make_app):
+    # With collection stopped, /api/clear does NOT re-seed — the log is simply empty after
+    # the wipe (nothing is silently written to a store whose collector isn't running).
+    client, store = make_app()
+    client.post("/api/collector/motion-only", json={"motion_only": True})  # a mode row exists
+    assert store.motion_only_spans() != []
+
+    client.post("/api/clear")
+    assert store.motion_only_spans() == []  # dropped, and not re-seeded (collector stopped)
+
+
+# --- New read endpoints: resolve / sample / timeline / visits -------------------
+
+
+def test_frames_resolve_and_sample_endpoints(make_app):
+    client, store = make_app()
+    base = 1_700_000_000_000
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=base + i * 100) for i in range(5)]
+
+    resolved = client.get("/api/frames/resolve", params={"start_ts": base, "end_ts": base + 400}).json()
+    assert resolved == {"since_id": ids[0], "until_id": ids[4]}
+
+    # A None-ish window (no bounds) still resolves both sides to null.
+    assert client.get("/api/frames/resolve").json() == {"since_id": None, "until_id": None}
+
+    sampled = client.get("/api/frames/sample", params={"count": 2}).json()["frames"]
+    assert sampled[0]["id"] == ids[0]  # first frame always included
+    assert set(sampled[0].keys()) == {"id", "recv_ts", "url"}
+
+
+def test_timeline_and_visits_endpoints_shape_and_validation(make_app):
+    client, store = make_app()
+    base = 1_700_000_000_000
+    f1 = store.add(_frame(frame_id=1, motion=False), recv_ts_ms=base)
+    store.write_analysis(f1, "yolo", True, 0.9, None)  # a miss (motion 0, present)
+
+    tl = client.get("/api/timeline", params={"oracle": "yolo", "bins": 4}).json()
+    assert "bins" in tl and "motion_only_spans" in tl
+    assert tl["motion_only_spans"] == []  # no motion-only span in this window
+
+    vis = client.get("/api/visits", params={"oracle": "yolo", "mode": "missed"}).json()
+    assert "visits" in vis and "motion_only_spans" in vis
+    assert len(vis["visits"]) == 1  # the single missed frame is one visit
+
+    # Validation: a bad oracle (400) on both, a bad mode (400) on visits.
+    assert client.get("/api/timeline", params={"oracle": "bogus"}).status_code == 400
+    assert client.get("/api/visits", params={"oracle": "bogus"}).status_code == 400
+    assert client.get("/api/visits", params={"oracle": "yolo", "mode": "bogus"}).status_code == 400
+
+
+def test_timeline_visits_attach_motion_only_spans_over_a_motion_only_window(make_app):
+    # When the window overlaps a motion-only span, both endpoints hand the UI the span
+    # list so it can flag "misses unmeasurable here" rather than reading an empty missed
+    # set as perfect recall.
+    client, store = make_app()
+    store.record_mode_change(True)  # motion-only ON from the store start
+    base = 1_700_000_000_000
+    f1 = store.add(_frame(frame_id=1, motion=True, bbox=(0, 0, 0.1, 0.1), area=0.05), recv_ts_ms=base)
+    store.write_analysis(f1, "yolo", False, 0.1, None)
+
+    tl = client.get("/api/timeline", params={"oracle": "yolo"}).json()
+    assert tl["motion_only_spans"] == [{"start_id": 0, "end_id": 1}]
+    vis = client.get("/api/visits", params={"oracle": "yolo", "mode": "false"}).json()
+    assert vis["motion_only_spans"] == [{"start_id": 0, "end_id": 1}]
+
+
+@_requires_cv
+def test_windowed_enqueue_flags_motion_only_overlap_but_yolo_does_not(make_app):
+    # BSUV is windowed → flagged at enqueue over a motion-only span (its contiguity
+    # assumption is broken there). YOLO is per-frame → never flagged, even over the same
+    # span. Both drain (gate pre-set), each over the whole store.
+    gate = threading.Event()
+    gate.set()  # don't block — we only care about the enqueue-time overlap flag
+    client, store = make_app(
+        analyzers={
+            "yolo": FakeAnalyzer(name="yolo", gate=gate),
+            "bsuv": FakeAnalyzer(name="bsuv", windowed=True, gate=gate),
+        }
+    )
+    store.record_mode_change(True)  # motion-only ON from the store start
+    for i in range(2):
+        store.add(_frame(frame_id=i, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000 + i)
+
+    ry = client.post("/api/analysis/run", json={"analyzer": "yolo"})
+    assert ry.status_code == 200
+    assert ry.json()["motion_only_overlap"] is False
+    _poll_until_done(client)
+
+    rb = client.post("/api/analysis/run", json={"analyzer": "bsuv"})
+    assert rb.status_code == 200
+    assert rb.json()["motion_only_overlap"] is True
+    _poll_until_done(client)

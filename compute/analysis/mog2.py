@@ -13,7 +13,7 @@ diffed as (missed, false-trigger) scorecards against an oracle.
 
 **Deliberately NOT in the oracle registry.** Its params come from the run request,
 which ``get_analyzer(name)`` cannot supply, so the tuning path constructs it directly
-and hands the instance to ``AnalysisManager.start_analyzer`` — no ``ANALYZER_NAMES``
+and hands the instance to ``AnalysisManager.enqueue_analyzer`` — no ``ANALYZER_NAMES``
 entry, no ``get_analyzer`` branch.
 
 ``windowed = True`` for the same reason ``BsuvAnalyzer`` is: MOG2 is stateful (its

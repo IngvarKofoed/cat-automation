@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -69,6 +70,17 @@ _SCORECARD_ORACLES = ("yolo", "bsuv")
 # matching recv_ts.
 _VISIT_GAP_MS = 2000
 _VISIT_WINDOW_MS = 3000
+
+# Server-side cap on how many frames ``sample_frames`` returns, so a wide window
+# can never request tens of thousands of thumbnails: the density viewer computes
+# ``count = X × span-minutes`` and this clamps it into ``[1, _MAX_SAMPLE]``.
+_MAX_SAMPLE = 4000
+
+# The visit-inbox error modes ``visits`` clusters and ranks (see the
+# motion-detection-workflow spec). "missed"/"false" judge the LIVE edge gate
+# (``frames.motion``) against one oracle; "conflict" compares the two oracles
+# (YOLO vs BSUV) and ignores the ``oracle`` argument.
+_VISIT_MODES = ("missed", "false", "conflict")
 
 
 def _parse_id_cursor(cursor: str) -> int:
@@ -163,6 +175,23 @@ class Store:
         # dropped only by a full `clear` (see the note there). `start_ts`/`end_ts`
         # denormalize the endpoints' recv_ts so the window's wall-clock span
         # survives those endpoint frames aging out.
+        #
+        # The `settings` table is a tiny key→value config store (motion-only
+        # capture flag + the last operator collector-running intent) that reuses
+        # this same connection + lock instead of a second settings.json file. It
+        # is CONFIG, not frame data, so — unlike `analysis`/`groups`/`mode_changes`
+        # — `clear` does NOT wipe it (see the note there).
+        #
+        # The `mode_changes` table is an append-only log of motion-only capture
+        # toggles: one row per flip (and one for the initial state on first
+        # collect), stamped with the store's latest frame id + recv_ts AT the flip.
+        # That is a step function over the id axis, from which `motion_only_spans`
+        # reconstructs the ON sub-ranges overlapping any window — so a window that
+        # spans a motion-only stretch is flagged "misses unmeasurable" rather than
+        # read as perfect recall. Like `groups` it is keyed to frame ids, so a full
+        # `clear` (which reuses rowids from 1) drops it too, or stale boundaries
+        # would misalign against new frames. `idx_frames_recv_ts` makes the clock→id
+        # resolution and the density timeline's recv_ts binning indexed lookups.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS frames (
@@ -196,6 +225,16 @@ class Store:
               end_ts     INTEGER NOT NULL,   -- recv_ts of the end frame, captured at create
               created_ts INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS settings (
+              key   TEXT PRIMARY KEY,
+              value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS mode_changes (
+              at_id       INTEGER NOT NULL,   -- frames.id at the flip (latest id at the time)
+              at_ts       INTEGER NOT NULL,   -- recv_ts at the flip
+              motion_only INTEGER NOT NULL    -- 1 = motion-only capture on, 0 = full capture
+            );
+            CREATE INDEX IF NOT EXISTS idx_frames_recv_ts ON frames(recv_ts);
             """
         )
         self._conn.commit()
@@ -468,9 +507,118 @@ class Store:
             # range would then spuriously match brand-new, unrelated frames, so a
             # full clear must drop groups too.
             self._conn.execute("DELETE FROM groups")
+            # Drop the motion-only change log for the SAME rowid-reuse reason as
+            # groups: its `at_id` boundaries are frame ids, and a full clear resets
+            # ids from 1, so stale spans would misalign against brand-new frames. A
+            # clear during a live motion-only run leaves the mode active over an
+            # EMPTY log, so re-seeding the current mode (latest id after the wipe)
+            # is the caller's job (the /api/clear route) — NOT clear()'s, which
+            # doesn't know whether collection is live. `settings` is deliberately
+            # NOT dropped — it is config, so `motion_only` survives the wipe.
+            self._conn.execute("DELETE FROM mode_changes")
             self._conn.commit()
             self._total_bytes = 0
             return len(rows)
+
+    # --- Settings + collector-mode persistence ------------------------------
+    #
+    # A tiny KV (`settings`) plus the motion-only change log (`mode_changes`),
+    # both on the store's single connection + lock. The store stays policy-free:
+    # it records what it is told and reconstructs spans, but the WHEN of writing
+    # intent (only on operator start/stop, never on the process-exit hook) is the
+    # API route's decision, not the store's.
+
+    def get_setting(self, key: str) -> "str | None":
+        """Value stored under ``key`` in the settings KV, or ``None`` if unset."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Upsert ``key`` → ``value`` in the settings KV (INSERT OR REPLACE)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+            )
+            self._conn.commit()
+
+    def record_mode_change(self, motion_only: bool) -> None:
+        """Append one ``mode_changes`` row for a motion-only capture flip.
+
+        Stamps the row with ``at_id = COALESCE(MAX(id), 0)`` and ``at_ts =
+        COALESCE(MAX(recv_ts), now_ms)`` from ``frames`` — i.e. the store's latest
+        frame at the moment of the flip, so the new mode applies to frames
+        collected AFTER it. Called for the initial mode on first collect, on every
+        operator toggle, and again after a mid-run ``clear`` re-seeds the current
+        mode (see ``clear``). ``motion_only`` is coerced to a 0/1 int.
+        """
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            (at_id,) = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM frames").fetchone()
+            (at_ts,) = self._conn.execute(
+                "SELECT COALESCE(MAX(recv_ts), ?) FROM frames", (now_ms,)
+            ).fetchone()
+            self._conn.execute(
+                "INSERT INTO mode_changes (at_id, at_ts, motion_only) VALUES (?, ?, ?)",
+                (int(at_id), int(at_ts), 1 if motion_only else 0),
+            )
+            self._conn.commit()
+
+    def motion_only_spans(
+        self, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> "list[dict]":
+        """The motion-only ON sub-ranges overlapping ``[since_id, until_id]``.
+
+        Reconstructs the motion-only step function from ``mode_changes`` (ordered
+        by ``at_id`` ASC, ties by insertion ``rowid``), coalescing consecutive
+        equal states, and returns the ON segments that overlap the window as
+        ``{"start_id", "end_id"}`` dicts clipped to it. Each segment runs from its
+        change's ``at_id`` to the NEXT change's ``at_id``; the final segment (no
+        successor) runs to ``until_id`` — or, when ``until_id`` is ``None``, to
+        ``COALESCE(MAX(frames.id), 0)`` (the store end). ``since_id``/``until_id``
+        ``None`` mean the store start / end. Empty list when the window is wholly
+        full-capture (the common, default-off case).
+
+        A window overlapping any returned span is where a *miss* — a cat present
+        while the motion flag is 0 — was never stored, so recall reads as
+        unmeasurable rather than perfect (and BSUV / MOG2-rerun verdicts across the
+        span are unreliable too, since those oracles assume contiguous frames).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT at_id, motion_only FROM mode_changes ORDER BY at_id ASC, rowid ASC"
+            ).fetchall()
+            if not rows:
+                return []
+            if until_id is None:
+                (store_end,) = self._conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM frames"
+                ).fetchone()
+                store_end = int(store_end)
+            else:
+                store_end = int(until_id)
+
+        # Coalesce consecutive equal states into change points; a redundant flip
+        # (same state as the running one) leaves the step function unchanged.
+        changes: "list[tuple[int, bool]]" = []
+        for at_id, mo in rows:
+            state = bool(mo)
+            if changes and changes[-1][1] == state:
+                continue
+            changes.append((int(at_id), state))
+
+        spans: "list[dict]" = []
+        for i, (start, state) in enumerate(changes):
+            if not state:
+                continue  # only ON segments are motion-only spans
+            end = changes[i + 1][0] if i + 1 < len(changes) else store_end
+            lo = start if since_id is None else max(start, int(since_id))
+            hi = end if until_id is None else min(end, int(until_id))
+            if lo <= hi:  # overlaps the window after clipping
+                spans.append({"start_id": lo, "end_id": hi})
+        return spans
 
     # --- Frame-range groups -------------------------------------------------
     #
@@ -580,6 +728,117 @@ class Store:
                 "SELECT COUNT(*) FROM frames" + clause, params
             ).fetchone()
         return int(count)
+
+    def resolve_ts_range(
+        self, start_ts: "int | None", end_ts: "int | None"
+    ) -> "tuple[int | None, int | None]":
+        """Resolve a wall-clock window to inclusive frame-id bounds.
+
+        Maps the clock-picker range to the id axis every scoped read shares:
+        ``since_id`` = ``MIN(id) WHERE recv_ts >= start_ts`` (the nearest frame
+        at-or-after the start), ``until_id`` = ``MAX(id) WHERE recv_ts <= end_ts``
+        (nearest at-or-before the end). A ``None`` bound stays ``None`` (unbounded
+        on that side); a bound that matches no frame also resolves to ``None`` on
+        that side. Served off ``idx_frames_recv_ts`` so it is an indexed lookup,
+        not a full-table walk. Returns ``(since_id, until_id)``.
+        """
+        since_id: "int | None" = None
+        until_id: "int | None" = None
+        with self._lock:
+            if start_ts is not None:
+                (since_id,) = self._conn.execute(
+                    "SELECT MIN(id) FROM frames WHERE recv_ts >= ?", (int(start_ts),)
+                ).fetchone()
+            if end_ts is not None:
+                (until_id,) = self._conn.execute(
+                    "SELECT MAX(id) FROM frames WHERE recv_ts <= ?", (int(end_ts),)
+                ).fetchone()
+        return (
+            int(since_id) if since_id is not None else None,
+            int(until_id) if until_id is not None else None,
+        )
+
+    def sample_frames(
+        self, since_id: "int | None", until_id: "int | None", count: int
+    ) -> "list[dict]":
+        """~``count`` frames evenly spread across ``[since_id, until_id]`` by INDEX, id ASC.
+
+        A count-based decimation: pick ~``count`` frames uniformly over the id
+        range. ``count`` is clamped server-side into ``[1, _MAX_SAMPLE]`` so a wide
+        window can't request tens of thousands of thumbnails. Selects every
+        ``stride``-th row where ``stride = max(1, ceil(matched / count))`` via
+        ``ROW_NUMBER() OVER (ORDER BY id)`` with ``(rn - 1) % stride = 0`` — the
+        ``rn - 1`` offset keeps the FIRST frame (``rn = 1``) always included.
+
+        NOTE: this spaces frames by index, not by time, so it only tracks a
+        wall-clock rate when the capture is uniform. The density viewer's "per
+        minute / per hour" uses ``sample_frames_by_interval`` instead, which is a
+        true time rate. Each row is ``{"id", "recv_ts", "url"}`` with
+        ``url = f"/media/{id}"``. Empty list when the window matches no frame.
+        """
+        count = max(1, min(int(count), _MAX_SAMPLE))
+        frags, params = _range_bounds("id", since_id, until_id)
+        clause = (" WHERE " + " AND ".join(frags)) if frags else ""
+        with self._lock:
+            (matched,) = self._conn.execute(
+                "SELECT COUNT(*) FROM frames" + clause, params
+            ).fetchone()
+            if not matched:
+                return []
+            stride = max(1, math.ceil(matched / count))
+            rows = self._conn.execute(
+                "SELECT id, recv_ts FROM ("
+                "  SELECT id, recv_ts, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM frames"
+                + clause +
+                ") WHERE (rn - 1) % ? = 0 ORDER BY id ASC",
+                params + [stride],
+            ).fetchall()
+        return [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
+
+    def sample_frames_by_interval(
+        self, since_id: "int | None", until_id: "int | None", interval_ms: int
+    ) -> "list[dict]":
+        """One frame per ``interval_ms`` of wall-clock ``recv_ts`` across the window, id ASC.
+
+        The density viewer's TRUE "X per minute / per hour" rate: unlike
+        ``sample_frames`` (which decimates by frame index and so only tracks a time
+        rate when capture is uniform), this buckets the window's frames into fixed
+        ``interval_ms`` recv_ts intervals and returns the EARLIEST frame in each
+        non-empty bucket — so the result is ~one frame per interval regardless of
+        the capture fps, of how wide the (mostly-empty) clock window is, or of gaps
+        where the collector was stopped. Empty intervals simply yield no thumbnail.
+
+        ``interval_ms`` is the requested spacing (e.g. 60000 for 1/min, 30000 for
+        2/min, 3600000 for 1/hour); it is raised if needed so the number of buckets
+        can't exceed ``_MAX_SAMPLE`` (a very fine rate over a very wide window can't
+        return tens of thousands of thumbs). Buckets are measured from the window's
+        first ``recv_ts``. Each row is ``{"id", "recv_ts", "url"}``; empty list when
+        the window matches no frame.
+        """
+        interval_ms = max(1, int(interval_ms))
+        frags, params = _range_bounds("id", since_id, until_id)
+        clause = (" WHERE " + " AND ".join(frags)) if frags else ""
+        with self._lock:
+            mn, _mx, matched = self._conn.execute(
+                "SELECT MIN(recv_ts), MAX(recv_ts), COUNT(*) FROM frames" + clause, params
+            ).fetchone()
+            if not matched:
+                return []
+            mn, mx = int(mn), int(_mx)
+            # Raise the interval if a finer one would bucket into more than
+            # _MAX_SAMPLE thumbnails (span/interval buckets). +1 so a single-instant
+            # window still asks for at least one bucket-width.
+            floor_interval = max(1, math.ceil((mx - mn + 1) / _MAX_SAMPLE))
+            interval_ms = max(interval_ms, floor_interval)
+            rows = self._conn.execute(
+                "SELECT id, recv_ts FROM ("
+                "  SELECT id, recv_ts,"
+                "    ROW_NUMBER() OVER (PARTITION BY (recv_ts - ?) / ? ORDER BY recv_ts ASC, id ASC) AS rn"
+                "  FROM frames" + clause +
+                ") WHERE rn = 1 ORDER BY id ASC",
+                [mn, interval_ms] + params,
+            ).fetchall()
+        return [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
 
     # --- Analysis layer -----------------------------------------------------
     #
@@ -717,6 +976,26 @@ class Store:
                 (int(frame_id), int(n)),
             ).fetchall()
         return [os.path.join(self._media_root, rel_path) for (rel_path,) in reversed(rows)]
+
+    def recent_before_rows(self, frame_id: int, n: int) -> "list[dict]":
+        """The ``n`` frames just before ``frame_id`` as ``{id, recv_ts, url}`` dicts.
+
+        The row-shaped sibling of ``recent_before`` (which returns bare filesystem
+        paths for a windowed analyzer's warm-start): the visit inbox's filmstrip
+        needs frame ids → ``/media/{id}`` URLs to show the gate's warm-up context
+        (a few frames preceding the visit). Returned in CHRONOLOGICAL (id ASC)
+        order — queried ``id DESC LIMIT n`` (the newest preceding frames), then
+        reversed for replay order.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, recv_ts FROM frames WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (int(frame_id), int(n)),
+            ).fetchall()
+        return [
+            {"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"}
+            for r in reversed(rows)
+        ]
 
     def count_unanalyzed(
         self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
@@ -1050,39 +1329,93 @@ class Store:
         }
 
     @staticmethod
-    def _cluster_visits(interesting: "list") -> "tuple[int, int]":
+    def _gap_split(items: "list", gap_ms: int, ts_of) -> "list[list]":
+        """Cluster a recv_ts-ascending sequence into runs split at recv_ts gaps.
+
+        The single gap-clustering primitive BOTH the scorecard's visit counts
+        (``_cluster_visits`` → ``_split_into_visits``) and the visit inbox's
+        per-visit records (``visits``) share, so the two can never cluster the same
+        frames differently. ``items`` must already be sorted ascending by the
+        recv_ts that ``ts_of(item)`` extracts; a new run starts wherever
+        consecutive timestamps differ by more than ``gap_ms``. Returns a list of
+        runs (each a non-empty list of the original items, order preserved); an
+        empty input yields an empty list.
+        """
+        runs: "list[list]" = []
+        run: "list" = []
+        prev_ts: "int | None" = None
+        for item in items:
+            ts = ts_of(item)
+            if prev_ts is not None and ts - prev_ts > gap_ms:
+                runs.append(run)
+                run = []
+            run.append(item)
+            prev_ts = ts
+        if run:
+            runs.append(run)
+        return runs
+
+    @classmethod
+    def _split_into_visits(cls, present_ts: "list[int]") -> "list[tuple[int, int]]":
+        """Scorecard visit spans: sorted present timestamps → ``(lo_ts, hi_ts)``.
+
+        Thin wrapper over ``_gap_split`` for ``_cluster_visits``: ``present_ts`` is
+        ascending, and each run of frames closer than ``_VISIT_GAP_MS`` collapses
+        to its ``(first, last)`` recv_ts span — the span shape the caught test
+        consumes. Kept separate so ``gate_scorecard``'s counts stay byte-for-byte
+        while ``visits`` builds full records over the same primitive.
+        """
+        return [
+            (run[0], run[-1])
+            for run in cls._gap_split(present_ts, _VISIT_GAP_MS, lambda ts: ts)
+        ]
+
+    @staticmethod
+    def _visit_caught(lo_ts: int, hi_ts: int, motion_ts: "list[int]") -> bool:
+        """Whether any source-motion frame lands in ``[lo_ts, hi_ts]`` ±window.
+
+        A visit counts as caught when a source-motion recv_ts falls inside its span
+        expanded by ``_VISIT_WINDOW_MS`` on each side (the gate may fire just
+        before/after the oracle sees the cat — on approach or in the tail — so an
+        exact-frame match is too strict). ``motion_ts`` must be sorted ascending;
+        found by binary search.
+        """
+        lo, hi = lo_ts - _VISIT_WINDOW_MS, hi_ts + _VISIT_WINDOW_MS
+        i = bisect.bisect_left(motion_ts, lo)
+        return i < len(motion_ts) and motion_ts[i] <= hi
+
+    @staticmethod
+    def _conflict_present_score(row) -> float:
+        """Presence confidence of a YOLO-vs-BSUV conflict row.
+
+        ``row`` is ``(id, recv_ts, yolo_verdict, yolo_score, bsuv_verdict,
+        bsuv_score)`` where the two verdicts differ, so exactly one oracle claims
+        the subject present — its score is the presence confidence used to pick the
+        representative frame. Returns ``-inf`` when that oracle stored no numeric
+        score, so it never wins the representative pick over a scored peer.
+        """
+        score = row[3] if row[2] == 1 else row[5]
+        return score if score is not None else float("-inf")
+
+    @classmethod
+    def _cluster_visits(cls, interesting: "list") -> "tuple[int, int]":
         """Cluster oracle-present frames into visits and count how many were caught.
 
         ``interesting`` is ``(recv_ts, source_motion, oracle_verdict)`` rows in
         recv_ts order (only present-or-motion rows). Present frames split into a
         new visit wherever the recv_ts gap exceeds ``_VISIT_GAP_MS``; a visit is
-        caught when any source-motion frame lands in its span ±``_VISIT_WINDOW_MS``
-        (binary-searched over the sorted motion timestamps). Returns
-        ``(total_visits, caught_visits)``.
+        caught when any source-motion frame lands in its span ±``_VISIT_WINDOW_MS``.
+        Returns ``(total_visits, caught_visits)`` — the counts ``gate_scorecard``
+        reports, now computed over the shared ``_split_into_visits`` /
+        ``_visit_caught`` primitives so it can never drift from ``visits``.
         """
         present_ts = sorted(ts for ts, _motion, verdict in interesting if verdict == 1)
         if not present_ts:
             return 0, 0
         motion_ts = sorted(ts for ts, motion, _verdict in interesting if motion == 1)
-
-        # Split present_ts into visits at gaps > _VISIT_GAP_MS; each visit is its
-        # (start, end) recv_ts span (present_ts is sorted, so first/last bound it).
-        visits: "list[tuple[int, int]]" = []
-        start = prev = present_ts[0]
-        for ts in present_ts[1:]:
-            if ts - prev > _VISIT_GAP_MS:
-                visits.append((start, prev))
-                start = ts
-            prev = ts
-        visits.append((start, prev))
-
-        caught = 0
-        for lo_ts, hi_ts in visits:
-            lo, hi = lo_ts - _VISIT_WINDOW_MS, hi_ts + _VISIT_WINDOW_MS
-            i = bisect.bisect_left(motion_ts, lo)
-            if i < len(motion_ts) and motion_ts[i] <= hi:
-                caught += 1
-        return len(visits), caught
+        spans = cls._split_into_visits(present_ts)
+        caught = sum(1 for lo_ts, hi_ts in spans if cls._visit_caught(lo_ts, hi_ts, motion_ts))
+        return len(spans), caught
 
     def gate_fidelity(self, slot: str, since_id: "int | None" = None, until_id: "int | None" = None) -> dict:
         """How faithfully a re-run slot reproduces the live gate it was seeded from.
@@ -1133,3 +1466,207 @@ class Store:
         except (ValueError, TypeError):
             return None
         return detail if isinstance(detail, dict) else None
+
+    # --- Density timeline + visit inbox ------------------------------------
+    #
+    # The two read endpoints the motion-detection workflow's drill-down leans on
+    # (see the motion-detection-workflow spec). Both judge disagreements against
+    # the LIVE edge gate — the stored ``frames.motion`` flag, NOT a ``mog2:*``
+    # re-run slot — because that flag came from a MOG2 model already warm at
+    # capture time, so there is no un-primed warm-up prefix to drop (unlike
+    # ``gate_scorecard``, whose offline re-run must). Their totals therefore
+    # legitimately differ from a scorecard's over the same window. Both scope to
+    # an id window and run under the single store lock like every other read.
+
+    def timeline_bins(
+        self, since_id: "int | None", until_id: "int | None", oracle: str, bins: int
+    ) -> "list[dict]":
+        """Per-bin disagreement counts across the window — the density overview.
+
+        Bins the window's frames by ``recv_ts`` into ``bins`` equal-width bins
+        spanning ``[min(recv_ts), max(recv_ts)]`` of the window (so quiet hours
+        read as sparse bins — bins with no frames are simply absent — which
+        equal-id-count bins would hide). Returns one dict per NON-empty bin, time
+        ordered::
+
+            {t0, t1, total, motion, present, missed, false}
+
+        ``motion = SUM(frames.motion)`` (the live gate). ``present``/``missed``/
+        ``false`` come from a LEFT JOIN on ``analysis`` for ``oracle`` and are 0
+        in bins where it has no verdicts: ``present`` = oracle verdict 1,
+        ``missed`` = ``frames.motion = 0 AND verdict = 1`` (a gate miss),
+        ``false`` = ``frames.motion = 1 AND verdict = 0`` (a false trigger).
+        ``t0``/``t1`` are the bin's nominal recv_ts boundaries. Empty list when the
+        window has no frames. One grouped query does the binning.
+        """
+        bins = max(1, int(bins))
+        # Range fragments for the aliased-``f`` grouped query and the bare-``id``
+        # bounds probe; the recv_ts index backs the min/max lookup.
+        f_frags, f_params = _range_bounds("f.id", since_id, until_id)
+        id_frags, id_params = _range_bounds("id", since_id, until_id)
+        id_clause = (" WHERE " + " AND ".join(id_frags)) if id_frags else ""
+        with self._lock:
+            mn, mx, total_all = self._conn.execute(
+                "SELECT MIN(recv_ts), MAX(recv_ts), COUNT(*) FROM frames" + id_clause,
+                id_params,
+            ).fetchone()
+            if not total_all or mn is None:
+                return []
+            mn, mx = int(mn), int(mx)
+            span = mx - mn
+            # span == 0 (a single distinct recv_ts) would divide by zero; a
+            # divisor of 1 with recv_ts - mn == 0 for every row lands them all in
+            # bin 0, which is exactly the one-bin degenerate we want.
+            divisor = span if span > 0 else 1
+            f_where = (" WHERE " + " AND ".join(f_frags)) if f_frags else ""
+            grouped = self._conn.execute(
+                "SELECT bin_idx, COUNT(*),"
+                " COALESCE(SUM(motion), 0),"
+                " COALESCE(SUM(present), 0),"
+                " COALESCE(SUM(missed), 0),"
+                " COALESCE(SUM(false_ct), 0)"
+                " FROM ("
+                "   SELECT MIN(?, (f.recv_ts - ?) * ? / ?) AS bin_idx,"
+                "          f.motion AS motion,"
+                "          CASE WHEN o.verdict = 1 THEN 1 ELSE 0 END AS present,"
+                "          CASE WHEN f.motion = 0 AND o.verdict = 1 THEN 1 ELSE 0 END AS missed,"
+                "          CASE WHEN f.motion = 1 AND o.verdict = 0 THEN 1 ELSE 0 END AS false_ct"
+                "   FROM frames f"
+                "   LEFT JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                + f_where +
+                " ) GROUP BY bin_idx ORDER BY bin_idx",
+                [bins - 1, mn, bins, divisor, oracle] + f_params,
+            ).fetchall()
+
+        result: "list[dict]" = []
+        for bin_idx, total, motion, present, missed, false_ct in grouped:
+            i = int(bin_idx)
+            result.append(
+                {
+                    "t0": mn + (span * i) // bins,
+                    "t1": mn + (span * (i + 1)) // bins,
+                    "total": int(total),
+                    "motion": int(motion),
+                    "present": int(present),
+                    "missed": int(missed),
+                    "false": int(false_ct),
+                }
+            )
+        return result
+
+    def visits(
+        self, since_id: "int | None", until_id: "int | None", oracle: str, mode: str
+    ) -> "list[dict]":
+        """The ranked visit inbox for one error mode over the window (worst-first).
+
+        ``mode`` ∈ ``{"missed", "false", "conflict"}`` (ValueError otherwise).
+        Clusters the mode's candidate frames into visits by the shared
+        ``_gap_split`` recv_ts-gap primitive and returns per-visit records::
+
+            {start_id, end_id, start_ts, end_ts, rep_frame_id, n_frames,
+             present_count, caught}
+
+        ``start_id``/``end_id`` are the id bounds of the visit's clustered frames
+        and are load-bearing: the inbox fetches the visit's own frames via
+        ``/api/frames?since_id=&until_id=``, so a record must hand back the id
+        window it clustered. ``caught`` is whether any live-gate motion frame lands
+        in the visit's span ±``_VISIT_WINDOW_MS`` (the same rule for every mode).
+
+        - ``missed``: cluster oracle-present frames (verdict 1). ``rep_frame_id`` =
+          highest oracle-score frame; ``present_count`` = oracle-present count in
+          the visit. Sorted wholly-missed (``caught`` False) before caught, then
+          ``n_frames`` desc, then peak oracle score desc — the wholly-missed, long
+          visits that cost a real GPU trigger surface first.
+        - ``false``: cluster ``frames.motion = 1 AND`` oracle verdict 0.
+          ``rep_frame_id`` = highest-area frame. Sorted ``n_frames`` desc, then
+          peak area desc.
+        - ``conflict``: cluster frames where YOLO and BSUV verdicts differ (needs
+          both oracles run for the frame); ignores ``oracle``. ``rep_frame_id`` =
+          the frame whose present oracle is most confident. Sorted ``n_frames``
+          desc, then peak score-gap desc.
+
+        ``present_count`` is the oracle-present count for ``missed`` and the cluster
+        size otherwise. Judged against the LIVE gate, so no warm-up prefix is
+        dropped — totals may differ from a scorecard's over the same window.
+        """
+        if mode not in _VISIT_MODES:
+            raise ValueError(f"mode must be one of {_VISIT_MODES}, got {mode!r}")
+
+        f_frags, f_params = _range_bounds("f.id", since_id, until_id)
+        f_and = "".join(" AND " + frag for frag in f_frags)
+        mo_frags, mo_params = _range_bounds("id", since_id, until_id)
+        mo_where = " AND ".join(["motion = 1"] + mo_frags)
+
+        with self._lock:
+            # Live-gate motion timestamps for the shared caught test.
+            motion_ts = sorted(
+                int(r[0])
+                for r in self._conn.execute(
+                    "SELECT recv_ts FROM frames WHERE " + mo_where, mo_params
+                ).fetchall()
+            )
+            if mode == "missed":
+                rows = self._conn.execute(
+                    "SELECT f.id, f.recv_ts, o.score FROM frames f"
+                    " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                    " WHERE o.verdict = 1" + f_and +
+                    " ORDER BY f.recv_ts ASC, f.id ASC",
+                    [oracle] + f_params,
+                ).fetchall()
+            elif mode == "false":
+                rows = self._conn.execute(
+                    "SELECT f.id, f.recv_ts, f.area FROM frames f"
+                    " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                    " WHERE f.motion = 1 AND o.verdict = 0" + f_and +
+                    " ORDER BY f.recv_ts ASC, f.id ASC",
+                    [oracle] + f_params,
+                ).fetchall()
+            else:  # conflict — compare the two oracles, ignore `oracle`
+                rows = self._conn.execute(
+                    "SELECT f.id, f.recv_ts, y.verdict, y.score, b.verdict, b.score FROM frames f"
+                    " JOIN analysis y ON y.frame_id = f.id AND y.analyzer = ?"
+                    " JOIN analysis b ON b.frame_id = f.id AND b.analyzer = ?"
+                    " WHERE y.verdict <> b.verdict" + f_and +
+                    " ORDER BY f.recv_ts ASC, f.id ASC",
+                    ["yolo", "bsuv"] + f_params,
+                ).fetchall()
+
+        # Cluster + build records outside the lock (pure Python over the fetched
+        # rows, already recv_ts-ordered by the query's ORDER BY).
+        scored: "list[tuple]" = []
+        for cluster in self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[1]):
+            ids = [int(r[0]) for r in cluster]
+            start_ts, end_ts = int(cluster[0][1]), int(cluster[-1][1])
+            n_frames = len(cluster)
+            caught = self._visit_caught(start_ts, end_ts, motion_ts)
+            record = {
+                "start_id": min(ids),
+                "end_id": max(ids),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "n_frames": n_frames,
+                "present_count": n_frames,
+                "caught": caught,
+            }
+            if mode == "missed":
+                rep = max(
+                    cluster,
+                    key=lambda r: (r[2] if r[2] is not None else float("-inf"), r[0]),
+                )
+                peak = max((r[2] for r in cluster if r[2] is not None), default=float("-inf"))
+                record["rep_frame_id"] = int(rep[0])
+                sort_key: "tuple" = (caught, -n_frames, -peak)
+            elif mode == "false":
+                rep = max(cluster, key=lambda r: (r[2], r[0]))  # area is NOT NULL
+                peak_area = max(r[2] for r in cluster)
+                record["rep_frame_id"] = int(rep[0])
+                sort_key = (-n_frames, -peak_area)
+            else:  # conflict
+                rep = max(cluster, key=lambda r: (self._conflict_present_score(r), r[0]))
+                peak_gap = max(abs((r[3] or 0.0) - (r[5] or 0.0)) for r in cluster)
+                record["rep_frame_id"] = int(rep[0])
+                sort_key = (-n_frames, -peak_gap)
+            scored.append((sort_key, record))
+
+        scored.sort(key=lambda x: x[0])
+        return [rec for _, rec in scored]

@@ -16,10 +16,14 @@ Two runtime controls sit on top of that base (the motion-gate-oracles spec):
   ``CAT_COLLECT_AUTOSTART=1`` opts into begin-immediately for an unattended run.
 - **Offline analysis.** A stronger, slower oracle (YOLO / BSUV) is swept over the
   *stored* frames on demand to validate the edge's cheap MOG2 gate, its verdicts
-  landing in the store's ``analysis`` table. ``AnalysisManager`` runs one such job
-  at a time (``/api/analysis/{run,cancel,status}``), and ``/api/frames`` grows a
-  disagreement view (``analyzer`` + ``disagree=missed|false``) that surfaces the
-  frames where MOG2 and a chosen oracle disagree.
+  landing in the store's ``analysis`` table. ``AnalysisManager`` drains an in-memory
+  FIFO of such jobs one at a time — a second request *enqueues* rather than being
+  refused, so several buckets × oracles can be queued and left to run unattended
+  (``/api/analysis/{run,cancel,queue/clear,queue/stop-all,status}``) — and
+  ``/api/frames`` grows a disagreement view (``analyzer`` + ``disagree=missed|false``)
+  that surfaces the frames where MOG2 and a chosen oracle disagree. On top of that,
+  ``/api/timeline`` and ``/api/visits`` summarize a bucket's disagreements as a density
+  strip and a worst-first visit inbox for review at 24-hour scale.
 
 ``create_app`` is the injection seam, mirroring the edge's
 ``create_app(source_factory, start_grabber)``: tests pass an explicit ``store``
@@ -62,6 +66,14 @@ _DEFAULT_MAX_BYTES = 5368709120  # 5 GiB — ~2 h at 10 fps, a testing window
 # thumbnails actually fetch, so a big page is cheap to serve.
 _DEFAULT_LIMIT = 200
 _MAX_LIMIT = 1000
+
+# Density-timeline binning: the default bin count when the caller omits ``bins``, and a
+# hard cap so a direct API caller can't ask ``/api/timeline`` to shard an 864k-frame
+# window into a bin-per-frame result. ``timeline_bins`` returns only NON-empty bins, so
+# the real result is bounded by the window's frame count regardless; the cap bounds the
+# JSON size and keeps the strip's cell count in the "few hundred" the spec intends.
+_DEFAULT_TIMELINE_BINS = 200
+_MAX_TIMELINE_BINS = 2000
 
 class AnalysisRunRequest(BaseModel):
     """Body of ``POST /api/analysis/run``: which oracle to sweep, and whether to redo.
@@ -116,6 +128,15 @@ _EDGE_MOTION_DEFAULTS = {
 _BASELINE_SLOT = "mog2:baseline"
 _CANDIDATE_SLOT = "mog2:candidate"
 
+# The oracles whose sweep is WINDOWED/stateful — BSUV replays temporally-contiguous
+# frames to build its background — so a motion-only span's multi-minute gaps make their
+# verdicts (and any scorecard built from them) unreliable across it. A run over a bucket
+# overlapping such a span therefore returns a ``motion_only_overlap`` warning at enqueue
+# so the UI can flag "verdicts unreliable across the motion-only span" rather than
+# presenting a clean scorecard. YOLO is per-frame and unaffected, so it is NOT here; a
+# MOG2 re-run is windowed too and ``/api/tuning/rerun`` flags it directly.
+_WINDOWED_ORACLES = {"bsuv"}
+
 # The warm-up prefix length the tuning compare drops from a scorecard. Mirrors
 # ``MogAnalyzer._WARMUP`` (the number of recent frames a windowed re-run primes its
 # background over) BY HAND — same discipline as ``_EDGE_MOTION_DEFAULTS`` mirrors the
@@ -155,6 +176,21 @@ class GroupCreateRequest(BaseModel):
     name: str
     start_id: int
     end_id: int
+
+
+class CollectorMotionOnlyRequest(BaseModel):
+    """Body of ``POST /api/collector/motion-only``: the desired motion-only capture flag.
+
+    ``motion_only`` True switches the collector to persist only frames the edge saw
+    motion in — a compact false-triggers-only / cat-crop capture mode; False (the
+    default) stores every frame. ``CollectorManager.set_motion_only`` records the
+    mode-change boundary (only on a real flip) and persists the setting. The
+    load-bearing caveat: a *miss* is a non-motion frame that held a cat, so dropping
+    non-motion frames makes recall/misses unmeasurable in that store — which the UI
+    labels and which every overlapping window is flagged for (see *Motion-only spans*).
+    """
+
+    motion_only: bool
 
 
 def _motion_params_from(params: dict) -> MotionParams:
@@ -338,6 +374,14 @@ def create_app(
     collector_manager = CollectorManager(client, store)
     app.state.collector_manager = collector_manager
 
+    # Restore the persisted motion-only capture flag into memory WITHOUT starting the
+    # collector or writing the store: a bare launch must never silently write (changelog
+    # 28), and the collector still starts stopped unless ``autostart``. The operator's
+    # last motion-only choice thus survives a restart; the separate collector-running
+    # intent is read (not restored here) only to drive the Start-page Resume prompt (see
+    # /api/stats.resume_available).
+    collector_manager.restore_motion_only(store.get_setting("motion_only") == "1")
+
     if start_collector:
         # The collector is now WIRED (live client above, shutdown hook below) but
         # begins only if autostart is set — otherwise a fresh launch stays stopped
@@ -414,9 +458,20 @@ def create_app(
 
     @app.get("/api/stats")
     def api_stats():
-        # Fold the collector's live run state into the store summary so the UI can
-        # render its start/stop badge from the same poll it already makes.
-        return {**store.stats(), "collector_running": collector_manager.running}
+        # Fold the collector's live run state into the store summary so the UI can render
+        # its start/stop badge from the same poll it already makes. Also expose the
+        # motion-only capture flag (so the Start toggle reflects persisted state) and
+        # ``resume_available`` — the persisted collector-running intent was on yet the
+        # collector is currently stopped, i.e. the process restarted mid-run — which
+        # drives the Start-page one-click Resume prompt.
+        return {
+            **store.stats(),
+            "collector_running": collector_manager.running,
+            "motion_only": collector_manager.current_motion_only,
+            "resume_available": (
+                store.get_setting("collector_running") == "1" and not collector_manager.running
+            ),
+        }
 
     @app.get("/media/{frame_id}")
     def media(frame_id: int):
@@ -429,7 +484,15 @@ def create_app(
 
     @app.post("/api/clear")
     def api_clear():
+        # clear() drops mode_changes (keyed to frame ids → the same rowid-reuse hazard as
+        # groups) but KEEPS the settings KV (config). If collection is LIVE across the
+        # clear, the current motion-only mode would then sit in an EMPTY mode_changes log
+        # — reading later as reliable full capture even mid motion-only run — so re-seed
+        # one boundary row with the current mode (stamped at the store's post-wipe latest
+        # id). clear() can't do this itself: it doesn't know whether collection is running.
         deleted = store.clear()
+        if collector_manager.running:
+            store.record_mode_change(collector_manager.current_motion_only)
         return JSONResponse({"ok": True, "deleted": deleted})
 
     # --- Frame-range groups (the name->bounds bookmark layer) -----------------------
@@ -472,17 +535,131 @@ def create_app(
         # store), matching the scope params the feeds and re-runs take.
         return {"count": store.count_in_range(since_id, until_id)}
 
+    # --- Windowed reads for the Buckets + Motion-Detection views --------------------
+    #
+    # The clock→id resolution, the density-viewer sample, and the density timeline +
+    # visit inbox that back the motion-detection workflow (see the
+    # motion-detection-workflow spec). All scope by the same optional since_id/until_id
+    # id bounds a bucket (group) expands to; timeline/visits additionally attach the
+    # window's motion_only_spans so the UI can flag stretches where a miss is
+    # unmeasurable (a non-motion frame that held a cat was never stored — see the
+    # only-save-motion mode) rather than reading the empty missed set as perfect recall.
+
+    @app.get("/api/frames/resolve")
+    def api_frames_resolve(
+        start_ts: "int | None" = Query(default=None),
+        end_ts: "int | None" = Query(default=None),
+    ):
+        # Clock-picker → id bounds: the ONLY time-domain input in the app resolves ONCE
+        # here (nearest frame at-or-after start_ts, at-or-before end_ts) to the id window
+        # every scoped read then shares. A None bound — or a bound matching no frame —
+        # stays null on that side, which the UI reads as "no frames in that window".
+        since_id, until_id = store.resolve_ts_range(start_ts, end_ts)
+        return {"since_id": since_id, "until_id": until_id}
+
+    @app.get("/api/frames/sample")
+    def api_frames_sample(
+        count: int = Query(default=_DEFAULT_LIMIT),
+        per_ms: "int | None" = Query(default=None),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The density viewer's decimated preview, so a wide bucket is never dumped as tens
+        # of thousands of thumbs. Two strategies:
+        #  - per_ms set → one frame per that many ms of recv_ts (a TRUE per-minute/hour
+        #    time rate that holds regardless of capture fps, clock-window width, or gaps);
+        #  - else → ~count frames evenly spread by frame INDEX.
+        # Both clamp their density server-side (interval raised / count capped) so the
+        # result can't exceed _MAX_SAMPLE thumbnails.
+        if per_ms is not None:
+            frames = store.sample_frames_by_interval(since_id, until_id, per_ms)
+        else:
+            frames = store.sample_frames(since_id, until_id, count)
+        return {"frames": frames}
+
+    @app.get("/api/timeline")
+    def api_timeline(
+        oracle: str = Query(default="yolo"),
+        bins: int = Query(default=_DEFAULT_TIMELINE_BINS),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The density overview: per-bin disagreement counts across the bucket, plus the
+        # window's motion_only_spans so the strip can shade stretches where misses aren't
+        # measurable. The oracle is the fixed ground truth (400 if unknown — the same gate
+        # /api/frames uses); bins are clamped so a caller can't shard bin-per-frame.
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        _validate_bounds(since_id, until_id)
+        bins = max(1, min(int(bins), _MAX_TIMELINE_BINS))
+        return {
+            "bins": store.timeline_bins(since_id, until_id, oracle, bins),
+            "motion_only_spans": store.motion_only_spans(since_id, until_id),
+        }
+
+    @app.get("/api/visits")
+    def api_visits(
+        oracle: str = Query(default="yolo"),
+        mode: str = Query(default="missed"),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The ranked visit inbox for one error mode over the bucket, worst-first, plus the
+        # window's motion_only_spans (so the missed tab is marked unreliable rather than
+        # reassuringly empty across a motion-only span). The oracle is validated here
+        # (400); the MODE is validated by the store alone (ValueError → 400), so the set
+        # of valid modes has a single source — mirroring /api/frames' disagree handling.
+        # ``conflict`` mode ignores the oracle, but it is still validated for a uniform
+        # contract (the default "yolo" is valid, so conflict works without naming one).
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        _validate_bounds(since_id, until_id)
+        try:
+            visits = store.visits(since_id, until_id, oracle, mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "visits": visits,
+            "motion_only_spans": store.motion_only_spans(since_id, until_id),
+        }
+
     @app.post("/api/collector/start")
     def api_collector_start():
-        # The manager owns idempotency/thread-replacement; the route just toggles
-        # and reports the resulting state so the UI badge follows the truth.
+        # The manager owns idempotency/thread-replacement; the route just toggles and
+        # reports the resulting state so the UI badge follows the truth. Persist the
+        # collector-running INTENT here (not in the manager) so it is written only on an
+        # operator-initiated start — never by the process-exit shutdown hook, which calls
+        # the bare stop() — letting the Start-page Resume prompt distinguish "was
+        # collecting when the process died" from "operator stopped it" (see the spec's
+        # Persistence section).
         collector_manager.start()
+        store.set_setting("collector_running", "1")
         return {"running": collector_manager.running}
 
     @app.post("/api/collector/stop")
     def api_collector_stop():
+        # Symmetric to start: clear the persisted intent on an operator stop so a later
+        # launch does NOT offer Resume. The shutdown hook deliberately does not come
+        # through here — it calls collector_manager.stop() directly, leaving the intent
+        # untouched so a mid-run restart still surfaces Resume.
         collector_manager.stop()
+        store.set_setting("collector_running", "0")
         return {"running": collector_manager.running}
+
+    @app.post("/api/collector/motion-only")
+    def api_collector_motion_only(req: CollectorMotionOnlyRequest):
+        # Flip motion-only capture at runtime. The manager records the mode-change
+        # boundary (only on a real flip) and persists the setting; the route just reports
+        # the resulting flag. Missed cats become unmeasurable while this is on — the UI
+        # labels that caveat and shades any overlapping window (see Motion-only spans).
+        collector_manager.set_motion_only(bool(req.motion_only))
+        return {"motion_only": collector_manager.current_motion_only}
 
     @app.post("/api/analysis/run")
     def api_analysis_run(req: AnalysisRunRequest):
@@ -494,34 +671,59 @@ def create_app(
                 detail=f"unknown analyzer {req.analyzer!r}; known: {ANALYZER_NAMES}",
             )
         _validate_bounds(req.since_id, req.until_id)
-        if analysis_manager.running:
-            raise HTTPException(status_code=409, detail="analysis already running")
         try:
-            # start() resolves the backend AND calls ensure_available() synchronously, so
-            # a backend with missing optional deps/hardware surfaces HERE as ImportError
-            # (→ 503 with the install hint) instead of vanishing into the worker thread as
-            # a delayed status().error; a race that slipped past the check above →
-            # RuntimeError (→ 409). reanalyze rides into the worker, where the verdict
-            # clear happens only after a successful prepare() (see run_analysis), so a
-            # deps-missing run can't wipe an analyzer's verdicts with no replacement.
-            # since_id/until_id scope the sweep to a group's window (None = whole store).
-            analysis_manager.start(
+            # enqueue_named resolves the backend AND calls ensure_available()
+            # synchronously (both while the HTTP handler is still on the stack), so a bad
+            # name surfaces as ValueError (→ 400) and a backend with missing optional
+            # deps/hardware as ImportError (→ 503 with the install hint) — instead of
+            # vanishing into the worker as a delayed status().error. There is no
+            # busy-refusal anymore: a second request ENQUEUES (position ≥ 1) rather than
+            # 409ing — the queue drains serially. reanalyze rides into the worker, where
+            # the verdict clear happens only after a successful prepare() (see
+            # run_analysis), so a deps-missing run can't wipe verdicts with no
+            # replacement. since_id/until_id scope the sweep to a group's window (None =
+            # whole store).
+            result = analysis_manager.enqueue_named(
                 store,
                 req.analyzer,
                 reanalyze=req.reanalyze,
                 since_id=req.since_id,
                 until_id=req.until_id,
             )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except ImportError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
-        return analysis_manager.status()
+        # BSUV (windowed) verdicts are unreliable across a motion-only span's multi-minute
+        # gaps; warn at enqueue over an overlapping bucket so the UI can flag the resulting
+        # scorecard rather than present it as clean. YOLO is per-frame → never flagged.
+        overlap = (
+            bool(store.motion_only_spans(req.since_id, req.until_id))
+            if req.analyzer in _WINDOWED_ORACLES
+            else False
+        )
+        return {**result, "motion_only_overlap": overlap}
 
     @app.post("/api/analysis/cancel")
     def api_analysis_cancel():
-        # Idempotent: safe when no job runs (the next start replaces the event).
+        # Cancel the RUNNING job → the worker's finally records it "canceled" and promotes
+        # the next pending job. Idempotent: a no-op when idle (cancel() only sets
+        # stop_event under the lock while running — it does NOT arm a future job).
         analysis_manager.cancel()
+        return analysis_manager.status()
+
+    @app.post("/api/analysis/queue/clear")
+    def api_analysis_queue_clear():
+        # Drop every PENDING job; the running job finishes normally then, finding an empty
+        # deque, promotes nothing and the manager goes idle. "Clear the queue."
+        analysis_manager.clear_pending()
+        return analysis_manager.status()
+
+    @app.post("/api/analysis/queue/stop-all")
+    def api_analysis_queue_stop_all():
+        # Clear pending AND cancel the running job, atomically under the manager lock so
+        # no pending job is promoted between the two — the unsurprising "stop everything".
+        analysis_manager.stop_all()
         return analysis_manager.status()
 
     @app.get("/api/analysis/status")
@@ -556,7 +758,7 @@ def create_app(
     @app.post("/api/tuning/rerun")
     def api_tuning_rerun(req: TuningRerunRequest):
         # Validate slot + params FIRST (400) — a client mistake, before touching the
-        # manager — mirroring /api/analysis/run's name-before-busy ordering. Bad params
+        # manager — mirroring /api/analysis/run's name-before-enqueue ordering. Bad params
         # (missing/ill-typed) and a bad slot both surface as ValueError -> 400.
         try:
             params = _motion_params_from(req.params)
@@ -564,24 +766,27 @@ def create_app(
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         _validate_bounds(req.since_id, req.until_id)
-        if analysis_manager.running:
-            raise HTTPException(status_code=409, detail="analysis already running")
         try:
             # reanalyze=True: a re-run always re-verdicts its whole slot with the new
-            # params (the clear happens in the worker only after a successful prepare,
-            # so a cv2-missing run can't wipe a prior slot). start_analyzer runs
+            # params (the clear happens in the worker only after a successful prepare, so
+            # a cv2-missing run can't wipe a prior slot). enqueue_analyzer runs
             # ensure_available() synchronously, so a missing/broken OpenCV surfaces HERE
-            # as ImportError (-> 503) instead of a delayed status().error; a race past
-            # the busy check above -> RuntimeError (-> 409). since_id/until_id scope the
-            # re-run to a group's window (None = whole store).
-            analysis_manager.start_analyzer(
+            # as ImportError (→ 503) instead of a delayed status().error. No busy-refusal:
+            # a re-run ENQUEUES behind any running sweep (position ≥ 1) rather than
+            # 409ing, so interactive tuning re-runs queue on the one GPU. A re-run with
+            # DIFFERENT params over the same window is NOT a dedup (that is the tune
+            # loop); an identical same-params re-run is dropped. since_id/until_id scope
+            # the re-run to a group's window (None = whole store).
+            result = analysis_manager.enqueue_analyzer(
                 store, analyzer, reanalyze=True, since_id=req.since_id, until_id=req.until_id
             )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
         except ImportError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
-        return analysis_manager.status()
+        # A MOG2 re-run is windowed/stateful like BSUV, so it too is unreliable across a
+        # motion-only span — flag an overlapping window at enqueue (mog2 is always
+        # windowed, so unlike /api/analysis/run there is no per-oracle guard here).
+        overlap = bool(store.motion_only_spans(req.since_id, req.until_id))
+        return {**result, "motion_only_overlap": overlap}
 
     @app.get("/api/tuning/compare")
     def api_tuning_compare(

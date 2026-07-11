@@ -13,12 +13,17 @@ Two pieces:
   matches its statefulness, then for every frame decode → infer → write the verdict,
   surviving a bad frame and honoring a cancel between frames. It takes a ``manager`` only
   to report progress and read the stop flag, so it is exercisable with a stub manager.
-- ``AnalysisManager`` — owns the single active job's ``(thread, stop_event, counters,
-  error)`` and serializes it, mirroring the collector's daemon-thread + stop-event style
-  (see how ``create_app`` drives ``run_collector``). A second ``start`` while one runs is
-  refused; the analyzer is resolved *synchronously* in ``start`` so a bad name
-  (``ValueError``) or a backend with missing optional deps (``ImportError``) surfaces to
-  the HTTP caller instead of vanishing into the worker thread.
+- ``AnalysisManager`` — the walk-away job queue. Instead of refusing a second request
+  while one runs, it now holds an in-memory FIFO of pending jobs and drains them one at a
+  time (the GPU and the single SQLite connection are shared, so serial is the only correct
+  execution — this is a status list, not a scheduler). It mirrors the collector's
+  daemon-thread + stop-event style (see how ``create_app`` drives ``run_collector``): the
+  head job runs on a background daemon thread, the rest wait, and each job's terminal
+  outcome (done / failed / canceled) lands in a bounded history so a returning operator can
+  tell a clean drain from a silent partial failure. The analyzer is resolved and its deps
+  checked *synchronously* at enqueue so a bad name (``ValueError``) or a backend with
+  missing optional deps (``ImportError``) surfaces to the HTTP caller up front instead of
+  vanishing into the worker thread.
 
 ``cv2``/``numpy`` are imported lazily inside ``run_analysis`` (never at module top) — the
 same discipline ``StreamFrame.image`` and the backends follow — so importing this module,
@@ -29,6 +34,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from compute.analysis import get_analyzer
@@ -44,6 +51,11 @@ logger = logging.getLogger(__name__)
 # the throttle period for per-frame error logging, so a systematically bad store can't
 # flood the log at frame rate. Mirrors the collector's ``_LOG_EVERY``.
 _LOG_EVERY = 500
+
+# How many finished jobs ``status()`` reports back, most-recent-first. Bounded because the
+# history is in-memory diagnostics for a returning operator, not a durable audit log — a
+# restart drops it (the verdicts it summarizes persist, and a re-enqueue resumes cheaply).
+_HISTORY_LIMIT = 20
 
 
 def run_analysis(
@@ -173,26 +185,74 @@ def run_analysis(
     logger.info("analysis sweep finished: analyzer=%s %d verdicts, %d skipped", analyzer.name, done, errors)
 
 
+@dataclass(frozen=True)
+class _Job:
+    """One queued (or running) sweep, immutable once created.
+
+    Carries everything the worker needs to run the sweep and everything ``status()`` needs
+    to describe it, but NOT the counters (those live on the manager and belong to whatever
+    job is currently running) nor the store (a single instance shared by every job, held on
+    the manager). ``kind`` is the oracle/slot id reported to the UI
+    (``'yolo'``/``'bsuv'``/``'mog2:baseline'``/``'mog2:candidate'``); ``name`` is set only
+    for a registry oracle (unused after resolution, kept for provenance); ``analyzer`` is
+    the resolved backend instance held from enqueue so the worker doesn't re-resolve.
+    ``params`` is the hashable MOG2 param tuple for a pre-built slot (``None`` for the fixed
+    oracles) — it is IN the dedup key so re-running ``mog2:candidate`` with *different*
+    params over the same window is a distinct job (the tune loop), not a duplicate.
+    """
+
+    kind: str
+    analyzer: "Analyzer"
+    name: "str | None"
+    reanalyze: bool
+    since_id: "int | None"
+    until_id: "int | None"
+    params: "tuple | None"
+    label: str
+
+    def dedup_key(self) -> tuple:
+        """The full job identity used to drop a duplicate enqueue.
+
+        ``(kind, params, reanalyze, since_id, until_id)`` — the spec's dedup key. ``params``
+        distinguishes two MOG2 candidates over the same window (different params → different
+        jobs); ``reanalyze`` distinguishes a plain sweep from a re-verdict of the same
+        oracle+window (otherwise a re-run would dedup away against the earlier run and
+        silently never happen).
+        """
+        return (self.kind, self.params, self.reanalyze, self.since_id, self.until_id)
+
+
 class AnalysisManager:
-    """Owns the single active analysis job and serializes it (one at a time).
+    """Owns the pending FIFO + the single active job, and drains the queue one at a time.
 
     Mirrors the collector's daemon-thread + stop-event shape (see
-    ``compute/collection/collector.py`` and how ``create_app`` drives it): a background
-    daemon thread runs ``run_analysis``; a ``threading.Event`` cancels it between frames; a
-    ``threading.Lock`` guards the mutable state (``running`` / counters / ``error``) so the
-    API's status poll and the worker thread never race. Only ONE job runs at once —
-    ``start`` refuses a second while one is live — because the store's single connection and
-    the GPU are shared and the progress counters assume a single sweep.
+    ``compute/collection/collector.py`` and how ``create_app`` drives it): the head job runs
+    on a background daemon thread; a ``threading.Event`` cancels it between frames; a single
+    ``threading.Lock`` guards *all* mutable state — the ``running`` flag, the counters, the
+    per-job ``error``, the pending deque, the finished-job history, and the ``stop_event``
+    reference itself — so the API's status poll, an external enqueue, a cancel, and the
+    worker's own finished-job promotion never race.
+
+    The load-bearing invariant is that exactly one job runs at a time and the
+    "record terminal state → clear ``running`` → promote the next" transition is ONE atomic
+    lock hold in the worker's ``finally``: an external ``enqueue`` can therefore never
+    observe ``running=False`` mid-promotion and double-start a second worker. ``cancel``
+    sets ``stop_event`` *under the same lock*, so it can never race the promotion's
+    ``stop_event`` swap — it targets whatever is running at the moment the lock is held (a
+    cancel that loses the race to a natural completion is a harmless no-op, not a mis-fire
+    against the successor). There is no more "refuse a second job": a second request
+    enqueues and waits.
 
     ``resolver`` is the injection seam: it defaults to the package registry
     ``get_analyzer`` but a test can pass a stub returning a fake analyzer, so the manager's
-    threading/lifecycle can be exercised with no real model and none of its heavy deps.
+    queue/threading/lifecycle can be exercised with no real model and none of its heavy deps.
     """
 
     def __init__(self, resolver=get_analyzer) -> None:
         self._resolver = resolver
         # One lock guards every field below; taken briefly for reads (status) and writes
-        # (start / set_total / record / _run's finally), NEVER held across the inference.
+        # (enqueue / cancel / clear / set_total / record / _run's finally), NEVER held
+        # across the inference.
         self._lock = threading.Lock()
         self._running = False
         self._analyzer: "str | None" = None
@@ -205,133 +265,273 @@ class AnalysisManager:
         # over <group>" rather than silently sweeping the whole store.
         self._since_id: "int | None" = None
         self._until_id: "int | None" = None
-        # Replaced with a fresh Event on every ``start`` so a prior job's set flag can't
+        # Replaced with a fresh Event on every promotion so a prior job's set flag can't
         # pre-cancel the next one; the worker reads it directly between frames, which is
-        # safe because ``running`` forbids overlapping jobs from ever reassigning it mid-run.
+        # safe because only one job runs at a time — the reference is only ever swapped by a
+        # promotion, which happens after this job's run_analysis has returned.
         self.stop_event = threading.Event()
         self._thread: "threading.Thread | None" = None
+        # Pending jobs (FIFO: appended at the tail, promoted from the head) and the running
+        # job descriptor. Invariant: pending is non-empty ONLY while a job is running (an
+        # idle enqueue promotes its job immediately, and a finished job promotes the next),
+        # so ``not running`` implies an empty pending deque.
+        self._pending: "deque[_Job]" = deque()
+        self._current_job: "_Job | None" = None
+        # Finished-job outcomes, most-recent-first, bounded — appendleft + maxlen evicts the
+        # oldest automatically. Each record is written once (in the worker's finally) and
+        # never mutated, so status() can hand out the list without a per-entry copy.
+        self._history: "deque[dict]" = deque(maxlen=_HISTORY_LIMIT)
+        # The store every job sweeps. All enqueues pass the same instance (one manager is
+        # bound to one app's store), so re-assigning it per enqueue is idempotent; held here
+        # so the worker's finally can promote the next job without a store parameter.
+        self._store: "Store | None" = None
 
-    def start(
+    # --- Public enqueue API (replaces the old refuse-second-job start/start_analyzer) ----
+
+    def enqueue_named(
         self,
         store: "Store",
         name: str,
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
-    ) -> None:
-        """Resolve a registered oracle by ``name`` and launch a sweep; refuse if one runs.
+    ) -> dict:
+        """Resolve a registered oracle by ``name`` and enqueue a sweep of it.
 
         The name-based entry point for the fixed oracles (yolo/bsuv): it resolves the
-        backend through ``self._resolver`` (a bad name raises ``ValueError`` → 400, and
-        an ``ImportError`` from a backend whose optional deps are absent propagates → 503
-        with the install hint), then delegates to ``start_analyzer``, which does the
-        launch under the lock. Resolution is a pure construction with no heavy import
-        (see ``get_analyzer``) and no manager side effects, so doing it before the lock
-        is harmless — the atomicity that matters (dep check + counter reset + the
-        ``running`` flip) lives in ``start_analyzer``.
+        backend through ``self._resolver`` (a bad name raises ``ValueError`` → 400) and
+        runs ``ensure_available()`` SYNCHRONOUSLY (an ``ImportError`` from a backend whose
+        optional deps are absent propagates → 503 with the install hint) — both *before*
+        the job is enqueued and while the HTTP handler is still on the stack, so a
+        bad-name / missing-deps request fails at request time instead of vanishing into the
+        worker as a delayed ``status().error``. Then, under the lock, the job is deduped and
+        appended, and the head is promoted if idle (see ``_enqueue``).
 
-        ``reanalyze`` and the optional ``since_id`` / ``until_id`` scope bounds ride
-        through to the worker unchanged (see ``start_analyzer`` / ``run_analysis``).
-        Behavior for the registered oracles with no scope is exactly as before — this
-        method is now a thin wrapper so that ``start_analyzer`` can also run a
-        *pre-constructed* analyzer the registry can't build (a parameterized
-        ``MogAnalyzer`` tuning run).
+        ``reanalyze`` and the optional ``since_id`` / ``until_id`` scope bounds ride through
+        to the worker unchanged (see ``run_analysis``). Returns ``{**status(), "position":
+        int, "deduped": bool}`` — ``position`` is how many jobs must finish before this one
+        starts (0 = running now), and ``deduped`` is True when an identical job was already
+        pending/running so this request was dropped onto it.
         """
         analyzer = self._resolver(name)
-        self.start_analyzer(store, analyzer, reanalyze=reanalyze, since_id=since_id, until_id=until_id)
+        analyzer.ensure_available()
+        job = _Job(
+            kind=name,
+            analyzer=analyzer,
+            name=name,
+            reanalyze=bool(reanalyze),
+            since_id=since_id,
+            until_id=until_id,
+            params=None,
+            label=name,
+        )
+        return self._enqueue(store, job)
 
-    def start_analyzer(
+    def enqueue_analyzer(
         self,
         store: "Store",
         analyzer: "Analyzer",
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
-    ) -> None:
-        """Launch a sweep for an ALREADY-CONSTRUCTED analyzer instance; refuse if one runs.
+    ) -> dict:
+        """Enqueue a sweep for an ALREADY-CONSTRUCTED analyzer instance (the MOG2 tuning path).
 
-        The instance-based core ``start`` delegates to, and the seam the tuning path uses
-        directly: a ``MogAnalyzer(params, slot)`` needs params from the run request, which
-        the name→instance registry can't supply, so it is constructed by the caller and
-        handed here without any ``ANALYZER_NAMES`` entry.
+        The instance-based seam the tuning path uses directly: a ``MogAnalyzer(params, slot)``
+        needs params from the run request, which the name→instance registry can't supply, so
+        it is constructed by the caller and handed here without any ``ANALYZER_NAMES`` entry.
+        ``ensure_available()`` runs SYNCHRONOUSLY here (missing/broken OpenCV → ``ImportError``
+        → 503) before the job is enqueued. ``kind`` is the instance's own ``name`` (e.g.
+        ``'mog2:candidate'``); its MOG2 params are captured into the dedup key as a hashable
+        tuple, so two candidates with *different* params over the same window are distinct
+        jobs (the tune loop) while a same-params double-click is dropped.
 
-        ``analyzer.ensure_available()`` runs SYNCHRONOUSLY here — before the thread is
-        spawned, while the HTTP handler is still on the stack — so a backend whose optional
-        deps/hardware are absent surfaces to the caller as ``ImportError`` (→ 503) rather
-        than vanishing into the worker as a delayed ``status().error``. ``status()['analyzer']``
-        is set to ``analyzer.name`` (e.g. ``'mog2:candidate'``), the instance's own id, so
-        the poll reports which run is live.
+        ``reanalyze`` and the optional scope bounds ride along to the worker, where the
+        verdict clear happens only after a successful ``prepare`` (see ``run_analysis``), so
+        a deps-missing run can't wipe verdicts. Returns the same shape as ``enqueue_named``.
+        """
+        analyzer.ensure_available()
+        raw_params = getattr(analyzer, "_params", None)
+        params = tuple(raw_params) if raw_params is not None else None
+        job = _Job(
+            kind=analyzer.name,
+            analyzer=analyzer,
+            name=None,
+            reanalyze=bool(reanalyze),
+            since_id=since_id,
+            until_id=until_id,
+            params=params,
+            label=analyzer.name,
+        )
+        return self._enqueue(store, job)
 
-        ``reanalyze`` and the optional ``since_id`` / ``until_id`` scope bounds ride along
-        to the worker, where the verdict clear happens only after a successful ``prepare``
-        (see ``run_analysis``), so a deps-missing run can't wipe verdicts here. Raising
-        ``RuntimeError`` when one already runs is what the API maps to a 409. The dep check
-        + counter/scope reset + the ``running`` flip all happen under the lock: if any
-        raises, no job started and ``running`` stays False. The dep check is imports-only
-        (no weights load), so holding the lock across it is negligible and buys atomicity
-        against a racing second start.
+    def _enqueue(self, store: "Store", job: "_Job") -> dict:
+        """Dedup + append ``job`` under the lock, promote the head if idle, start outside.
+
+        The one place the pending deque grows. Under the lock: if an identical job (same
+        ``dedup_key``) is already the running job or already pending, DROP this one and
+        return the existing job's position with ``deduped=True`` (guards a double-click).
+        Otherwise append; if nothing is running, promote the head — which pops THIS job
+        (pending was empty by the invariant) and prepares its thread — and report position
+        0; if a job is running, report the tail position (jobs ahead of it in line). The
+        prepared thread is started AFTER releasing the lock so a concurrent status poll isn't
+        blocked by thread spin-up, mirroring the collector's start-outside-the-lock pattern.
+        """
+        thread: "threading.Thread | None" = None
+        with self._lock:
+            self._store = store
+            key = job.dedup_key()
+            # Dedup against the running job.
+            if self._running and self._current_job is not None and self._current_job.dedup_key() == key:
+                return {**self._status_locked(), "position": 0, "deduped": True}
+            # Dedup against a pending job (position = jobs ahead: 1 running + its index).
+            for index, pending_job in enumerate(self._pending):
+                if pending_job.dedup_key() == key:
+                    return {**self._status_locked(), "position": index + 1, "deduped": True}
+            # Not a duplicate: append and, if idle, promote it to running immediately.
+            self._pending.append(job)
+            if self._running:
+                # Appended at the tail behind the running job (and any earlier pending):
+                # its index is len(pending) - 1, so jobs-ahead = (running) + index = len.
+                position = len(self._pending)
+            else:
+                thread = self._promote_locked()
+                position = 0
+            snapshot = {**self._status_locked(), "position": position, "deduped": False}
+        if thread is not None:
+            thread.start()
+        return snapshot
+
+    # --- Cancellation / queue controls (all lock-guarded) --------------------------------
+
+    def cancel(self) -> None:
+        """Cancel the running job; the worker stops at the next frame boundary and advances.
+
+        Under the lock so it can never race the promotion's ``stop_event`` swap: it targets
+        whatever job is ``running`` at the moment the lock is held. A no-op when idle (there
+        is nothing to cancel — unlike the old bare ``stop_event.set()``, this does NOT arm a
+        future job). The worker's ``finally`` records the terminal state as ``canceled`` and
+        promotes the next pending job. Does not block for the thread to finish; the caller
+        polls ``status().running`` to watch it wind down.
         """
         with self._lock:
             if self._running:
-                raise RuntimeError("analysis already running")
-            analyzer.ensure_available()
-            self._analyzer = analyzer.name
-            self._done = 0
-            self._total = 0
-            self._present = 0
-            self._error = None
-            # Record the active scope alongside the counters so status() reports the exact
-            # window this job runs over (both None = whole store).
-            self._since_id = since_id
-            self._until_id = until_id
-            self.stop_event = threading.Event()
-            self._running = True
-            thread = threading.Thread(
-                target=self._run,
-                args=(store, analyzer, reanalyze, since_id, until_id),
-                name="analysis",
-                daemon=True,
-            )
-            self._thread = thread
-        # Start outside the lock so a concurrent status() poll isn't blocked by thread spin-up.
-        thread.start()
+                self.stop_event.set()
 
-    def _run(
-        self,
-        store: "Store",
-        analyzer: "Analyzer",
-        reanalyze: bool = False,
-        since_id: "int | None" = None,
-        until_id: "int | None" = None,
-    ) -> None:
-        """Worker body: run the sweep, capture any fatal error, always clear ``running``.
+    def clear_pending(self) -> None:
+        """Drop every pending job; leave the running job alone (it finishes normally).
 
-        Per-frame failures are handled inside ``run_analysis`` (log-and-skip); anything
-        that reaches here is fatal to the job (``prepare`` failed, the store iterator broke)
-        — recorded into ``error`` for the status poll and logged. ``running`` is cleared in
-        a ``finally`` no matter what, so a crashed job never wedges the manager into a
-        permanently-busy state that would refuse every future ``start``. ``reanalyze`` and
-        the ``since_id`` / ``until_id`` scope are forwarded so the (post-prepare) verdict
-        clear and the scoped iteration happen on this thread.
+        The "clear the queue" control: after this the running job completes and, finding an
+        empty pending deque, promotes nothing — the manager goes idle.
         """
+        with self._lock:
+            self._pending.clear()
+
+    def stop_all(self) -> None:
+        """Stop everything: clear pending AND cancel the running job, atomically.
+
+        Both under one lock hold so no pending job can be promoted between the clear and the
+        cancel — the running job's ``finally`` then finds an empty deque and the manager goes
+        idle. The unsurprising "stop the whole queue" button.
+        """
+        with self._lock:
+            self._pending.clear()
+            if self._running:
+                self.stop_event.set()
+
+    # --- Worker + promotion --------------------------------------------------------------
+
+    def _promote_locked(self) -> "threading.Thread | None":
+        """Prepare (but do NOT start) the next job's worker thread. Caller holds the lock.
+
+        If a job is already running or the pending deque is empty, returns ``None`` (nothing
+        to promote). Otherwise pops the head, resets the counters/scope/error for the new
+        job, installs a FRESH ``stop_event`` (so a prior job's set flag can't pre-cancel it),
+        flips ``running`` True, records the job as current, builds the daemon thread, and
+        RETURNS it unstarted — the caller starts it after releasing the lock. Preparing the
+        thread here (rather than starting it) is what lets the worker's ``finally`` promote
+        the next job inside its single atomic lock hold: recording the terminal state,
+        clearing ``running``, and readying the successor are indivisible, so an external
+        enqueue can never slip in and double-start.
+        """
+        if self._running or not self._pending:
+            return None
+        job = self._pending.popleft()
+        self._current_job = job
+        self._analyzer = job.kind
+        self._done = 0
+        self._total = 0
+        self._present = 0
+        self._error = None
+        self._since_id = job.since_id
+        self._until_id = job.until_id
+        self.stop_event = threading.Event()
+        self._running = True
+        thread = threading.Thread(
+            target=self._run,
+            args=(job, self._store),
+            name="analysis",
+            daemon=True,
+        )
+        self._thread = thread
+        return thread
+
+    def _run(self, job: "_Job", store: "Store") -> None:
+        """Worker body: run one sweep, then atomically record its outcome + promote the next.
+
+        Per-frame failures are handled inside ``run_analysis`` (log-and-skip); anything that
+        reaches here is fatal to THIS job (``prepare`` failed, the store iterator broke) — it
+        is caught, logged, and turned into the job's terminal ``error``. The ``finally`` then,
+        **under a single lock hold**: determines the terminal state (exception → ``failed``;
+        else the current ``stop_event`` set → ``canceled``; else ``done``), appends a history
+        record carrying that state plus this job's final ``done``/``present`` counts, clears
+        ``running`` and the current-job slot, and prepares the next job's thread. Doing all of
+        that atomically is the invariant that stops an external enqueue from observing
+        ``running=False`` mid-promotion and starting a second worker. The promoted thread (if
+        any) is started only after the lock is released.
+        """
+        error: "str | None" = None
         try:
-            run_analysis(store, analyzer, self, reanalyze, since_id, until_id)
+            run_analysis(store, job.analyzer, self, job.reanalyze, job.since_id, job.until_id)
         except Exception as exc:
             logger.exception("analysis sweep failed")
-            with self._lock:
-                self._error = str(exc)
+            error = str(exc)
         finally:
+            # Promotion lives in ``finally`` (not after the ``except``) so that even a
+            # BaseException escaping the sweep — SystemExit/KeyboardInterrupt/GeneratorExit,
+            # which ``except Exception`` deliberately does not catch — still records the
+            # outcome and promotes the next job rather than dying with ``running=True`` and
+            # wedging the whole queue. A BaseException still propagates after this runs; it
+            # just no longer leaves the manager permanently busy.
+            next_thread: "threading.Thread | None" = None
             with self._lock:
+                if error is not None:
+                    state = "failed"
+                    # Surface the failure on status().error too, so a returning poll with an
+                    # empty queue still shows it; a promoted successor resets it to None.
+                    self._error = error
+                elif self.stop_event.is_set():
+                    state = "canceled"
+                else:
+                    state = "done"
+                self._history.appendleft(
+                    {
+                        "kind": job.kind,
+                        "since_id": job.since_id,
+                        "until_id": job.until_id,
+                        "state": state,
+                        "error": error,
+                        "done": self._done,
+                        "present": self._present,
+                    }
+                )
                 self._running = False
+                self._current_job = None
+                next_thread = self._promote_locked()
+            if next_thread is not None:
+                next_thread.start()
 
-    def cancel(self) -> None:
-        """Request cancellation; the worker stops at the next frame boundary.
-
-        Idempotent and safe to call when idle — it just sets the current Event, which the
-        next ``start`` replaces. Does not block for the thread to finish; the caller polls
-        ``status().running`` to watch it wind down.
-        """
-        self.stop_event.set()
+    # --- Progress hooks (called by run_analysis) -----------------------------------------
 
     def set_total(self, total: int) -> None:
         """Set the progress denominator once the sweep has counted its frames.
@@ -355,24 +555,47 @@ class AnalysisManager:
             if present:
                 self._present += 1
 
+    # --- Status ---------------------------------------------------------------------------
+
     def status(self) -> dict:
         """A consistent snapshot of the job state for the ``/api/analysis/status`` poll.
 
+        The running job's counters/scope PLUS the pending ``queue`` (FIFO order,
+        next-to-run first) and the finished-job ``history`` (most-recent-first, bounded).
         ``since_id`` / ``until_id`` report the active job's id-range scope (both ``None``
-        when the sweep runs over the whole store), so the UI can show which window a run
-        or re-run is covering rather than assuming whole-store.
+        when the sweep runs over the whole store), so the UI can show which window a run or
+        re-run is covering rather than assuming whole-store.
         """
         with self._lock:
-            return {
-                "running": self._running,
-                "analyzer": self._analyzer,
-                "done": self._done,
-                "total": self._total,
-                "present": self._present,
-                "error": self._error,
-                "since_id": self._since_id,
-                "until_id": self._until_id,
-            }
+            return self._status_locked()
+
+    def _status_locked(self) -> dict:
+        """Build the status dict; caller holds the lock.
+
+        Split out so the enqueue path can compose ``position``/``deduped`` onto a snapshot
+        without re-acquiring the (non-reentrant) lock. The ``history`` list is a shallow copy
+        of never-mutated records, so the caller can't perturb the deque.
+        """
+        return {
+            "running": self._running,
+            "analyzer": self._analyzer,
+            "done": self._done,
+            "total": self._total,
+            "present": self._present,
+            "error": self._error,
+            "since_id": self._since_id,
+            "until_id": self._until_id,
+            "queue": [
+                {
+                    "kind": job.kind,
+                    "since_id": job.since_id,
+                    "until_id": job.until_id,
+                    "reanalyze": job.reanalyze,
+                }
+                for job in self._pending
+            ],
+            "history": list(self._history),
+        }
 
     @property
     def running(self) -> bool:

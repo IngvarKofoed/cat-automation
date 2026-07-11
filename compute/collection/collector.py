@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Callable
 
 from compute.collection.store import Store
 
@@ -32,19 +33,45 @@ logger = logging.getLogger(__name__)
 _LOG_EVERY = 500
 
 
-def run_collector(client, store: Store, stop_event: threading.Event) -> None:
+def run_collector(
+    client,
+    store: Store,
+    stop_event: threading.Event,
+    motion_only: "Callable[[], bool]" = lambda: False,
+) -> None:
     """Loop the reconnecting stream into ``store`` until ``stop_event`` is set.
 
     ``recv_ts`` is stamped from the compute clock here (``int(time.time()*1000)``)
     — the reliable time axis, since the Pi has no RTC — while ``edge_ts`` and
     ``frame_id`` ride along in ``frame.meta`` for reference only.
+
+    ``motion_only`` is a zero-arg getter for the CURRENT motion-only capture flag,
+    read fresh per frame so an operator's mid-run toggle takes effect live (the
+    manager just flips the flag the closure reads). When it returns True, frames
+    the edge motion gate saw *no* motion in are dropped instead of stored — a
+    space-saver for long unattended captures. Its cost is that missed cats become
+    unmeasurable (a dropped non-motion frame that actually held a cat leaves no
+    trace for an oracle to catch), which is why full capture is the default and
+    the boundary of every on/off flip is recorded (see ``record_mode_change``) so
+    later analysis can scope "misses unmeasurable" to the motion-only spans. The
+    default always-False getter keeps the old always-store-everything behavior.
     """
     saved = 0
     errors = 0
     logger.info("collector started")
+    # Stamp the mode boundary at which this run begins, before the first frame, so
+    # the mode_changes step-function has a defined starting state and the ON spans
+    # reconstruct correctly (a run started motion-only must open an ON span here,
+    # not only on a later toggle).
+    store.record_mode_change(motion_only())
     for frame in client.iter_stream_reconnecting():
         if stop_event.is_set():
             break
+        if motion_only() and not frame.meta.motion:
+            # Motion-only capture is on and the edge gate saw no motion in this
+            # frame: skip it (do not store). Checked after the stop check so a
+            # wind-down still wins, and read live so the flag can flip mid-run.
+            continue
         try:
             store.add(frame, int(time.time() * 1000))
         except Exception:
@@ -114,6 +141,12 @@ class CollectorManager:
         self._thread: "threading.Thread | None" = None
         self._stop_event: "threading.Event | None" = None
         self._running = False
+        # Motion-only capture intent. Read live by the collector thread via the
+        # closure passed in ``start`` (``lambda: self._motion_only``) so a toggle
+        # takes effect without restarting the loop. In-memory only here; the API
+        # route owns persisting the setting (see ``set_motion_only`` /
+        # ``compute/api/app.py``), and ``restore_motion_only`` seeds it at launch.
+        self._motion_only = False
 
     def start(self) -> None:
         """Start collecting; idempotent, and a no-op when already running or client-less.
@@ -140,6 +173,9 @@ class CollectorManager:
             thread = threading.Thread(
                 target=run_collector,
                 args=(self._client, self._store, stop_event),
+                # Pass the flag as a live getter, not its current value, so a
+                # ``set_motion_only`` after start is picked up by the running loop.
+                kwargs={"motion_only": lambda: self._motion_only},
                 name="collector",
                 daemon=True,
             )
@@ -175,3 +211,41 @@ class CollectorManager:
         """Whether collection is currently on (lock-guarded read of the intent flag)."""
         with self._lock:
             return self._running
+
+    def set_motion_only(self, value: bool) -> None:
+        """Toggle motion-only capture at runtime and persist the intent.
+
+        The operator-facing flip (via ``POST /api/collector/motion-only``). Records
+        a mode-change boundary in the store *only when the state actually changes*
+        (so a no-op flip doesn't litter ``mode_changes`` with zero-width spans), then
+        updates the in-memory flag the collector thread reads live, and ALWAYS
+        persists the setting so a later launch can restore it (see
+        ``restore_motion_only``). The manager lock guards the flag flip; the store
+        calls take the store's own lock — never held together, so no lock inversion.
+        """
+        with self._lock:
+            changed = value != self._motion_only
+            self._motion_only = value
+        # Store writes OUTSIDE the manager lock: they take the store lock, and the
+        # in-memory flag is already updated for the live collector loop to read.
+        if changed:
+            self._store.record_mode_change(value)
+        self._store.set_setting("motion_only", "1" if value else "0")
+
+    def restore_motion_only(self, value: bool) -> None:
+        """Seed the in-memory motion-only flag at launch WITHOUT writing the store.
+
+        Used by ``create_app`` to restore the persisted intent into memory on boot.
+        Deliberately does NOT record a mode change or re-persist the setting — a bare
+        launch must never write to the store (changelog 28): the boundary that
+        matters is stamped when the collector actually starts (``run_collector``
+        records the initial mode) or on a real toggle (``set_motion_only``).
+        """
+        with self._lock:
+            self._motion_only = value
+
+    @property
+    def current_motion_only(self) -> bool:
+        """The current motion-only capture intent (lock-guarded read of the flag)."""
+        with self._lock:
+            return self._motion_only

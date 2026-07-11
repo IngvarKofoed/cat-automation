@@ -3,12 +3,13 @@
 
 The lower layers are already covered directly: ``test_scorecard.py`` exercises
 ``Store.gate_scorecard`` / ``gate_fidelity``, ``test_mog2.py`` the ``MogAnalyzer`` +
-``start_analyzer`` machinery, and ``test_edge_config.py`` ``EdgeClient.get_config``.
+``enqueue_analyzer`` machinery, and ``test_edge_config.py`` ``EdgeClient.get_config``.
 This file is the layer above: it drives ``GET /api/edge/config``,
 ``POST /api/tuning/rerun``, and ``GET /api/tuning/compare`` *through* ``create_app`` +
 ``TestClient``, so what's under test is the routing/validation/wiring ``app.py`` adds —
-the defaults fallback, the param vocabulary translation, the 400/409 mapping, and how
-the three scorecards + fidelity + deltas are assembled.
+the defaults fallback, the param vocabulary translation, the 400 mapping, the
+enqueue-a-rerun-behind-a-running-sweep behavior, and how the three scorecards +
+fidelity + deltas are assembled.
 
 No real edge, no real model: ``create_app(store=..., client=<fake>,
 start_collector=False, analysis_manager=AnalysisManager(resolver=...))`` — the same
@@ -148,31 +149,33 @@ class NoConfigClient:
 
 
 class SpyAnalysisManager(AnalysisManager):
-    """A real ``AnalysisManager`` that also records each ``start_analyzer()`` call's args.
+    """A real ``AnalysisManager`` that also records each ``enqueue_analyzer()`` call's args.
 
     Used only by the frame-range-groups scoping tests below, to verify that
     ``POST /api/tuning/rerun`` forwards its ``since_id``/``until_id`` straight through to
-    the manager, unmodified. Delegates to ``super().start_analyzer()`` so the re-run
+    the manager, unmodified. Delegates to ``super().enqueue_analyzer()`` so the re-run
     still actually executes — every other assertion (status, written verdicts) behaves
     exactly as the non-spy tests above; only the call args are captured.
     """
 
     def __init__(self, resolver) -> None:
         super().__init__(resolver=resolver)
-        self.start_analyzer_calls: "list[dict]" = []
+        self.enqueue_analyzer_calls: "list[dict]" = []
 
-    def start_analyzer(
+    def enqueue_analyzer(
         self,
         store,
         analyzer,
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
-    ) -> None:
-        self.start_analyzer_calls.append(
+    ) -> dict:
+        self.enqueue_analyzer_calls.append(
             {"analyzer": analyzer.name, "reanalyze": reanalyze, "since_id": since_id, "until_id": until_id}
         )
-        super().start_analyzer(store, analyzer, reanalyze=reanalyze, since_id=since_id, until_id=until_id)
+        return super().enqueue_analyzer(
+            store, analyzer, reanalyze=reanalyze, since_id=since_id, until_id=until_id
+        )
 
 
 def _make_app_with_manager(tmp_path, manager, client=None) -> "tuple[TestClient, Store]":
@@ -320,18 +323,24 @@ def test_tuning_compare_inverted_range_is_400(make_app):
 
 
 @_requires_cv
-def test_tuning_rerun_while_running_is_409(make_app):
-    # A gated oracle sweep occupies the single job slot; a rerun must be refused (409).
+def test_tuning_rerun_while_running_enqueues(make_app):
+    # A gated oracle sweep occupies the single active job; a rerun no longer 409s — it
+    # ENQUEUES behind the running sweep (position 1) so interactive tuning re-runs queue
+    # on the one GPU rather than being refused.
     gate = threading.Event()  # cleared: the one frame blocks until released
     client, store = make_app(analyzers={"yolo": FakeAnalyzer(name="yolo", gate=gate)})
     store.add(_frame(frame_id=1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
 
     assert client.post("/api/analysis/run", json={"analyzer": "yolo"}).status_code == 200
     resp = client.post("/api/tuning/rerun", json={"slot": "baseline", "params": _edge_params()})
-    assert resp.status_code == 409
+    assert resp.status_code == 200
+    assert resp.json()["position"] == 1
+    assert resp.json()["deduped"] is False
 
     gate.set()
     _poll_until_done(client)
+    # Both jobs drained: the yolo sweep and the queued mog2:baseline re-run.
+    assert store.analysis_summary("mog2:baseline")["analyzed"] == 1
 
 
 @_requires_cv
@@ -351,6 +360,22 @@ def test_tuning_rerun_runs_mog2_into_slot(make_app):
     assert store.analysis_summary("mog2:candidate")["analyzed"] == 3
     # The sibling slot was never touched by this run.
     assert store.analysis_summary("mog2:baseline")["analyzed"] == 0
+
+
+@_requires_cv
+def test_tuning_rerun_flags_motion_only_overlap(make_app):
+    # A MOG2 re-run is windowed/stateful, so it is unreliable across a motion-only span's
+    # multi-minute gaps; enqueuing one over an overlapping window returns a
+    # ``motion_only_overlap`` warning (mog2 is always windowed, so unlike /api/analysis/run
+    # there is no per-oracle guard — it is always flagged when the window overlaps a span).
+    client, store = make_app()
+    store.record_mode_change(True)  # motion-only ON from the store start
+    store.add(_frame(frame_id=1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
+
+    resp = client.post("/api/tuning/rerun", json={"slot": "candidate", "params": _edge_params()})
+    assert resp.status_code == 200
+    assert resp.json()["motion_only_overlap"] is True
+    _poll_until_done(client)
 
 
 # --- GET /api/tuning/compare ----------------------------------------------------
@@ -589,7 +614,7 @@ def test_tuning_rerun_forwards_since_id_until_id_to_manager(tmp_path):
         },
     )
     assert resp.status_code == 200
-    assert manager.start_analyzer_calls == [
+    assert manager.enqueue_analyzer_calls == [
         {"analyzer": "mog2:candidate", "reanalyze": True, "since_id": ids[0], "until_id": ids[1]}
     ]
     body = resp.json()
@@ -614,7 +639,7 @@ def test_tuning_rerun_absent_scope_forwards_none(tmp_path):
 
     resp = client.post("/api/tuning/rerun", json={"slot": "baseline", "params": _edge_params()})
     assert resp.status_code == 200
-    assert manager.start_analyzer_calls == [
+    assert manager.enqueue_analyzer_calls == [
         {"analyzer": "mog2:baseline", "reanalyze": True, "since_id": None, "until_id": None}
     ]
     body = resp.json()

@@ -1,5 +1,5 @@
 """Tests for the offline MOG2 re-run analyzer (compute/analysis/mog2.py) and the
-runner's instance-based launch seam (AnalysisManager.start_analyzer).
+runner's instance-based launch seam (AnalysisManager.enqueue_analyzer).
 
 ``MogAnalyzer`` re-runs the SHARED live gate (``shared.motion.MotionGate``) over stored
 frames with an explicit ``MotionParams`` set, persisting each verdict to a named slot
@@ -12,7 +12,7 @@ Two layers, like ``test_analysis.py``:
 - **MogAnalyzer directly** — warm-start off a store of background JPEGs, then verdicts on
   raw numpy frames (``verdict`` == the gate's debounced motion, ``score`` == the blob
   area fraction, ``detail`` carries the bbox + the six params and is JSON-serializable).
-- **AnalysisManager.start_analyzer** — runs a PRE-CONSTRUCTED instance (no registry
+- **AnalysisManager.enqueue_analyzer** — runs a PRE-CONSTRUCTED instance (no registry
   entry) through the same worker machinery, reporting the instance's own ``.name``;
   mirrors the fake-analyzer style in ``test_analysis.py``.
 
@@ -120,7 +120,7 @@ class _FakeAnalyzer:
 
     ``analyze`` derives its verdict from the frame's own mean gray level (bright ≥ 127 →
     present), so a test fixes each verdict by the JPEG it stores. Its ``name`` is what
-    ``start_analyzer`` must report back through ``status()`` — the point of the test.
+    ``enqueue_analyzer`` must report back through ``status()`` — the point of the test.
     """
 
     def __init__(self, name: str) -> None:
@@ -306,21 +306,21 @@ def test_prepare_scoped_warm_start_replays_only_the_frames_before_since_id(tmp_p
     assert result.verdict is True
 
 
-# --- AnalysisManager.start_analyzer: pre-constructed instance -----------------
+# --- AnalysisManager.enqueue_analyzer: pre-constructed instance ---------------
 
 
 @_requires_cv
-def test_start_analyzer_runs_prebuilt_instance_and_reports_its_name(tmp_path):
+def test_enqueue_analyzer_runs_prebuilt_instance_and_reports_its_name(tmp_path):
     store = _store(tmp_path)
     # Two "present" (bright) + two "absent" (dark) frames the fake reads back by mean.
     for i in range(4):
         store.add(_frame(i, i, _jpeg_gray(255 if i < 2 else 0)), recv_ts_ms=1_700_000_000_000 + i)
 
     fake = _FakeAnalyzer(name="mog2:candidate")
-    # Default resolver — start_analyzer must NOT consult it: there is no registry entry
+    # Default resolver — enqueue_analyzer must NOT consult it: there is no registry entry
     # for 'mog2:candidate'; it runs the instance handed to it directly.
     manager = AnalysisManager()
-    manager.start_analyzer(store, fake)
+    manager.enqueue_analyzer(store, fake)
 
     assert _wait(lambda: not manager.running), "sweep did not finish within timeout"
     st = manager.status()
@@ -333,14 +333,14 @@ def test_start_analyzer_runs_prebuilt_instance_and_reports_its_name(tmp_path):
 
 
 @_requires_cv
-def test_start_analyzer_refuses_second_job_while_running(tmp_path):
-    # One at a time also holds for the instance-based path: a fake whose analyze blocks
-    # keeps the sweep live while a second start_analyzer must raise (→ 409).
+def test_enqueue_analyzer_enqueues_second_job_while_running(tmp_path):
+    # The instance-based path shares the walk-away queue: while a fake whose analyze
+    # blocks keeps the sweep live, a second enqueue_analyzer lands in the pending FIFO
+    # (a DIFFERENT slot → distinct kind → not deduped) rather than raising.
     import threading
 
     store = _store(tmp_path)
-    for i in range(3):
-        store.add(_frame(i, i, _jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i)
+    ids = [store.add(_frame(i, i, _jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i) for i in range(3)]
 
     entered = threading.Event()
     release = threading.Event()
@@ -353,22 +353,25 @@ def test_start_analyzer_refuses_second_job_while_running(tmp_path):
 
     gated = _Gated(name="mog2:baseline")
     manager = AnalysisManager()
-    manager.start_analyzer(store, gated)
+    r1 = manager.enqueue_analyzer(store, gated, since_id=ids[0], until_id=ids[0])
+    assert r1["position"] == 0
     try:
-        assert entered.wait(timeout=5) or manager.running
-        with pytest.raises(RuntimeError):
-            manager.start_analyzer(store, _FakeAnalyzer(name="mog2:candidate"))
+        assert entered.wait(timeout=5)
+        r2 = manager.enqueue_analyzer(
+            store, _FakeAnalyzer(name="mog2:candidate"), since_id=ids[1], until_id=ids[1]
+        )
+        assert r2["position"] == 1 and r2["deduped"] is False
     finally:
         manager.cancel()
         release.set()
         _wait(lambda: not manager.running)
 
 
-# --- AnalysisManager.start_analyzer: a REAL MogAnalyzer end to end ------------
+# --- AnalysisManager.enqueue_analyzer: a REAL MogAnalyzer end to end ----------
 
 
 @_requires_cv
-def test_start_analyzer_runs_real_mog_analyzer_into_its_slot(tmp_path):
+def test_enqueue_analyzer_runs_real_mog_analyzer_into_its_slot(tmp_path):
     store = _store(tmp_path)
     # A window of background frames then a run of sustained-blob frames.
     n_bg, n_blob = 15, 5
@@ -379,7 +382,7 @@ def test_start_analyzer_runs_real_mog_analyzer_into_its_slot(tmp_path):
         store.add(_frame(i, i, _jpeg(_with_blob())), recv_ts_ms=1_700_000_000_000 + i)
 
     manager = AnalysisManager()
-    manager.start_analyzer(store, MogAnalyzer(_params(), slot="baseline"))
+    manager.enqueue_analyzer(store, MogAnalyzer(_params(), slot="baseline"))
 
     assert _wait(lambda: not manager.running), "mog2 sweep did not finish"
     st = manager.status()

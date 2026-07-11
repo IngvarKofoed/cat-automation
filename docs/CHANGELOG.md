@@ -160,3 +160,35 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `create_app`'s `start_collector` now only *wires* the live client + shutdown hook; a separate
     `autostart` flag — default off, resolved from `CAT_COLLECT_AUTOSTART` — gates begin-immediately.
 
+29. Three-view motion-detection workflow: start collection, define buckets, review & tune — replaced single-page layout.
+    Hash-routed (#start / #buckets / #motion) UI in one file; redistributes existing panels without rewriting.
+    Starts addressing 24-h collection scalability: walk-away oracle jobs on several buckets, findable errors, bucket definition by eye.
+
+30. Analysis job queue (FIFO, in-memory): enqueue replaces refuse-second-job 409; jobs drain serially with history.
+    Cancel current / Clear pending / Stop all controls + per-job terminal state (done/failed/canceled).
+    Addresses walk-away workflow — several buckets × oracles queued unattended, outcomes visible on return.
+
+31. Collector intent persisted across restart (settings KV table in index.db): on-launch restore, one-click Resume.
+    Intent written on user-initiated start/stop only — never by shutdown hook (preserves changelog 28's safety property).
+    Collection survives mid-run restart; CAT_COLLECT_AUTOSTART=1 still forces immediate-start for unattended runs.
+
+32. Optional motion-only capture mode (compute-side filter, default off): drops non-motion frames to save disk.
+    Toggleable live via motion_only setting. Mode transitions recorded in mode_changes table with frame id + ts.
+    Caveat: misses unmeasurable when motion-only is on; buckets/timelines flag "misses unmeasurable here" if overlapping a motion-only span.
+
+33. Density timeline + visit inbox (keyboard-first review): clock→id bucket boundary definition via recv_ts index.
+    Timeline bins a bucket by recv_ts; inbox clusters visits worst-first, surfaces rep frame + warm-up context.
+    Addresses scale review — 864k frames becomes findable at a glance (density control + visit ranks).
+
+34. Buckets viewer refinements. The clock end bound is now inclusive through the selected 3 h block
+    (+step), so the newest frames — which fell after the last 21:00 option — are reachable, not silently
+    excluded. Added a Clear-window button (reset the grid to re-see the saved-buckets list), a total
+    frame count on the "All frames" badge, and a "Per hour" decimation density alongside "Per minute".
+    "Per minute/hour" now decimates by TIME (one frame per recv_ts interval, via /api/frames/sample?per_ms)
+    instead of by frame index — so the rate is a true wall-clock rate regardless of capture fps, clock-window
+    width, or collector gaps. The prior index-stride computed its count from the (often huge, mostly-empty)
+    clock window, yielding near-every-frame at "1/min".
+
+35. The density-rate field refreshes the preview live. It now reloads on `input` (debounced), not `change`,
+    so a typed "frames / min|hour" updates the grid and count immediately instead of only on blur/Enter.
+

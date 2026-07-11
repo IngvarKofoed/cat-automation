@@ -596,7 +596,8 @@ def test_manager_start_runs_to_completion(tmp_path):
 
     fake = FakeAnalyzer(name="fake", windowed=False)
     manager = AnalysisManager(resolver=lambda name: fake)
-    manager.start(store, "fake")
+    result = manager.enqueue_named(store, "fake")
+    assert result["position"] == 0 and result["deduped"] is False
 
     assert _wait(lambda: not manager.running), "sweep did not finish within timeout"
     st = manager.status()
@@ -617,7 +618,7 @@ def test_manager_cancel_stops_early(tmp_path):
 
     gated = GatedAnalyzer(name="gated")
     manager = AnalysisManager(resolver=lambda name: gated)
-    manager.start(store, "gated")
+    manager.enqueue_named(store, "gated")
 
     assert gated.entered.wait(timeout=5), "sweep never reached the first analyze()"
     manager.cancel()        # set the stop flag while frame 1 is blocked
@@ -628,33 +629,49 @@ def test_manager_cancel_stops_early(tmp_path):
     assert manager.status()["done"] == 1
     assert store.analysis_summary("gated")["analyzed"] == 1
     assert store.count_unanalyzed("gated") == 5  # the rest were never touched
+    # The canceled job lands a "canceled" terminal state in the history.
+    hist = manager.status()["history"]
+    assert hist[0]["state"] == "canceled" and hist[0]["error"] is None
+    assert hist[0]["done"] == 1
 
 
 @_requires_cv
-def test_manager_start_refuses_second_job_while_running(tmp_path):
-    # One job at a time: while a gated sweep is blocked mid-frame, a second start
-    # must raise RuntimeError (the API maps this to 409). The gate only trips after
-    # a real decode reaches analyze(), so the frames need real JPEGs (and cv2).
+def test_manager_enqueues_second_job_while_running(tmp_path):
+    # The queue replaces the old refuse-second-job behavior: while a gated sweep is
+    # blocked mid-frame, a second enqueue no longer raises RuntimeError — it lands in
+    # the pending FIFO and drains after the first. Two DISTINCT windows keep the jobs
+    # from deduping. The gate only trips after a real decode reaches analyze(), so the
+    # frames need real JPEGs (and cv2).
     store = _store(tmp_path)
-    for i in range(3):
+    ids = [
         store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(3)
+    ]
 
     gated = GatedAnalyzer(name="gated")
     manager = AnalysisManager(resolver=lambda name: gated)
-    manager.start(store, "gated")
+    r1 = manager.enqueue_named(store, "gated", since_id=ids[0], until_id=ids[0])
+    assert r1["position"] == 0 and r1["deduped"] is False
     try:
-        assert gated.entered.wait(timeout=5) or manager.running
-        with pytest.raises(RuntimeError):
-            manager.start(store, "gated")
+        assert gated.entered.wait(timeout=5), "first sweep never reached analyze()"
+        # Second request enqueues behind the running job rather than raising.
+        r2 = manager.enqueue_named(store, "gated", since_id=ids[1], until_id=ids[1])
+        assert r2["position"] == 1 and r2["deduped"] is False
+        assert r2["running"] is True  # the first job is still the active one
+        assert len(manager.status()["queue"]) == 1
     finally:
-        manager.cancel()
         gated.release.set()
         _wait(lambda: not manager.running)
+    # Both jobs drained serially, each verdicting its own one-frame window.
+    assert store.analysis_summary("gated")["analyzed"] == 2
+    hist = manager.status()["history"]
+    assert [h["state"] for h in hist[:2]] == ["done", "done"]
+    assert [h["since_id"] for h in hist[:2]] == [ids[1], ids[0]]  # most-recent first
 
 
-def test_manager_start_surfaces_importerror_from_resolver(tmp_path):
+def test_manager_enqueue_named_surfaces_importerror_from_resolver(tmp_path):
     # A backend whose optional deps are missing raises ImportError from the resolver;
-    # because start() resolves SYNCHRONOUSLY before spawning the thread, that error
+    # because enqueue_named resolves SYNCHRONOUSLY before promoting any job, that error
     # reaches the caller (→ 503) instead of vanishing into the worker — and no job
     # starts, so the manager stays idle for the next attempt.
     store = _store(tmp_path)
@@ -664,6 +681,206 @@ def test_manager_start_surfaces_importerror_from_resolver(tmp_path):
 
     manager = AnalysisManager(resolver=bad_resolver)
     with pytest.raises(ImportError):
-        manager.start(store, "yolo")
+        manager.enqueue_named(store, "yolo")
     assert manager.running is False
     assert manager.status()["error"] is None  # nothing ran, so no recorded error
+    assert manager.status()["queue"] == []    # and nothing was left pending
+
+
+# --- AnalysisManager: the walk-away FIFO queue (enqueue / dedup / controls) ----
+#
+# The motion-detection-workflow spec turns the manager's refuse-second-job into an
+# in-memory FIFO drained one at a time. These pin the queue mechanics deterministically
+# with a gated fake that freezes the head job mid-frame, so the pending order, dedup,
+# and the three controls (cancel / clear_pending / stop_all) can be asserted while a job
+# is provably blocked — no sleep-and-hope. Real JPEGs (and cv2) are needed because the
+# gate only trips once the worker's decode reaches analyze().
+
+
+def _seed_real_frames(store, n: int, level: int = 200) -> "list[int]":
+    """Add ``n`` real, decodable gray JPEGs and return their row ids in order."""
+    return [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(level)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(n)
+    ]
+
+
+@_requires_cv
+def test_enqueue_fifo_order_and_serial_drain(tmp_path):
+    # Head job A runs (position 0) and blocks; B and C enqueue behind it in FIFO order
+    # (next-to-run first). Releasing the gate drains all three serially, and the history
+    # records three "done" jobs most-recent-first.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 3)
+    gated = GatedAnalyzer(name="yolo")
+    manager = AnalysisManager(resolver=lambda name: gated)
+
+    a = manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0])
+    assert a["position"] == 0
+    assert gated.entered.wait(timeout=5)
+    b = manager.enqueue_named(store, "yolo", since_id=ids[1], until_id=ids[1])
+    c = manager.enqueue_named(store, "yolo", since_id=ids[2], until_id=ids[2])
+    assert b["position"] == 1 and c["position"] == 2
+    assert b["deduped"] is False and c["deduped"] is False
+
+    queue = manager.status()["queue"]
+    assert [(j["since_id"], j["until_id"]) for j in queue] == [(ids[1], ids[1]), (ids[2], ids[2])]
+
+    gated.release.set()
+    assert _wait(lambda: not manager.running)
+    assert store.analysis_summary("yolo")["analyzed"] == 3
+    hist = manager.status()["history"]
+    assert [h["state"] for h in hist[:3]] == ["done", "done", "done"]
+    assert [h["since_id"] for h in hist[:3]] == [ids[2], ids[1], ids[0]]
+
+
+@_requires_cv
+def test_enqueue_dedup_drops_identical_running_and_pending(tmp_path):
+    # An identical (kind, params, reanalyze, since_id, until_id) key already running or
+    # pending is DROPPED (deduped=True) with the existing job's position — guarding a
+    # double-click. A distinct window is a real new job.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 3)
+    gated = GatedAnalyzer(name="yolo")
+    manager = AnalysisManager(resolver=lambda name: gated)
+
+    manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0])  # A: running
+    assert gated.entered.wait(timeout=5)
+
+    # Identical to the RUNNING job → deduped onto it at position 0.
+    dup_a = manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0])
+    assert dup_a["deduped"] is True and dup_a["position"] == 0
+
+    # A distinct window is a genuine new job at position 1.
+    b = manager.enqueue_named(store, "yolo", since_id=ids[1], until_id=ids[1])
+    assert b["deduped"] is False and b["position"] == 1
+
+    # Identical to the PENDING job → deduped onto it at its position (1), not appended.
+    dup_b = manager.enqueue_named(store, "yolo", since_id=ids[1], until_id=ids[1])
+    assert dup_b["deduped"] is True and dup_b["position"] == 1
+    assert len(manager.status()["queue"]) == 1  # still just B pending, no duplicate
+
+    gated.release.set()
+    _wait(lambda: not manager.running)
+
+
+@_requires_cv
+def test_enqueue_reanalyze_flag_is_part_of_the_dedup_key(tmp_path):
+    # reanalyze is IN the key: a plain sweep and a reanalyze sweep of the same
+    # oracle+window are DIFFERENT jobs — otherwise the re-verdict would dedup away
+    # against the earlier run and silently never happen.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 2)
+    gated = GatedAnalyzer(name="yolo")
+    manager = AnalysisManager(resolver=lambda name: gated)
+
+    manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0])  # running, reanalyze=False
+    assert gated.entered.wait(timeout=5)
+    r = manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0], reanalyze=True)
+    assert r["deduped"] is False and r["position"] == 1  # reanalyze differs → distinct job
+
+    gated.release.set()
+    _wait(lambda: not manager.running)
+
+
+@_requires_cv
+def test_enqueue_analyzer_dedups_on_params_not_just_window(tmp_path):
+    # For a pre-built MOG2 slot the params ARE part of the dedup key: re-queuing the same
+    # slot+window with DIFFERENT params is the tune loop (NOT a duplicate), while an
+    # identical-params re-enqueue is dropped. GatedAnalyzer instances carry a fake
+    # ``_params`` tuple, which is exactly what enqueue_analyzer reads for the key.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 2)
+    a1 = GatedAnalyzer(name="mog2:candidate")
+    a1._params = (16.0, 0.001, 0.01, 0.6, 2, 320)
+    a2 = GatedAnalyzer(name="mog2:candidate")
+    a2._params = (20.0, 0.002, 0.02, 0.5, 3, 256)  # same slot+window, DIFFERENT params
+    a1b = GatedAnalyzer(name="mog2:candidate")
+    a1b._params = (16.0, 0.001, 0.01, 0.6, 2, 320)  # identical params to a1
+
+    manager = AnalysisManager()
+    manager.enqueue_analyzer(store, a1, since_id=ids[0], until_id=ids[0])  # running
+    assert a1.entered.wait(timeout=5)
+
+    diff = manager.enqueue_analyzer(store, a2, since_id=ids[0], until_id=ids[0])
+    assert diff["deduped"] is False and diff["position"] == 1  # different params → new job
+
+    same = manager.enqueue_analyzer(store, a1b, since_id=ids[0], until_id=ids[0])
+    assert same["deduped"] is True and same["position"] == 0  # identical to the running job
+
+    a1.release.set()
+    a2.release.set()
+    _wait(lambda: not manager.running)
+
+
+@_requires_cv
+def test_clear_pending_drops_queue_and_leaves_running(tmp_path):
+    # clear_pending empties the pending deque but never touches the running job, which
+    # completes normally and (finding nothing pending) promotes nothing.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 3)
+    gated = GatedAnalyzer(name="yolo")
+    manager = AnalysisManager(resolver=lambda name: gated)
+
+    manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[0])  # running
+    assert gated.entered.wait(timeout=5)
+    manager.enqueue_named(store, "yolo", since_id=ids[1], until_id=ids[1])
+    manager.enqueue_named(store, "yolo", since_id=ids[2], until_id=ids[2])
+    assert len(manager.status()["queue"]) == 2
+
+    manager.clear_pending()
+    assert manager.status()["queue"] == []
+    assert manager.running is True  # the active job is untouched
+
+    gated.release.set()
+    assert _wait(lambda: not manager.running)
+    # Only the running job verdicted; the cleared pending jobs never ran (nor were
+    # recorded in history).
+    assert store.analysis_summary("yolo")["analyzed"] == 1
+    hist = manager.status()["history"]
+    assert len(hist) == 1 and hist[0]["state"] == "done"
+
+
+@_requires_cv
+def test_stop_all_clears_pending_and_cancels_running(tmp_path):
+    # stop_all clears pending AND cancels the running job atomically — the running job
+    # winds down (canceled) and nothing pending is promoted.
+    store = _store(tmp_path)
+    ids = _seed_real_frames(store, 4)
+    gated = GatedAnalyzer(name="yolo")
+    manager = AnalysisManager(resolver=lambda name: gated)
+
+    manager.enqueue_named(store, "yolo", since_id=ids[0], until_id=ids[3])  # running, 4 frames
+    assert gated.entered.wait(timeout=5)
+    manager.enqueue_named(store, "yolo", since_id=ids[1], until_id=ids[1])  # pending
+    assert len(manager.status()["queue"]) == 1
+
+    manager.stop_all()
+    assert manager.status()["queue"] == []
+
+    gated.release.set()  # release the in-flight frame; cancel stops at the next boundary
+    assert _wait(lambda: not manager.running)
+    assert store.analysis_summary("yolo")["analyzed"] == 1  # one verdict, then canceled
+    hist = manager.status()["history"]
+    assert len(hist) == 1 and hist[0]["state"] == "canceled"
+
+
+@_requires_cv
+def test_history_records_failed_state_on_fatal_error(tmp_path):
+    # A fatal error inside the sweep (here: prepare raises) lands "failed" + the message
+    # in both status().error and the history record, so a returning operator can tell a
+    # silent partial failure from a clean drain.
+    store = _store(tmp_path)
+    store.add(_frame(frame_id=1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
+
+    class _Boom(FakeAnalyzer):
+        def prepare(self, store, since_id: "int | None" = None) -> None:
+            raise RuntimeError("prepare boom")
+
+    manager = AnalysisManager(resolver=lambda name: _Boom(name="yolo"))
+    manager.enqueue_named(store, "yolo")
+    assert _wait(lambda: not manager.running)
+    st = manager.status()
+    assert st["error"] == "prepare boom"
+    assert st["history"][0]["state"] == "failed"
+    assert st["history"][0]["error"] == "prepare boom"

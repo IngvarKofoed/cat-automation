@@ -106,6 +106,7 @@ class FakeAnalyzer:
         self.gate = gate
         self.unavailable = unavailable
         self.prepared_with = None
+        self.prepared_since_id = None
 
     def ensure_available(self) -> None:
         # The synchronous dep gate the runner calls in start(); set unavailable=True
@@ -114,8 +115,12 @@ class FakeAnalyzer:
         if self.unavailable:
             raise ImportError("optional analysis deps not installed (fake)")
 
-    def prepare(self, store) -> None:
+    def prepare(self, store, since_id: "int | None" = None) -> None:
+        # since_id is the frame-range-groups scope run_analysis now always passes
+        # (see Analyzer.prepare); FakeAnalyzer is stateless so it just records what it
+        # was called with, for the scoped-run tests below to assert against.
         self.prepared_with = store
+        self.prepared_since_id = since_id
 
     def analyze(self, image) -> AnalysisResult:
         if self.gate is not None:
@@ -138,6 +143,55 @@ class FakeClient:
 
     def iter_stream_reconnecting(self):
         return iter(())
+
+
+class SpyAnalysisManager(AnalysisManager):
+    """A real ``AnalysisManager`` that also records each ``start()`` call's args.
+
+    Used only by the frame-range-groups scoping tests below, to verify that
+    ``POST /api/analysis/run`` forwards its ``since_id``/``until_id`` straight
+    through to the manager, unmodified. Delegates to ``super().start()`` so the
+    job still actually runs — every other assertion (status, written verdicts)
+    behaves exactly as the non-spy tests above; only the call args are captured.
+    """
+
+    def __init__(self, resolver) -> None:
+        super().__init__(resolver=resolver)
+        self.start_calls: "list[dict]" = []
+
+    def start(
+        self,
+        store,
+        name: str,
+        reanalyze: bool = False,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ) -> None:
+        self.start_calls.append(
+            {"name": name, "reanalyze": reanalyze, "since_id": since_id, "until_id": until_id}
+        )
+        super().start(store, name, reanalyze=reanalyze, since_id=since_id, until_id=until_id)
+
+
+def _make_app_with_manager(tmp_path, manager, client=None) -> "tuple[TestClient, Store]":
+    """Build a ``TestClient`` wired to a caller-supplied ``AnalysisManager``.
+
+    ``make_app`` (the fixture below) always builds its own manager internally, so
+    the scoping-forwarding tests — which need to inspect a spy manager *after* the
+    request completes — construct the app directly here instead, mirroring
+    ``make_app``'s own ``Store``/``create_app`` wiring.
+    """
+    from compute.api.app import create_app
+
+    store = Store(
+        db_path=str(tmp_path / "index.db"),
+        media_root=str(tmp_path / "media"),
+        max_bytes=10_000_000,
+    )
+    app = create_app(
+        store=store, client=client or FakeClient(), start_collector=False, analysis_manager=manager
+    )
+    return TestClient(app), store
 
 
 def _make_resolver(analyzers: dict, import_error_for: "frozenset[str]" = frozenset()):
@@ -297,6 +351,16 @@ def test_analysis_run_unknown_analyzer_is_400(make_app):
     assert resp.status_code == 400
 
 
+def test_analysis_run_inverted_range_is_400(make_app):
+    # since_id > until_id is an impossible window (selects no frames): reject it as a
+    # client error rather than launch a sweep that silently verdicts nothing.
+    client, _store = make_app()
+    resp = client.post(
+        "/api/analysis/run", json={"analyzer": "yolo", "since_id": 90, "until_id": 10}
+    )
+    assert resp.status_code == 400
+
+
 def test_analysis_run_missing_deps_is_503(make_app):
     # "yolo" is a valid analyzer name (passes the ANALYZER_NAMES gate), but the
     # resolver raises ImportError for it, simulating requirements-analysis.txt
@@ -414,3 +478,188 @@ def test_collector_start_then_stop_flips_running(make_app):
     assert resp.status_code == 200
     assert resp.json()["running"] is False
     assert client.get("/api/stats").json()["collector_running"] is False
+
+
+# --- Frame-range groups: POST/GET/DELETE /api/groups, GET /api/range/count -----
+#
+# The name->bounds bookmark layer (see the frame-range-groups spec). No cv2/sweep
+# involved — group CRUD and range counting are pure store reads/writes over the
+# `frames`/`groups` tables.
+
+
+def test_groups_create_list_delete_roundtrip(make_app):
+    client, store = make_app()
+    ids = [
+        store.add(_frame(frame_id=i, ts=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(5)
+    ]
+
+    resp = client.post(
+        "/api/groups", json={"name": "dusk visit", "start_id": ids[1], "end_id": ids[3]}
+    )
+    assert resp.status_code == 200
+    created = resp.json()
+    assert created["name"] == "dusk visit"
+    assert created["start_id"] == ids[1]
+    assert created["end_id"] == ids[3]
+    assert created["count"] == 3  # ids[1], ids[2], ids[3]
+    group_id = created["id"]
+
+    resp = client.get("/api/groups")
+    assert resp.status_code == 200
+    groups = resp.json()["groups"]
+    assert len(groups) == 1
+    assert groups[0]["id"] == group_id
+    assert groups[0]["name"] == "dusk visit"
+    assert groups[0]["count"] == 3
+
+    resp = client.delete(f"/api/groups/{group_id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "deleted": 1}
+
+    # Removing the bookmark never touches the frames it spanned.
+    assert client.get("/api/groups").json()["groups"] == []
+    assert client.get("/api/range/count", params={"since_id": ids[1], "until_id": ids[3]}).json() == {
+        "count": 3
+    }
+
+
+def test_groups_create_normalizes_endpoint_order(make_app):
+    # The two endpoint clicks can arrive in either order; create_group normalizes
+    # to start_id=min/end_id=max regardless of which one the caller names "start".
+    client, store = make_app()
+    ids = [store.add(_frame(frame_id=i, ts=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(3)]
+
+    resp = client.post("/api/groups", json={"name": "reversed", "start_id": ids[2], "end_id": ids[0]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["start_id"] == ids[0]
+    assert body["end_id"] == ids[2]
+
+
+def test_groups_delete_unknown_id_is_idempotent(make_app):
+    client, _store = make_app()
+    resp = client.delete("/api/groups/999")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "deleted": 0}
+
+
+def test_groups_create_unknown_endpoint_is_400(make_app):
+    client, store = make_app()
+    fid = store.add(_frame(frame_id=1), recv_ts_ms=1_700_000_000_000)
+
+    resp = client.post("/api/groups", json={"name": "bad", "start_id": fid, "end_id": fid + 999})
+    assert resp.status_code == 400
+
+
+def test_range_count_scoped_and_unscoped(make_app):
+    client, store = make_app()
+    ids = [store.add(_frame(frame_id=i, ts=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(5)]
+
+    resp = client.get("/api/range/count")
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 5  # absent bounds = whole store
+
+    resp = client.get("/api/range/count", params={"since_id": ids[1], "until_id": ids[3]})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 3
+
+    # One-sided bounds are each unbounded on the other side.
+    assert client.get("/api/range/count", params={"since_id": ids[3]}).json()["count"] == 2
+    assert client.get("/api/range/count", params={"until_id": ids[1]}).json()["count"] == 2
+
+
+# --- /api/frames?since_id=&until_id= scopes the browse + disagreement feeds ----
+
+
+def test_frames_since_id_until_id_scopes_the_feed(make_app):
+    client, store = make_app()
+    ids = [store.add(_frame(frame_id=i, ts=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(5)]
+
+    resp = client.get("/api/frames", params={"since_id": ids[1], "until_id": ids[3]})
+    assert resp.status_code == 200
+    got_ids = {f["id"] for f in resp.json()["frames"]}
+    assert got_ids == set(ids[1:4])
+
+    # Absent bounds still return the whole store, byte-for-byte today's behavior.
+    resp = client.get("/api/frames")
+    assert {f["id"] for f in resp.json()["frames"]} == set(ids)
+
+
+@_requires_cv
+def test_frames_disagreement_view_scoped_by_since_until(make_app):
+    fake = FakeAnalyzer(name="yolo")
+    client, store = make_app(analyzers={"yolo": fake})
+    # Five "missed" frames: motion=0 (still), oracle bright -> present -> a genuine miss.
+    ids = [
+        store.add(
+            _frame(frame_id=i, ts=i, motion=False, body=_jpeg_gray(255)),
+            recv_ts_ms=1_700_000_000_000 + i,
+        )
+        for i in range(5)
+    ]
+
+    resp = client.post("/api/analysis/run", json={"analyzer": "yolo"})
+    assert resp.status_code == 200
+    _poll_until_done(client)
+
+    resp = client.get(
+        "/api/frames",
+        params={"analyzer": "yolo", "disagree": "missed", "since_id": ids[1], "until_id": ids[3]},
+    )
+    assert resp.status_code == 200
+    got_ids = {f["id"] for f in resp.json()["frames"]}
+    assert got_ids == set(ids[1:4])
+
+
+# --- POST /api/analysis/run forwards since_id/until_id to the manager ----------
+
+
+@_requires_cv
+def test_analysis_run_forwards_since_id_until_id_to_manager(tmp_path):
+    fake = FakeAnalyzer(name="yolo")
+    manager = SpyAnalysisManager(_make_resolver({"yolo": fake}))
+    client, store = _make_app_with_manager(tmp_path, manager)
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(3)
+    ]
+
+    resp = client.post(
+        "/api/analysis/run",
+        json={"analyzer": "yolo", "since_id": ids[0], "until_id": ids[1]},
+    )
+    assert resp.status_code == 200
+    assert manager.start_calls == [
+        {"name": "yolo", "reanalyze": False, "since_id": ids[0], "until_id": ids[1]}
+    ]
+    body = resp.json()
+    assert body["since_id"] == ids[0]
+    assert body["until_id"] == ids[1]
+
+    status = _poll_until_done(client)
+    assert status["since_id"] == ids[0]
+    assert status["until_id"] == ids[1]
+    # Only the in-scope frames were verdicted, not the third (id ids[2]).
+    assert store.analysis_summary("yolo")["analyzed"] == 2
+
+
+@_requires_cv
+def test_analysis_run_absent_scope_forwards_none(tmp_path):
+    # The strict-superset case: an absent since_id/until_id in the request body must
+    # forward as None — a whole-store sweep, exactly as before this feature existed.
+    fake = FakeAnalyzer(name="yolo")
+    manager = SpyAnalysisManager(_make_resolver({"yolo": fake}))
+    client, store = _make_app_with_manager(tmp_path, manager)
+    store.add(_frame(frame_id=1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
+
+    resp = client.post("/api/analysis/run", json={"analyzer": "yolo"})
+    assert resp.status_code == 200
+    assert manager.start_calls == [
+        {"name": "yolo", "reanalyze": False, "since_id": None, "until_id": None}
+    ]
+    body = resp.json()
+    assert body["since_id"] is None
+    assert body["until_id"] is None
+
+    _poll_until_done(client)
+    assert store.analysis_summary("yolo")["analyzed"] == 1

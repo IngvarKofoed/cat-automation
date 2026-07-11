@@ -95,6 +95,31 @@ def _parse_area_cursor(cursor: str) -> "tuple[float, int]":
         raise ValueError(f"invalid area cursor: {cursor!r}")
 
 
+def _range_bounds(col: str, since_id: "int | None", until_id: "int | None") -> "tuple[list, list]":
+    """Inclusive id-range SQL fragments + bind params for one column.
+
+    The single owner of the ``since_id`` / ``until_id`` scope semantics every
+    scoped read shares (see the frame-range-groups spec): returns
+    ``(fragments, params)`` where ``fragments`` is 0–2 of ``"<col> >= ?"`` /
+    ``"<col> <= ?"`` and ``params`` the matching ``int`` bounds, in the same
+    order — so a caller splices the fragments into its WHERE (joined with AND) and
+    extends its params. Empty on both sides when unbounded, so an unscoped read is
+    byte-for-byte unchanged. ``col`` is a fixed identifier (``"id"``, ``"f.id"``,
+    ``"frame_id"``), never user input, so interpolating it is safe. Centralizing it
+    means a future change to the range semantics can't scope one of the seven-plus
+    call sites differently from the rest.
+    """
+    fragments: list = []
+    params: list = []
+    if since_id is not None:
+        fragments.append(f"{col} >= ?")
+        params.append(int(since_id))
+    if until_id is not None:
+        fragments.append(f"{col} <= ?")
+        params.append(int(until_id))
+    return fragments, params
+
+
 class Store:
     """SQLite index + media dir + size-based retention for collected frames."""
 
@@ -127,6 +152,17 @@ class Store:
         # eviction/clear is handled in code, under the same lock, so a verdict
         # never outlives its frame. The (analyzer, verdict) index serves the
         # disagreement query's verdict filter and the present-count summary.
+        #
+        # The `groups` table is a thin name→bounds bookmark: a saved, contiguous
+        # frame window [start_id, end_id] that scopes the tuning tools to a slice
+        # (see the frame-range-groups spec). It stores no membership — a group is
+        # id *bounds* evaluated live against `frames`, so its `count` is a
+        # primary-key range scan, not a stored set. That is why it needs no
+        # eviction cascade (a wholly-evicted group simply counts zero, its bounds
+        # still valid as ids advance monotonically) and, unlike `analysis`, is
+        # dropped only by a full `clear` (see the note there). `start_ts`/`end_ts`
+        # denormalize the endpoints' recv_ts so the window's wall-clock span
+        # survives those endpoint frames aging out.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS frames (
@@ -151,6 +187,15 @@ class Store:
               PRIMARY KEY (frame_id, analyzer)
             );
             CREATE INDEX IF NOT EXISTS idx_analysis_analyzer_verdict ON analysis(analyzer, verdict);
+            CREATE TABLE IF NOT EXISTS groups (
+              id         INTEGER PRIMARY KEY,
+              name       TEXT    NOT NULL,
+              start_id   INTEGER NOT NULL,   -- frames.id lower bound (inclusive)
+              end_id     INTEGER NOT NULL,   -- frames.id upper bound (inclusive)
+              start_ts   INTEGER NOT NULL,   -- recv_ts of the start frame, captured at create
+              end_ts     INTEGER NOT NULL,   -- recv_ts of the end frame, captured at create
+              created_ts INTEGER NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -262,7 +307,15 @@ class Store:
         except OSError:
             pass
 
-    def query(self, cursor: "str | None", limit: int, motion: str, order: str):
+    def query(
+        self,
+        cursor: "str | None",
+        limit: int,
+        motion: str,
+        order: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ):
         """Return ``(rows, next_cursor)`` for one page of the browse feed.
 
         ``motion`` ∈ {all, motion, still}; ``order`` ∈ {time, area_desc, area_asc}.
@@ -277,6 +330,12 @@ class Store:
         - ``area_desc`` / ``area_asc``: ordered by ``area`` then ``id DESC``; the
           window advances over the compound ``(area, id)`` key. Token is
           ``"<area>:<id>"``.
+
+        ``since_id`` / ``until_id`` are an optional inclusive id-range scope
+        (``None`` = unbounded on that side), so a group can scope the feed to its
+        window (see the frame-range-groups spec). They AND with the keyset cursor
+        predicate, so paging is unaffected; absent, the feed is the whole store
+        exactly as before.
         """
         if motion not in _ALLOWED_MOTION:
             raise ValueError(f"motion must be one of {_ALLOWED_MOTION}, got {motion!r}")
@@ -306,6 +365,11 @@ class Store:
                 cmp = "<" if order == "area_desc" else ">"
                 where.append(f"(area {cmp} ? OR (area = ? AND id < ?))")
                 params.extend([c_area, c_area, c_id])
+
+        # Optional id-range scope; ANDs with the motion filter and keyset cursor.
+        range_frags, range_params = _range_bounds("id", since_id, until_id)
+        where.extend(range_frags)
+        params.extend(range_params)
 
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         params.append(int(limit))
@@ -396,9 +460,126 @@ class Store:
             # Cascade: wiping the frames wipes every oracle verdict too, so a
             # cleared store starts with no analysis rows dangling.
             self._conn.execute("DELETE FROM analysis")
+            # Also drop every saved group — unlike eviction, which leaves groups
+            # alone. ``_evict_locked`` only removes the OLDEST rows while ids keep
+            # advancing monotonically, so a surviving group's [start_id, end_id]
+            # still bounds valid (if fewer) live frames. ``clear`` is a FULL wipe,
+            # after which SQLite reuses rowids from 1 — a stale group's old id
+            # range would then spuriously match brand-new, unrelated frames, so a
+            # full clear must drop groups too.
+            self._conn.execute("DELETE FROM groups")
             self._conn.commit()
             self._total_bytes = 0
             return len(rows)
+
+    # --- Frame-range groups -------------------------------------------------
+    #
+    # A named, contiguous frame window [start_id, end_id] the tuning tools scope
+    # to (see the frame-range-groups spec). The store stays group-agnostic
+    # everywhere else: a group is just a saved (name, bounds) bookmark, and the
+    # scoped reads below take raw since_id/until_id bounds a caller expands a
+    # group into. Same single connection + single lock as every other op.
+
+    @staticmethod
+    def _group_to_dict(row) -> dict:
+        """Map a groups row + its live count to the API dict shape.
+
+        ``row`` is ``(id, name, start_id, end_id, start_ts, end_ts, created_ts,
+        count)`` — the fixed column order both ``create_group`` and
+        ``list_groups`` build, so the returned key set can never drift between the
+        two (the same discipline ``_row_to_dict`` gives the frame feed).
+        """
+        group_id, name, start_id, end_id, start_ts, end_ts, created_ts, count = row
+        return {
+            "id": group_id,
+            "name": name,
+            "start_id": start_id,
+            "end_id": end_id,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "created_ts": created_ts,
+            "count": int(count),
+        }
+
+    def create_group(self, name: str, start_id: int, end_id: int) -> dict:
+        """Save a contiguous frame window and return it (with a live ``count``).
+
+        The two endpoint ids may arrive in either click order, so they are
+        normalized to ``start_id = min`` / ``end_id = max``. Each endpoint's
+        ``recv_ts`` is resolved from ``frames`` and denormalized into the row, so
+        the window's wall-clock span survives the endpoint frames aging out. If
+        EITHER id is not a current frame row the range can't be anchored — a
+        client-input error — so this raises ``ValueError`` (the API maps it to a
+        400), before inserting anything.
+        """
+        lo = min(int(start_id), int(end_id))
+        hi = max(int(start_id), int(end_id))
+        created_ts = int(time.time() * 1000)
+        with self._lock:
+            lo_row = self._conn.execute("SELECT recv_ts FROM frames WHERE id = ?", (lo,)).fetchone()
+            hi_row = self._conn.execute("SELECT recv_ts FROM frames WHERE id = ?", (hi,)).fetchone()
+            if lo_row is None or hi_row is None:
+                raise ValueError(f"group endpoints must be current frame ids: {start_id!r}, {end_id!r}")
+            start_ts, end_ts = int(lo_row[0]), int(hi_row[0])
+            cur = self._conn.execute(
+                "INSERT INTO groups (name, start_id, end_id, start_ts, end_ts, created_ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (name, lo, hi, start_ts, end_ts, created_ts),
+            )
+            group_id = int(cur.lastrowid)
+            # A fast primary-key range scan; taken under the same lock as the
+            # insert so the returned count is consistent with the just-saved row.
+            (count,) = self._conn.execute(
+                "SELECT COUNT(*) FROM frames WHERE id BETWEEN ? AND ?", (lo, hi)
+            ).fetchone()
+            self._conn.commit()
+        return self._group_to_dict((group_id, name, lo, hi, start_ts, end_ts, created_ts, count))
+
+    def list_groups(self) -> "list[dict]":
+        """All saved groups, newest-first (``id DESC``), each with a live ``count``.
+
+        ``count`` is a correlated ``COUNT(*) FROM frames WHERE id BETWEEN
+        start_id AND end_id`` — a primary-key range scan per group — so it
+        reflects the live frames still in the window, not a stored membership
+        (which lets a wholly-evicted group report 0 rather than vanish).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT g.id, g.name, g.start_id, g.end_id, g.start_ts, g.end_ts, g.created_ts,"
+                " (SELECT COUNT(*) FROM frames WHERE id BETWEEN g.start_id AND g.end_id)"
+                " FROM groups g ORDER BY g.id DESC"
+            ).fetchall()
+        return [self._group_to_dict(r) for r in rows]
+
+    def delete_group(self, group_id: int) -> int:
+        """Delete one saved group by id; return the rowcount (0 if unknown).
+
+        Removes only the bookmark row — never touches ``frames`` (a group is id
+        *bounds*, not a membership set), so deleting a group leaves every frame it
+        spanned in place.
+        """
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM groups WHERE id = ?", (int(group_id),))
+            self._conn.commit()
+            return cur.rowcount
+
+    def count_in_range(self, since_id: "int | None" = None, until_id: "int | None" = None) -> int:
+        """Count of frames whose id is in the inclusive ``[since_id, until_id]`` range.
+
+        Both bounds are optional (``None`` = unbounded on that side, so an
+        all-``None`` call counts the whole store), matching the scope params the
+        reads below take. Backs the windowed sweep's progress denominator (frames
+        in the scoped window) and the range-count endpoint the UI shows as "N
+        frames in range" while picking a pending range. A fast primary-key range
+        scan — ``id`` is the primary key.
+        """
+        where, params = _range_bounds("id", since_id, until_id)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            (count,) = self._conn.execute(
+                "SELECT COUNT(*) FROM frames" + clause, params
+            ).fetchone()
+        return int(count)
 
     # --- Analysis layer -----------------------------------------------------
     #
@@ -452,7 +633,9 @@ class Store:
             )
             self._conn.commit()
 
-    def iter_unanalyzed(self, analyzer: str, batch: int = 512, until_id: "int | None" = None):
+    def iter_unanalyzed(
+        self, analyzer: str, batch: int = 512, since_id: "int | None" = None, until_id: "int | None" = None
+    ):
         """Yield ``(frame_id, abs_path)`` for frames lacking a verdict for ``analyzer``.
 
         Oldest-first (id ASC), the driver for a STATELESS sweep (e.g. YOLO): a
@@ -467,20 +650,20 @@ class Store:
         until_id``): paired with the same cap on ``count_unanalyzed``, it keeps the
         progress denominator honest — frames the collector inserts mid-sweep are
         out of scope for this pass (the next sweep picks them up) rather than
-        pushing ``done`` past ``total``.
+        pushing ``done`` past ``total``. ``since_id`` is the symmetric floor
+        (``f.id >= since_id``) that scopes the sweep to a group's window; both
+        ``None`` sweeps the whole store exactly as before.
         """
         last_id = 0
-        cap = "" if until_id is None else " AND f.id <= ?"
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
         while True:
-            params: list = [analyzer, last_id]
-            if until_id is not None:
-                params.append(int(until_id))
-            params.append(int(batch))
+            params: list = [analyzer, last_id] + range_params + [int(batch)]
             with self._lock:
                 rows = self._conn.execute(
                     "SELECT f.id, f.path FROM frames f"
                     " LEFT JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ?"
-                    " WHERE a.frame_id IS NULL AND f.id > ?" + cap +
+                    " WHERE a.frame_id IS NULL AND f.id > ?" + range_sql +
                     " ORDER BY f.id ASC LIMIT ?",
                     params,
                 ).fetchall()
@@ -490,7 +673,7 @@ class Store:
                 yield int(row_id), os.path.join(self._media_root, rel_path)
             last_id = rows[-1][0]
 
-    def iter_time_order(self, batch: int = 512, until_id: "int | None" = None):
+    def iter_time_order(self, batch: int = 512, since_id: "int | None" = None, until_id: "int | None" = None):
         """Yield ``(frame_id, abs_path)`` for EVERY frame, oldest-first (id ASC).
 
         The driver for a WINDOWED sweep (e.g. BSUV), which must see frames in
@@ -499,18 +682,19 @@ class Store:
         Same keyset-per-batch, yield-outside-the-lock discipline as
         ``iter_unanalyzed`` so a long sweep never starves the collector.
         ``until_id`` caps the pass to frames present at start (see
-        ``iter_unanalyzed``), keeping ``done`` bounded by the snapshot ``total``.
+        ``iter_unanalyzed``), keeping ``done`` bounded by the snapshot ``total``;
+        ``since_id`` is the symmetric floor (``id >= since_id``) that scopes a
+        windowed re-run to a group's window. Both ``None`` sweeps the whole store
+        exactly as before.
         """
         last_id = 0
-        cap = "" if until_id is None else " AND id <= ?"
+        range_frags, range_params = _range_bounds("id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
         while True:
-            params: list = [last_id]
-            if until_id is not None:
-                params.append(int(until_id))
-            params.append(int(batch))
+            params: list = [last_id] + range_params + [int(batch)]
             with self._lock:
                 rows = self._conn.execute(
-                    "SELECT id, path FROM frames WHERE id > ?" + cap + " ORDER BY id ASC LIMIT ?",
+                    "SELECT id, path FROM frames WHERE id > ?" + range_sql + " ORDER BY id ASC LIMIT ?",
                     params,
                 ).fetchall()
             if not rows:
@@ -534,22 +718,25 @@ class Store:
             ).fetchall()
         return [os.path.join(self._media_root, rel_path) for (rel_path,) in reversed(rows)]
 
-    def count_unanalyzed(self, analyzer: str, until_id: "int | None" = None) -> int:
+    def count_unanalyzed(
+        self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> int:
         """Count of frames with no verdict for ``analyzer`` — a stateless sweep's TODO.
 
         ``until_id`` caps to frames present at sweep start (``f.id <= until_id``),
         matching ``iter_unanalyzed``'s cap so this count is the true denominator
-        for exactly the frames that pass will visit.
+        for exactly the frames that pass will visit; ``since_id`` (``f.id >=
+        since_id``) is the symmetric floor for a scoped sweep. Both ``None`` counts
+        the whole store's un-analyzed frames exactly as before.
         """
-        cap = "" if until_id is None else " AND f.id <= ?"
-        params: list = [analyzer]
-        if until_id is not None:
-            params.append(int(until_id))
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
+        params: list = [analyzer] + range_params
         with self._lock:
             (count,) = self._conn.execute(
                 "SELECT COUNT(*) FROM frames f"
                 " LEFT JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ?"
-                " WHERE a.frame_id IS NULL" + cap,
+                " WHERE a.frame_id IS NULL" + range_sql,
                 params,
             ).fetchone()
         return int(count)
@@ -579,19 +766,40 @@ class Store:
             ).fetchone()
         return {"analyzed": int(analyzed), "present": int(present)}
 
-    def clear_analysis(self, analyzer: str) -> int:
-        """Delete every verdict for ``analyzer``; return the rowcount.
+    def clear_analysis(
+        self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> int:
+        """Delete verdicts for ``analyzer``; return the rowcount.
 
         The reanalyze path: dropping prior rows makes the next sweep re-verdict
-        the whole store (e.g. after swapping the model/threshold). Only this
-        analyzer's rows go; other oracles' verdicts are untouched.
+        the store (e.g. after swapping the model/threshold). Only this analyzer's
+        rows go; other oracles' verdicts are untouched.
+
+        ``since_id`` / ``until_id`` optionally restrict the delete to an inclusive
+        ``frame_id`` range (``None`` = unbounded). A *scoped* reanalyze clears only
+        the window's verdicts, so re-running an oracle (or a MOG2 slot) over one
+        group re-verdicts just that window instead of discarding every verdict
+        OUTSIDE it — the whole-store clear a scoped run does NOT want. Unscoped
+        (both ``None``) it clears the analyzer's whole slot exactly as before.
         """
+        range_frags, range_params = _range_bounds("frame_id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
         with self._lock:
-            cur = self._conn.execute("DELETE FROM analysis WHERE analyzer = ?", (analyzer,))
+            cur = self._conn.execute(
+                "DELETE FROM analysis WHERE analyzer = ?" + range_sql, [analyzer] + range_params
+            )
             self._conn.commit()
             return cur.rowcount
 
-    def query_disagreements(self, analyzer: str, mode: str, cursor: "str | None", limit: int):
+    def query_disagreements(
+        self,
+        analyzer: str,
+        mode: str,
+        cursor: "str | None",
+        limit: int,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ):
         """Return ``(rows, next_cursor)`` for frames where MOG2 and ``analyzer`` disagree.
 
         The analysis analogue of ``query``'s "Missed?"/"False triggers" triage
@@ -608,7 +816,10 @@ class Store:
         An unknown ``mode`` raises ValueError, mirroring ``query``'s handling of a
         bad ``motion``/``order``. The INNER JOIN restricts the result to analyzed
         frames only. Each row is exactly what ``_row_to_dict`` produces plus a
-        ``score`` key carrying the oracle's ``analysis.score``.
+        ``score`` key carrying the oracle's ``analysis.score``. ``since_id`` /
+        ``until_id`` are the same optional inclusive id-range scope as ``query``
+        (``None`` = unbounded), so the disagreement view scopes to a group's
+        window without touching the keyset paging.
         """
         if mode == "missed":
             disagree_clause = "f.motion = 0 AND a.verdict = 1"
@@ -619,11 +830,15 @@ class Store:
 
         where = [disagree_clause]
         # The analyzer binds the JOIN's ON (evaluated before WHERE), so it is the
-        # first param; the optional cursor id and the limit follow, in SQL order.
+        # first param; the optional cursor id, range bounds, and the limit follow,
+        # in SQL order.
         params: list = [analyzer]
         if cursor is not None:
             where.append("f.id < ?")
             params.append(_parse_id_cursor(cursor))
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        where.extend(range_frags)
+        params.extend(range_params)
         params.append(int(limit))
 
         with self._lock:
@@ -659,6 +874,8 @@ class Store:
         min_area: float,
         max_area: float,
         persistence: int,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
     ) -> dict:
         """Recall / false-trigger / miss-breakdown scorecard for one (source, oracle).
 
@@ -695,6 +912,14 @@ class Store:
         re-run has populated the slot. ``near_zero`` (area < ``min_area``/10, MOG2
         saw ~nothing) is a subset of ``below_min``, so ``below_min + above_max +
         in_band`` equals the total missed count.
+
+        ``since_id`` / ``until_id`` optionally scope every scored-set query below
+        to an inclusive id range (``None`` = unbounded), so all four compare
+        columns (live / baseline / candidate / oracle) score the same window and
+        the numbers stay comparable (see the frame-range-groups spec). ``warmup``
+        is still honored as passed — a scoped caller supplies ``warmup=0`` because
+        a scoped re-run is warm-started from the frames just before the window, so
+        its first frames are already warm and must not be dropped.
         """
         if oracle not in _SCORECARD_ORACLES:
             raise ValueError(f"oracle must be one of {_SCORECARD_ORACLES}, got {oracle!r}")
@@ -717,10 +942,30 @@ class Store:
         near_zero_area = min_area / 10.0
         missed = f"({src_motion} = 0 AND o.verdict = 1)"
 
+        # Optional id-range scope, applied to EVERY scored-set query below so a
+        # scoped compare scores exactly the window. ``scope_where`` is the
+        # standalone WHERE for the threshold probe (which has no other predicate);
+        # ``scope_and`` is the AND-continuation for the two queries that already
+        # filter on the warmup threshold id. Both empty (and no params) when
+        # unscoped, so an unscoped scorecard is byte-for-byte unchanged.
+        scope_fragments, scope_params = _range_bounds("f.id", since_id, until_id)
+        scope_where = (" WHERE " + " AND ".join(scope_fragments)) if scope_fragments else ""
+        scope_and = "".join(" AND " + frag for frag in scope_fragments)
+
         with self._lock:
             if not is_live:
+                # Scope the "has this slot been run?" check to the SAME window
+                # (analysis.frame_id, not the JOINed f.id — this query hits only
+                # `analysis`). Otherwise a scoped compare over a window with no
+                # verdicts for this slot would see the slot's OTHER-window rows,
+                # skip needs_rerun, and fall through to fabricate an all-zero
+                # scorecard from an empty scored set instead of reporting
+                # "Not yet run".
+                slot_frags, slot_params = _range_bounds("frame_id", since_id, until_id)
+                slot_and = "".join(" AND " + frag for frag in slot_frags)
                 (slot_rows,) = self._conn.execute(
-                    "SELECT COUNT(*) FROM analysis WHERE analyzer = ?", (source,)
+                    "SELECT COUNT(*) FROM analysis WHERE analyzer = ?" + slot_and,
+                    [source] + slot_params,
                 ).fetchone()
                 if slot_rows == 0:
                     return {"source": source, "oracle": oracle, "needs_rerun": True}
@@ -728,9 +973,11 @@ class Store:
             # Warmup threshold: the id at rank ``warmup`` (0-indexed) in the scored
             # set ordered id ASC — rows with id >= it are scored. None when the
             # scored set has <= warmup rows (nothing past the cold-start prefix).
+            # The scope narrows the scored set here too, so the threshold ranks
+            # within the window rather than the whole store.
             threshold_row = self._conn.execute(
-                "SELECT f.id" + base_from + " ORDER BY f.id ASC LIMIT 1 OFFSET ?",
-                join_params + [warmup],
+                "SELECT f.id" + base_from + scope_where + " ORDER BY f.id ASC LIMIT 1 OFFSET ?",
+                join_params + scope_params + [warmup],
             ).fetchone()
 
             if threshold_row is None:
@@ -754,9 +1001,9 @@ class Store:
                         f" SUM(CASE WHEN {missed} AND {src_area} < ? THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} AND {src_area} > ? THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} AND {src_area} >= ? AND {src_area} <= ? THEN 1 ELSE 0 END)"
-                        + base_from + " WHERE f.id >= ?",
+                        + base_from + " WHERE f.id >= ?" + scope_and,
                         [min_area, near_zero_area, max_area, min_area, max_area]
-                        + join_params + [threshold_id],
+                        + join_params + [threshold_id] + scope_params,
                     ).fetchone()
                 )
                 # Visit clustering needs only the "interesting" rows — oracle-present
@@ -764,9 +1011,9 @@ class Store:
                 # window) — in time order, not the whole scored set.
                 interesting = self._conn.execute(
                     f"SELECT f.recv_ts, {src_motion}, o.verdict" + base_from
-                    + f" WHERE f.id >= ? AND (o.verdict = 1 OR {src_motion} = 1)"
+                    + " WHERE f.id >= ?" + scope_and + f" AND (o.verdict = 1 OR {src_motion} = 1)"
                     " ORDER BY f.recv_ts ASC, f.id ASC",
-                    join_params + [threshold_id],
+                    join_params + [threshold_id] + scope_params,
                 ).fetchall()
 
         (analyzed, present, caught, missed_n, false_n, conf_high, conf_med,
@@ -837,7 +1084,7 @@ class Store:
                 caught += 1
         return len(visits), caught
 
-    def gate_fidelity(self, slot: str) -> dict:
+    def gate_fidelity(self, slot: str, since_id: "int | None" = None, until_id: "int | None" = None) -> dict:
         """How faithfully a re-run slot reproduces the live gate it was seeded from.
 
         Over the frames that carry a verdict for ``slot`` (INNER JOIN, so only
@@ -846,15 +1093,20 @@ class Store:
         ``frames.motion`` and ``rate`` is ``agree / compared`` (0.0 when nothing is
         compared). High agreement empirically validates the offline method; low
         agreement quantifies the transfer gap. No warmup exclusion — this is the
-        raw reproduction check across the whole slot.
+        raw reproduction check across the whole slot. ``since_id`` / ``until_id``
+        optionally restrict the check to an inclusive id range (``None`` =
+        unbounded) so a scoped compare reports fidelity over the same window.
         """
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
+        params: list = [slot] + range_params
         with self._lock:
             compared, agree = self._conn.execute(
                 "SELECT COUNT(*),"
                 " COALESCE(SUM(CASE WHEN a.verdict = f.motion THEN 1 ELSE 0 END), 0)"
                 " FROM analysis a JOIN frames f ON f.id = a.frame_id"
-                " WHERE a.analyzer = ?",
-                (slot,),
+                " WHERE a.analyzer = ?" + range_sql,
+                params,
             ).fetchone()
         compared, agree = int(compared), int(agree)
         return {"compared": compared, "agree": agree, "rate": (agree / compared) if compared else 0.0}

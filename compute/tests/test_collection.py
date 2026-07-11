@@ -163,6 +163,41 @@ def test_eviction_survives_an_undeletable_media_file(tmp_path, monkeypatch):
     assert stats["bytes"] == body_len
 
 
+def test_eviction_does_not_drop_group_but_count_reflects_thinning(tmp_path):
+    # Cap fits exactly 4 frames' worth; each add past that evicts exactly the
+    # single oldest row (see the retention test above for the same arithmetic).
+    # A group's bounds are id ranges, not a stored membership set, so eviction
+    # (per the frame-range-groups spec) must NEVER cascade-delete the group
+    # itself — only its live COUNT(*) should shrink as endpoint frames age out.
+    body_len = len(_JPEG_BODY)
+    store = Store(
+        db_path=str(tmp_path / "index.db"),
+        media_root=str(tmp_path / "media"),
+        max_bytes=int(body_len * 4.5),
+    )
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(4)]
+    group = store.create_group("thinning", ids[0], ids[3])
+    assert group["count"] == 4
+
+    # One more add pushes past the cap and evicts the oldest row (ids[0]), which
+    # is the group's own start endpoint — the bookmark must still survive.
+    store.add(_frame(frame_id=4), recv_ts_ms=1_700_000_000_004)
+    groups = store.list_groups()
+    assert len(groups) == 1  # NOT dropped by eviction
+    assert groups[0]["id"] == group["id"]
+    assert groups[0]["start_id"] == ids[0]  # bounds are untouched...
+    assert groups[0]["count"] == 3          # ...but the live count already shrank
+
+    # Evict the rest of the group's span (ids[1], ids[2], ids[3]) one at a time.
+    store.add(_frame(frame_id=5), recv_ts_ms=1_700_000_000_005)
+    store.add(_frame(frame_id=6), recv_ts_ms=1_700_000_000_006)
+    store.add(_frame(frame_id=7), recv_ts_ms=1_700_000_000_007)
+
+    groups = store.list_groups()
+    assert len(groups) == 1  # a wholly-evicted group is reported empty, not deleted
+    assert groups[0]["count"] == 0
+
+
 # --- Store: clear() -----------------------------------------------------------
 
 
@@ -184,6 +219,20 @@ def test_clear_removes_all_rows_and_files_and_returns_count(tmp_path):
     assert stats["motion_count"] == 0
     assert stats["oldest_ts"] is None
     assert stats["newest_ts"] is None
+
+
+def test_clear_also_drops_groups(tmp_path):
+    # A full clear() must wipe saved groups too — unlike eviction (see the
+    # retention test above). After a clear, SQLite reuses rowids from 1, so a
+    # stale group's old [start_id, end_id] would otherwise spuriously match
+    # brand-new, unrelated frames.
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(3)]
+    store.create_group("wiped on clear", ids[0], ids[2])
+    assert len(store.list_groups()) == 1
+
+    store.clear()
+    assert store.list_groups() == []
 
 
 # --- Store: query() -----------------------------------------------------------
@@ -315,12 +364,203 @@ def test_query_rejects_invalid_motion_and_order(tmp_path):
         store.query(cursor=None, limit=10, motion="all", order="bogus")
 
 
+# --- Store: query() range scoping (since_id/until_id) -------------------------
+#
+# The frame-range-groups spec's scoping half: an optional inclusive id range
+# that a group (or a pending, unsaved selection) expands into. None on both
+# sides must remain the whole-store feed, unchanged (see the plain query()
+# tests above); these cover the new floor/ceiling and their interaction with
+# keyset paging.
+
+
+def test_query_scoped_by_since_and_until_id_returns_only_in_range_rows(populated_store):
+    store, ids, _specs = populated_store
+
+    # Bounded on both sides: only the middle four survive (ids[1]..ids[4]).
+    rows, _ = store.query(
+        cursor=None, limit=100, motion="all", order="time", since_id=ids[1], until_id=ids[4]
+    )
+    assert [r["id"] for r in rows] == list(reversed(ids[1:5]))
+
+    # since_id only: unbounded above.
+    rows, _ = store.query(cursor=None, limit=100, motion="all", order="time", since_id=ids[1])
+    assert [r["id"] for r in rows] == list(reversed(ids[1:]))
+
+    # until_id only: unbounded below.
+    rows, _ = store.query(cursor=None, limit=100, motion="all", order="time", until_id=ids[4])
+    assert [r["id"] for r in rows] == list(reversed(ids[:5]))
+
+    # Both None (today's default) is still the whole store.
+    rows, _ = store.query(cursor=None, limit=100, motion="all", order="time")
+    assert [r["id"] for r in rows] == list(reversed(ids))
+
+
+def test_query_time_order_keyset_pagination_stays_within_scope(populated_store):
+    # Same walk as test_query_time_order_keyset_pagination above, but bounded to
+    # the middle four ids (ids[1]..ids[4]) — paging must never surface ids[0] or
+    # ids[5], and must terminate once the WINDOW (not the whole store) is
+    # exhausted.
+    store, ids, _ = populated_store
+    since_id, until_id = ids[1], ids[4]
+
+    page1, cursor1 = store.query(
+        cursor=None, limit=2, motion="all", order="time", since_id=since_id, until_id=until_id
+    )
+    assert [r["id"] for r in page1] == [ids[4], ids[3]]
+    assert cursor1 == str(ids[3])
+
+    page2, cursor2 = store.query(
+        cursor=cursor1, limit=2, motion="all", order="time", since_id=since_id, until_id=until_id
+    )
+    assert [r["id"] for r in page2] == [ids[2], ids[1]]
+    assert cursor2 == str(ids[1])  # exactly limit-sized -> still a token
+
+    page3, cursor3 = store.query(
+        cursor=cursor2, limit=2, motion="all", order="time", since_id=since_id, until_id=until_id
+    )
+    assert page3 == []
+    assert cursor3 is None
+
+
+# --- Store: query_disagreements() range scoping --------------------------------
+
+
+def test_query_disagreements_scoped_by_since_and_until_id(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    # Six still frames, every one an oracle-present "missed" disagreement
+    # (motion=0, verdict=1) — scoping is the only thing narrowing the result.
+    ids = []
+    for i in range(6):
+        row_id = store.add(_frame(frame_id=i, ts=1000 + i, motion=False), recv_ts_ms=1_700_000_000_000 + i)
+        store.write_analysis(row_id, "yolo", True, 0.9, None)
+        ids.append(row_id)
+
+    since_id, until_id = ids[1], ids[4]
+    rows, _ = store.query_disagreements(
+        "yolo", "missed", cursor=None, limit=100, since_id=since_id, until_id=until_id
+    )
+    assert {r["id"] for r in rows} == set(ids[1:5])
+
+    # Keyset paging stays within the scope across a full walk to exhaustion.
+    page1, c1 = store.query_disagreements(
+        "yolo", "missed", cursor=None, limit=2, since_id=since_id, until_id=until_id
+    )
+    assert [r["id"] for r in page1] == [ids[4], ids[3]]
+    assert c1 == str(ids[3])
+
+    page2, c2 = store.query_disagreements(
+        "yolo", "missed", cursor=c1, limit=2, since_id=since_id, until_id=until_id
+    )
+    assert [r["id"] for r in page2] == [ids[2], ids[1]]
+    assert c2 == str(ids[1])
+
+    page3, c3 = store.query_disagreements(
+        "yolo", "missed", cursor=c2, limit=2, since_id=since_id, until_id=until_id
+    )
+    assert page3 == []
+    assert c3 is None
+
+
 # --- Store: path_for() ---------------------------------------------------------
 
 
 def test_path_for_unknown_id_returns_none(tmp_path):
     store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
     assert store.path_for(999) is None
+
+
+# --- Store: frame-range groups (create/list/delete) ----------------------------
+#
+# A group is a named, contiguous [start_id, end_id] bookmark (see the
+# frame-range-groups spec) — no membership set, just bounds resolved against
+# the live frames table.
+
+
+def test_create_group_resolves_start_end_ts_from_endpoint_frames(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i * 100) for i in range(5)]
+
+    group = store.create_group("dusk visit", ids[1], ids[3])
+    assert group["start_id"] == ids[1]
+    assert group["end_id"] == ids[3]
+    assert group["start_ts"] == 1_700_000_000_000 + 100  # ids[1]'s recv_ts
+    assert group["end_ts"] == 1_700_000_000_000 + 300    # ids[3]'s recv_ts
+    assert group["name"] == "dusk visit"
+    assert group["count"] == 3  # ids[1], ids[2], ids[3]
+    assert "created_ts" in group
+
+
+def test_create_group_normalizes_endpoints_regardless_of_arg_order(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i * 100) for i in range(5)]
+
+    # The two endpoint clicks can arrive in either order — the later frame
+    # passed as start_id must still resolve to start_id=min/end_id=max.
+    forward = store.create_group("forward", ids[1], ids[3])
+    backward = store.create_group("backward", ids[3], ids[1])
+    for group in (forward, backward):
+        assert group["start_id"] == ids[1]
+        assert group["end_id"] == ids[3]
+        assert group["start_ts"] == 1_700_000_000_000 + 100
+        assert group["end_ts"] == 1_700_000_000_000 + 300
+
+
+def test_create_group_raises_on_unknown_endpoint(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    valid_id = store.add(_frame(frame_id=0), recv_ts_ms=1_700_000_000_000)
+
+    with pytest.raises(ValueError):
+        store.create_group("bad end", valid_id, 999_999)
+    with pytest.raises(ValueError):
+        store.create_group("bad start", 999_999, valid_id)
+    with pytest.raises(ValueError):
+        store.create_group("both bad", 999_998, 999_999)
+
+
+def test_list_groups_returns_newest_first_with_live_count(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i * 100) for i in range(6)]
+
+    first = store.create_group("first", ids[0], ids[2])
+    second = store.create_group("second", ids[2], ids[4])
+    third = store.create_group("third", ids[3], ids[5])
+
+    groups = store.list_groups()
+    assert [g["id"] for g in groups] == [third["id"], second["id"], first["id"]]
+    assert [g["name"] for g in groups] == ["third", "second", "first"]
+    assert groups[0]["count"] == 3  # third: ids[3], ids[4], ids[5]
+    assert groups[1]["count"] == 3  # second: ids[2], ids[3], ids[4]
+    assert groups[2]["count"] == 3  # first: ids[0], ids[1], ids[2]
+
+
+def test_delete_group_removes_it(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i * 100) for i in range(3)]
+    group = store.create_group("temp", ids[0], ids[2])
+
+    deleted = store.delete_group(group["id"])
+    assert deleted == 1
+    assert store.list_groups() == []
+
+    # Idempotent: deleting an already-gone (or never-existing) id is a 0
+    # rowcount, not an error.
+    assert store.delete_group(group["id"]) == 0
+    assert store.delete_group(999_999) == 0
+
+
+# --- Store: count_in_range() ----------------------------------------------------
+
+
+def test_count_in_range_with_and_without_each_bound(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(5)]
+
+    assert store.count_in_range() == 5                              # both None -> whole store
+    assert store.count_in_range(since_id=ids[2]) == 3                # ids[2], ids[3], ids[4]
+    assert store.count_in_range(until_id=ids[2]) == 3                # ids[0], ids[1], ids[2]
+    assert store.count_in_range(since_id=ids[1], until_id=ids[3]) == 3  # ids[1..3]
+    assert store.count_in_range(since_id=ids[4] + 1) == 0            # past the newest id
+    assert store.count_in_range(until_id=ids[0] - 1) == 0            # before the oldest id
 
 
 # --- API ------------------------------------------------------------------

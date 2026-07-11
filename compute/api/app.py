@@ -66,10 +66,16 @@ class AnalysisRunRequest(BaseModel):
     ``reanalyze`` clears the analyzer's prior verdicts first, so the next sweep
     re-verdicts the whole store (e.g. after swapping the model or its threshold)
     rather than the stateless default of skipping already-analyzed frames.
+
+    ``since_id`` / ``until_id`` optionally scope the sweep to a group's inclusive id
+    window (``None`` on either side = unbounded, so an absent scope sweeps the whole
+    store exactly as before — see the frame-range-groups spec).
     """
 
     analyzer: str
     reanalyze: bool = False
+    since_id: "int | None" = None
+    until_id: "int | None" = None
 
 
 # The six motion-gate params, in the edge's own vocabulary — the exact keys the Pi
@@ -107,6 +113,13 @@ _EDGE_MOTION_DEFAULTS = {
 _BASELINE_SLOT = "mog2:baseline"
 _CANDIDATE_SLOT = "mog2:candidate"
 
+# The warm-up prefix length the tuning compare drops from a scorecard. Mirrors
+# ``MogAnalyzer._WARMUP`` (the number of recent frames a windowed re-run primes its
+# background over) BY HAND — same discipline as ``_EDGE_MOTION_DEFAULTS`` mirrors the
+# edge defaults — rather than importing a private from mog2. See ``api_tuning_compare``
+# for how a scoped compare derives its warmup from this and the pre-window frame count.
+_WARMUP_FRAMES = 500
+
 
 class TuningRerunRequest(BaseModel):
     """Body of ``POST /api/tuning/rerun``: which slot to (re)run and its params.
@@ -115,10 +128,30 @@ class TuningRerunRequest(BaseModel):
     typed model, so a missing/ill-typed field surfaces as a 400 with a clear
     message (not FastAPI's 422 field-error blob) and the param vocabulary lives in
     one place (``_MOTION_PARAM_KEYS``).
+
+    ``since_id`` / ``until_id`` optionally scope the re-run to a group's inclusive id
+    window (``None`` = unbounded on that side); absent, the re-run covers the whole
+    store as before. The intended workflow scopes baseline/candidate re-runs *and* the
+    compare to the same window so the scorecards score exactly it.
     """
 
     slot: str
     params: dict
+    since_id: "int | None" = None
+    until_id: "int | None" = None
+
+
+class GroupCreateRequest(BaseModel):
+    """Body of ``POST /api/groups``: name a contiguous frame window ``[start_id, end_id]``.
+
+    The two endpoint ids may arrive in either click order — ``Store.create_group``
+    normalizes them to ``min``/``max`` — and both must be current frame rows, else the
+    range can't be anchored (a client-input error the route maps to 400).
+    """
+
+    name: str
+    start_id: int
+    end_id: int
 
 
 def _motion_params_from(params: dict) -> MotionParams:
@@ -214,6 +247,22 @@ def _compare_deltas(baseline: dict, candidate: dict) -> "dict | None":
     }
 
 
+def _validate_bounds(since_id: "int | None", until_id: "int | None") -> None:
+    """Reject an inverted explicit range (both bounds set, ``since_id > until_id``).
+
+    Such a window selects no frames, so a scoped run would silently no-op (0 total,
+    0 verdicts, "completed") rather than fail — a confusing outcome for what is an
+    impossible window. The UI never sends one (it normalizes to min/max), so this is
+    a guard for a direct API caller. Either bound ``None`` is fine (unbounded side).
+    Raises ``HTTPException`` 400.
+    """
+    if since_id is not None and until_id is not None and since_id > until_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"since_id ({since_id}) must be <= until_id ({until_id})",
+        )
+
+
 def _store_from_env() -> Store:
     """Build a ``Store`` under ``CAT_COLLECT_DIR`` with the ``index.db`` + media/ split.
 
@@ -294,11 +343,16 @@ def create_app(
         order: str = Query(default="time"),
         analyzer: "str | None" = Query(default=None),
         disagree: "str | None" = Query(default=None),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
     ):
         # cursor is an OPAQUE keyset token from a prior page's next_cursor (the
         # store parses it per order/mode; a malformed one → 400 via the ValueError
         # path below). Clamp the limit rather than reject it — a client asking
-        # for more just gets the cap.
+        # for more just gets the cap. since_id/until_id are the optional inclusive
+        # id-range scope a selected group expands to (absent = whole store); both the
+        # disagreement view and the plain feed thread them straight to the store,
+        # which ANDs them with the keyset predicate so paging is unaffected.
         limit = max(1, min(limit, _MAX_LIMIT))
         if disagree is not None:
             # Disagreement view: MOG2 vs. a chosen oracle. An analyzer is required
@@ -313,14 +367,16 @@ def create_app(
                     detail=f"disagree requires analyzer in {ANALYZER_NAMES}, got {analyzer!r}",
                 )
             try:
-                rows, next_cursor = store.query_disagreements(analyzer, disagree, cursor, limit)
+                rows, next_cursor = store.query_disagreements(
+                    analyzer, disagree, cursor, limit, since_id, until_id
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return {"frames": rows, "next_cursor": next_cursor}
 
-        # Plain browse feed (unchanged): motion filter + order, keyset-paginated.
+        # Plain browse feed: motion filter + order, keyset-paginated, optionally scoped.
         try:
-            rows, next_cursor = store.query(cursor, limit, motion, order)
+            rows, next_cursor = store.query(cursor, limit, motion, order, since_id, until_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"frames": rows, "next_cursor": next_cursor}
@@ -345,6 +401,46 @@ def create_app(
         deleted = store.clear()
         return JSONResponse({"ok": True, "deleted": deleted})
 
+    # --- Frame-range groups (the name->bounds bookmark layer) -----------------------
+    #
+    # A group is a saved (name, [start_id, end_id]) window; the frontend expands the
+    # selected one into since_id/until_id before calling the scoped feeds/runs, so the
+    # backend stays group-agnostic (see the frame-range-groups spec). Only this CRUD is
+    # new surface; scoping rides the existing endpoints as optional bounds.
+
+    @app.get("/api/groups")
+    def api_groups_list():
+        # Saved groups newest-first, each with a LIVE count of the frames still in its
+        # window (a group whose endpoints aged out reads a smaller/zero count — the
+        # bounds stay valid, the window just holds fewer live frames).
+        return {"groups": store.list_groups()}
+
+    @app.post("/api/groups")
+    def api_groups_create(req: GroupCreateRequest):
+        # Resolve the endpoints' timestamps and save the window; a start/end id that
+        # isn't a live frame row can't anchor the range (ValueError -> 400, the same
+        # client-input mapping the rest of the app uses). Returns the created group.
+        try:
+            return store.create_group(req.name, req.start_id, req.end_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/groups/{group_id}")
+    def api_groups_delete(group_id: int):
+        # Removes only the bookmark row — never touches frames (a group is id bounds,
+        # not a membership set). ``deleted`` is 0 for an unknown id (idempotent).
+        return {"ok": True, "deleted": store.delete_group(group_id)}
+
+    @app.get("/api/range/count")
+    def api_range_count(
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The live "N frames in range" readout the UI shows while picking a pending
+        # range, before it is saved as a group. Both bounds optional (absent = whole
+        # store), matching the scope params the feeds and re-runs take.
+        return {"count": store.count_in_range(since_id, until_id)}
+
     @app.post("/api/collector/start")
     def api_collector_start():
         # The manager owns idempotency/thread-replacement; the route just toggles
@@ -366,6 +462,7 @@ def create_app(
                 status_code=400,
                 detail=f"unknown analyzer {req.analyzer!r}; known: {ANALYZER_NAMES}",
             )
+        _validate_bounds(req.since_id, req.until_id)
         if analysis_manager.running:
             raise HTTPException(status_code=409, detail="analysis already running")
         try:
@@ -376,7 +473,14 @@ def create_app(
             # RuntimeError (→ 409). reanalyze rides into the worker, where the verdict
             # clear happens only after a successful prepare() (see run_analysis), so a
             # deps-missing run can't wipe an analyzer's verdicts with no replacement.
-            analysis_manager.start(store, req.analyzer, reanalyze=req.reanalyze)
+            # since_id/until_id scope the sweep to a group's window (None = whole store).
+            analysis_manager.start(
+                store,
+                req.analyzer,
+                reanalyze=req.reanalyze,
+                since_id=req.since_id,
+                until_id=req.until_id,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ImportError as exc:
@@ -428,6 +532,7 @@ def create_app(
             analyzer = MogAnalyzer(params, req.slot)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        _validate_bounds(req.since_id, req.until_id)
         if analysis_manager.running:
             raise HTTPException(status_code=409, detail="analysis already running")
         try:
@@ -436,8 +541,11 @@ def create_app(
             # so a cv2-missing run can't wipe a prior slot). start_analyzer runs
             # ensure_available() synchronously, so a missing/broken OpenCV surfaces HERE
             # as ImportError (-> 503) instead of a delayed status().error; a race past
-            # the busy check above -> RuntimeError (-> 409).
-            analysis_manager.start_analyzer(store, analyzer, reanalyze=True)
+            # the busy check above -> RuntimeError (-> 409). since_id/until_id scope the
+            # re-run to a group's window (None = whole store).
+            analysis_manager.start_analyzer(
+                store, analyzer, reanalyze=True, since_id=req.since_id, until_id=req.until_id
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except ImportError as exc:
@@ -445,7 +553,11 @@ def create_app(
         return analysis_manager.status()
 
     @app.get("/api/tuning/compare")
-    def api_tuning_compare(oracle: str = Query(default="yolo")):
+    def api_tuning_compare(
+        oracle: str = Query(default="yolo"),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
         # The oracle is the fixed ground truth both scorecards score against; only a
         # registered one is valid (400 otherwise — the same gate /api/frames uses).
         if oracle not in ANALYZER_NAMES:
@@ -453,31 +565,72 @@ def create_app(
                 status_code=400,
                 detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
             )
+        _validate_bounds(since_id, until_id)
         # Area-bucket thresholds are per-source: each scorecard buckets its misses by
         # the params THAT source ran with. Live -> the Pi's current config; a slot ->
         # the params stored in its analysis.detail, falling back to the edge config.
         _source, edge_params = _edge_config_params(client)
 
+        # Scope: when a group's bounds are present, all four columns (live / baseline /
+        # candidate / oracle) score the SAME window so the denominators match. The
+        # warm-up prefix drop then depends on how well the window was primed. A scoped
+        # windowed re-run warm-starts from up to _WARMUP_FRAMES frames immediately BEFORE
+        # the window (recent_before(since_id, N)):
+        #  - If at least that many precede it, the model enters fully warm → drop NOTHING
+        #    (warmup=0); dropping would discard the very frames you selected to study.
+        #  - If FEWER precede it (a window at/near the store's oldest frame — the extreme
+        #    being since_id absent, i.e. the window starts at the very beginning), the
+        #    model entered under-primed, so drop only the still-adapting shortfall
+        #    (_WARMUP_FRAMES - available), matching what an unscoped cold-start drops.
+        # Unscoped (both None): the full _WARMUP_FRAMES, exactly as today.
+        scoped = since_id is not None or until_id is not None
+        if not scoped or since_id is None:
+            warmup = _WARMUP_FRAMES
+        else:
+            # Frames strictly before the window are what a scoped re-run primed from
+            # (capped at _WARMUP_FRAMES by recent_before's LIMIT); drop only the shortfall.
+            pre_window = store.count_in_range(until_id=since_id - 1)
+            warmup = max(0, _WARMUP_FRAMES - pre_window)
+
         live = store.gate_scorecard(
             "live",
             oracle,
+            warmup=warmup,
             min_area=float(edge_params["min_area"]),
             max_area=float(edge_params["max_area_fraction"]),
             persistence=int(edge_params["persistence"]),
+            since_id=since_id,
+            until_id=until_id,
         )
         b_min, b_max, b_pers = _slot_thresholds(store, _BASELINE_SLOT, edge_params)
         baseline = store.gate_scorecard(
-            _BASELINE_SLOT, oracle, min_area=b_min, max_area=b_max, persistence=b_pers
+            _BASELINE_SLOT,
+            oracle,
+            warmup=warmup,
+            min_area=b_min,
+            max_area=b_max,
+            persistence=b_pers,
+            since_id=since_id,
+            until_id=until_id,
         )
         c_min, c_max, c_pers = _slot_thresholds(store, _CANDIDATE_SLOT, edge_params)
         candidate = store.gate_scorecard(
-            _CANDIDATE_SLOT, oracle, min_area=c_min, max_area=c_max, persistence=c_pers
+            _CANDIDATE_SLOT,
+            oracle,
+            warmup=warmup,
+            min_area=c_min,
+            max_area=c_max,
+            persistence=c_pers,
+            since_id=since_id,
+            until_id=until_id,
         )
 
         # Fidelity is the baseline re-run vs. stored frames.motion — only meaningful
-        # once baseline has run; null until then. Deltas need both slots (null if either
-        # is unrun).
-        fidelity = None if baseline.get("needs_rerun") else store.gate_fidelity(_BASELINE_SLOT)
+        # once baseline has run; null until then, and scoped to the same window. Deltas
+        # need both slots (null if either is unrun).
+        fidelity = (
+            None if baseline.get("needs_rerun") else store.gate_fidelity(_BASELINE_SLOT, since_id, until_id)
+        )
         return {
             "oracle": oracle,
             "live": live,

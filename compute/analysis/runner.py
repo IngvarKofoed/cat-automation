@@ -47,24 +47,39 @@ _LOG_EVERY = 500
 
 
 def run_analysis(
-    store: "Store", analyzer: "Analyzer", manager: "AnalysisManager", reanalyze: bool = False
+    store: "Store",
+    analyzer: "Analyzer",
+    manager: "AnalysisManager",
+    reanalyze: bool = False,
+    since_id: "int | None" = None,
+    until_id: "int | None" = None,
 ) -> None:
     """Run ``analyzer`` over every applicable frame in ``store``, writing a verdict each.
 
     Steps, in order:
 
-    1. ``analyzer.prepare(store)`` — the one-time heavy setup (load weights; a windowed
-       analyzer also primes its recent-frame window off the store here).
-    2. Pick the store iterator by ``analyzer.windowed`` and set the manager's ``total``:
-       - stateless (YOLO) → ``store.iter_unanalyzed(name)`` over just the frames lacking a
-         verdict, so a re-run resumes cheaply and skips done work; ``total`` is that count.
-       - windowed (BSUV) → ``store.iter_time_order()`` over the *full* set in time order,
-         because its verdict depends on temporal neighbours and it must revisit every
-         frame; ``total`` is the whole store count.
-    3. For each ``(frame_id, abs_path)``: read the JPEG bytes off disk, ``cv2.imdecode`` to
+    1. Resolve the scope: snapshot the frame horizon (``latest = store.latest_id()``),
+       clamp the ceiling to ``until = min(until_id, latest)`` (or ``latest`` when
+       ``until_id`` is ``None``), and carry ``since = since_id`` as the floor. ``since`` /
+       ``until_id`` are the optional inclusive id bounds a group expands to (both ``None``
+       = the whole store, exactly as before); the clamp keeps frames the collector inserts
+       after now (id > ``until``) out of scope so ``done`` can't overrun ``total``.
+    2. ``analyzer.prepare(store, since_id=since)`` — the one-time heavy setup (load
+       weights; a windowed analyzer also primes its recent-frame window off the store
+       here, warm-starting from the frames just *before* ``since`` when scoped).
+    3. Pick the store iterator by ``analyzer.windowed`` and set the manager's ``total``,
+       both scoped to ``[since, until]``:
+       - stateless (YOLO) → ``store.iter_unanalyzed(name, since, until)`` over just the
+         in-scope frames lacking a verdict, so a re-run resumes cheaply and skips done
+         work; ``total`` is that scoped count.
+       - windowed (BSUV/MOG2) → ``store.iter_time_order(since, until)`` over the *full*
+         scoped set in time order, because its verdict depends on temporal neighbours and
+         it must revisit every frame; ``total`` is the count of frames in ``[since,
+         until]``.
+    4. For each ``(frame_id, abs_path)``: read the JPEG bytes off disk, ``cv2.imdecode`` to
        a BGR ndarray, ``analyzer.analyze`` it, and ``store.write_analysis`` the verdict;
        then advance the manager's ``done`` (and ``present`` when the verdict is True).
-    4. A read/decode/inference error on ONE frame is logged (throttled) and skipped — just
+    5. A read/decode/inference error on ONE frame is logged (throttled) and skipped — just
        like the collector's per-frame ``store.add`` failure handling — so a single corrupt
        or just-evicted frame can never abort a long sweep. A *fatal* error (``prepare``
        failed, the iterator itself broke) propagates to the worker (``_run``), which
@@ -82,29 +97,41 @@ def run_analysis(
     import cv2
     import numpy as np
 
-    analyzer.prepare(store)
+    # Resolve the scope BEFORE prepare, so a windowed analyzer's warm-start (which reads
+    # the store) primes for the same window the sweep will run over. ``until`` is clamped
+    # to the live horizon so frames the collector inserts after now get id > ``until`` and
+    # are out of scope (the next sweep picks them up), keeping ``done`` from overrunning
+    # ``total`` while ingest runs; ``since`` is the (optional) range floor, passed through.
+    latest = store.latest_id()
+    until = latest if until_id is None else min(until_id, latest)
+    since = since_id
+
+    # prepare() takes the scope so a WINDOWED analyzer warm-starts from the frames
+    # immediately BEFORE the window (see MogAnalyzer/BsuvAnalyzer._warm_start); a stateless
+    # analyzer ignores since_id. Unscoped (since is None) this is exactly today's priming.
+    analyzer.prepare(store, since_id=since)
 
     # Reanalyze clears the analyzer's prior verdicts only AFTER prepare() succeeds —
     # never before — so a prepare that fails (missing deps, no CUDA, model not wired)
     # leaves the old verdicts intact rather than wiping them for a sweep that never runs.
+    # The clear is SCOPED to the same window the sweep re-verdicts (since/until): an
+    # unscoped run clears the whole slot as before, but a scoped run clears ONLY the
+    # window, so re-running an oracle over one group no longer discards every verdict
+    # OUTSIDE it (the whole-store disagreement view and other windows keep their verdicts).
     if reanalyze:
-        store.clear_analysis(analyzer.name)
+        store.clear_analysis(analyzer.name, since_id=since, until_id=until)
 
-    # Snapshot the frame horizon so the progress denominator matches exactly the frames
-    # this pass will visit: frames the collector inserts after now get id > until_id and
-    # are out of scope (the next sweep picks them up), so ``done`` can never overrun
-    # ``total`` while ingest keeps running.
-    until_id = store.latest_id()
     if analyzer.windowed:
-        # Windowed oracle: drive the whole store in time order so its rolling
-        # recent-background window stays contiguous; the denominator is the snapshot count.
-        iterator = store.iter_time_order(until_id=until_id)
-        total = store.stats()["count"]
+        # Windowed oracle: drive the scoped window in time order so its rolling
+        # recent-background window stays contiguous; the denominator is the count of
+        # frames in [since, until].
+        iterator = store.iter_time_order(since_id=since, until_id=until)
+        total = store.count_in_range(since, until)
     else:
-        # Stateless oracle: drive only the un-verdicted frames so a re-run is cheap; the
-        # denominator is just that outstanding TODO count, capped to the snapshot horizon.
-        iterator = store.iter_unanalyzed(analyzer.name, until_id=until_id)
-        total = store.count_unanalyzed(analyzer.name, until_id=until_id)
+        # Stateless oracle: drive only the in-scope un-verdicted frames so a re-run is
+        # cheap; the denominator is that outstanding TODO count within [since, until].
+        iterator = store.iter_unanalyzed(analyzer.name, since_id=since, until_id=until)
+        total = store.count_unanalyzed(analyzer.name, since_id=since, until_id=until)
     manager.set_total(total)
 
     logger.info(
@@ -173,13 +200,25 @@ class AnalysisManager:
         self._total = 0
         self._present = 0
         self._error: "str | None" = None
+        # The active job's optional id-range scope (a group's bounds, or None on either
+        # side for unbounded) — reported by status() so the UI can show "running MOG2
+        # over <group>" rather than silently sweeping the whole store.
+        self._since_id: "int | None" = None
+        self._until_id: "int | None" = None
         # Replaced with a fresh Event on every ``start`` so a prior job's set flag can't
         # pre-cancel the next one; the worker reads it directly between frames, which is
         # safe because ``running`` forbids overlapping jobs from ever reassigning it mid-run.
         self.stop_event = threading.Event()
         self._thread: "threading.Thread | None" = None
 
-    def start(self, store: "Store", name: str, reanalyze: bool = False) -> None:
+    def start(
+        self,
+        store: "Store",
+        name: str,
+        reanalyze: bool = False,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ) -> None:
         """Resolve a registered oracle by ``name`` and launch a sweep; refuse if one runs.
 
         The name-based entry point for the fixed oracles (yolo/bsuv): it resolves the
@@ -191,16 +230,24 @@ class AnalysisManager:
         is harmless — the atomicity that matters (dep check + counter reset + the
         ``running`` flip) lives in ``start_analyzer``.
 
-        ``reanalyze`` rides through to the worker unchanged (see ``start_analyzer`` /
-        ``run_analysis``). Behavior for the registered oracles is exactly as before —
-        this method is now a thin wrapper so that ``start_analyzer`` can also run a
+        ``reanalyze`` and the optional ``since_id`` / ``until_id`` scope bounds ride
+        through to the worker unchanged (see ``start_analyzer`` / ``run_analysis``).
+        Behavior for the registered oracles with no scope is exactly as before — this
+        method is now a thin wrapper so that ``start_analyzer`` can also run a
         *pre-constructed* analyzer the registry can't build (a parameterized
         ``MogAnalyzer`` tuning run).
         """
         analyzer = self._resolver(name)
-        self.start_analyzer(store, analyzer, reanalyze=reanalyze)
+        self.start_analyzer(store, analyzer, reanalyze=reanalyze, since_id=since_id, until_id=until_id)
 
-    def start_analyzer(self, store: "Store", analyzer: "Analyzer", reanalyze: bool = False) -> None:
+    def start_analyzer(
+        self,
+        store: "Store",
+        analyzer: "Analyzer",
+        reanalyze: bool = False,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ) -> None:
         """Launch a sweep for an ALREADY-CONSTRUCTED analyzer instance; refuse if one runs.
 
         The instance-based core ``start`` delegates to, and the seam the tuning path uses
@@ -215,13 +262,14 @@ class AnalysisManager:
         is set to ``analyzer.name`` (e.g. ``'mog2:candidate'``), the instance's own id, so
         the poll reports which run is live.
 
-        ``reanalyze`` rides along to the worker, where the verdict clear happens only after
-        a successful ``prepare`` (see ``run_analysis``), so a deps-missing run can't wipe
-        verdicts here. Raising ``RuntimeError`` when one already runs is what the API maps to
-        a 409. The dep check + counter reset + the ``running`` flip all happen under the lock:
-        if any raises, no job started and ``running`` stays False. The dep check is
-        imports-only (no weights load), so holding the lock across it is negligible and buys
-        atomicity against a racing second start.
+        ``reanalyze`` and the optional ``since_id`` / ``until_id`` scope bounds ride along
+        to the worker, where the verdict clear happens only after a successful ``prepare``
+        (see ``run_analysis``), so a deps-missing run can't wipe verdicts here. Raising
+        ``RuntimeError`` when one already runs is what the API maps to a 409. The dep check
+        + counter/scope reset + the ``running`` flip all happen under the lock: if any
+        raises, no job started and ``running`` stays False. The dep check is imports-only
+        (no weights load), so holding the lock across it is negligible and buys atomicity
+        against a racing second start.
         """
         with self._lock:
             if self._running:
@@ -232,27 +280,42 @@ class AnalysisManager:
             self._total = 0
             self._present = 0
             self._error = None
+            # Record the active scope alongside the counters so status() reports the exact
+            # window this job runs over (both None = whole store).
+            self._since_id = since_id
+            self._until_id = until_id
             self.stop_event = threading.Event()
             self._running = True
             thread = threading.Thread(
-                target=self._run, args=(store, analyzer, reanalyze), name="analysis", daemon=True
+                target=self._run,
+                args=(store, analyzer, reanalyze, since_id, until_id),
+                name="analysis",
+                daemon=True,
             )
             self._thread = thread
         # Start outside the lock so a concurrent status() poll isn't blocked by thread spin-up.
         thread.start()
 
-    def _run(self, store: "Store", analyzer: "Analyzer", reanalyze: bool = False) -> None:
+    def _run(
+        self,
+        store: "Store",
+        analyzer: "Analyzer",
+        reanalyze: bool = False,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ) -> None:
         """Worker body: run the sweep, capture any fatal error, always clear ``running``.
 
         Per-frame failures are handled inside ``run_analysis`` (log-and-skip); anything
         that reaches here is fatal to the job (``prepare`` failed, the store iterator broke)
         — recorded into ``error`` for the status poll and logged. ``running`` is cleared in
         a ``finally`` no matter what, so a crashed job never wedges the manager into a
-        permanently-busy state that would refuse every future ``start``. ``reanalyze`` is
-        forwarded so the (post-prepare) verdict clear happens on this thread.
+        permanently-busy state that would refuse every future ``start``. ``reanalyze`` and
+        the ``since_id`` / ``until_id`` scope are forwarded so the (post-prepare) verdict
+        clear and the scoped iteration happen on this thread.
         """
         try:
-            run_analysis(store, analyzer, self, reanalyze)
+            run_analysis(store, analyzer, self, reanalyze, since_id, until_id)
         except Exception as exc:
             logger.exception("analysis sweep failed")
             with self._lock:
@@ -293,7 +356,12 @@ class AnalysisManager:
                 self._present += 1
 
     def status(self) -> dict:
-        """A consistent snapshot of the job state for the ``/api/analysis/status`` poll."""
+        """A consistent snapshot of the job state for the ``/api/analysis/status`` poll.
+
+        ``since_id`` / ``until_id`` report the active job's id-range scope (both ``None``
+        when the sweep runs over the whole store), so the UI can show which window a run
+        or re-run is covering rather than assuming whole-store.
+        """
         with self._lock:
             return {
                 "running": self._running,
@@ -302,6 +370,8 @@ class AnalysisManager:
                 "total": self._total,
                 "present": self._present,
                 "error": self._error,
+                "since_id": self._since_id,
+                "until_id": self._until_id,
             }
 
     @property

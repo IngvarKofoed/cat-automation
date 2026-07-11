@@ -103,16 +103,16 @@ class YoloAnalyzer:
                 "pip install -r compute/requirements-analysis.txt"
             ) from exc
 
-    def prepare(self, store: "Store") -> None:
-        """Load the model once and pick the device; ``store`` is unused.
+    def prepare(self, store: "Store", since_id: "int | None" = None) -> None:
+        """Load the model once and pick the device; ``store`` / ``since_id`` are unused.
 
-        ``store`` exists only to satisfy the shared ``Analyzer.prepare`` shape —
-        a WINDOWED analyzer (BSUV) uses it to prime a recent-frame window, but
-        this analyzer is stateless per-frame, so it has nothing to prime. Heavy
-        imports live here (via ``ensure_available``), not at module scope (see the
-        module docstring).
+        Both exist only to satisfy the shared ``Analyzer.prepare`` shape — a WINDOWED
+        analyzer (BSUV/MOG2) uses ``store`` + ``since_id`` to warm-start a recent-frame
+        window scoped to the run, but this analyzer is stateless per-frame, so it has
+        nothing to prime. Heavy imports live here (via ``ensure_available``), not at
+        module scope (see the module docstring).
         """
-        del store  # unused: stateless — see the docstring above
+        del store, since_id  # unused: stateless — see the docstring above
         self.ensure_available()  # deps checked synchronously in start(); re-checked here
         import torch
         from ultralytics import YOLO

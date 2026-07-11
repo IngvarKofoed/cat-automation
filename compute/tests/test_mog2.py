@@ -28,7 +28,7 @@ import time
 import pytest
 
 from compute.analysis.base import AnalysisResult
-from compute.analysis.mog2 import MogAnalyzer
+from compute.analysis.mog2 import _WARMSTART_ID, _WARMUP, MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.collection.store import Store
 from compute.ingest import StreamFrame
@@ -127,9 +127,11 @@ class _FakeAnalyzer:
         self.name = name
         self.windowed = False
         self.prepared_with = None
+        self.prepared_since_id = None
 
-    def prepare(self, store) -> None:
+    def prepare(self, store, since_id: "int | None" = None) -> None:
         self.prepared_with = store
+        self.prepared_since_id = since_id
 
     def ensure_available(self) -> None:
         pass
@@ -204,6 +206,104 @@ def test_empty_store_warm_start_is_graceful(tmp_path):
     assert analyzer._gate is not None
     # A first frame against a cold model simply yields a verdict (here: no motion).
     assert analyzer.analyze(_background()).verdict is False
+
+
+# --- MogAnalyzer: prepare() scoping (frame-range groups warm-start) -----------
+#
+# A scoped run's warm-start must prime from the frames JUST BEFORE the window
+# (``since_id``), not from the newest frames in the whole store — see
+# ``MogAnalyzer._warm_start`` and docs/specs/2026-07-10-frame-range-groups.md
+# ("A scoped windowed re-run warm-starts from the frames immediately before
+# start_id"). Unscoped (``since_id=None``) must still prime from the newest
+# frames exactly as before — the strict-superset property this feature preserves.
+
+
+@_requires_cv
+def test_prepare_scoped_since_id_anchors_recent_before_at_the_scope_floor(tmp_path, monkeypatch):
+    # Spy on the REAL Store.recent_before (not a fake — so the SQL keyset behavior
+    # stays exercised) to pin the exact anchor a scoped prepare() hands it: since_id
+    # itself, not the newest-frames sentinel an unscoped run falls back to.
+    store = _store(tmp_path)
+    for i in range(20):
+        store.add(_frame(i, i, _jpeg(_background())), recv_ts_ms=1_700_000_000_000 + i)
+
+    calls: "list[tuple[int, int]]" = []
+    real_recent_before = Store.recent_before
+
+    def spy(self, frame_id, n):
+        calls.append((frame_id, n))
+        return real_recent_before(self, frame_id, n)
+
+    monkeypatch.setattr(Store, "recent_before", spy)
+
+    analyzer = MogAnalyzer(_params(), slot="baseline")
+    analyzer.prepare(store, since_id=12)
+
+    assert calls == [(12, _WARMUP)]  # the scope floor, not _WARMSTART_ID
+    assert analyzer._gate is not None  # priming still built a usable model
+
+
+@_requires_cv
+def test_prepare_unscoped_still_anchors_recent_before_at_the_newest_frames_sentinel(tmp_path, monkeypatch):
+    # The superset property: with since_id absent, prepare() must fall back to
+    # EXACTLY today's newest-frames sentinel (_WARMSTART_ID) — proving the
+    # frame-range-groups scoping addition changes nothing when no scope is given.
+    store = _store(tmp_path)
+    for i in range(5):
+        store.add(_frame(i, i, _jpeg(_background())), recv_ts_ms=1_700_000_000_000 + i)
+
+    calls: "list[tuple[int, int]]" = []
+    real_recent_before = Store.recent_before
+
+    def spy(self, frame_id, n):
+        calls.append((frame_id, n))
+        return real_recent_before(self, frame_id, n)
+
+    monkeypatch.setattr(Store, "recent_before", spy)
+
+    analyzer = MogAnalyzer(_params(), slot="baseline")
+    analyzer.prepare(store)  # since_id defaults to None
+
+    assert calls == [(_WARMSTART_ID, _WARMUP)]
+
+
+@_requires_cv
+def test_prepare_scoped_warm_start_replays_only_the_frames_before_since_id(tmp_path):
+    # Behavioral pin, not just the call args: clean background frames sit BEFORE
+    # since_id and a run of BLOB frames sits strictly AFTER it (frames a scoped
+    # warm-start must never see while priming — they stand in for "the rest of a
+    # much longer store" beyond the selected window). A correct scoped warm-start
+    # primes only off the pre-window background, so the model still reads a still
+    # frame as not-motion and a fresh blob as motion after prepare() — exactly like
+    # ``test_warm_starts_then_detects_motion_with_area_and_params`` above, just
+    # anchored mid-store instead of at the tail.
+    store = _store(tmp_path)
+    n_bg, n_blob = 15, 5
+    for i in range(n_bg):
+        store.add(_frame(i, i, _jpeg(_background())), recv_ts_ms=1_700_000_000_000 + i)
+    blob_ids = []
+    for j in range(n_blob):
+        i = n_bg + j
+        blob_ids.append(store.add(_frame(i, i, _jpeg(_with_blob())), recv_ts_ms=1_700_000_000_000 + i))
+
+    # Anchor at the first post-window (blob) frame: recent_before(since_id, _WARMUP)
+    # then returns exactly the n_bg background frames, none of the withheld blobs.
+    since_id = blob_ids[0]
+
+    params = _params()
+    analyzer = MogAnalyzer(params, slot="candidate")
+    analyzer.prepare(store, since_id=since_id)
+    assert analyzer._gate is not None
+
+    # The learned background is the flat scene, not a blob that came after the scope
+    # floor: a still frame reads not-motion...
+    assert analyzer.analyze(_background()).verdict is False
+    # ...and re-presenting the very blob withheld from priming still reads as fresh
+    # motion once the persistence streak is met — proof the model never saw it warm-starting.
+    result = None
+    for _ in range(params.persistence):
+        result = analyzer.analyze(_with_blob())
+    assert result.verdict is True
 
 
 # --- AnalysisManager.start_analyzer: pre-constructed instance -----------------

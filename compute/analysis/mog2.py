@@ -120,36 +120,44 @@ class MogAnalyzer:
                 "it) — reinstall with: pip install -r compute/requirements.txt"
             ) from exc
 
-    def prepare(self, store: "Store") -> None:
+    def prepare(self, store: "Store", since_id: "int | None" = None) -> None:
         """Build a fresh ``MotionGate`` and warm-start its background off recent frames.
 
         A fresh gate per job so a re-run never inherits a prior sweep's learned model,
-        then replay the newest ``_WARMUP`` stored frames through ``gate.process`` to
-        prime the MOG2 background — mirroring ``BsuvAnalyzer``'s window priming, and the
-        reason this analyzer is windowed. Without it the first scored frames would see a
-        still-adapting model and burst false motion exactly where recall matters most.
+        then replay ``_WARMUP`` recent stored frames through ``gate.process`` to prime the
+        MOG2 background — mirroring ``BsuvAnalyzer``'s window priming, and the reason this
+        analyzer is windowed. Without it the first scored frames would see a still-adapting
+        model and burst false motion exactly where recall matters most.
+
+        ``since_id`` scopes the priming: on a scoped run (a group's ``start_id``) the model
+        primes from the frames IMMEDIATELY BEFORE the window so it enters that era
+        genuinely warm; unscoped (``None``) it primes from the newest frames as before.
         """
         self.ensure_available()
         # Fresh gate per job (no prior sweep's model), primed from recent frames.
         self._gate = MotionGate()
-        self._warm_start(store)
+        self._warm_start(store, since_id)
 
-    def _warm_start(self, store: "Store") -> None:
+    def _warm_start(self, store: "Store", since_id: "int | None" = None) -> None:
         """Prime the MOG2 background by replaying recent stored frames (best-effort).
 
-        We prime from the *newest* ``_WARMUP`` frames (``recent_before`` with a huge
-        sentinel id) even though the sweep itself runs oldest-first — the same bounded
-        approximation ``BsuvAnalyzer`` makes: there is nothing before the oldest frame
-        to prime from, and at a fixed door the scene is largely static, so any recent
-        window is a far better prior than a cold model. Frames are replayed in
-        chronological order (``recent_before``'s contract); an empty store yields an
-        empty prime (graceful cold start). A store-read failure is logged and skipped —
-        priming is an optimization, never a correctness requirement, so it must not
-        abort the whole sweep before it begins.
+        The priming anchor is ``since_id`` on a scoped run, else the ``_WARMSTART_ID``
+        sentinel: ``recent_before(anchor, _WARMUP)`` returns the ``_WARMUP`` frames just
+        before the anchor in chronological order. Scoped, that is the frames IMMEDIATELY
+        BEFORE the window, so the model enters it warm for that era; unscoped, the sentinel
+        selects the *newest* frames even though the sweep itself runs oldest-first — the
+        same bounded approximation ``BsuvAnalyzer`` makes: there is nothing before the
+        oldest frame to prime from, and at a fixed door the scene is largely static, so any
+        recent window is a far better prior than a cold model. Frames are replayed in
+        chronological order (``recent_before``'s contract); an empty store yields an empty
+        prime (graceful cold start). A store-read failure is logged and skipped — priming
+        is an optimization, never a correctness requirement, so it must not abort the whole
+        sweep before it begins.
         """
         assert self._gate is not None  # set by prepare() immediately before this call
+        anchor = since_id if since_id is not None else _WARMSTART_ID
         try:
-            paths = store.recent_before(_WARMSTART_ID, _WARMUP)
+            paths = store.recent_before(anchor, _WARMUP)
         except Exception:
             logger.warning("mog2: warm-start read failed; starting with a cold model", exc_info=True)
             return

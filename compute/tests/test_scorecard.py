@@ -214,6 +214,75 @@ def test_scorecard_rejects_bad_oracle(tmp_path):
         store.gate_scorecard("live", "bogus", min_area=0.01, max_area=0.5, persistence=3)
 
 
+# --- gate_scorecard: since_id/until_id range scoping -------------------------
+#
+# The frame-range-groups spec's scoped compare: a caller passes warmup=0
+# (the window is warm-started from the frames just before it, so there is no
+# cold-start prefix to drop) alongside since_id/until_id, and every one of the
+# scorecard's internal queries (threshold probe, aggregate pass, and the
+# visit-clustering "interesting" rows) must apply the SAME bounds so the
+# counts reflect only the window, not the whole store.
+
+
+def test_gate_scorecard_scoped_by_since_and_until_id(tmp_path):
+    store = _store(tmp_path)
+    # Two frames OUTSIDE the window (a false trigger before it, a missed
+    # present after it) that would inflate an unscoped scorecard, plus three
+    # INSIDE it (caught, missed, false trigger) — scoping must count only the
+    # three inside.
+    _seed(store, 10_000, motion=True, area=0.05, yolo=(0, 0.05))            # before window: false trigger
+    id_start = _seed(store, 20_000, motion=True, area=0.05, yolo=(1, 0.9))  # window start: caught
+    _seed(store, 20_500, motion=False, area=0.05, yolo=(1, 0.9))            # window middle: missed
+    id_end = _seed(store, 21_000, motion=True, area=0.05, yolo=(0, 0.05))   # window end: false trigger
+    _seed(store, 40_000, motion=False, area=0.05, yolo=(1, 0.9))            # after window: missed
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        since_id=id_start, until_id=id_end,
+    )
+    assert card["analyzed"] == 3
+    assert card["present"] == 2
+    assert card["recall"]["caught"] == 1
+    assert card["recall"]["missed"] == 1
+    assert card["recall"]["rate"] == pytest.approx(0.5)
+    assert card["false_triggers"] == {"count": 1}
+
+    # Same store, unscoped: sees the extra false trigger + miss that lie
+    # outside the window — proof the narrower numbers above came from the
+    # scope, not from the fixture data itself.
+    whole = store.gate_scorecard("live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3)
+    assert whole["analyzed"] == 5
+    assert whole["present"] == 3
+    assert whole["recall"]["caught"] == 1
+    assert whole["recall"]["missed"] == 2
+    assert whole["false_triggers"] == {"count": 2}
+
+
+def test_gate_scorecard_scoped_needs_rerun_when_slot_unrun_in_window(tmp_path):
+    # The slot has verdicts, but only for frames OUTSIDE the scoped window (e.g. a
+    # prior re-run scoped to a different group). A scoped scorecard over THIS window
+    # must report needs_rerun ("run the slot first"), NOT fabricate an all-zero card
+    # from an empty in-window scored set — the needs_rerun check is scoped to the same
+    # window, not the whole slot.
+    store = _store(tmp_path)
+    _seed(store, 10_000, motion=True, area=0.05, yolo=(1, 0.9), slot=(1, 0.05))  # out-of-window: slot present
+    id_start = _seed(store, 20_000, motion=True, area=0.05, yolo=(1, 0.9))       # in-window: oracle only, no slot
+    id_end = _seed(store, 21_000, motion=False, area=0.0, yolo=(1, 0.8))
+
+    card = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        since_id=id_start, until_id=id_end,
+    )
+    assert card == {"source": "mog2:candidate", "oracle": "yolo", "needs_rerun": True}
+
+    # Unscoped the slot IS populated (its out-of-window row), so NOT needs_rerun —
+    # proof the needs_rerun above came from the window scope, not a globally-empty slot.
+    whole = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3
+    )
+    assert "needs_rerun" not in whole
+
+
 # --- gate_fidelity -----------------------------------------------------------
 
 
@@ -235,3 +304,20 @@ def test_gate_fidelity_empty_slot_is_zero(tmp_path):
     store = _store(tmp_path)
     _seed(store, 1_000, motion=True, area=0.05, yolo=(1, 0.9))
     assert store.gate_fidelity("mog2:candidate") == {"compared": 0, "agree": 0, "rate": 0.0}
+
+
+def test_gate_fidelity_scoped_by_since_and_until_id(tmp_path):
+    store = _store(tmp_path)
+    # Frames before and after the window disagree; scoping must drop them from
+    # both `compared` and `agree` so the rate reflects only the window.
+    _seed(store, 1_000, motion=True, area=0.05, slot=(0, 0.0))              # before window: disagree
+    id_start = _seed(store, 2_000, motion=True, area=0.05, slot=(1, 0.9))   # window start: agree
+    _seed(store, 3_000, motion=False, area=0.0, slot=(1, 0.1))              # window middle: disagree
+    id_end = _seed(store, 4_000, motion=False, area=0.0, slot=(0, 0.0))     # window end: agree
+    _seed(store, 5_000, motion=True, area=0.05, slot=(0, 0.0))              # after window: disagree
+
+    scoped = store.gate_fidelity("mog2:candidate", since_id=id_start, until_id=id_end)
+    assert scoped == {"compared": 3, "agree": 2, "rate": pytest.approx(2 / 3)}
+
+    unscoped = store.gate_fidelity("mog2:candidate")
+    assert unscoped == {"compared": 5, "agree": 2, "rate": pytest.approx(2 / 5)}

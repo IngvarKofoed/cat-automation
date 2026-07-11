@@ -95,18 +95,22 @@ class FakeAnalyzer:
     level (bright ≥ 127 → present), so a test fixes each frame's verdict purely by
     the JPEG it stores — no model, no randomness. It also records, in order, every
     level it is fed, so a windowed sweep can be asserted to visit frames in ascending
-    time order. ``prepare`` just captures the store handle so the windowed-priming
-    hand-off can be checked.
+    time order. ``prepare`` captures both the store handle AND the scope's
+    ``since_id`` floor, so the windowed-priming hand-off *and* the frame-range-groups
+    scoping contract (``run_analysis`` must call ``prepare(store, since_id=since)``)
+    can both be checked.
     """
 
     def __init__(self, name: str = "fake", windowed: bool = False) -> None:
         self.name = name
         self.windowed = windowed
         self.prepared_with = None
+        self.prepared_since_id = None
         self.seen: "list[float]" = []
 
-    def prepare(self, store) -> None:
+    def prepare(self, store, since_id: "int | None" = None) -> None:
         self.prepared_with = store
+        self.prepared_since_id = since_id
 
     def ensure_available(self) -> None:
         # No optional deps to check for the fake; the runner calls this in start().
@@ -136,7 +140,7 @@ class GatedAnalyzer:
         self.release = threading.Event()
         self.calls = 0
 
-    def prepare(self, store) -> None:  # pragma: no cover - trivial
+    def prepare(self, store, since_id: "int | None" = None) -> None:  # pragma: no cover - trivial
         pass
 
     def ensure_available(self) -> None:  # pragma: no cover - trivial
@@ -345,6 +349,24 @@ def test_clear_analysis_scopes_to_one_analyzer(tmp_path):
     assert store.analysis_summary("bsuv") == {"analyzed": 3, "present": 3}  # untouched
 
 
+def test_clear_analysis_scoped_to_id_range_preserves_out_of_window(tmp_path):
+    # A SCOPED reanalyze clears ONLY the window's verdicts, so re-running an oracle over
+    # one group no longer discards every verdict outside it (the whole-store disagreement
+    # view and other windows keep theirs).
+    store = _store(tmp_path)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(5)]
+    for fid in ids:
+        store.write_analysis(fid, "yolo", True, 0.5, None)
+
+    deleted = store.clear_analysis("yolo", since_id=ids[1], until_id=ids[3])
+    assert deleted == 3  # only ids[1..3] cleared
+    assert store.analysis_summary("yolo") == {"analyzed": 2, "present": 2}  # ids[0], ids[4] survive
+    for fid in (ids[1], ids[2], ids[3]):
+        assert store.count_unanalyzed("yolo", since_id=fid, until_id=fid) == 1  # verdict gone
+    for fid in (ids[0], ids[4]):
+        assert store.count_unanalyzed("yolo", since_id=fid, until_id=fid) == 0  # verdict kept
+
+
 # --- Store: cascade (eviction + clear drop analysis rows) ---------------------
 
 
@@ -431,6 +453,135 @@ def test_run_analysis_windowed_visits_every_frame_in_time_order(tmp_path):
     assert len(fake.seen) == len(levels)
     assert store.analysis_summary("fakewin")["analyzed"] == len(levels)
     assert manager.status()["done"] == len(levels)
+
+
+# --- Runner: since_id/until_id scoping (frame-range groups) --------------------
+#
+# A group expands to an inclusive [since_id, until_id] id range that a Run/re-run
+# scopes to (see docs/specs/2026-07-10-frame-range-groups.md). Both bounds are
+# optional and independent; None on both sides is exactly today's whole-store
+# sweep — the existing unscoped tests above pin that superset property.
+
+
+@_requires_cv
+def test_run_analysis_passes_since_id_to_prepare_before_the_scan(tmp_path):
+    # prepare() must see the scope's floor BEFORE the sweep iterates, so a windowed
+    # analyzer can warm-start off the frames just before it (see MogAnalyzer). No
+    # frames are needed here — the point is purely that the anchor makes it to
+    # prepare(), not what the (empty) sweep then does with it.
+    store = _store(tmp_path)
+    fake = FakeAnalyzer(name="anchor", windowed=False)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager, since_id=42, until_id=99)
+
+    assert fake.prepared_with is store
+    assert fake.prepared_since_id == 42  # the floor, not the ceiling
+
+
+@_requires_cv
+def test_run_analysis_stateless_scoped_by_since_and_until_id(tmp_path):
+    # Eight frames, alternating bright/dark; scope to the middle four (ids[2..5]).
+    # Only those four may receive a verdict, and the reported total must be the
+    # SCOPED todo count, not the whole-store one — the point of threading
+    # since_id/until_id through iter_unanalyzed/count_unanalyzed.
+    store = _store(tmp_path)
+    ids = []
+    for i in range(8):
+        level = 255 if i % 2 == 0 else 0
+        ids.append(
+            store.add(
+                _frame(frame_id=i, ts=i, motion=False, body=_jpeg_gray(level)),
+                recv_ts_ms=1_700_000_000_000 + i,
+            )
+        )
+
+    since, until = ids[2], ids[5]
+    # Captured BEFORE the sweep runs: nothing is verdicted yet, so this is the exact
+    # scoped TODO count run_analysis must report as `total` — asserting it AFTER the
+    # sweep would trivially read back 0 (everything in range now has a verdict).
+    expected_total = store.count_unanalyzed("scoped", since_id=since, until_id=until)
+
+    fake = FakeAnalyzer(name="scoped", windowed=False)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager, since_id=since, until_id=until)
+
+    # total reflects the scoped stateless TODO count (4 frames, none done yet).
+    assert manager.status()["total"] == expected_total == 4
+    assert len(fake.seen) == 4  # exactly the in-window frames were decoded/analyzed
+
+    # Only the windowed frames got a verdict: asking "how many unanalyzed within
+    # just this one frame's id" is 0 for every in-window id, 1 (still untouched)
+    # for every id outside it.
+    for fid in ids[2:6]:
+        assert store.count_unanalyzed("scoped", since_id=fid, until_id=fid) == 0
+    for fid in ids[:2] + ids[6:]:
+        assert store.count_unanalyzed("scoped", since_id=fid, until_id=fid) == 1
+
+
+@_requires_cv
+def test_run_analysis_windowed_scoped_by_since_and_until_id(tmp_path):
+    # Ascending gray levels across 7 frames; scope to the middle window (ids[1..4]).
+    # A windowed sweep must drive iter_time_order SCOPED to that window — the
+    # fake's recorded levels must be exactly that sub-range, strictly ascending —
+    # and the total must be store.count_in_range(since, until), not the
+    # whole-store count.
+    store = _store(tmp_path)
+    levels = [30, 70, 110, 150, 190, 230, 250]
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(lv)), recv_ts_ms=1_700_000_000_000 + i)
+        for i, lv in enumerate(levels)
+    ]
+
+    since, until = ids[1], ids[4]
+    fake = FakeAnalyzer(name="scopedwin", windowed=True)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager, since_id=since, until_id=until)
+
+    assert fake.seen == [70.0, 110.0, 150.0, 190.0]  # exactly the in-window levels, in time order
+    assert manager.status()["total"] == store.count_in_range(since, until) == 4
+    assert store.analysis_summary("scopedwin")["analyzed"] == 4  # not all 7 frames
+
+
+@_requires_cv
+def test_run_analysis_since_id_floor_without_until_id_covers_to_latest(tmp_path):
+    # A floor with NO ceiling must sweep from since_id through the live horizon —
+    # proving the two bounds are independent, not a package deal.
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(255)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(5)
+    ]
+
+    fake = FakeAnalyzer(name="floor", windowed=False)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager, since_id=ids[2], until_id=None)
+
+    assert manager.status()["total"] == 3  # ids[2], ids[3], ids[4]
+    assert store.count_unanalyzed("floor") == 2  # ids[0], ids[1] left alone
+
+
+@_requires_cv
+def test_run_analysis_clamps_until_id_to_latest_id(tmp_path, monkeypatch):
+    # A requested ceiling far beyond the live horizon (e.g. a stale UI request)
+    # must be clamped to store.latest_id() at sweep start, so frames the collector
+    # inserts after the sweep began stay out of scope. Simulated here by pinning
+    # latest_id() to an EARLIER id than the store actually holds, mirroring "the
+    # sweep started before frames 2/3 existed" without needing real concurrency.
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(255)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(4)
+    ]
+    monkeypatch.setattr(store, "latest_id", lambda: ids[1])
+
+    fake = FakeAnalyzer(name="clamp", windowed=False)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager, since_id=None, until_id=ids[3] + 100)
+
+    # Clamped to the pinned latest_id() (ids[1]), NOT the requested ceiling: only
+    # the first two frames got a verdict, the other two are untouched.
+    assert manager.status()["total"] == 2
+    assert store.count_unanalyzed("clamp") == 2
 
 
 # --- AnalysisManager: lifecycle ------------------------------------------------

@@ -313,6 +313,54 @@
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             background: #f5f5f5;
         }
+        /* Scope & groups panel. A group is a saved (name, [start_id, end_id])
+           window; picking two endpoint frames in the grid builds a pending range
+           which, once named and saved, becomes a reusable scope applied to every
+           feed/run. See docs/specs/2026-07-10-frame-range-groups.md. */
+        #groupNameInput {
+            width: 180px;
+        }
+        .groups-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 12px;
+        }
+        .group-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            padding: 6px 10px;
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+        }
+        .groups-empty {
+            color: #888;
+            font-size: 13px;
+            margin-top: 8px;
+        }
+        /* Per-tile range affordance: one "Set start" + one "Set end" click define a
+           contiguous id window across thousands of frames — ids are monotonic in
+           time, so the range holds from any sort. */
+        .range-btns {
+            display: flex;
+            gap: 6px;
+            padding: 0 8px 8px;
+        }
+        .btn-tiny {
+            padding: 4px 8px;
+            font-size: 11px;
+        }
+        .range-btns .btn-tiny {
+            flex: 1;
+            background: #607d8b;
+        }
+        .range-btns .btn-tiny:hover {
+            background: #4f6875;
+        }
     </style>
 </head>
 <body>
@@ -330,6 +378,50 @@
             <button type="button" id="collectorToggleBtn"
                 title="Start or stop the always-on collector. Stop it to freeze the store for a clean offline analysis pass.">Start</button>
         </div>
+    </div>
+
+    <!-- Scope & groups: a group is a saved, named [start_id, end_id] window. The
+         Scope select applies the selected group's window UNIFORMLY to every feed
+         view AND to every Run / Compare, so "scope" means one thing everywhere;
+         "All frames" restores today's whole-store behavior. A pending range is
+         built by picking two endpoint frames in the grid below (per-tile "Set
+         start" / "Set end"), previewed as a live count, then named and saved. See
+         docs/specs/2026-07-10-frame-range-groups.md. -->
+    <div class="panel" id="scopePanel">
+        <h2>Scope &amp; groups</h2>
+        <div class="controls-row">
+            <div class="control-group">
+                <label for="scopeSelect">Frames</label>
+                <select id="scopeSelect">
+                    <option value="">All frames</option>
+                </select>
+            </div>
+            <div class="control-group" style="margin-left: auto;">
+                <span id="scopeBadge" class="badge">Scope: All frames</span>
+            </div>
+        </div>
+        <div class="controls-row" style="margin-top: 12px;">
+            <div class="control-group">
+                <label>Start frame</label>
+                <span id="pendingStartTs" class="badge">—</span>
+            </div>
+            <div class="control-group">
+                <label>End frame</label>
+                <span id="pendingEndTs" class="badge">—</span>
+            </div>
+            <div class="control-group">
+                <label for="groupNameInput">Group name</label>
+                <input type="text" id="groupNameInput" class="param-input" placeholder="e.g. dusk visit">
+            </div>
+            <span id="rangeCount" class="badge">Frames in range: —</span>
+            <div class="control-group" style="margin-left: auto;">
+                <div class="btn-row">
+                    <button type="button" id="groupSaveBtn" disabled>Save group</button>
+                    <button type="button" id="groupClearBtn" class="btn-secondary">Clear selection</button>
+                </div>
+            </div>
+        </div>
+        <div id="groupsList" class="groups-list"></div>
     </div>
 
     <div class="panel">
@@ -453,6 +545,11 @@
                 </div>
             </div>
             <div class="control-group" style="margin-left: auto;">
+                <!-- The active scope, mirrored from the panel above so a re-run or
+                     compare is never silently whole-store when a window was intended. -->
+                <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
+            </div>
+            <div class="control-group">
                 <span id="tuningProgressBadge" class="badge">Tuning: —</span>
             </div>
         </div>
@@ -520,6 +617,16 @@
         const tuningCopyRowEl = document.getElementById('tuningCopyRow');
         const tuningCopyTextEl = document.getElementById('tuningCopyText');
         const tuningCopyBtn = document.getElementById('tuningCopyBtn');
+        const scopeSelect = document.getElementById('scopeSelect');
+        const scopeBadge = document.getElementById('scopeBadge');
+        const pendingStartTsEl = document.getElementById('pendingStartTs');
+        const pendingEndTsEl = document.getElementById('pendingEndTs');
+        const rangeCountEl = document.getElementById('rangeCount');
+        const groupNameInput = document.getElementById('groupNameInput');
+        const groupSaveBtn = document.getElementById('groupSaveBtn');
+        const groupClearBtn = document.getElementById('groupClearBtn');
+        const groupsListEl = document.getElementById('groupsList');
+        const tuningScopeBadgeEl = document.getElementById('tuningScopeBadge');
 
         // View state. Every order is keyset-paginated. pageCursors[i] is the
         // opaque token that fetches page i (pageCursors[0] === null = first
@@ -544,6 +651,15 @@
         let lastStoreCount = null;     // last known /api/stats count — the analysis coverage denominator (see pollAnalysisStatus)
         let tuningPrevRunning = false;  // edge-detects analysisRunning true->false to auto-refresh the compare view when a rerun finishes
         let lastCandidateParams = null; // params actually submitted on the last successful "Run candidate" — the copy-paste line reflects THIS, not whatever is currently typed (which may have been edited since)
+
+        // Frame-range scope (docs/specs/2026-07-10-frame-range-groups.md). A
+        // "pending range" is the two endpoints picked in the grid but not yet
+        // saved; `activeScope` is the currently-selected group's inclusive id
+        // window (or null = whole store) that EVERY feed/run threads through.
+        let pendingStartId = null, pendingStartTs = null;
+        let pendingEndId = null, pendingEndTs = null;
+        let activeScope = null;   // {since_id, until_id} | null (null = All frames)
+        let groups = [];          // last GET /api/groups payload, for select + list rendering
 
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart). The <select> options AND
@@ -784,10 +900,15 @@
                 clearTuningError();
                 tuningRunBaselineBtn.disabled = true;
                 tuningRunCandidateBtn.disabled = true;
+                const body = { slot, params };
+                if (activeScope) {
+                    body.since_id = activeScope.since_id;
+                    body.until_id = activeScope.until_id;
+                }
                 const res = await fetch('/api/tuning/rerun', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ slot, params }),
+                    body: JSON.stringify(body),
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 // Remember exactly what was submitted, for the copy-paste line —
@@ -904,8 +1025,12 @@
                 tuningDeltasEl.textContent = 'Deltas: run both baseline and candidate to see the change.';
             }
 
+            // Only meaningful when the scorecards actually dropped a warm-up prefix.
+            // A scoped compare passes warmup=0 (the slots were warm-started before
+            // the window), so there's nothing to note — suppress it rather than
+            // claim "First 0 frames excluded".
             const warmup = data.live && typeof data.live.warmup === 'number' ? data.live.warmup : null;
-            tuningWarmupNoteEl.textContent = warmup !== null
+            tuningWarmupNoteEl.textContent = warmup
                 ? `First ${warmup} frames of the store are excluded from every scorecard above (MOG2 warm-up).`
                 : '';
 
@@ -921,7 +1046,9 @@
             try {
                 clearTuningError();
                 const oracle = analyzerSelect.value;
-                const res = await fetch('/api/tuning/compare?oracle=' + encodeURIComponent(oracle));
+                const params = new URLSearchParams({ oracle });
+                applyScopeParams(params);   // scoped: all four columns score the same window (warmup 0)
+                const res = await fetch('/api/tuning/compare?' + params.toString());
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
                 renderTuningCompare(data);
@@ -942,6 +1069,231 @@
                 tuningCopyTextEl.select();
             }
         });
+
+        // ---- frame-range scope & groups ----
+        // A group is a saved (name, [start_id, end_id]) window; the frontend
+        // expands the selected one into since_id/until_id before every scoped call,
+        // so the backend stays group-agnostic. See
+        // docs/specs/2026-07-10-frame-range-groups.md.
+
+        // Add the active scope's inclusive id bounds to a URLSearchParams. No active
+        // scope leaves the params untouched, so an unscoped call is byte-for-byte
+        // today's whole-store request.
+        function applyScopeParams(params) {
+            if (!activeScope) return;
+            if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
+            if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
+        }
+
+        // The pending range's effective inclusive bounds, or null when neither
+        // endpoint is picked. Both picked → since=min/until=max (the two clicks may
+        // arrive in either id order; the backend normalizes too); only one picked →
+        // that side bounds and the other stays unbounded, so the preview count still
+        // works while a range is half-built.
+        function pendingBounds() {
+            if (pendingStartId == null && pendingEndId == null) return null;
+            if (pendingStartId != null && pendingEndId != null) {
+                return {
+                    since_id: Math.min(pendingStartId, pendingEndId),
+                    until_id: Math.max(pendingStartId, pendingEndId),
+                };
+            }
+            return pendingStartId != null
+                ? { since_id: pendingStartId, until_id: null }
+                : { since_id: null, until_id: pendingEndId };
+        }
+
+        // Save is armed only with BOTH endpoints and a name — a group is a full
+        // window, and the backend rejects an endpoint that isn't a live frame id.
+        function updateSaveButton() {
+            const ready = pendingStartId != null && pendingEndId != null && groupNameInput.value.trim() !== '';
+            groupSaveBtn.disabled = !ready;
+        }
+
+        // Refresh the "Frames in range: N" readout from /api/range/count. Tagged
+        // with a seq so a slower stale count (the user picked again mid-fetch) is
+        // discarded rather than overwriting the newer one — the same guard loadPage
+        // uses.
+        let rangeCountSeq = 0;
+        async function refreshRangeCount() {
+            const bounds = pendingBounds();
+            if (!bounds) {
+                rangeCountEl.textContent = 'Frames in range: —';
+                return;
+            }
+            const seq = ++rangeCountSeq;
+            try {
+                const params = new URLSearchParams();
+                if (bounds.since_id != null) params.set('since_id', String(bounds.since_id));
+                if (bounds.until_id != null) params.set('until_id', String(bounds.until_id));
+                const res = await fetch('/api/range/count?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== rangeCountSeq) return;   // superseded by a newer pick
+                rangeCountEl.textContent = `Frames in range: ${data.count}`;
+            } catch (err) {
+                if (seq !== rangeCountSeq) return;
+                rangeCountEl.textContent = 'Frames in range: —';
+                showError(`Range count failed: ${err.message}`);
+            }
+        }
+
+        // Reflect the pending endpoints' timestamps, re-arm Save, and re-count.
+        function updatePendingReadout() {
+            pendingStartTsEl.textContent = pendingStartTs != null ? formatTime(pendingStartTs) : '—';
+            pendingEndTsEl.textContent = pendingEndTs != null ? formatTime(pendingEndTs) : '—';
+            updateSaveButton();
+            refreshRangeCount();
+        }
+
+        // Full reset of the pending builder — used by "Clear selection" and after a
+        // successful save (the endpoints are then captured in the saved group).
+        function clearPendingSelection() {
+            pendingStartId = pendingStartTs = pendingEndId = pendingEndTs = null;
+            groupNameInput.value = '';
+            updatePendingReadout();
+        }
+
+        // Show the active scope in the scope panel AND the MOG2 tuning panel,
+        // highlighted (warn) when it's a real window so a scoped run/compare can't be
+        // mistaken for a whole-store one.
+        function updateScopeBadge() {
+            let label = 'All frames';
+            if (activeScope) {
+                const g = groups.find(x => String(x.id) === scopeSelect.value);
+                label = g ? g.name : `ids ${activeScope.since_id ?? ''}–${activeScope.until_id ?? ''}`;
+            }
+            const text = `Scope: ${label}`;
+            scopeBadge.textContent = text;
+            scopeBadge.classList.toggle('warn', !!activeScope);
+            tuningScopeBadgeEl.textContent = text;
+            tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
+        }
+
+        // Derive activeScope from the current scopeSelect value, then re-issue every
+        // scoped view: the grid (pager cursors reset via reloadView) and the tuning
+        // compare. Called on a scope change and after save/delete move the selection
+        // programmatically (a programmatic .value change fires no 'change' event).
+        function applyScope() {
+            const val = scopeSelect.value;
+            const g = val ? groups.find(x => String(x.id) === val) : null;
+            activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
+            updateScopeBadge();
+            reloadView();
+            loadTuningCompare();
+        }
+
+        // Rebuild the scope <select>, preserving the current selection when its
+        // group still exists (a deleted/absent group falls back to All frames).
+        // This never touches activeScope — that moves only through applyScope, so
+        // repopulating the options can't silently change the effective window.
+        function renderScopeSelect() {
+            const prev = scopeSelect.value;
+            scopeSelect.innerHTML = '';
+            const allOpt = document.createElement('option');
+            allOpt.value = '';
+            allOpt.textContent = 'All frames';
+            scopeSelect.appendChild(allOpt);
+            for (const g of groups) {
+                const opt = document.createElement('option');
+                opt.value = String(g.id);
+                opt.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames`;
+                scopeSelect.appendChild(opt);
+            }
+            scopeSelect.value = [...scopeSelect.options].some(o => o.value === prev) ? prev : '';
+        }
+
+        // The saved-groups list, each with a delete button. Counts are live from the
+        // store, so a wholly-evicted group reads 0 frames rather than vanishing.
+        function renderGroupsList() {
+            groupsListEl.innerHTML = '';
+            if (groups.length === 0) {
+                const note = document.createElement('div');
+                note.className = 'groups-empty';
+                note.textContent = 'No saved groups yet — pick a Start and End frame below, name it, and Save group.';
+                groupsListEl.appendChild(note);
+                return;
+            }
+            for (const g of groups) {
+                const row = document.createElement('div');
+                row.className = 'group-row';
+                const info = document.createElement('span');
+                info.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames · ids ${g.start_id}–${g.end_id}`;
+                const del = document.createElement('button');
+                del.type = 'button';
+                del.className = 'btn-danger btn-tiny';
+                del.textContent = 'Delete';
+                del.addEventListener('click', () => deleteGroup(g.id));
+                row.append(info, del);
+                groupsListEl.appendChild(row);
+            }
+        }
+
+        // Load groups and repaint both the select and the list. A failed call uses
+        // the shared error banner — this IS a user-triggered fetch, unlike the 4s polls.
+        async function loadGroups() {
+            try {
+                clearError();
+                const res = await fetch('/api/groups');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                groups = data.groups || [];
+                renderScopeSelect();
+                renderGroupsList();
+                updateScopeBadge();   // a still-selected group's count/label may have changed
+            } catch (err) {
+                showError(`Failed to load groups: ${err.message}`);
+            }
+        }
+
+        async function saveGroup() {
+            const name = groupNameInput.value.trim();
+            if (!name || pendingStartId == null || pendingEndId == null) return;
+            try {
+                clearError();
+                groupSaveBtn.disabled = true;
+                const res = await fetch('/api/groups', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, start_id: pendingStartId, end_id: pendingEndId }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const group = await res.json();
+                await loadGroups();
+                // Select the freshly-saved group as the active scope, then reset the
+                // pending builder.
+                scopeSelect.value = String(group.id);
+                applyScope();
+                clearPendingSelection();
+            } catch (err) {
+                showError(`Save group failed: ${err.message}`);
+            } finally {
+                updateSaveButton();   // re-derive from the (now-cleared) fields
+            }
+        }
+
+        async function deleteGroup(groupId) {
+            try {
+                clearError();
+                const wasActive = scopeSelect.value === String(groupId);
+                const res = await fetch('/api/groups/' + encodeURIComponent(groupId), { method: 'DELETE' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                await loadGroups();
+                // If the deleted group was the active scope its option is now gone;
+                // fall back to All frames and re-issue the views on the whole store.
+                if (wasActive) {
+                    scopeSelect.value = '';
+                    applyScope();
+                }
+            } catch (err) {
+                showError(`Delete group failed: ${err.message}`);
+            }
+        }
+
+        scopeSelect.addEventListener('change', applyScope);
+        groupNameInput.addEventListener('input', updateSaveButton);
+        groupSaveBtn.addEventListener('click', saveGroup);
+        groupClearBtn.addEventListener('click', clearPendingSelection);
 
         // ---- frame grid ----
 
@@ -983,6 +1335,32 @@
             caption.appendChild(areaSpan);
             tile.appendChild(caption);
 
+            // Per-tile range affordance: make this frame the pending range's start
+            // or end endpoint (stores its id + recv_ts). Two clicks anywhere in the
+            // grid define a contiguous id window — ids are monotonic in time.
+            const rangeBtns = document.createElement('div');
+            rangeBtns.className = 'range-btns';
+            const setStartBtn = document.createElement('button');
+            setStartBtn.type = 'button';
+            setStartBtn.className = 'btn-tiny';
+            setStartBtn.textContent = 'Set start';
+            setStartBtn.addEventListener('click', () => {
+                pendingStartId = frame.id;
+                pendingStartTs = frame.recv_ts;
+                updatePendingReadout();
+            });
+            const setEndBtn = document.createElement('button');
+            setEndBtn.type = 'button';
+            setEndBtn.className = 'btn-tiny';
+            setEndBtn.textContent = 'Set end';
+            setEndBtn.addEventListener('click', () => {
+                pendingEndId = frame.id;
+                pendingEndTs = frame.recv_ts;
+                updatePendingReadout();
+            });
+            rangeBtns.append(setStartBtn, setEndBtn);
+            tile.appendChild(rangeBtns);
+
             return tile;
         }
 
@@ -1012,6 +1390,11 @@
                     params.set('motion', motion);
                     params.set('order', order);
                 }
+                // Apply the active group's inclusive id window (if any) to whichever
+                // view this is: the plain feed, both motion presets, and the
+                // disagreement view all funnel through here, so scope means one
+                // consistent thing across every feed.
+                applyScopeParams(params);
                 const cursor = pageCursors[targetIndex];
                 if (cursor != null) params.set('cursor', String(cursor));
                 const res = await fetch('/api/frames?' + params.toString());
@@ -1114,7 +1497,15 @@
                 clearBtn.disabled = true;
                 const res = await fetch('/api/clear', { method: 'POST' });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
-                reloadView();
+                // A full clear drops every saved group server-side AND SQLite reuses
+                // rowids from 1, so a stale activeScope (or a deleted group left selected)
+                // would re-apply an old id window to brand-new, unrelated frames — the exact
+                // rowid-reuse hazard clear()-drops-groups guards against on the backend. Reset
+                // the scope + pending builder and reload the (now empty) group list first.
+                scopeSelect.value = '';
+                clearPendingSelection();
+                await loadGroups();
+                applyScope();   // '' -> activeScope=null, resets the pager, reloads grid + compare
                 pollStats();
             } catch (err) {
                 showError(`Clear failed: ${err.message}`);
@@ -1161,6 +1552,10 @@
                 clearError();
                 analysisRunBtn.disabled = true;
                 const body = { analyzer: analyzerSelect.value, reanalyze: reanalyzeCheckbox.checked };
+                if (activeScope) {
+                    body.since_id = activeScope.since_id;
+                    body.until_id = activeScope.until_id;
+                }
                 const res = await fetch('/api/analysis/run', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1198,6 +1593,7 @@
         window.addEventListener('load', () => {
             pollStats();
             pollAnalysisStatus();
+            loadGroups();
             reloadView();
             loadTuningDefaults();
             loadTuningCompare();

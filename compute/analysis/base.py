@@ -96,13 +96,18 @@ class Analyzer(Protocol):
         """
         ...
 
-    def prepare(self, store: "Store") -> None:
+    def prepare(self, store: "Store", since_id: "int | None" = None) -> None:
         """Heavy one-time setup at job start, before the first ``analyze``.
 
         Loads model weights and picks the device. A windowed analyzer also takes
         the ``store`` handle here to prime its recent-frame window (via
-        ``recent_before``) so a resumed sweep has no cold-start artifact; a
-        stateless analyzer ignores ``store``.
+        ``recent_before``) so a sweep has no cold-start artifact; ``since_id``
+        scopes that priming. Given a scope (a group's ``start_id``), it primes
+        from the frames IMMEDIATELY BEFORE ``since_id`` —
+        ``recent_before(since_id, N)`` — so the model enters the window genuinely
+        warm for that era; unscoped (``since_id=None``) it primes from the newest
+        frames as today. A stateless analyzer ignores both ``store`` and
+        ``since_id``.
         """
         ...
 

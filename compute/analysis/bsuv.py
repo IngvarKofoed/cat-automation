@@ -197,7 +197,7 @@ class BsuvAnalyzer:
         self._model = None
         self._device: "str | None" = None
 
-    def prepare(self, store: "Store") -> None:
+    def prepare(self, store: "Store", since_id: "int | None" = None) -> None:
         """Load the network, pick the device, then build and warm-start the window.
 
         Order is deliberate: **load the model first, prime the window second.**
@@ -206,6 +206,10 @@ class BsuvAnalyzer:
         keeps a mistaken run on the dev box cheap. When it does succeed (the CUDA
         compute box), the freshly-built deque is primed from the store so the first
         analyzed frames aren't garbage.
+
+        ``since_id`` scopes that priming: on a scoped run (a group's ``start_id``) the
+        window primes from the frames IMMEDIATELY BEFORE the window so it enters that
+        era warm; unscoped (``None``) it primes from the newest frames as before.
 
         A missing/unavailable model (deps absent, no CUDA, or the variant not yet
         wired up) raises ``ImportError`` with an actionable message. All three
@@ -221,7 +225,7 @@ class BsuvAnalyzer:
         # Fresh window per job so a re-run never inherits a prior sweep's frames,
         # then prime it from recent stored frames (best-effort).
         self._window = collections.deque(maxlen=self._window_size)
-        self._warm_start(store)
+        self._warm_start(store, since_id)
 
     def ensure_available(self) -> None:
         """Verify ``torch`` imports AND a CUDA device is present; raise if not.
@@ -290,7 +294,7 @@ class BsuvAnalyzer:
             "meanwhile."
         )
 
-    def _warm_start(self, store: "Store") -> None:
+    def _warm_start(self, store: "Store", since_id: "int | None" = None) -> None:
         """Prime the rolling window with recent stored frames (best-effort).
 
         Without priming, the first ``analyze`` calls would build a background from
@@ -298,8 +302,11 @@ class BsuvAnalyzer:
         a *missed* subject exactly when we care most. Priming gives those early
         frames a real background prior.
 
-        We prime from the *newest* ``window_size`` frames (``recent_before`` with a
-        huge sentinel id) even though the sweep runs oldest-first. This is a
+        The priming anchor is ``since_id`` on a scoped run, else the ``_WARMSTART_ID``
+        sentinel: ``recent_before(anchor, window_size)`` returns the ``window_size``
+        frames just before the anchor. Scoped, that is the frames IMMEDIATELY BEFORE
+        the window, so the window enters that era warm; unscoped, the sentinel selects
+        the *newest* frames even though the sweep runs oldest-first. This is a
         deliberate, bounded approximation: there is nothing before the oldest frame
         to prime from, and at a fixed door the scene is largely static, so any
         recent window is a far better prior than an empty one. Its only effect is
@@ -309,8 +316,9 @@ class BsuvAnalyzer:
         order ``recent_before`` returns), and an empty store simply yields an empty
         prime (graceful cold start).
         """
+        anchor = since_id if since_id is not None else _WARMSTART_ID
         try:
-            paths = store.recent_before(_WARMSTART_ID, self._window_size)
+            paths = store.recent_before(anchor, self._window_size)
         except Exception:
             # Priming is an optimization, never a correctness requirement — a store
             # read that trips must not abort the whole sweep before it starts.

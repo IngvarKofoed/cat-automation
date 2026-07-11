@@ -1,0 +1,2 @@
+- [x] Select all when creating buckets
+- [ ] Better UI in generel. Things are jumping around because of size and visiblity changes.

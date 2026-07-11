@@ -555,7 +555,14 @@ def create_app(
         # every scoped read then shares. A None bound — or a bound matching no frame —
         # stays null on that side, which the UI reads as "no frames in that window".
         since_id, until_id = store.resolve_ts_range(start_ts, end_ts)
-        return {"since_id": since_id, "until_id": until_id}
+        # Also report each bound's actual frame recv_ts so the Buckets viewer can
+        # label a whole-window "Select all" selection with real frame times.
+        return {
+            "since_id": since_id,
+            "until_id": until_id,
+            "since_ts": store.frame_recv_ts(since_id),
+            "until_ts": store.frame_recv_ts(until_id),
+        }
 
     @app.get("/api/frames/sample")
     def api_frames_sample(

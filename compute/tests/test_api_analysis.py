@@ -899,10 +899,20 @@ def test_frames_resolve_and_sample_endpoints(make_app):
     ids = [store.add(_frame(frame_id=i), recv_ts_ms=base + i * 100) for i in range(5)]
 
     resolved = client.get("/api/frames/resolve", params={"start_ts": base, "end_ts": base + 400}).json()
-    assert resolved == {"since_id": ids[0], "until_id": ids[4]}
+    assert resolved == {
+        "since_id": ids[0],
+        "until_id": ids[4],
+        "since_ts": base,
+        "until_ts": base + 400,
+    }
 
     # A None-ish window (no bounds) still resolves both sides to null.
-    assert client.get("/api/frames/resolve").json() == {"since_id": None, "until_id": None}
+    assert client.get("/api/frames/resolve").json() == {
+        "since_id": None,
+        "until_id": None,
+        "since_ts": None,
+        "until_ts": None,
+    }
 
     sampled = client.get("/api/frames/sample", params={"count": 2}).json()["frames"]
     assert sampled[0]["id"] == ids[0]  # first frame always included

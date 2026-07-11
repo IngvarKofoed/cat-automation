@@ -203,3 +203,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     picking "21:00" misleadingly meant "through 24:00". The End value now IS the end instant (no
     hidden +step at load); Start still shows slot starts (00:00 … 21:00).
 
+38. Buckets "Select all" button: one click makes the pending bucket the whole loaded window
+    (its resolved [since_id, until_id]), instead of hunting for the exact first/last tile in a
+    decimated grid. Uses the resolved id bounds, not on-screen tiles, so density/paging can't
+    truncate it. GET /api/frames/resolve now also returns since_ts/until_ts so the readout labels
+    the selection with real frame times.
+

@@ -758,6 +758,22 @@ class Store:
             int(until_id) if until_id is not None else None,
         )
 
+    def frame_recv_ts(self, frame_id: "int | None") -> "int | None":
+        """The ``recv_ts`` of one frame id, or ``None`` if it isn't a live row.
+
+        Lets the resolve endpoint report each id bound's wall-clock instant
+        without a second round trip, so the Buckets viewer can label a
+        whole-window ("Select all") selection with real frame times rather than
+        the requested clock instants. ``None`` id passes through as ``None``.
+        """
+        if frame_id is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT recv_ts FROM frames WHERE id = ?", (int(frame_id),)
+            ).fetchone()
+        return int(row[0]) if row is not None else None
+
     def sample_frames(
         self, since_id: "int | None", until_id: "int | None", count: int
     ) -> "list[dict]":

@@ -683,6 +683,8 @@
                 </div>
                 <div class="control-group" style="margin-left: auto;">
                     <div class="btn-row">
+                        <button type="button" id="pickAllBtn" class="btn-secondary" disabled
+                                title="Select the whole loaded window as the bucket — no need to click a start and end frame.">Select all</button>
                         <button type="button" id="bucketSaveBtn" disabled>Save bucket</button>
                         <button type="button" id="pickClearBtn" class="btn-secondary">Clear selection</button>
                     </div>
@@ -900,6 +902,7 @@
         const viewerRangeCountEl = document.getElementById('viewerRangeCount');
         const bucketNameInput = document.getElementById('bucketNameInput');
         const bucketSaveBtn = document.getElementById('bucketSaveBtn');
+        const pickAllBtn = document.getElementById('pickAllBtn');
         const pickClearBtn = document.getElementById('pickClearBtn');
         const viewerReadonlyNote = document.getElementById('viewerReadonlyNote');
         const viewerEmpty = document.getElementById('viewerEmpty');
@@ -1338,7 +1341,10 @@
                     showError('No frames in that time window — widen the clock range.');
                     return;
                 }
-                viewerScope = { since_id: data.since_id, until_id: data.until_id };
+                viewerScope = {
+                    since_id: data.since_id, until_id: data.until_id,
+                    since_ts: data.since_ts, until_ts: data.until_ts,
+                };
                 viewerTotalCount = null;
                 viewerReadOnly = false;
                 clearPendingSelection();
@@ -1368,9 +1374,17 @@
             sampleReloadTimer = setTimeout(() => loadViewer(true), 250);
         });
 
+        // "Select all" only means something with an editable window loaded (not a
+        // read-only saved-bucket view, and with both resolved id bounds present).
+        function canSelectAll() {
+            return !viewerReadOnly && !!viewerScope
+                && viewerScope.since_id != null && viewerScope.until_id != null;
+        }
+
         function setViewerMode() {
             pickToolbar.classList.toggle('hidden', viewerReadOnly);
             viewerReadonlyNote.classList.toggle('hidden', !viewerReadOnly);
+            pickAllBtn.disabled = !canSelectAll();
         }
 
         // "All frames" badge: the window's TOTAL frame count (paging shows a subset) plus
@@ -1605,6 +1619,19 @@
         });
         pickClearBtn.addEventListener('click', clearPendingSelection);
 
+        // Select the whole loaded window as the pending bucket — its resolved id
+        // bounds (since_id/until_id), not the decimated tiles on screen, so the
+        // saved [start_id, end_id] covers every frame in the window regardless of
+        // the display density or page. Timestamps come from the same resolve so
+        // the readout shows the real bound frame times.
+        pickAllBtn.addEventListener('click', () => {
+            if (!canSelectAll()) return;
+            pickStartId = viewerScope.since_id; pickStartTs = viewerScope.since_ts;
+            pickEndId = viewerScope.until_id; pickEndTs = viewerScope.until_ts;
+            updatePickReadout();
+            applyViewerHighlights();
+        });
+
         bucketSaveBtn.addEventListener('click', async () => {
             const name = bucketNameInput.value.trim();
             if (!name || pickStartId == null || pickEndId == null) return;
@@ -1628,7 +1655,7 @@
 
         // View a saved bucket read-only over its stored ids.
         function viewSavedBucket(g) {
-            viewerScope = { since_id: g.start_id, until_id: g.end_id };
+            viewerScope = { since_id: g.start_id, until_id: g.end_id, since_ts: g.start_ts, until_ts: g.end_ts };
             viewerTotalCount = g.count;  // known from the group; skips the /api/range/count fetch
             viewerReadOnly = true;
             clearPendingSelection();

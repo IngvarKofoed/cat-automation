@@ -988,6 +988,11 @@
         // job COMPLETING even after the bounded (20) list stops growing — a length
         // comparison would stop working once it is capped.
         let lastHistoryTop; // undefined until first poll
+        // ETA anchor for the running job: {key, t0, done0}. The server carries no timing,
+        // so we extrapolate a rate from progress observed across polls. Anchored at the
+        // first poll of a given job identity (re-anchored when that identity changes, and
+        // dropped when idle), so a new sweep never inherits the prior job's rate.
+        let etaAnchor = null;
 
         // Groups / buckets (from /api/groups), shared by both views.
         let groups = [];
@@ -1061,6 +1066,8 @@
                 span.textContent = `${a.label}: —`;
                 const btn = document.createElement('button');
                 btn.type = 'button';
+                btn.className = 'enqueue-btn';
+                btn.dataset.oracle = a.id;
                 btn.textContent = 'Enqueue ' + a.label;
                 btn.addEventListener('click', () => enqueueOracle(a.id));
                 row.append(span, btn);
@@ -1098,14 +1105,17 @@
             if (typeof ts !== 'number') return '—';
             return new Date(ts).toLocaleString();
         }
-        function formatSpan(oldest, newest) {
-            if (typeof oldest !== 'number' || typeof newest !== 'number') return '—';
-            let secs = Math.max(0, Math.round((newest - oldest) / 1000));
+        function formatDuration(secs) {
+            secs = Math.max(0, Math.round(secs));
             const h = Math.floor(secs / 3600); secs -= h * 3600;
             const m = Math.floor(secs / 60); secs -= m * 60;
             if (h > 0) return `${h}h ${m}m`;
             if (m > 0) return `${m}m ${secs}s`;
             return `${secs}s`;
+        }
+        function formatSpan(oldest, newest) {
+            if (typeof oldest !== 'number' || typeof newest !== 'number') return '—';
+            return formatDuration((newest - oldest) / 1000);
         }
         function kindLabel(kind) { return ANALYZER_LABELS[kind] || kind; }
         // A window description for queue/history/scope readouts: match a saved bucket
@@ -1838,6 +1848,16 @@
         }
 
         async function enqueueOracle(oracle) {
+            // The enqueue request blocks while the server verifies the oracle's ML deps
+            // (the first YOLO/BSUV enqueue imports torch/ultralytics synchronously — several
+            // seconds, one-time). Disable both buttons and show a pending label so that wait
+            // is visible instead of looking like a dead click; the job isn't queued until the
+            // request returns, so there is nothing to poll into view until then.
+            const btns = coverageListEl.querySelectorAll('.enqueue-btn');
+            const target = coverageListEl.querySelector(`.enqueue-btn[data-oracle="${oracle}"]`);
+            const targetLabel = target ? target.textContent : '';
+            btns.forEach(b => { b.disabled = true; });
+            if (target) target.textContent = `Enqueuing ${kindLabel(oracle)}…`;
             try {
                 clearError();
                 enqueueWarnEl.classList.add('hidden');
@@ -1862,11 +1882,43 @@
             } catch (err) {
                 showError(`Enqueue failed: ${err.message}`);
             } finally {
+                btns.forEach(b => { b.disabled = false; });
+                if (target) target.textContent = targetLabel;
                 await pollAnalysisStatus();
             }
         }
 
         // ================= MOTION view: queue panel =================
+        // The running job's identity: analyzer + scope + total. `total` is in the key on
+        // purpose — it is 0 until the sweep counts its frames, so the flip to the real
+        // denominator re-anchors the ETA exactly when counting begins.
+        function runningJobKey(status) {
+            return [status.analyzer, status.since_id, status.until_id, status.total].join('|');
+        }
+        // A " · ~Xm Ys left" suffix for the running line, or '' when there is no basis yet
+        // (no total, no progress observed since the anchor, or already complete). Rate is a
+        // simple average over the observation window — smooth enough at the 4 s poll cadence,
+        // and it self-corrects as the sweep runs.
+        function etaText(status) {
+            if (!status.running || !status.total || status.total <= 0) { etaAnchor = null; return ''; }
+            const now = Date.now();
+            const key = runningJobKey(status);
+            // Re-anchor on a new job identity OR when `done` drops below the anchor — two
+            // jobs can share the same key-tuple and be promoted back-to-back with no idle
+            // poll between (the worker promotes the successor under lock), so a done that
+            // went backwards means a fresh job whose rate must not be measured against the
+            // predecessor's t0.
+            if (!etaAnchor || etaAnchor.key !== key || status.done < etaAnchor.done0) {
+                etaAnchor = { key, t0: now, done0: status.done };
+                return '';
+            }
+            const dDone = status.done - etaAnchor.done0;
+            const dt = (now - etaAnchor.t0) / 1000;
+            const remaining = status.total - status.done;
+            if (dDone <= 0 || dt <= 0 || remaining <= 0) return '';
+            return ` · ~${formatDuration(remaining / (dDone / dt))} left`;
+        }
+
         function renderQueuePanel(status) {
             const running = !!status.running;
             const queue = status.queue || [];
@@ -1877,8 +1929,9 @@
             queueStopAllBtn.disabled = !running && queue.length === 0;
 
             if (running) {
-                queueRunningEl.textContent = `Running ${kindLabel(status.analyzer)} — ${status.done}/${status.total} · ${windowLabel(status.since_id, status.until_id)}`;
+                queueRunningEl.textContent = `Running ${kindLabel(status.analyzer)} — ${status.done}/${status.total}${etaText(status)} · ${windowLabel(status.since_id, status.until_id)}`;
             } else {
+                etaAnchor = null;  // idle: drop the anchor so the next job re-anchors fresh
                 queueRunningEl.textContent = 'Idle.';
             }
 

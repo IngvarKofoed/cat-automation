@@ -209,3 +209,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     truncate it. GET /api/frames/resolve now also returns since_ts/until_ts so the readout labels
     the selection with real frame times.
 
+39. Motion view: enqueuing an oracle now shows an in-flight state ("Enqueuing YOLO…", buttons
+    disabled) and the running job shows a live ETA ("~Xm Ys left"). The first YOLO/BSUV enqueue
+    blocks several seconds on the synchronous ensure_available() dep import (torch/ultralytics),
+    during which the job isn't queued yet — so the click looked dead. ETA is client-side: rate
+    extrapolated from progress across polls, re-anchored per job (total is in the anchor key, so
+    it re-anchors when the denominator resolves), dropped when idle. No server change.
+

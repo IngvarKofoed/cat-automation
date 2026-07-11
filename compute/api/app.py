@@ -738,6 +738,25 @@ def create_app(
             "summaries": {name: store.analysis_summary(name) for name in ANALYZER_NAMES},
         }
 
+    @app.get("/api/analysis/coverage")
+    def api_analysis_coverage(
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # Per-oracle verdict coverage scoped to the SELECTED bucket's window, so the Motion
+        # view shows what a scoped sweep will actually cover ("0/356 analyzed in this
+        # bucket") instead of the whole-store counts /api/analysis/status carries. ``total``
+        # is the window's frame count (shared across oracles — an enqueue sweeps the same
+        # frames whichever oracle); analyzed/present are per oracle. Both bounds absent =
+        # whole store.
+        _validate_bounds(since_id, until_id)
+        cov = {name: store.analysis_coverage(name, since_id, until_id) for name in ANALYZER_NAMES}
+        total = next(iter(cov.values()))["total"] if cov else store.count_in_range(since_id, until_id)
+        return {
+            "total": total,
+            "oracles": {name: {"analyzed": c["analyzed"], "present": c["present"]} for name, c in cov.items()},
+        }
+
     # --- Edge-config proxy + offline MOG2 tuning (motion-gate-diagnostic spec) ------
     #
     # Kept SIBLING to /api/analysis/* on purpose: the /api/analysis oracles are fixed

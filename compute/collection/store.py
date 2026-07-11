@@ -1045,6 +1045,34 @@ class Store:
             ).fetchone()
         return {"analyzed": int(analyzed), "present": int(present)}
 
+    def analysis_coverage(
+        self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> dict:
+        """``{total, analyzed, present}`` for ``analyzer`` over an id WINDOW.
+
+        Unlike ``analysis_summary`` (whole-store verdict counts), this scopes to
+        ``[since_id, until_id]`` and reports the counts against the window's frame
+        ``total`` — so the UI can show what a bucket-scoped sweep will actually
+        cover ("0/356 analyzed in this bucket") instead of whole-store numbers.
+        ``total`` = frames in the window; ``analyzed`` = those carrying a verdict
+        for ``analyzer``; ``present`` = those whose verdict says the subject is
+        present. One LEFT JOIN pass (a frame with no verdict contributes to
+        ``total`` only). Both bounds ``None`` = the whole store.
+        """
+        frags, params = _range_bounds("f.id", since_id, until_id)
+        where = (" WHERE " + " AND ".join(frags)) if frags else ""
+        with self._lock:
+            total, analyzed, present = self._conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(CASE WHEN a.frame_id IS NOT NULL THEN 1 ELSE 0 END), 0),"
+                " COALESCE(SUM(CASE WHEN a.verdict = 1 THEN 1 ELSE 0 END), 0)"
+                " FROM frames f"
+                " LEFT JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ?"
+                + where,
+                [analyzer] + params,
+            ).fetchone()
+        return {"total": int(total), "analyzed": int(analyzed), "present": int(present)}
+
     def clear_analysis(
         self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
     ) -> int:

@@ -270,6 +270,22 @@ def test_sample_frames_by_interval_is_a_time_rate(tmp_path):
     assert store.sample_frames_by_interval(ids[5] + 1, None, 3000) == []
 
 
+def test_analysis_coverage_scopes_to_window(tmp_path):
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=base + i) for i in range(6)]  # ids 1..6
+    store.write_analysis(ids[1], "yolo", True, 0.9, None)   # present
+    store.write_analysis(ids[2], "yolo", False, 0.1, None)  # analyzed, absent
+    store.write_analysis(ids[4], "yolo", True, 0.8, None)   # present
+
+    # Whole store: 3 of 6 analyzed, 2 present.
+    assert store.analysis_coverage("yolo") == {"total": 6, "analyzed": 3, "present": 2}
+    # Scoped to ids[1..3]: 3 frames, ids[1]+ids[2] analyzed (1 present), ids[3] unanalyzed.
+    assert store.analysis_coverage("yolo", ids[1], ids[3]) == {"total": 3, "analyzed": 2, "present": 1}
+    # An oracle with no verdicts in the window → zeroes, but total still counts the frames.
+    assert store.analysis_coverage("bsuv", ids[0], ids[2]) == {"total": 3, "analyzed": 0, "present": 0}
+
+
 # --- Store: timeline_bins -----------------------------------------------------
 
 

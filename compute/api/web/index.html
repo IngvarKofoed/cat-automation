@@ -1028,14 +1028,23 @@
         }
 
         function buildTimeOptions() {
-            for (const sel of [startTimeEl, endTimeEl]) {
-                sel.innerHTML = '';
-                for (let h = 0; h < 24; h += CLOCK_STEP_HOURS) {
-                    const opt = document.createElement('option');
-                    opt.value = String(h);
-                    opt.textContent = pad2(h) + ':00';
-                    sel.appendChild(opt);
-                }
+            // A window brackets whole 3 h slots: [start of the start slot, END of the end
+            // slot]. So Start lists slot STARTS (00:00 … 21:00) and End lists slot ENDS
+            // (03:00 … 24:00) — the End dropdown shows the actual end of the chosen slot,
+            // not its start, and its value is the real end hour (so no hidden +step at load).
+            startTimeEl.innerHTML = '';
+            endTimeEl.innerHTML = '';
+            for (let h = 0; h < 24; h += CLOCK_STEP_HOURS) {
+                const startOpt = document.createElement('option');
+                startOpt.value = String(h);
+                startOpt.textContent = pad2(h) + ':00';
+                startTimeEl.appendChild(startOpt);
+
+                const endH = h + CLOCK_STEP_HOURS;  // 03:00 … 24:00 (24:00 = end of day)
+                const endOpt = document.createElement('option');
+                endOpt.value = String(endH);
+                endOpt.textContent = pad2(endH) + ':00';
+                endTimeEl.appendChild(endOpt);
             }
         }
 
@@ -1184,7 +1193,7 @@
                 analysisStatus = data;
 
                 renderQueuePanel(data);
-                renderCoverage(data);
+                if (route === 'motion') loadCoverage();  // scoped to the picked bucket; live during a sweep
                 updateTuningStatusBadges(data);
 
                 analysisErrorEl.textContent = data.error ? `Last analysis run failed: ${data.error}` : '';
@@ -1301,27 +1310,22 @@
             }
             if (!endDateEl.value) {
                 endDateEl.value = maxD;
-                // Default to the 3 h block CONTAINING the newest frame (floor, like the
-                // start). The end bound is inclusive-through-end-of-block (see the load
-                // handler's + CLOCK_STEP_HOURS), so this block covers the newest frame
-                // even when it lands late in the block (e.g. newest 23:43 → 21:00 block
-                // → end_ts 24:00). ceil could round to an invalid "24:00" option and,
-                // once clamped to 21:00 as an exact instant, silently exclude the last
-                // hours of the store — the most recent frames you usually want to bucket.
-                const eh = Math.floor(new Date(storeNewestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS;
-                endTimeEl.value = String(eh);
+                // Default End to the END of the slot CONTAINING the newest frame — i.e. the
+                // slot start (floor) + one step — so the default window covers the newest
+                // frame even when it lands late in a slot (newest 23:43 → 21:00 slot → End
+                // 24:00). End values are slot ends (03:00 … 24:00), so this is a valid option.
+                const slotStart = Math.floor(new Date(storeNewestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS;
+                endTimeEl.value = String(slotStart + CLOCK_STEP_HOURS);
             }
         }
 
         loadWindowBtn.addEventListener('click', async () => {
-            // The clock is a coarse 3 h-block era selector: the start bound is the block
-            // start, the end bound is the END of the selected block (+ CLOCK_STEP_HOURS),
-            // so a window "through the 21:00 block" reaches 24:00 and includes frames
-            // after 21:00 that no 3 h option could otherwise select (resolve clamps the
-            // id to the actual last frame ≤ that instant). hour+3 = 24 correctly rolls to
-            // next-day 00:00 via the Date constructor.
+            // Coarse 3 h-slot era selector. Start value = slot start; End value already IS
+            // the slot end (03:00 … 24:00), so no +step here. End 24:00 correctly rolls to
+            // next-day 00:00 via the Date constructor; resolve then clamps the id to the
+            // actual last frame ≤ that instant.
             const s = tsFromControls(startDateEl.value, Number(startTimeEl.value));
-            const e = tsFromControls(endDateEl.value, Number(endTimeEl.value) + CLOCK_STEP_HOURS);
+            const e = tsFromControls(endDateEl.value, Number(endTimeEl.value));
             if (s == null || e == null) { showError('Pick a start and end date.'); return; }
             const lo = Math.min(s, e), hi = Math.max(s, e);
             try {
@@ -1763,27 +1767,54 @@
 
         function reloadMotionView() {
             updateMotionScopeBadge();
-            renderCoverage(analysisStatus);
+            loadCoverage();
             loadTimeline();
             loadVisits();
             loadTuningCompare();
         }
 
         // ================= MOTION view: coverage + enqueue =================
-        function renderCoverage(status) {
-            const summaries = (status && status.summaries) || {};
-            for (const a of ANALYZERS) {
-                const s = summaries[a.id] || { analyzed: 0, present: 0 };
-                const N = typeof lastStoreCount === 'number' ? lastStoreCount : '—';
-                const el = document.getElementById('cov-' + a.id);
-                if (el) el.textContent = `${a.label}: ${s.analyzed}/${N} analyzed · ${s.present} present (whole store)`;
+        // Coverage is scoped to activeScope (the picked bucket) — the SAME window enqueue
+        // sweeps — so "X/N analyzed" reflects what a sweep will actually cover, not the
+        // whole store. Fetched from /api/analysis/coverage (total = frames in the window).
+        async function loadCoverage() {
+            const scope = activeScope;  // the enqueue target, not the drill sub-window
+            const params = new URLSearchParams();
+            if (scope) {
+                if (scope.since_id != null) params.set('since_id', String(scope.since_id));
+                if (scope.until_id != null) params.set('until_id', String(scope.until_id));
             }
+            try {
+                const res = await fetch('/api/analysis/coverage?' + params.toString());
+                if (!res.ok) return;
+                renderCoverage(await res.json(), scope);
+            } catch (err) { /* leave the last coverage in place on a transient failure */ }
+        }
+
+        function renderCoverage(data, scope) {
+            const total = (data && typeof data.total === 'number') ? data.total : '—';
+            const oracles = (data && data.oracles) || {};
+            const where = scope ? 'in this bucket' : 'whole store';
+            for (const a of ANALYZERS) {
+                const s = oracles[a.id] || { analyzed: 0, present: 0 };
+                const el = document.getElementById('cov-' + a.id);
+                if (el) el.textContent = `${a.label}: ${s.analyzed}/${total} analyzed · ${s.present} present (${where})`;
+            }
+        }
+
+        // Human label for what a scoped sweep covers, for the enqueue confirmation — so it
+        // is explicit whether a job runs over the picked bucket or the whole store.
+        function motionScopeText() {
+            if (!activeScope) return 'the whole store';
+            const g = groups.find(x => String(x.id) === motionScopeSelect.value);
+            return g ? `bucket "${g.name}"` : `ids ${activeScope.since_id}–${activeScope.until_id}`;
         }
 
         async function enqueueOracle(oracle) {
             try {
                 clearError();
                 enqueueWarnEl.classList.add('hidden');
+                const scopeText = motionScopeText();
                 const body = { analyzer: oracle, reanalyze: reanalyzeCheckbox.checked };
                 if (activeScope) { body.since_id = activeScope.since_id; body.until_id = activeScope.until_id; }
                 const res = await fetch('/api/analysis/run', {
@@ -1794,8 +1825,8 @@
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
                 let msg = data.deduped
-                    ? `${kindLabel(oracle)} already queued (position ${data.position}).`
-                    : `${kindLabel(oracle)} enqueued (position ${data.position}).`;
+                    ? `${kindLabel(oracle)} already queued over ${scopeText} (position ${data.position}).`
+                    : `${kindLabel(oracle)} enqueued over ${scopeText} (position ${data.position}).`;
                 if (data.motion_only_overlap) {
                     msg += ' Window overlaps a motion-only span — BSUV/MOG2 verdicts across it are unreliable (arbitrary time gaps break the windowed sweep).';
                 }

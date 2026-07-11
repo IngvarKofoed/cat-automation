@@ -192,3 +192,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 35. The density-rate field refreshes the preview live. It now reloads on `input` (debounced), not `change`,
     so a typed "frames / min|hour" updates the grid and count immediately instead of only on blur/Enter.
 
+36. Motion-view oracle coverage is scoped to the selected bucket, not whole-store. New GET
+    /api/analysis/coverage returns per-oracle {analyzed, present} against the window's frame total,
+    so "X/N analyzed · P present (in this bucket)" and the enqueue confirmation ("enqueued over
+    bucket …") make it clear what a scoped sweep will actually cover — the enqueue was already
+    bucket-scoped; only the display lagged.
+
+37. Clock-picker End dropdown shows slot ENDS (03:00 … 24:00), not slot starts. Previously the end
+    bound was inclusive-through-the-3 h-slot but the dropdown still displayed the slot start, so
+    picking "21:00" misleadingly meant "through 24:00". The End value now IS the end instant (no
+    hidden +step at load); Start still shows slot starts (00:00 … 21:00).
+

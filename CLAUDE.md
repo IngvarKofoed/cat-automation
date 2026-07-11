@@ -50,6 +50,8 @@ Once the fixes are applied, report what changed:
 2. **Summarize each bucket in one line** so the user can see what was fixed without expanding every finding.
 3. Do not stop to ask which to fix — all findings are fixed by default. The user can review the diff and revert anything they disagree with.
 
+For a **significant** change — a broad or high-risk diff, or a large batch of auto-applied fixes — end the turn by suggesting the user run a deliberate `/code-review medium` pass themselves. The single auto-`--fix` pass above is never re-reviewed, so a large diff still warrants a human-in-the-loop second look; the nudge is the checkpoint.
+
 ## Multi-agent workflows
 
 When you fan a task out across subagents — the Workflow tool ("ultracode") — tier each agent's model and reasoning effort to the work, so cost tracks value instead of every agent defaulting to the strongest (most expensive) model:

@@ -12,6 +12,8 @@ Two runtime controls sit on top of that base (the motion-gate-oracles spec):
   a bare thread), so the browse UI can *freeze* the store — stop ingest — for a
   clean offline pass, then resume it. ``app.state.collector_manager`` is that
   handle; ``/api/collector/{start,stop}`` toggle it and ``/api/stats`` reports it.
+  Collection is OFF at launch by default — the operator clicks Start in the UI;
+  ``CAT_COLLECT_AUTOSTART=1`` opts into begin-immediately for an unattended run.
 - **Offline analysis.** A stronger, slower oracle (YOLO / BSUV) is swept over the
   *stored* frames on demand to validate the edge's cheap MOG2 gate, its verdicts
   landing in the store's ``analysis`` table. ``AnalysisManager`` runs one such job
@@ -50,6 +52,7 @@ _INDEX_HTML = _WEB_DIR / "index.html"
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
 _ENV_DIR = "CAT_COLLECT_DIR"
 _ENV_MAX_BYTES = "CAT_COLLECT_MAX_BYTES"
+_ENV_AUTOSTART = "CAT_COLLECT_AUTOSTART"
 _DEFAULT_DIR = "./data/collection"
 _DEFAULT_MAX_BYTES = 5368709120  # 5 GiB — ~2 h at 10 fps, a testing window
 
@@ -263,6 +266,22 @@ def _validate_bounds(since_id: "int | None", until_id: "int | None") -> None:
         )
 
 
+# Truthy spellings for the autostart env flag. Collection is OFF at launch by
+# default — the operator clicks Start in the browse UI — so a fresh compute run
+# never begins writing to the store until asked. Set CAT_COLLECT_AUTOSTART to one
+# of these to restore begin-immediately (e.g. an unattended long run).
+_AUTOSTART_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _autostart_from_env() -> bool:
+    """Whether the collector should begin at launch, read from ``CAT_COLLECT_AUTOSTART``.
+
+    Absent/empty/anything not in ``_AUTOSTART_TRUTHY`` → ``False`` (the default:
+    start stopped, let the UI start it).
+    """
+    return os.environ.get(_ENV_AUTOSTART, "").strip().lower() in _AUTOSTART_TRUTHY
+
+
 def _store_from_env() -> Store:
     """Build a ``Store`` under ``CAT_COLLECT_DIR`` with the ``index.db`` + media/ split.
 
@@ -282,15 +301,18 @@ def _store_from_env() -> Store:
 
 
 def create_app(
-    *, store=None, client=None, start_collector: bool = True, analysis_manager=None
+    *, store=None, client=None, start_collector: bool = True, autostart: "bool | None" = None, analysis_manager=None
 ) -> FastAPI:
     """Build the FastAPI app.
 
     ``store`` defaults to a ``Store`` built from the environment. The collector is
     always wrapped in a ``CollectorManager`` (on ``app.state.collector_manager``)
-    so the UI can start/stop it at runtime; when ``start_collector`` is true it is
-    started here, and ``client`` defaults to an ``EdgeClient()`` built from
-    ``CAT_PI_URL``. Tests pass an explicit ``store`` and ``start_collector=False``
+    so the UI can start/stop it at runtime. ``start_collector`` *wires* the live
+    collector — builds the default ``EdgeClient()`` from ``CAT_PI_URL`` and registers
+    the shutdown hook — but does NOT begin collecting on its own: a fresh launch
+    starts stopped and the operator clicks Start in the browse UI. ``autostart``
+    (default from ``CAT_COLLECT_AUTOSTART``, off) restores begin-immediately for an
+    unattended run. Tests pass an explicit ``store`` and ``start_collector=False``
     so no edge connection and no thread are created — the manager then holds a
     ``None`` client and simply stays stopped.
 
@@ -299,6 +321,7 @@ def create_app(
     returns a fake analyzer, exercising the analysis routes with no real model.
     """
     store = store if store is not None else _store_from_env()
+    autostart = _autostart_from_env() if autostart is None else autostart
     app = FastAPI()
     app.state.store = store
 
@@ -316,12 +339,20 @@ def create_app(
     app.state.collector_manager = collector_manager
 
     if start_collector:
-        collector_manager.start()
+        # The collector is now WIRED (live client above, shutdown hook below) but
+        # begins only if autostart is set — otherwise a fresh launch stays stopped
+        # and the operator starts it from the browse UI (POST /api/collector/start).
+        # This keeps a bare `compute.sh` run from silently writing to the store;
+        # CAT_COLLECT_AUTOSTART=1 restores begin-immediately for an unattended run.
+        if autostart:
+            collector_manager.start()
 
         @app.on_event("shutdown")
         def _stop_collector() -> None:
-            # Wind the collector down between frames on process exit; the manager's
-            # thread is a daemon so this is best-effort tidiness, not a hard join.
+            # Wind the collector down between frames on process exit — whether it was
+            # autostarted or started later from the UI; the manager's thread is a
+            # daemon so this is best-effort tidiness, not a hard join. Idempotent when
+            # already stopped.
             collector_manager.stop()
 
     analysis_manager = analysis_manager if analysis_manager is not None else AnalysisManager()

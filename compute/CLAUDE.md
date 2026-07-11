@@ -7,7 +7,7 @@ Contents: `ingest/` (stream client), `detection/` (YOLO cat detection), `trackin
 ## Required tools
 
 - **`LSP`** — Python symbol navigation, references, and hover across the compute code. Load if deferred: `ToolSearch select:LSP`. (Python support is provided by the installed `pyright-lsp` plugin — Pyright.)
-- **Browser automation (`claude-in-chrome`)** — for verifying the **dashboard UI** in a real browser, once that phase begins. Load the core set via `ToolSearch` per the claude-in-chrome guidance. Not needed for ML/backend work.
+- **Browser automation (Playwright MCP)** — for verifying the **dashboard UI** (and the existing browse/tuning UI) in a real browser. The tools are deferred `mcp__playwright__*`; load them via `ToolSearch` (keyword `playwright browser`, or `select:mcp__playwright__browser_navigate,mcp__playwright__browser_snapshot,mcp__playwright__browser_console_messages,mcp__playwright__browser_network_requests`). Not needed for ML/backend work.
 
 ## Testing
 
@@ -20,7 +20,7 @@ Python unit and integration tests use **pytest**. GPU-/model-dependent tests sho
 - **Confidence isn't free.** Raw embedding distance is not calibrated confidence; tune the threshold(s) against real collected data rather than trusting a default.
 - **Verification workflow.**
   - *ML / backend changes:* the pytest suite **plus** running the actual pipeline over sample images and inspecting the result (detections, identities, confidences).
-  - *Dashboard UI changes (when the dashboard exists):* 1. start the dashboard (FastAPI) locally; 2. drive the changed view in a real browser via the claude-in-chrome browser tools; 3. check console messages + network requests for errors; 4. only then report complete.
+  - *Dashboard / browse-UI changes:* 1. start the relevant FastAPI app locally; 2. drive the changed view in a real browser via the Playwright MCP (`mcp__playwright__*`) tools; 3. check console messages + network requests for errors; 4. only then report complete.
 
 ## Required skills
 

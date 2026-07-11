@@ -148,3 +148,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     scoped scorecards drop only the still-unprimed prefix (0 when fully primed, full warm-up at the store's start).
     Persist via /api/groups CRUD (new groups table); groups survive eviction but drop on full clear() (rowid reuse).
 
+27. CLAUDE.md guidance refreshed to current scaffold conventions. Root code-review mandate now ends a
+    significant change by suggesting a deliberate user-run `/code-review medium` pass — the single
+    auto-`--fix` pass is never re-reviewed, so a big diff still gets a human second look.
+    Edge/compute UI-verification now name the installed Playwright MCP (`mcp__playwright__*`),
+    replacing the uninstalled `claude-in-chrome` that couldn't actually be loaded here.
+
+28. Compute collector no longer auto-starts at launch — a fresh `compute.sh` / `compute.ps1` run
+    wires the collector but stays stopped, so the operator clicks Start in the browse UI before
+    any frame is written to the store (avoids silently filling the store on every launch).
+    `create_app`'s `start_collector` now only *wires* the live client + shutdown hook; a separate
+    `autostart` flag — default off, resolved from `CAT_COLLECT_AUTOSTART` — gates begin-immediately.
+

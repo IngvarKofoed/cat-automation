@@ -480,6 +480,66 @@ def test_collector_start_then_stop_flips_running(make_app):
     assert client.get("/api/stats").json()["collector_running"] is False
 
 
+def _live_app(tmp_path, *, autostart) -> TestClient:
+    """A production-shaped app (``start_collector=True``) with a Fake edge client.
+
+    Passing an explicit ``FakeClient`` keeps the real ``EdgeClient`` (and its
+    ``requests``/network) out of the wiring path while still exercising
+    ``start_collector=True`` — the branch a bare ``compute.sh`` launch takes.
+    ``autostart`` is passed explicitly so ambient ``CAT_COLLECT_AUTOSTART`` can't
+    flip the assertion.
+    """
+    from compute.api.app import create_app
+
+    store = Store(
+        db_path=str(tmp_path / "index.db"),
+        media_root=str(tmp_path / "media"),
+        max_bytes=10_000_000,
+    )
+    return TestClient(create_app(store=store, client=FakeClient(), start_collector=True, autostart=autostart))
+
+
+def test_live_app_wires_collector_but_does_not_autostart(tmp_path):
+    # The fresh-launch contract: start_collector=True wires the collector (so the UI
+    # can start it) but does NOT begin collecting — the store isn't written until the
+    # operator clicks Start. Verify it starts stopped AND is genuinely startable.
+    client = _live_app(tmp_path, autostart=False)
+    assert client.get("/api/stats").json()["collector_running"] is False
+    assert client.post("/api/collector/start").json()["running"] is True
+    client.post("/api/collector/stop")
+
+
+def test_autostart_true_begins_collecting(tmp_path):
+    # The CAT_COLLECT_AUTOSTART opt-in: autostart=True restores begin-immediately, so
+    # the collector is already running before any /api/collector/start call.
+    client = _live_app(tmp_path, autostart=True)
+    assert client.get("/api/stats").json()["collector_running"] is True
+    client.post("/api/collector/stop")
+
+
+def test_autostart_resolves_from_env_when_unset(tmp_path, monkeypatch):
+    # autostart=None (the factory default) reads CAT_COLLECT_AUTOSTART: unset/empty →
+    # off, a truthy spelling → on. This is what `uvicorn --factory create_app` gets,
+    # since it calls create_app() with no args.
+    from compute.api.app import create_app
+
+    def build(name):
+        store = Store(
+            db_path=str(tmp_path / name / "index.db"),
+            media_root=str(tmp_path / name / "media"),
+            max_bytes=10_000_000,
+        )
+        return TestClient(create_app(store=store, client=FakeClient(), start_collector=True))
+
+    monkeypatch.delenv("CAT_COLLECT_AUTOSTART", raising=False)
+    assert build("off").get("/api/stats").json()["collector_running"] is False
+
+    monkeypatch.setenv("CAT_COLLECT_AUTOSTART", "yes")
+    c = build("on")
+    assert c.get("/api/stats").json()["collector_running"] is True
+    c.post("/api/collector/stop")
+
+
 # --- Frame-range groups: POST/GET/DELETE /api/groups, GET /api/range/count -----
 #
 # The name->bounds bookmark layer (see the frame-range-groups spec). No cv2/sweep

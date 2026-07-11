@@ -4,8 +4,9 @@
 #
 # On first run this bootstraps a virtualenv at .venv-compute from
 # compute/requirements.txt; on later runs it just launches. Works from any
-# directory. It always-on collects every frame off the edge stream into a bounded
-# local store and serves a web UI to browse them.
+# directory. It serves a web UI to browse collected frames; collection into the
+# bounded local store starts OFF — click Start in the UI (or set
+# CAT_COLLECT_AUTOSTART=1) to begin ingesting the edge stream.
 #
 #   ./compute.sh                           # edge defaults to localhost:8000
 #   ./compute.sh catpi.local:8000          # edge as an argument (http:// added if omitted)
@@ -21,6 +22,7 @@
 #   CAT_COLLECT_DIR        store root      (default ./data/collection)
 #   CAT_COLLECT_MAX_BYTES  retention cap   (default 5368709120 = 5 GiB)
 #   CAT_COLLECT_PORT       web port        (default 8001; the edge uses 8000)
+#   CAT_COLLECT_AUTOSTART  begin collecting at launch (default off; 1/true/yes/on to enable)
 set -euo pipefail
 
 # This script lives at the repo root; run everything relative to it.
@@ -55,7 +57,8 @@ export CAT_PI_URL
 echo "[compute] edge stream: ${CAT_PI_URL}"
 echo "[compute] store:       ${CAT_COLLECT_DIR:-./data/collection}  (cap ${CAT_COLLECT_MAX_BYTES:-5368709120} bytes)"
 echo "[compute] browse UI:   http://localhost:${PORT}   (Ctrl-C to stop)"
-# --factory: create_app() builds the store and starts the collector thread; there
+# --factory: create_app() builds the store and wires the collector (which stays
+# stopped until Started from the UI, unless CAT_COLLECT_AUTOSTART is set); there
 # is no module-level app that would start a thread on import. exec so Ctrl-C /
 # SIGTERM go straight to uvicorn.
 exec "$PY" -m uvicorn --factory compute.api.app:create_app --host 0.0.0.0 --port "$PORT"

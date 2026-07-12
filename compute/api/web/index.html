@@ -1596,7 +1596,13 @@
         }
         function formatTime(ts) {
             if (typeof ts !== 'number') return '—';
-            return new Date(ts).toLocaleString();
+            // Fixed dd/mm-yyyy date + 24-hour HH:MM:SS time, built by hand (local
+            // time) rather than via toLocaleString — no locale produces the mixed
+            // "/" then "-" separators, and we want one clock format everywhere.
+            const d = new Date(ts);
+            const date = `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}-${d.getFullYear()}`;
+            const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+            return `${date}, ${time}`;
         }
         function formatDuration(secs) {
             secs = Math.max(0, Math.round(secs));
@@ -2703,10 +2709,11 @@
         function runningJobKey(status) {
             return [status.analyzer, status.since_id, status.until_id, status.total].join('|');
         }
-        // A " · ~Xm Ys left" suffix for the running line, or '' when there is no basis yet
-        // (no total, no progress observed since the anchor, or already complete). Rate is a
-        // simple average over the observation window — smooth enough at the 4 s poll cadence,
-        // and it self-corrects as the sweep runs.
+        // A " · N.N fps · ~Xm Ys left" suffix for the running line, or '' when there is no
+        // basis yet (no total, no progress observed since the anchor, or already complete).
+        // The rate (frames/sec) is a simple average over the observation window — smooth
+        // enough at the 4 s poll cadence, and it self-corrects as the sweep runs; the same
+        // rate drives both the fps readout and the ETA (ETA = remaining / rate).
         function etaText(status) {
             if (!status.running || !status.total || status.total <= 0) { etaAnchor = null; return ''; }
             const now = Date.now();
@@ -2724,7 +2731,8 @@
             const dt = (now - etaAnchor.t0) / 1000;
             const remaining = status.total - status.done;
             if (dDone <= 0 || dt <= 0 || remaining <= 0) return '';
-            return ` · ~${formatDuration(remaining / (dDone / dt))} left`;
+            const rate = dDone / dt;
+            return ` · ${rate.toFixed(1)} fps · ~${formatDuration(remaining / rate)} left`;
         }
 
         function renderQueuePanel(status) {

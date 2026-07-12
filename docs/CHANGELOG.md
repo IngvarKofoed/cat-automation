@@ -282,3 +282,16 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     the duration — you couldn't tell *when* a bucket sat, only how long it was. New formatRange
     helper; presentation only.
 
+50. All dashboard timestamps now render on a 24-hour clock (`formatTime` forces `hour12:false`)
+    instead of following the locale's AM/PM default — every readout flows through formatTime, the
+    lone chokepoint. Explicit date+h:m:s components keep the prior layout (4-digit year); only the
+    clock changed. Presentation only.
+
+51. Dashboard date format fixed to `dd/mm-yyyy` (e.g. `12/07-2026`), superseding the locale's
+    m/d/y order. formatTime now builds the string by hand (local time) since no locale yields the
+    mixed "/" then "-" separators. Presentation only.
+
+52. Analysis-queue running line now shows throughput as `N.N fps` alongside the ETA. The rate
+    (frames/sec, client-side average since the job's anchor poll) was already computed to derive
+    the ETA — it's now surfaced instead of only its reciprocal. Presentation only.
+

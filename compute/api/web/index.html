@@ -1610,6 +1610,13 @@
             if (typeof oldest !== 'number' || typeof newest !== 'number') return '—';
             return formatDuration((newest - oldest) / 1000);
         }
+        // Wall-clock start → end plus the duration in parens — for readouts where
+        // *when* the window sits matters, not just how long it is (formatSpan alone
+        // gives only the length).
+        function formatRange(start, end) {
+            if (typeof start !== 'number' || typeof end !== 'number') return '—';
+            return `${formatTime(start)} → ${formatTime(end)} (${formatSpan(start, end)})`;
+        }
         function kindLabel(kind) { return ANALYZER_LABELS[kind] || kind; }
         // A window description for queue/history/scope readouts: match a saved bucket
         // by its exact bounds, else show the raw ids, else "whole store".
@@ -2472,7 +2479,7 @@
             clearPendingSelection();
             viewerReadonlyNote.innerHTML = '';
             const label = document.createElement('span');
-            label.textContent = `Viewing bucket "${g.name}" · ${g.count} frames · ${formatSpan(g.start_ts, g.end_ts)} (read-only). `;
+            label.textContent = `Viewing bucket "${g.name}" · ${g.count} frames · ${formatRange(g.start_ts, g.end_ts)} · read-only. `;
             const exit = document.createElement('button');
             exit.type = 'button';
             exit.className = 'btn-secondary btn-tiny';

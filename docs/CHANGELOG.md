@@ -268,3 +268,13 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     recall — is the metric the gate is tuned toward: one caught frame per visit is enough to wake
     the GPU, so a wholly-missed visit is the only miss that costs a real trigger. Presentation only.
 
+47. Activity playback now opens in an almost-full-page modal, replacing the in-view panel that
+    read as cramped. **Double-click** an event to open (single click is a no-op, so scanning the
+    grid never launches it); Esc, the × button, or a backdrop click closes it. Opening locks
+    body scroll and moves focus into the dialog; leaving the route fully closes it. Same player
+    logic (same element ids) — only the container changed.
+
+48. Activity playback now auto-plays: opening an event (and each Prev/Next hop, both routed
+    through openEvent) starts from frame 0 instead of waiting for a Play click. Playback rate
+    dropped 8→5 fps to match the ~5 fps capture, so the clip plays back at real speed.
+

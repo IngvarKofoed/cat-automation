@@ -263,3 +263,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     was being forgotten. Per-machine and explicit, not inferred: `compute.sh` (dev) stays off, so
     changelog 28's "a bare launch never silently writes" holds where it matters.
 
+46. Tuning scorecards (Live gate / Baseline / Candidate) now headline **visit recall** as a big
+    footer % instead of a one-line "Visits" row. Visit recall (caught/total visits) — not frame
+    recall — is the metric the gate is tuned toward: one caught frame per visit is enough to wake
+    the GPU, so a wholly-missed visit is the only miss that costs a real trigger. Presentation only.
+

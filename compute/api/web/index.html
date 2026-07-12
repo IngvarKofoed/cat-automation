@@ -768,6 +768,40 @@
         .tuning-row span:first-child {
             color: var(--color-text-muted);
         }
+        /* Visit recall promoted to the card footer: it's the metric the gate is
+           optimized toward (one caught frame per visit is enough to trigger the
+           GPU), so it gets a big number rather than a one-line row. Green = the
+           caught-visit rate; the wholly-missed count beneath stays red. */
+        .tuning-visit-recall {
+            margin-top: var(--space-3);
+            padding-top: var(--space-3);
+            border-top: 1px solid var(--color-border);
+            text-align: center;
+        }
+        .tuning-visit-recall .label {
+            font-size: 11px;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            color: var(--color-text-muted);
+            margin-bottom: var(--space-1);
+        }
+        .tuning-visit-recall .pct {
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+            font-size: 30px;
+            font-weight: 700;
+            line-height: 1.1;
+            color: var(--v-caught);
+        }
+        .tuning-visit-recall .breakdown {
+            font-size: 12px;
+            color: var(--color-text-muted);
+            margin-top: var(--space-1);
+        }
+        .tuning-visit-recall .breakdown .missed {
+            color: var(--v-missed);
+            font-weight: 600;
+        }
         .tuning-line {
             margin-top: 10px;
             font-size: 13px;
@@ -3036,7 +3070,33 @@
             card.appendChild(tuningRow('False triggers', `${falseT.count ?? '—'}`));
             card.appendChild(tuningRow('Miss confidence', `hi ${conf.high ?? 0} / med ${conf.medium ?? 0} / lo ${conf.low ?? 0}`));
             card.appendChild(tuningRow('Area buckets', `<min ${buckets.below_min ?? 0} · ~0 ${buckets.near_zero ?? 0} · >max ${buckets.above_max ?? 0} · in-band ${buckets.in_band ?? 0}`));
-            card.appendChild(tuningRow('Visits', `${visitsSc.caught ?? '—'}/${visitsSc.total ?? '—'} caught (${visitsSc.wholly_missed ?? '—'} wholly missed)`));
+            // Visit recall promoted from a row to a prominent footer — one caught
+            // frame per visit is enough to wake the GPU, so caught/total visits is
+            // the target metric, not the frame-level recall above.
+            const vTotal = visitsSc.total;
+            const vCaught = visitsSc.caught;
+            const vMissed = visitsSc.wholly_missed;
+            const footer = document.createElement('div');
+            footer.className = 'tuning-visit-recall';
+            const vLabel = document.createElement('div');
+            vLabel.className = 'label';
+            vLabel.textContent = 'Visit recall';
+            const vPct = document.createElement('div');
+            vPct.className = 'pct';
+            vPct.textContent = (typeof vTotal === 'number' && vTotal > 0 && typeof vCaught === 'number')
+                ? formatPct(vCaught / vTotal) : '—';
+            const vBreak = document.createElement('div');
+            vBreak.className = 'breakdown';
+            vBreak.append(document.createTextNode(`${vCaught ?? '—'}/${vTotal ?? '—'} visits caught`));
+            if (typeof vMissed === 'number' && vMissed > 0) {
+                vBreak.append(document.createTextNode(' · '));
+                const m = document.createElement('span');
+                m.className = 'missed';
+                m.textContent = `${vMissed} wholly missed`;
+                vBreak.append(m);
+            }
+            footer.append(vLabel, vPct, vBreak);
+            card.appendChild(footer);
             return card;
         }
         function deltaSpan(value) {

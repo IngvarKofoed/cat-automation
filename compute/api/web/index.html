@@ -5,187 +5,348 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cat Door — Motion Detection Workbench</title>
     <style>
+
+        /* ============================================================
+           DESIGN TOKENS — two tiers.
+           Tier 1 (primitives): the only place raw hexes live.
+           Tier 2 (semantics): everything a component rule may reference.
+           A theme is a semantic remap; components never see a hex.
+           ============================================================ */
+        :root {
+            /* ---- primitives ---- */
+            --gray-950: #0f1216;
+            --gray-900: #14181c;
+            --gray-850: #1b2127;
+            --gray-700: #2b333c;
+            --gray-500: #8b98a6;
+            --gray-300: #c7d0d9;
+            --gray-100: #e6edf3;
+
+            --accent: #4ab3ff;
+
+            --v-missed: #e5484d;
+            --v-false:  #f5a524;
+            --v-caught: #3fb950;
+            --v-rep:    #a371f7;
+
+            /* RGB channels for alpha-blended fills (timeline cells, washes) */
+            --v-missed-rgb:  229 72 77;
+            --v-false-rgb:   245 165 36;
+            --v-neutral-rgb: 139 152 166;
+            --accent-rgb:    74 179 255;
+
+            /* ---- semantics ---- */
+            --color-bg:         var(--gray-900);
+            --color-surface:    var(--gray-850);
+            --color-surface-2:  var(--gray-950);
+            --color-border:     var(--gray-700);
+            --color-text:       var(--gray-100);
+            --color-text-muted: var(--gray-500);
+
+            --color-primary: var(--accent);
+            /* Text that sits on a saturated fill (accent/verdict buttons, tabs, tags).
+               Dark on the light-cyan accent — white would fail contrast (~2.3:1). */
+            --color-on-accent: var(--gray-950);
+
+            --color-status-missed: var(--v-missed);
+            --color-status-false:  var(--v-false);
+            --color-status-caught: var(--v-caught);
+            --color-status-rep:    var(--v-rep);
+
+            /* ---- scales ---- */
+            --space-1: 4px;
+            --space-2: 8px;
+            --space-3: 12px;
+            --space-4: 16px;
+            --space-5: 20px;
+
+            --radius-sm:   4px;
+            --radius-md:   8px;
+            --radius-chip: 999px;
+
+            --shadow-1: 0 1px 3px rgba(0, 0, 0, .35);
+
+            --font-ui:   -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-data: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+
+        :root[data-theme="light"] {
+            --color-bg:         #f2efe9;
+            --color-surface:    #ffffff;
+            --color-surface-2:  #faf8f3;
+            --color-border:     #e2ddd3;
+            --color-text:       #1e2227;
+            --color-text-muted: #6b7280;
+
+            --color-primary: #1f6feb;
+            /* Light theme's accent/verdict fills are deeper, so white text sits on them. */
+            --color-on-accent: #ffffff;
+
+            --v-missed: #d1242f;
+            --v-false:  #bf8700;
+            --v-caught: #1a7f37;
+            --v-rep:    #8250df;
+
+            /* --color-status-* are NOT re-declared here: defined once on :root as
+               var(--v-*), they re-resolve to these light values automatically. */
+            /* alpha-blend channels re-declared per theme, else washes keep dark triples */
+            --v-missed-rgb:  209 36 47;
+            --v-false-rgb:   191 135 0;
+            --v-neutral-rgb: 107 114 128;
+            --accent-rgb:    31 111 235;
+
+            /* softened for a light canvas — the dark .35 halo is too heavy on white */
+            --shadow-1: 0 1px 3px rgba(0, 0, 0, .12);
+        }
+
+        /* ============================================================
+           APP SHELL — full-bleed bar, centered content column.
+           ============================================================ */
+        html {
+            scrollbar-gutter: stable;
+        }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: var(--font-ui);
+            margin: 0 0 60px;
+            padding: 0;
+            background: var(--color-bg);
+            color: var(--color-text);
+        }
+        .app-main {
             max-width: 1100px;
-            margin: 0 auto 60px;
-            padding: 0 20px;
-            background: #f5f5f5;
-            color: #333;
+            margin: 0 auto;
+            padding: 0 var(--space-5);
         }
         h1 {
             font-size: 26px;
-            margin: 10px 0 20px;
+            margin: 10px 0 var(--space-5);
         }
         .panel {
-            background: white;
-            padding: 16px 20px;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-            margin-bottom: 16px;
+            background: var(--color-surface);
+            padding: var(--space-4) var(--space-5);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-1);
+            margin-bottom: var(--space-4);
         }
         .panel h2 {
             font-size: 16px;
-            margin: 0 0 12px;
+            margin: 0 0 var(--space-3);
         }
-        /* Top nav: a sticky bar that switches the three hash-routed views. The
-           active link is highlighted so the current task surface is always
-           obvious (Start = collect, Buckets = define windows, Motion = validate). */
+
+        /* Top nav: a full-width sticky bar that switches the three hash-routed
+           views. Active route = an accent underline segment (not a pill), so the
+           bar reads as a segmented control. */
         #nav {
             position: sticky;
             top: 0;
             z-index: 10;
+            width: 100%;
+            background: var(--color-surface-2);
+            border-bottom: 1px solid var(--color-border);
+            margin: 0 0 var(--space-4);
+        }
+        .bar-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: var(--space-3) var(--space-5);
             display: flex;
             align-items: center;
-            gap: 6px;
-            background: #263238;
-            margin: 0 -20px 16px;
-            padding: 10px 20px;
+            gap: var(--space-2);
             flex-wrap: wrap;
         }
         #nav .nav-brand {
             font-weight: 700;
-            color: #fff;
-            margin-right: 12px;
+            color: var(--color-text);
+            margin-right: var(--space-3);
             font-size: 15px;
         }
         .nav-link {
-            color: #cfd8dc;
+            color: var(--color-text-muted);
             text-decoration: none;
-            padding: 6px 14px;
-            border-radius: 16px;
+            padding: var(--space-2) var(--space-3);
+            border-bottom: 2px solid transparent;
             font-size: 14px;
             font-weight: 600;
         }
         .nav-link:hover {
-            background: #37474f;
-            color: #fff;
+            color: var(--color-text);
         }
         .nav-link.active {
-            background: #0066cc;
-            color: #fff;
+            color: var(--color-primary);
+            border-bottom-color: var(--color-primary);
         }
         .view {
             /* Each view is a plain container; the router toggles .hidden. */
         }
-        /* Stats header: a row of badges summarizing the store, refreshed by
-           polling /api/stats so it stays live while the collector runs. */
+
+        /* Stats header: a row of chips summarizing the store, refreshed by polling. */
         #stats {
             display: flex;
             gap: 10px;
             flex-wrap: wrap;
             align-items: center;
         }
+
+        /* ---- chips (state badges) ---- */
         .badge {
             display: inline-block;
-            padding: 4px 10px;
-            border-radius: 12px;
-            background: #e0e0e0;
-            color: #333;
+            padding: var(--space-1) 10px;
+            border-radius: var(--radius-chip);
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            color: var(--color-text);
             font-size: 13px;
             font-weight: 600;
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
         }
         .badge.warn {
-            background: #fff3cd;
-            color: #856404;
+            background: rgb(var(--v-false-rgb) / .16);
+            border-color: rgb(var(--v-false-rgb) / .5);
+            color: var(--color-status-false);
         }
+        /* Live-updating counters: fixed width so a growing number never widens the row. */
+        #statCount { min-width: 168px; }
+        #statSize { min-width: 120px; }
+        #statMotion { min-width: 120px; }
+        #statSpan { min-width: 150px; }
+        #collectorBadge { min-width: 128px; }
+        #inboxProgress { min-width: 84px; text-align: center; }
+        #tuningProgressBadge { min-width: 120px; }
+
         .controls-row {
             display: flex;
-            gap: 16px;
+            gap: var(--space-4);
             flex-wrap: wrap;
             align-items: flex-end;
         }
         .control-group {
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: var(--space-1);
         }
         label {
             font-weight: 600;
             font-size: 13px;
         }
         select, input[type="date"] {
-            padding: 8px 12px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            padding: var(--space-2) var(--space-3);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-sm);
             font-size: 14px;
-            background: white;
+            font-family: var(--font-ui);
+            background: var(--color-surface);
+            color: var(--color-text);
         }
         button {
-            background: #0066cc;
-            color: white;
-            border: none;
-            padding: 9px 16px;
-            border-radius: 4px;
+            box-sizing: border-box;
+            background: var(--color-primary);
+            color: var(--color-on-accent);
+            /* 1px *transparent* border (not `none`): variants/disabled only recolor it,
+               so toggling disabled never changes an auto-width button's box — no jitter
+               while typing in a field that re-disables its Save button per keystroke. */
+            border: 1px solid transparent;
+            padding: 9px var(--space-4);
+            border-radius: var(--radius-sm);
             font-size: 14px;
+            font-family: var(--font-ui);
             cursor: pointer;
-            transition: background 0.2s;
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            button {
+                transition: background 0.2s;
+            }
         }
         button:hover {
-            background: #0052a3;
+            background: color-mix(in srgb, var(--color-primary) 85%, black);
         }
         button:active {
-            background: #003d7a;
+            background: color-mix(in srgb, var(--color-primary) 65%, black);
         }
         button:disabled {
-            background: #aaa;
+            background: var(--color-surface-2);
+            color: var(--color-text-muted);
+            border: 1px solid var(--color-border);
             cursor: default;
         }
         .btn-row {
             display: flex;
-            gap: 8px;
+            gap: var(--space-2);
             flex-wrap: wrap;
         }
         .btn-preset {
-            background: #2e7d32;
+            background: var(--color-status-caught);
         }
         .btn-preset:hover {
-            background: #256428;
+            background: color-mix(in srgb, var(--color-status-caught) 80%, black);
         }
         .btn-danger {
-            background: #c62828;
+            background: var(--color-status-missed);
         }
         .btn-danger:hover {
-            background: #a02020;
+            background: color-mix(in srgb, var(--color-status-missed) 80%, black);
         }
         .btn-secondary {
-            background: #888;
+            background: var(--color-surface-2);
+            color: var(--color-text);
+            border: 1px solid var(--color-border);
         }
         .btn-secondary:hover {
-            background: #666;
+            background: var(--color-border);
         }
         .btn-tiny {
-            padding: 4px 8px;
+            padding: var(--space-1) var(--space-2);
             font-size: 11px;
         }
+
+        /* Visible keyboard focus ring on every interactive element. */
+        a:focus-visible,
+        button:focus-visible,
+        select:focus-visible,
+        input:focus-visible,
+        .timeline-cell:focus-visible,
+        .viewer-tile:focus-visible {
+            outline: 2px solid var(--color-primary);
+            outline-offset: 2px;
+        }
+
+        /* #error is a rare request-failure banner directly below the bar. It collapses
+           when hidden (display:none) rather than holding a permanent slot: a reserved band
+           left a distracting empty gap on every page, whereas a one-time shift when a
+           (rare) fetch actually fails is the better trade. The .show hook is preserved. */
         #error {
-            background: #ffebee;
-            color: #c62828;
-            border: 1px solid #ef5350;
-            padding: 10px 14px;
-            border-radius: 4px;
-            margin: 16px 0;
+            box-sizing: border-box;
             display: none;
+            background: rgb(var(--v-missed-rgb) / .12);
+            color: var(--color-status-missed);
+            border: 1px solid rgb(var(--v-missed-rgb) / .6);
+            padding: 10px 14px;
+            border-radius: var(--radius-sm);
+            margin: var(--space-4) 0;
             font-size: 14px;
         }
         #error.show {
             display: block;
         }
         .caveat {
-            color: #856404;
+            color: var(--color-status-false);
             font-size: 12px;
             max-width: 520px;
             line-height: 1.4;
         }
         /* A soft "heads up" banner (motion-only spans, misses-unmeasurable). Distinct
            from #error (a red request failure): this is application state, not a fetch
-           error. */
+           error. Collapses via the blanket .hidden (display:none) when not shown — these
+           reflect data/scope state set once per view, not rapid toggles, so a reserved
+           empty band would cost more (a permanent gap) than the occasional one-time shift. */
         .banner-warn {
-            background: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffe08a;
-            padding: 8px 12px;
-            border-radius: 4px;
+            box-sizing: border-box;
+            background: rgb(var(--v-false-rgb) / .16);
+            color: var(--color-status-false);
+            border: 1px solid rgb(var(--v-false-rgb) / .5);
+            padding: var(--space-2) var(--space-3);
+            border-radius: var(--radius-sm);
             font-size: 13px;
             margin-top: 10px;
         }
@@ -195,55 +356,71 @@
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
             gap: 10px;
-            margin-top: 12px;
+            margin-top: var(--space-3);
         }
         .tile {
-            background: white;
-            border-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            background: var(--color-surface);
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-1);
             overflow: hidden;
             border: 3px solid transparent;
         }
         .tile.motion {
-            border-color: #2e7d32;
+            border-color: var(--color-status-caught);
         }
         .tile img {
             width: 100%;
             aspect-ratio: 4 / 3;
             object-fit: cover;
             display: block;
-            background: #e0e0e0;
+            background: var(--color-surface-2);
         }
         .tile .caption {
-            padding: 6px 8px;
+            padding: 6px var(--space-2);
             font-size: 12px;
-            color: #555;
+            color: var(--color-text-muted);
             display: flex;
             justify-content: space-between;
             gap: 6px;
         }
-        /* Bucket-viewer endpoint selection: clicking a thumb marks it start/end and
-           shades the frames between the two picks, so the chosen window is visible. */
+        /* Bucket-viewer endpoint selection: selection is an affordance, not a verdict,
+           so both endpoints use the cool accent (never green/red), told apart by an
+           S/E corner tag + position rather than by hue. .in-range = faint accent wash. */
         .viewer-tile {
             cursor: pointer;
+            position: relative;
         }
-        .viewer-tile.pick-start {
-            border-color: #2e7d32;
-            box-shadow: 0 0 0 2px #2e7d32;
-        }
+        .viewer-tile.pick-start,
         .viewer-tile.pick-end {
-            border-color: #c62828;
-            box-shadow: 0 0 0 2px #c62828;
+            border-color: var(--color-primary);
+            box-shadow: 0 0 0 2px var(--color-primary);
         }
+        .viewer-tile.pick-start::after,
+        .viewer-tile.pick-end::after {
+            content: "";
+            position: absolute;
+            top: var(--space-1);
+            right: var(--space-1);
+            min-width: 16px;
+            height: 16px;
+            padding: 0 3px;
+            border-radius: var(--radius-sm);
+            background: var(--color-primary);
+            color: var(--color-on-accent);
+            font: 700 10px/16px var(--font-data);
+            text-align: center;
+        }
+        .viewer-tile.pick-start::after { content: "S"; }
+        .viewer-tile.pick-end::after   { content: "E"; }
         .viewer-tile.in-range {
-            background: #e3f2fd;
+            background: rgb(var(--accent-rgb) / .12);
         }
         .pager {
             display: flex;
             justify-content: center;
             align-items: center;
-            gap: 12px;
-            margin: 20px 0;
+            gap: var(--space-3);
+            margin: var(--space-5) 0;
         }
         .pager .badge {
             min-width: 72px;
@@ -251,7 +428,7 @@
         }
         .empty {
             text-align: center;
-            color: #888;
+            color: var(--color-text-muted);
             padding: 40px 0;
             font-size: 14px;
         }
@@ -267,19 +444,24 @@
             cursor: pointer;
         }
         .analysis-error {
+            box-sizing: border-box;
             margin-top: 10px;
-            padding: 8px 12px;
-            background: #ffebee;
-            color: #c62828;
-            border: 1px solid #ef5350;
-            border-radius: 4px;
+            padding: var(--space-2) var(--space-3);
+            background: rgb(var(--v-missed-rgb) / .12);
+            color: var(--color-status-missed);
+            border: 1px solid rgb(var(--v-missed-rgb) / .6);
+            border-radius: var(--radius-sm);
             font-size: 13px;
+            min-height: 35px;
         }
         .param-input {
-            padding: 8px 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            padding: var(--space-2) 10px;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-sm);
             font-size: 14px;
+            font-family: var(--font-data);
+            background: var(--color-surface);
+            color: var(--color-text);
             width: 110px;
         }
         /* Saved-buckets / groups list rows. */
@@ -287,71 +469,71 @@
             display: flex;
             flex-direction: column;
             gap: 6px;
-            margin-top: 12px;
+            margin-top: var(--space-3);
         }
         .group-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 8px;
+            gap: var(--space-2);
             font-size: 13px;
             padding: 6px 10px;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
         }
         .group-row .group-actions {
             display: flex;
             gap: 6px;
         }
         .groups-empty {
-            color: #888;
+            color: var(--color-text-muted);
             font-size: 13px;
-            margin-top: 8px;
+            margin-top: var(--space-2);
         }
         /* Oracle coverage rows on the Motion view: coverage text + an enqueue button. */
         .coverage-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 8px;
+            gap: var(--space-2);
             padding: 6px 10px;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
-            margin-top: 8px;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            margin-top: var(--space-2);
             font-size: 13px;
         }
         /* Job queue panel lines. */
         .queue-line {
             font-size: 13px;
-            padding: 4px 0;
+            padding: var(--space-1) 0;
         }
         .queue-list {
             display: flex;
             flex-direction: column;
-            gap: 4px;
-            margin-top: 8px;
+            gap: var(--space-1);
+            margin-top: var(--space-2);
         }
         .queue-item {
             font-size: 12px;
             padding: 5px 10px;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
             display: flex;
             justify-content: space-between;
-            gap: 8px;
+            gap: var(--space-2);
         }
         .queue-heading {
             font-weight: 600;
             font-size: 12px;
-            color: #777;
-            margin-top: 12px;
+            color: var(--color-text-muted);
+            margin-top: var(--space-3);
         }
-        .state-done { color: #2e7d32; font-weight: 700; }
-        .state-failed { color: #c62828; font-weight: 700; }
-        .state-canceled { color: #888; font-weight: 700; }
+        .state-done { color: var(--color-status-caught); font-weight: 700; }
+        .state-failed { color: var(--color-status-missed); font-weight: 700; }
+        .state-canceled { color: var(--color-text-muted); font-weight: 700; }
         /* Density timeline: a horizontal strip of bins, one cell per bin, colored by
            disagreement (missed = red, false = amber, else neutral) with intensity by
            count. Clicking a bin narrows the drill-down. */
@@ -359,10 +541,11 @@
             display: flex;
             gap: 1px;
             height: 52px;
-            margin-top: 12px;
+            min-height: 52px;
+            margin-top: var(--space-3);
             overflow-x: auto;
-            background: #eceff1;
-            border-radius: 4px;
+            background: var(--color-surface-2);
+            border-radius: var(--radius-sm);
             padding: 2px;
         }
         .timeline-cell {
@@ -370,23 +553,21 @@
             min-width: 3px;
             border-radius: 2px;
             cursor: pointer;
-            background: #eceff1;
+            background: var(--color-surface-2);
         }
         .timeline-cell:hover {
-            outline: 2px solid #0066cc;
+            outline: 2px solid var(--color-primary);
             outline-offset: -1px;
         }
         /* When any part of the window was captured motion-only, misses are
-           unmeasurable there — hatch the whole strip to signal it (bin-precise
-           shading isn't possible from id-space spans, so the strip-level cue plus
-           the banner carry the warning). */
+           unmeasurable there — hatch the whole strip to signal it. */
         .timeline-strip.has-motion-only {
-            background-image: repeating-linear-gradient(45deg, #eceff1, #eceff1 6px, #e0d3a8 6px, #e0d3a8 12px);
+            background-image: repeating-linear-gradient(45deg, var(--color-surface-2), var(--color-surface-2) 6px, rgb(var(--v-false-rgb) / .35) 6px, rgb(var(--v-false-rgb) / .35) 12px);
         }
         .timeline-legend {
             font-size: 12px;
-            color: #777;
-            margin-top: 8px;
+            color: var(--color-text-muted);
+            margin-top: var(--space-2);
             display: flex;
             gap: 14px;
             flex-wrap: wrap;
@@ -397,8 +578,11 @@
             height: 12px;
             border-radius: 2px;
             vertical-align: middle;
-            margin-right: 4px;
+            margin-right: var(--space-1);
         }
+        .legend-swatch--missed  { background: var(--color-status-missed); }
+        .legend-swatch--false   { background: var(--color-status-false); }
+        .legend-swatch--neutral { background: rgb(var(--v-neutral-rgb)); }
         /* Visit inbox: one visit at a time — a large representative frame + a
            horizontal filmstrip of the visit's frames and preceding context. */
         .tabs {
@@ -407,68 +591,90 @@
             margin-bottom: 10px;
         }
         .tab {
-            background: #eceff1;
-            color: #37474f;
+            background: var(--color-surface-2);
+            color: var(--color-text);
+            border: 1px solid var(--color-border);
         }
         .tab:hover {
-            background: #cfd8dc;
+            background: var(--color-border);
         }
         .tab.active {
-            background: #6a1b9a;
-            color: #fff;
+            background: var(--color-primary);
+            border-color: var(--color-primary);
+            color: var(--color-on-accent);
         }
+        /* Fixed-height review stage: the visit frame is centered and object-fit
+           contained, so flipping visits never resizes the box and reflows the meta +
+           filmstrip below it. Collapses (:empty) on visitless buckets so the empty state
+           shows just the "no visits" message, not a large blank box. */
         #inboxRep {
-            text-align: center;
             margin: 10px 0;
+            height: 420px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--color-surface-2);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+        #inboxRep:empty {
+            display: none;
         }
         #inboxRep img {
+            box-sizing: border-box;
             max-width: 100%;
-            max-height: 420px;
-            border-radius: 6px;
-            border: 3px solid #6a1b9a;
-            background: #e0e0e0;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: var(--radius-md);
+            border: 3px solid var(--color-status-rep);
+            background: var(--color-surface-2);
         }
         .inbox-meta {
             font-size: 13px;
-            color: #555;
-            margin-top: 8px;
+            color: var(--color-text-muted);
+            margin-top: var(--space-2);
         }
         .inbox-meta .wholly-missed {
-            color: #c62828;
+            color: var(--color-status-missed);
             font-weight: 700;
         }
         .filmstrip {
             display: flex;
             gap: 6px;
             overflow-x: auto;
-            padding: 8px 0;
+            padding: var(--space-2) 0;
+            min-height: 96px;
+        }
+        .filmstrip:empty {
+            min-height: 0;
+            padding: 0;
         }
         .film-tile {
             flex: 0 0 auto;
             width: 96px;
-            border-radius: 4px;
+            border-radius: var(--radius-sm);
             overflow: hidden;
             border: 2px solid transparent;
-            background: white;
+            background: var(--color-surface);
         }
         .film-tile img {
             width: 96px;
             height: 72px;
             object-fit: cover;
             display: block;
-            background: #e0e0e0;
+            background: var(--color-surface-2);
         }
         .film-tile .film-cap {
             font-size: 10px;
-            color: #777;
-            padding: 2px 4px;
+            color: var(--color-text-muted);
+            padding: 2px var(--space-1);
             text-align: center;
         }
         .film-tile.film-context {
             opacity: 0.55;
         }
         .film-tile.film-motion {
-            border-color: #2e7d32;
+            border-color: var(--color-status-caught);
         }
         /* A visit frame the gate stayed silent on: within a visit (a cluster of
            oracle-present frames) a still gate is a genuine miss — the thing this
@@ -476,100 +682,138 @@
            "Missed" swatch. Mutually exclusive with .film-motion (motion true/false)
            and never applied to the rep or context frames (see filmTile). */
         .film-tile.film-miss {
-            border-color: #c62828;
+            border-color: var(--color-status-missed);
         }
         .film-tile.film-rep {
-            border-color: #6a1b9a;
-            box-shadow: 0 0 0 2px #6a1b9a;
+            border-color: var(--color-status-rep);
+            box-shadow: 0 0 0 2px var(--color-status-rep);
         }
         /* MOG2 tuning panel (relocated from the old single page, unchanged behavior). */
         .tuning-empty-note {
-            color: #888;
+            color: var(--color-text-muted);
             font-size: 13px;
-            margin-top: 8px;
+            margin-top: var(--space-2);
         }
         .tuning-cards {
             display: flex;
-            gap: 12px;
+            gap: var(--space-3);
             flex-wrap: wrap;
-            margin-top: 12px;
+            margin-top: var(--space-3);
         }
         .tuning-card {
             flex: 1 1 220px;
             min-width: 220px;
-            background: #fafafa;
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
             padding: 10px 14px;
         }
         .tuning-card h3 {
             font-size: 14px;
-            margin: 0 0 8px;
+            margin: 0 0 var(--space-2);
         }
         .tuning-card .tuning-empty {
-            color: #999;
+            color: var(--color-text-muted);
             font-size: 13px;
             margin: 0;
         }
         .tuning-row {
             display: flex;
             justify-content: space-between;
-            gap: 8px;
+            gap: var(--space-2);
             font-size: 12px;
             padding: 3px 0;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid var(--color-border);
         }
         .tuning-row:last-child {
             border-bottom: none;
         }
         .tuning-row span:first-child {
-            color: #777;
+            color: var(--color-text-muted);
         }
         .tuning-line {
             margin-top: 10px;
             font-size: 13px;
         }
         .tuning-note {
-            color: #777;
+            color: var(--color-text-muted);
             font-size: 12px;
         }
         /* Delta coloring: negative = fewer = improvement = green; positive = more =
            regression = red; zero = neutral. */
-        .delta-good { color: #2e7d32; font-weight: 700; }
-        .delta-bad { color: #c62828; font-weight: 700; }
-        .delta-neutral { color: #555; font-weight: 600; }
+        .delta-good { color: var(--color-status-caught); font-weight: 700; }
+        .delta-bad { color: var(--color-status-missed); font-weight: 700; }
+        .delta-neutral { color: var(--color-text-muted); font-weight: 600; }
         .tuning-copy-row {
-            margin-top: 12px;
+            margin-top: var(--space-3);
         }
         .tuning-copy-row label {
             display: block;
-            margin-bottom: 4px;
+            margin-bottom: var(--space-1);
             font-weight: 600;
             font-size: 13px;
         }
         .tuning-copy-controls {
             display: flex;
-            gap: 8px;
+            gap: var(--space-2);
         }
         #tuningCopyText {
             flex: 1;
-            padding: 8px 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
+            padding: var(--space-2) 10px;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-sm);
             font-size: 13px;
-            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            background: #f5f5f5;
+            font-family: var(--font-data);
+            background: var(--color-surface-2);
+            color: var(--color-text);
         }
-    </style>
+
+        /* Async-populated region floors — no collapse-then-expand on repopulate. */
+        #viewerGrid { min-height: 160px; }
+
+        /* ---- quiet labels ----
+           Static/live readouts that were pills become muted, divider-led labels:
+           same elements/ids, still class="badge" (so .badge.warn still fires amber),
+           only restyled. Id specificity beats the base .badge; #id.warn beats #id. */
+        #motionScopeBadge,
+        #tuningScopeBadge,
+        #tuningParamSource,
+        #viewerPageLabel {
+            background: none;
+            border: none;
+            border-left: 1px solid var(--color-border);
+            border-radius: 0;
+            padding: 0 0 0 var(--space-2);
+            color: var(--color-text-muted);
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+        }
+        #motionScopeBadge.warn,
+        #tuningScopeBadge.warn,
+        #tuningParamSource.warn {
+            color: var(--color-status-false);
+        }
+        #motionScopeBadge { min-width: 150px; }
+        #tuningScopeBadge { min-width: 150px; }
+        #tuningParamSource { min-width: 150px; }
+        #viewerPageLabel { min-width: 64px; text-align: center; }
+
+        /* Utilities (kept last so they win equal-specificity battles). */
+        .push-end { margin-left: auto; }
+        .text-muted { color: var(--color-text-muted); }
+</style>
 </head>
 <body>
     <nav id="nav">
+        <div class="bar-inner">
         <span class="nav-brand">Cat Door</span>
         <a href="#start" data-route="start" class="nav-link">Start</a>
         <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
         <a href="#motion" data-route="motion" class="nav-link">Motion Detection</a>
+        </div>
     </nav>
 
+    <div class="app-main">
     <div id="error"></div>
 
     <!-- ================= START VIEW ================= -->
@@ -612,7 +856,7 @@
         <div class="panel">
             <h2>Danger zone</h2>
             <button type="button" id="clearBtn" class="btn-danger">Clear all frames</button>
-            <p class="caveat" style="margin-top: 10px; color: #888;">
+            <p class="caveat text-muted" style="margin-top: 10px;">
                 Deletes every stored frame, oracle verdict, saved bucket, and mode history. Cannot be undone.
             </p>
         </div>
@@ -622,7 +866,7 @@
     <section id="view-buckets" class="view hidden">
         <div class="panel">
             <h2>Define a bucket</h2>
-            <p class="caveat" style="color: #777; margin: 0 0 12px;">
+            <p class="caveat text-muted" style="margin: 0 0 12px;">
                 Pick a rough era with the clock pickers, load it at a chosen image density, then
                 click one frame for the start endpoint and one for the end, name it, and Save. A
                 bucket is a contiguous <code>[start_id, end_id]</code> window — the only selection
@@ -653,7 +897,7 @@
                     <label>&nbsp;</label>
                     <button type="button" id="clearWindowBtn" class="btn-secondary">Clear window</button>
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="storeRangeBadge" class="badge">Store: —</span>
                 </div>
             </div>
@@ -670,7 +914,7 @@
                     <label for="perMin" id="perMinLabel">Frames / min</label>
                     <input type="number" id="perMin" class="param-input" value="2" min="1" step="1">
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="viewerInfoBadge" class="badge">—</span>
                 </div>
             </div>
@@ -689,7 +933,7 @@
                     <label for="bucketNameInput">Bucket name</label>
                     <input type="text" id="bucketNameInput" class="param-input" placeholder="e.g. dusk rain">
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <div class="btn-row">
                         <button type="button" id="pickAllBtn" class="btn-secondary" disabled
                                 title="Select the whole loaded window as the bucket — no need to click a start and end frame.">Select all</button>
@@ -729,7 +973,7 @@
                     <label for="motionOracleSelect">Oracle</label>
                     <select id="motionOracleSelect"></select>
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="motionScopeBadge" class="badge">Scope: All frames</span>
                 </div>
             </div>
@@ -777,16 +1021,16 @@
                         <button type="button" id="timelineResetBtn" class="btn-secondary hidden">Reset drill</button>
                     </div>
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="timelineScopeBadge" class="badge">—</span>
                 </div>
             </div>
             <div id="timelineStrip" class="timeline-strip"></div>
             <div id="timelineEmpty" class="empty hidden">No frames in this window.</div>
             <div class="timeline-legend">
-                <span><span class="legend-swatch" style="background:#c62828;"></span>Missed (gate still, oracle sees subject)</span>
-                <span><span class="legend-swatch" style="background:#f9a825;"></span>False (gate fired, oracle sees nothing)</span>
-                <span><span class="legend-swatch" style="background:#b0bec5;"></span>Frame density</span>
+                <span><span class="legend-swatch legend-swatch--missed"></span>Missed (gate still, oracle sees subject)</span>
+                <span><span class="legend-swatch legend-swatch--false"></span>False (gate fired, oracle sees nothing)</span>
+                <span><span class="legend-swatch legend-swatch--neutral"></span>Frame density</span>
             </div>
         </div>
 
@@ -801,7 +1045,7 @@
             <div id="inboxMissesNote" class="banner-warn hidden"></div>
             <div class="controls-row" style="align-items: center;">
                 <span id="inboxProgress" class="badge">— / —</span>
-                <div class="btn-row" style="margin-left: auto;">
+                <div class="btn-row push-end">
                     <button type="button" id="inboxPrevBtn" class="btn-secondary">← Prev (k)</button>
                     <button type="button" id="inboxNextBtn" class="btn-secondary">Next (j) →</button>
                 </div>
@@ -840,7 +1084,7 @@
                     <label for="param_motion_downscale">motion_downscale</label>
                     <input type="number" id="param_motion_downscale" step="1" class="param-input">
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="tuningParamSource" class="badge">Params: —</span>
                 </div>
             </div>
@@ -852,7 +1096,7 @@
                         <button type="button" id="tuningRefreshBtn" class="btn-secondary">Refresh compare</button>
                     </div>
                 </div>
-                <div class="control-group" style="margin-left: auto;">
+                <div class="control-group push-end">
                     <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
                 </div>
                 <div class="control-group">
@@ -876,6 +1120,8 @@
             </div>
         </div>
     </section>
+
+    </div>
 
     <script>
         // ================= element handles =================
@@ -2048,11 +2294,11 @@
                 cell.className = 'timeline-cell';
                 let bg;
                 if (b.missed > 0) {
-                    bg = `rgba(198,40,40,${0.25 + 0.75 * (maxMissed ? b.missed / maxMissed : 1)})`;
+                    bg = `rgb(var(--v-missed-rgb) / ${0.25 + 0.75 * (maxMissed ? b.missed / maxMissed : 1)})`;
                 } else if (b.false > 0) {
-                    bg = `rgba(249,168,37,${0.25 + 0.75 * (maxFalse ? b.false / maxFalse : 1)})`;
+                    bg = `rgb(var(--v-false-rgb) / ${0.25 + 0.75 * (maxFalse ? b.false / maxFalse : 1)})`;
                 } else if (b.total > 0) {
-                    bg = `rgba(120,144,156,${0.15 + 0.55 * (maxTotal ? b.total / maxTotal : 1)})`;
+                    bg = `rgb(var(--v-neutral-rgb) / ${0.15 + 0.55 * (maxTotal ? b.total / maxTotal : 1)})`;
                 } else {
                     bg = 'transparent';
                 }

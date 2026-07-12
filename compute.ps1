@@ -5,9 +5,11 @@
 .DESCRIPTION
     On first run this bootstraps a virtualenv at .venv-compute from
     compute/requirements.txt; on later runs it just launches. Works from any
-    directory. It serves a web UI to browse collected frames; collection into the
-    bounded local store starts OFF — click Start in the UI (or set
-    CAT_COLLECT_AUTOSTART=1) to begin ingesting the edge stream.
+    directory. It serves a web UI to browse collected frames. On this dedicated
+    compute PC collection AUTOSTARTS at launch (CAT_COLLECT_AUTOSTART defaults to 1
+    here, unlike the app's own off default) so a stop/start — e.g. to git pull —
+    comes back collecting with nothing to remember. Set CAT_COLLECT_AUTOSTART=0 to
+    launch stopped (browse-only) and click Start in the UI instead.
 
         .\compute.ps1                          # edge defaults to localhost:8000
         .\compute.ps1 catpi.local:8000         # edge as an argument (http:// added if omitted)
@@ -23,7 +25,7 @@
       CAT_COLLECT_DIR        store root      (default .\data\collection)
       CAT_COLLECT_MAX_BYTES  retention cap   (default 1099511627776 = 1 TiB on this PC)
       CAT_COLLECT_PORT       web port        (default 8001; the edge uses 8000)
-      CAT_COLLECT_AUTOSTART  begin collecting at launch (default off; 1/true/yes/on to enable)
+      CAT_COLLECT_AUTOSTART  begin collecting at launch (default 1 HERE; set 0/false to launch stopped)
 #>
 [CmdletBinding()]
 param(
@@ -103,12 +105,25 @@ $StoreDir = if ($env:CAT_COLLECT_DIR) { $env:CAT_COLLECT_DIR } else { '.\data\co
 if (-not $env:CAT_COLLECT_MAX_BYTES) { $env:CAT_COLLECT_MAX_BYTES = '1099511627776' }
 $MaxBytes = $env:CAT_COLLECT_MAX_BYTES
 
+# This is the dedicated compute/collection PC, so default collection ON at launch
+# (the app itself defaults it OFF for a bare/dev launch — see changelog 28). This
+# is what fixes the real footgun: a stop/start to `git pull` resumes collecting with
+# nothing to remember, regardless of HOW the process stopped. A caller-set value
+# still wins — CAT_COLLECT_AUTOSTART=0 launches stopped (browse-only). The unset/empty
+# test mirrors the MAX_BYTES default above; '0' is a non-empty string so it survives.
+if (-not $env:CAT_COLLECT_AUTOSTART) { $env:CAT_COLLECT_AUTOSTART = '1' }
+# Banner only — mirror the app's truthy spellings (1/true/yes/on); the app makes the
+# real decision from this same env var.
+$AutoOn = $env:CAT_COLLECT_AUTOSTART -match '^\s*(1|true|yes|on)\s*$'
+
 Write-Host "[compute] edge stream: $PiUrl"
 Write-Host "[compute] store:       $StoreDir  (cap $MaxBytes bytes)"
+Write-Host "[compute] autostart:   $(if ($AutoOn) { 'ON  (collecting at launch)' } else { 'off (click Start in the UI)' })"
 Write-Host "[compute] browse UI:   http://localhost:$Port   (Ctrl-C to stop)"
 
-# --factory: create_app() builds the store and wires the collector (which stays
-# stopped until Started from the UI, unless CAT_COLLECT_AUTOSTART is set); there
-# is no module-level app that would start a thread on import.
+# --factory: create_app() builds the store and wires the collector; it begins at
+# launch because CAT_COLLECT_AUTOSTART is defaulted on above (set it to 0 to stay
+# stopped until Started from the UI). There is no module-level app that would start
+# a thread on import.
 & $Py -m uvicorn --factory compute.api.app:create_app --host 0.0.0.0 --port $Port
 exit $LASTEXITCODE

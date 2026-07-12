@@ -257,3 +257,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     No oracle required — populated instantly. Event thumbnail is the peak-area frame; click opens
     an in-view player (play/pause/scrub, ~8 fps) via /api/frames + filmstrip. From/to date filter; cat-id filtering deferred.
 
+45. `compute.ps1` now defaults `CAT_COLLECT_AUTOSTART=1` (a caller-set value still wins; =0 launches
+    stopped). The Windows box is the dedicated collection PC, so a stop/start to `git pull` resumes
+    collecting with nothing to remember — the real footgun, since the one-click Resume prompt (31)
+    was being forgotten. Per-machine and explicit, not inferred: `compute.sh` (dev) stays off, so
+    changelog 28's "a bare launch never silently writes" holds where it matters.
+

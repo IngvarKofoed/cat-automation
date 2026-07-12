@@ -688,6 +688,43 @@
             border-color: var(--color-status-rep);
             box-shadow: 0 0 0 2px var(--color-status-rep);
         }
+        /* The frame the player is currently showing. An accent OUTLINE (not a border
+           or box-shadow) so it layers over film-motion/miss/rep without fighting them
+           for the same property — the tile never resizes as the highlight moves. */
+        .film-tile.film-current {
+            outline: 3px solid var(--color-primary);
+            outline-offset: -1px;
+        }
+
+        /* Activity view: event cards reuse .tile; the click affordance + selected ring
+           are the only additions. Selection is an accent recolor of the transparent
+           .tile border (no layout shift). */
+        .activity-card { cursor: pointer; }
+        .activity-card.selected { border-color: var(--color-primary); }
+        /* Player stage: a fixed-height contained frame, mirroring #inboxRep so flipping
+           events or scrubbing never resizes the box and reflows the strip below. */
+        #playerStage {
+            margin: 10px 0;
+            height: 420px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--color-surface-2);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+        #playerStage img {
+            box-sizing: border-box;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: var(--radius-md);
+            background: var(--color-surface-2);
+        }
+        #playerScrub {
+            width: 100%;
+            accent-color: var(--color-primary);
+        }
         /* MOG2 tuning panel (relocated from the old single page, unchanged behavior). */
         .tuning-empty-note {
             color: var(--color-text-muted);
@@ -808,6 +845,7 @@
         <div class="bar-inner">
         <span class="nav-brand">Cat Door</span>
         <a href="#start" data-route="start" class="nav-link">Start</a>
+        <a href="#activity" data-route="activity" class="nav-link">Activity</a>
         <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
         <a href="#motion" data-route="motion" class="nav-link">Motion Detection</a>
         </div>
@@ -859,6 +897,55 @@
             <p class="caveat text-muted" style="margin-top: 10px;">
                 Deletes every stored frame, oracle verdict, saved bucket, and mode history. Cannot be undone.
             </p>
+        </div>
+    </section>
+
+    <!-- ================= ACTIVITY VIEW ================= -->
+    <section id="view-activity" class="view hidden">
+        <div class="panel">
+            <h2>Activity</h2>
+            <p class="caveat text-muted" style="margin: 0 0 12px;">
+                Motion frames clustered into events — "what happened at the door" — newest first.
+                Pick a date range and Load, then click an event to play it back frame by frame.
+            </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="activityFromDate">From</label>
+                    <input type="date" id="activityFromDate">
+                </div>
+                <div class="control-group">
+                    <label for="activityToDate">To</label>
+                    <input type="date" id="activityToDate">
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="activityLoadBtn">Load</button>
+                </div>
+                <div class="control-group push-end">
+                    <span id="activityStoreRange" class="badge">Store: —</span>
+                </div>
+            </div>
+            <div id="activityTruncated" class="banner-warn hidden"></div>
+            <div id="activityEmpty" class="empty hidden">No activity in this range.</div>
+            <div id="activityGrid" class="grid"></div>
+        </div>
+
+        <!-- In-view player/stage (mirrors the visit-inbox stage; hidden until a card is clicked). -->
+        <div class="panel hidden" id="activityPlayerPanel">
+            <h2>Playback</h2>
+            <div class="controls-row" style="align-items: center;">
+                <button type="button" id="playerPlayBtn">Play</button>
+                <span id="playerTs" class="badge">—</span>
+                <div class="btn-row push-end">
+                    <button type="button" id="playerPrevBtn" class="btn-secondary">← Prev event</button>
+                    <button type="button" id="playerNextBtn" class="btn-secondary">Next event →</button>
+                </div>
+            </div>
+            <div id="playerStage"><img id="playerImg" alt="Event frame"></div>
+            <div class="controls-row" style="margin-top: 10px;">
+                <input type="range" id="playerScrub" min="0" max="0" value="0">
+            </div>
+            <div id="playerFilmstrip" class="filmstrip"></div>
         </div>
     </section>
 
@@ -1137,6 +1224,22 @@
         const resumePanel = document.getElementById('resumePanel');
         const resumeBtn = document.getElementById('resumeBtn');
         const clearBtn = document.getElementById('clearBtn');
+        // Activity view
+        const activityFromDateEl = document.getElementById('activityFromDate');
+        const activityToDateEl = document.getElementById('activityToDate');
+        const activityLoadBtn = document.getElementById('activityLoadBtn');
+        const activityStoreRangeEl = document.getElementById('activityStoreRange');
+        const activityTruncatedEl = document.getElementById('activityTruncated');
+        const activityEmptyEl = document.getElementById('activityEmpty');
+        const activityGridEl = document.getElementById('activityGrid');
+        const activityPlayerPanel = document.getElementById('activityPlayerPanel');
+        const playerPlayBtn = document.getElementById('playerPlayBtn');
+        const playerTsEl = document.getElementById('playerTs');
+        const playerPrevBtn = document.getElementById('playerPrevBtn');
+        const playerNextBtn = document.getElementById('playerNextBtn');
+        const playerImgEl = document.getElementById('playerImg');
+        const playerScrubEl = document.getElementById('playerScrub');
+        const playerFilmstripEl = document.getElementById('playerFilmstrip');
         // Buckets view
         const startDateEl = document.getElementById('startDate');
         const startTimeEl = document.getElementById('startTime');
@@ -1214,7 +1317,7 @@
         const tuningCopyBtn = document.getElementById('tuningCopyBtn');
 
         // ================= shared constants + state =================
-        const ROUTES = ['start', 'buckets', 'motion'];
+        const ROUTES = ['start', 'activity', 'buckets', 'motion'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
@@ -1227,6 +1330,9 @@
         const VIEWER_PAGE_SIZE = 500;          // "All" density paged feed
         const CONTEXT_FRAMES = 8;              // preceding frames shown in the inbox filmstrip
         const STATS_POLL_MS = 4000;
+        const MAX_PLAY_FRAMES = 240;           // cap preloaded/played frames per event
+        const PLAYER_FPS_MS = 125;             // ~8 fps playback (close to capture rate)
+        const PRELOAD_AHEAD = 16;              // frames to preload ahead of the current one (~2s buffer)
 
         let route = 'start';
 
@@ -1250,6 +1356,21 @@
 
         // Groups / buckets (from /api/groups), shared by both views.
         let groups = [];
+
+        // Activity view state.
+        let activityEvents = [];          // the loaded event list (newest-first from the backend)
+        let activityTruncated = false;    // the _MAX_EVENTS cap dropped events
+        let activitySelectedIndex = -1;   // index of the open event, or -1 when the player is closed
+        let activityAutoLoaded = false;   // gates the one stats-driven initial fetch (see pollStats)
+        let activitySeq = 0;              // stale-guard for event-list loads
+        // Player (per-event) state.
+        let playerFrames = [];            // chronological {id, recv_ts, url} rows being played
+        let playerImages = [];            // sparse cache of preloaded Image()s by frame index (held so they aren't GC'd)
+        let playerTiles = [];             // parallel filmstrip tile elements, for current-frame highlight
+        let playerIndex = 0;              // index into playerFrames of the shown frame
+        let playerPlaying = false;
+        let playerTimer = null;           // setInterval handle — cleared on switch/close/leave (no leaks)
+        let playerSeq = 0;                // stale-guard for per-event frame loads
 
         // Motion-view scope: activeScope = the picked bucket; drillScope = a narrower
         // window from clicking a timeline bin (null = the whole bucket).
@@ -1406,7 +1527,18 @@
             onRouteEnter(route);
         }
         function onRouteEnter(r) {
-            if (r === 'buckets') {
+            // Leaving Activity: kill any running playback timer so it can't tick in the
+            // background on another view (no leaked interval).
+            if (r !== 'activity') pausePlayback();
+            if (r === 'activity') {
+                populateActivityDefaults();
+                // Fetch on entry when a date range is available; when stats haven't landed
+                // yet (dates empty on first load) pollStats kicks the initial load once.
+                if (activityFromDateEl.value && activityToDateEl.value) {
+                    activityAutoLoaded = true;
+                    loadActivityEvents();
+                }
+            } else if (r === 'buckets') {
                 loadGroups();
                 populateClockDefaults();
             } else if (r === 'motion') {
@@ -1446,6 +1578,15 @@
                 // Keep the Buckets clock badge/limits live without clobbering edits
                 // (populateClockDefaults only fills empty fields).
                 populateClockDefaults();
+                // Same for the Activity date range + store badge; and if the user is on
+                // Activity but stats hadn't landed on first load (dates were empty), do the
+                // one deferred initial fetch now that a default range exists.
+                populateActivityDefaults();
+                if (route === 'activity' && !activityAutoLoaded
+                    && activityFromDateEl.value && activityToDateEl.value) {
+                    activityAutoLoaded = true;
+                    loadActivityEvents();
+                }
             } catch (err) {
                 console.warn('stats poll failed:', err);
             }
@@ -1557,6 +1698,269 @@
             } finally {
                 clearBtn.disabled = false;
             }
+        });
+
+        // ================= ACTIVITY view =================
+        // Keep the store badge + date range live; default the range to the newest
+        // stored frame's day. Only fills EMPTY date fields (never clobbers an edit),
+        // mirroring populateClockDefaults.
+        function populateActivityDefaults() {
+            const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
+            activityStoreRangeEl.textContent = hasRange
+                ? `Store: ${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
+                : 'Store: empty';
+            activityLoadBtn.disabled = !hasRange;
+            if (!hasRange) return;
+            const minD = dateInputValue(storeOldestTs);
+            const maxD = dateInputValue(storeNewestTs);
+            activityFromDateEl.min = minD; activityFromDateEl.max = maxD;
+            activityToDateEl.min = minD; activityToDateEl.max = maxD;
+            if (!activityFromDateEl.value) activityFromDateEl.value = maxD;
+            if (!activityToDateEl.value) activityToDateEl.value = maxD;
+        }
+
+        // Resolve the from/to dates to id bounds (the app's one time->id path), then fetch
+        // the clustered motion events over that scope. From date -> 00:00 local, To date ->
+        // END of that day (hour 24 rolls to next-day 00:00, so recv_ts <= that is inclusive
+        // through the day). A bound resolving to null passes through unbounded (addBounds
+        // skips it), so a lone side means "from that day onward" / "up to that day".
+        async function loadActivityEvents() {
+            const fromTs = tsFromControls(activityFromDateEl.value, 0);
+            const toTs = tsFromControls(activityToDateEl.value, 24);
+            if (fromTs == null || toTs == null) return;   // dates not ready yet — quiet no-op
+            const lo = Math.min(fromTs, toTs), hi = Math.max(fromTs, toTs);
+            const seq = ++activitySeq;
+            closePlayer();
+            try {
+                clearError();
+                const rp = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi) });
+                const rres = await fetch('/api/frames/resolve?' + rp.toString());
+                if (!rres.ok) throw new Error(await errorFromResponse(rres));
+                const rdata = await rres.json();
+                if (seq !== activitySeq) return;
+                // A date range falling entirely in a collection gap resolves to
+                // since_id > until_id (the first frame at-or-after 'From' is newer than
+                // the last frame at-or-before 'To') — a window that holds no frames. Show
+                // the empty state instead of sending that inverted range, which /api/events
+                // rejects with 400 (surfacing a raw error rather than "no activity").
+                if (rdata.since_id != null && rdata.until_id != null && rdata.since_id > rdata.until_id) {
+                    activityEvents = []; activityTruncated = false; renderActivityGrid(); return;
+                }
+                const params = new URLSearchParams();
+                addBounds(params, rdata.since_id, rdata.until_id);
+                const eres = await fetch('/api/events?' + params.toString());
+                if (!eres.ok) throw new Error(await errorFromResponse(eres));
+                const edata = await eres.json();
+                if (seq !== activitySeq) return;
+                activityEvents = edata.events || [];
+                activityTruncated = !!edata.truncated;
+                renderActivityGrid();
+            } catch (err) {
+                if (seq === activitySeq) showError(`Activity failed: ${err.message}`);
+            }
+        }
+
+        function renderActivityGrid() {
+            activityGridEl.innerHTML = '';
+            activitySelectedIndex = -1;
+            activityTruncatedEl.classList.toggle('hidden', !activityTruncated);
+            if (activityTruncated) {
+                activityTruncatedEl.textContent =
+                    `Showing the newest ${activityEvents.length} events — narrow the date range to see more.`;
+            }
+            activityEmptyEl.classList.toggle('hidden', activityEvents.length > 0);
+            if (!activityEvents.length) { closePlayer(); return; }
+            activityEvents.forEach((ev, i) => activityGridEl.appendChild(activityCard(ev, i)));
+        }
+
+        function activityCard(ev, i) {
+            const tile = document.createElement('div');
+            tile.className = 'tile activity-card';
+            tile.dataset.index = String(i);
+            const img = document.createElement('img');
+            img.src = `/media/${ev.rep_frame_id}`;   // peak-area frame of the cluster
+            img.loading = 'lazy';
+            img.alt = 'Event thumbnail';
+            const cap = document.createElement('div');
+            cap.className = 'caption';
+            const left = document.createElement('span');
+            left.textContent = formatTime(ev.start_ts);
+            const right = document.createElement('span');
+            // "motion frames" (not just "frames"): this is the count of motion frames that
+            // DEFINE the event, distinct from the player's clip length ("frame X / Y"),
+            // which spans the interleaved still frames too. Labelling it prevents the two
+            // counts reading as a bug when they differ.
+            right.textContent = `${formatSpan(ev.start_ts, ev.end_ts)} · ${ev.n_frames} motion frames`;
+            cap.append(left, right);
+            tile.append(img, cap);
+            tile.addEventListener('click', () => openEvent(i));
+            return tile;
+        }
+
+        function highlightSelectedCard() {
+            for (const el of activityGridEl.querySelectorAll('.activity-card')) {
+                el.classList.toggle('selected', Number(el.dataset.index) === activitySelectedIndex);
+            }
+        }
+
+        // Open the player on event `i`: sample its frames across the whole span
+        // (chronological, evenly decimated when long), preload a window, then enable play.
+        async function openEvent(i) {
+            if (i < 0 || i >= activityEvents.length) return;
+            const ev = activityEvents[i];
+            const seq = ++playerSeq;
+            pausePlayback();                 // stop any timer from the previous event
+            activitySelectedIndex = i;
+            highlightSelectedCard();
+            activityPlayerPanel.classList.remove('hidden');
+            // Reset to a loading state so a slow fetch never shows the previous event.
+            playerFrames = []; playerImages = []; playerTiles = [];
+            playerIndex = 0;
+            playerImgEl.removeAttribute('src');
+            playerTsEl.textContent = '—';
+            playerFilmstripEl.innerHTML = '<div class="empty" style="padding:12px;">Loading…</div>';
+            playerPlayBtn.disabled = true;
+            playerScrubEl.disabled = true;
+            playerScrubEl.min = '0'; playerScrubEl.max = '0'; playerScrubEl.value = '0';
+            updatePlayerNav();
+            try {
+                // Sample the WHOLE event span evenly (id ASC) rather than paging the newest
+                // 500 (id DESC): a long lingering event must play from its BEGINNING, not
+                // start mid-clip. sample_frames returns every frame when the span is short
+                // and an even ~MAX_PLAY_FRAMES spread when long — already chronological, so
+                // no reverse and no client-side decimation needed.
+                const sp = new URLSearchParams({ count: String(MAX_PLAY_FRAMES) });
+                addBounds(sp, ev.start_id, ev.end_id);
+                const sres = await fetch('/api/frames/sample?' + sp.toString());
+                if (!sres.ok) throw new Error(await errorFromResponse(sres));
+                const sdata = await sres.json();
+                if (seq !== playerSeq) return;
+                playerFrames = sdata.frames || [];
+                // Preload only a bounded window around the current frame (not the whole clip
+                // at once), so opening an event — or spamming Prev/Next — never fires a burst
+                // of media requests for frames that may never be reached; playback extends
+                // the window as the index advances (see preloadAround/showPlayerFrame).
+                playerImages = [];
+                preloadAround(0);
+                buildPlayerFilmstrip(ev.rep_frame_id);
+                playerScrubEl.max = String(Math.max(0, playerFrames.length - 1));
+                playerScrubEl.disabled = playerFrames.length <= 1;
+                playerPlayBtn.disabled = playerFrames.length <= 1;
+                showPlayerFrame(0);
+                updatePlayerNav();
+            } catch (err) {
+                if (seq === playerSeq) {
+                    playerFilmstripEl.innerHTML = '<div class="empty" style="padding:12px;">Frames unavailable.</div>';
+                }
+            }
+        }
+
+        function buildPlayerFilmstrip(repId) {
+            playerFilmstripEl.innerHTML = '';
+            playerTiles = playerFrames.map((f, idx) => {
+                const tile = filmTile(f, false, repId, { verdict: false });   // neutral strip — no motion/miss coloring
+                tile.addEventListener('click', () => { pausePlayback(); showPlayerFrame(idx); });
+                return tile;
+            });
+            for (const t of playerTiles) playerFilmstripEl.appendChild(t);
+        }
+
+        // Preload frames [idx, idx+PRELOAD_AHEAD) into the browser cache via Image objects,
+        // so playback/scrubbing stay smooth without eagerly fetching the whole clip. Cached
+        // by index in playerImages so each frame is requested at most once per event.
+        function preloadAround(idx) {
+            const end = Math.min(playerFrames.length, Math.max(0, idx) + PRELOAD_AHEAD);
+            for (let i = Math.max(0, idx); i < end; i++) {
+                if (!playerImages[i]) {
+                    const im = new Image();
+                    im.src = playerFrames[i].url;
+                    playerImages[i] = im;
+                }
+            }
+        }
+
+        function showPlayerFrame(idx) {
+            if (!playerFrames.length) return;
+            idx = Math.max(0, Math.min(idx, playerFrames.length - 1));
+            playerIndex = idx;
+            preloadAround(idx);        // keep the look-ahead window primed as we advance/scrub
+            const f = playerFrames[idx];
+            playerImgEl.src = f.url;   // preloaded -> served from cache, no flicker
+            playerTsEl.textContent = `${formatTime(f.recv_ts)} · frame ${idx + 1} / ${playerFrames.length}`;
+            if (playerScrubEl.value !== String(idx)) playerScrubEl.value = String(idx);
+            // Highlight the current tile and keep it in view — scrolling ONLY the filmstrip
+            // (never the page) so playback can't make the whole view jump.
+            playerTiles.forEach((t, j) => t.classList.toggle('film-current', j === idx));
+            const cur = playerTiles[idx];
+            if (cur) {
+                const cr = cur.getBoundingClientRect();
+                const sr = playerFilmstripEl.getBoundingClientRect();
+                if (cr.left < sr.left || cr.right > sr.right) {
+                    playerFilmstripEl.scrollLeft += (cr.left - sr.left) - (sr.width - cr.width) / 2;
+                }
+            }
+        }
+
+        function stopPlayerTimer() {
+            if (playerTimer !== null) { clearInterval(playerTimer); playerTimer = null; }
+        }
+        function startPlayback() {
+            if (playerFrames.length <= 1) return;
+            stopPlayerTimer();
+            playerPlaying = true;
+            playerPlayBtn.textContent = 'Pause';
+            playerTimer = setInterval(() => {
+                let next = playerIndex + 1;
+                if (next >= playerFrames.length) next = 0;   // loop (keep it simple)
+                showPlayerFrame(next);
+            }, PLAYER_FPS_MS);
+        }
+        function pausePlayback() {
+            stopPlayerTimer();
+            playerPlaying = false;
+            playerPlayBtn.textContent = 'Play';
+        }
+        function togglePlayback() {
+            if (playerPlaying) pausePlayback(); else startPlayback();
+        }
+
+        // Fully reset + hide the player (reload, empty grid, or a fresh event). Clears the
+        // timer first so no interval survives the reset.
+        function closePlayer() {
+            pausePlayback();
+            activityPlayerPanel.classList.add('hidden');
+            activitySelectedIndex = -1;
+            playerFrames = []; playerImages = []; playerTiles = [];
+            playerIndex = 0;
+        }
+
+        function moveEvent(delta) {
+            if (!activityEvents.length) return;
+            const next = activitySelectedIndex + delta;
+            if (next < 0 || next >= activityEvents.length) return;
+            openEvent(next);
+        }
+        function updatePlayerNav() {
+            playerPrevBtn.disabled = activitySelectedIndex <= 0;
+            playerNextBtn.disabled = activitySelectedIndex < 0 || activitySelectedIndex >= activityEvents.length - 1;
+        }
+
+        activityLoadBtn.addEventListener('click', loadActivityEvents);
+        playerPlayBtn.addEventListener('click', togglePlayback);
+        playerPrevBtn.addEventListener('click', () => moveEvent(-1));
+        playerNextBtn.addEventListener('click', () => moveEvent(1));
+        playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
+
+        // Keyboard: only on the Activity route with the player open, and never while typing
+        // (same input/select/textarea guard as the inbox). Space = play/pause, arrows scrub.
+        document.addEventListener('keydown', (e) => {
+            if (route !== 'activity') return;
+            if (activityPlayerPanel.classList.contains('hidden')) return;
+            const tag = (e.target && e.target.tagName) || '';
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            if (e.key === ' ' || e.key === 'Spacebar') { togglePlayback(); e.preventDefault(); }
+            else if (e.key === 'ArrowRight') { pausePlayback(); showPlayerFrame(playerIndex + 1); e.preventDefault(); }
+            else if (e.key === 'ArrowLeft') { pausePlayback(); showPlayerFrame(playerIndex - 1); e.preventDefault(); }
         });
 
         // ================= BUCKETS view: clock pickers =================
@@ -2447,12 +2851,18 @@
             }
         }
 
-        function filmTile(frame, isContext, repId) {
+        // `opts.verdict === false` renders a NEUTRAL tile (no motion/miss coloring) for the
+        // activity player: on that user-facing view a still frame between motion frames is
+        // just a frame, not a gate "miss", so the red/green tuning verdicts would mislead.
+        // The inbox omits opts and keeps the verdicts. film-rep (the rep/thumbnail frame) is
+        // kept either way — it's a useful "where's the thumbnail" cue in both strips.
+        function filmTile(frame, isContext, repId, opts) {
+            const showVerdict = !opts || opts.verdict !== false;
             const tile = document.createElement('div');
             tile.className = 'film-tile'
                 + (isContext ? ' film-context' : '')
-                + (frame.motion ? ' film-motion' : '')
-                + (!isContext && !frame.motion && frame.id !== repId ? ' film-miss' : '')
+                + (showVerdict && frame.motion ? ' film-motion' : '')
+                + (showVerdict && !isContext && !frame.motion && frame.id !== repId ? ' film-miss' : '')
                 + (frame.id === repId ? ' film-rep' : '');
             const img = document.createElement('img');
             img.src = frame.url;

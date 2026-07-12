@@ -76,6 +76,13 @@ _VISIT_WINDOW_MS = 3000
 # ``count = X × span-minutes`` and this clamps it into ``[1, _MAX_SAMPLE]``.
 _MAX_SAMPLE = 4000
 
+# Server-side cap on how many activity events ``events`` returns. Clustering is
+# cheap (it runs over the sparse motion frames only), so this bounds the response
+# and the client's DOM/JSON size, NOT compute: a busy multi-day store could yield
+# thousands of clusters, and the activity grid renders one card each. When the cap
+# bites, ``events`` flags ``truncated`` so the UI can prompt for a narrower date.
+_MAX_EVENTS = 500
+
 # The visit-inbox error modes ``visits`` clusters and ranks (see the
 # motion-detection-workflow spec). "missed"/"false" judge the LIVE edge gate
 # (``frames.motion``) against one oracle; "conflict" compares the two oracles
@@ -1781,3 +1788,89 @@ class Store:
 
         scored.sort(key=lambda x: x[0])
         return [rec for _, rec in scored]
+
+    def events(
+        self,
+        since_id: "int | None",
+        until_id: "int | None",
+        *,
+        min_frames: int = 1,
+        limit: int = _MAX_EVENTS,
+    ) -> dict:
+        """The user-facing activity feed: motion frames clustered into events, newest-first.
+
+        Returns ``{"events": [...], "truncated": bool}``. Each event is a run of
+        MOTION frames close in time — "something happened at the door" — built for
+        the activity page (see the activity-page spec), the oracle-free, human-facing
+        cousin of ``visits``: it needs no oracle sweep, so the view is populated the
+        moment any frames are collected.
+
+        Clusters ONLY ``frames.motion = 1``. This is the load-bearing choice: the
+        collector saves EVERY frame continuously (~5–10 fps), so gap-splitting *all*
+        frames would find no gaps and yield one blob per collection session — time
+        gaps only exist among the sparse motion frames. Clustering reuses the shared
+        ``_gap_split`` primitive with ``_VISIT_GAP_MS``, exactly as ``visits`` does,
+        so the two clusterings can never drift.
+
+        ``since_id`` / ``until_id`` are the same optional inclusive id scope every
+        windowed read shares (``None`` = unbounded on that side; both ``None`` =
+        whole store), which the client resolves a date filter into via
+        ``resolve_ts_range``. Clusters with fewer than ``min_frames`` motion frames
+        are dropped (a per-event noise floor; default 1 keeps every cluster).
+
+        Per surviving cluster the record is::
+
+            {start_id, end_id, start_ts, end_ts, n_frames, rep_frame_id}
+
+        ``start_id``/``end_id`` = min/max frame id in the cluster (the id span the
+        player fetches its frames over); ``start_ts``/``end_ts`` = first/last
+        ``recv_ts``; ``n_frames`` = motion-frame count; ``rep_frame_id`` = the
+        highest-``area`` frame (tie-break by id), matching how ``visits`` picks a
+        representative — the peak-area frame is likelier to show the cat prominently
+        than a middle-by-time one.
+
+        Events are sorted NEWEST-FIRST (``start_ts`` desc, tie-break ``start_id``
+        desc) and capped at ``limit`` (clamped into ``[1, _MAX_EVENTS]``);
+        ``truncated`` is True iff the cap dropped events. The cap bounds the
+        response and the client's DOM, not compute — clustering over the sparse
+        motion frames is cheap regardless.
+        """
+        limit = max(1, min(int(limit), _MAX_EVENTS))
+        min_frames = max(1, int(min_frames))
+
+        frags, params = _range_bounds("id", since_id, until_id)
+        where = " AND ".join(["motion = 1"] + frags)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, recv_ts, area FROM frames WHERE " + where +
+                " ORDER BY recv_ts ASC, id ASC",
+                params,
+            ).fetchall()
+
+        # Cluster + build records outside the lock (pure Python over the fetched
+        # rows, already recv_ts-ordered by the query's ORDER BY).
+        events: "list[dict]" = []
+        for cluster in self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[1]):
+            n_frames = len(cluster)
+            if n_frames < min_frames:
+                continue
+            ids = [int(r[0]) for r in cluster]
+            # area is NOT NULL; tie-break by id so the pick is deterministic,
+            # matching ``visits``'s ``(area, id)`` representative rule.
+            rep = max(cluster, key=lambda r: (r[2], r[0]))
+            events.append(
+                {
+                    "start_id": min(ids),
+                    "end_id": max(ids),
+                    "start_ts": int(cluster[0][1]),
+                    "end_ts": int(cluster[-1][1]),
+                    "n_frames": n_frames,
+                    "rep_frame_id": int(rep[0]),
+                }
+            )
+
+        # Newest-first: most recent event on top, ties broken by id so ordering is
+        # stable across calls.
+        events.sort(key=lambda e: (e["start_ts"], e["start_id"]), reverse=True)
+        truncated = len(events) > limit
+        return {"events": events[:limit], "truncated": truncated}

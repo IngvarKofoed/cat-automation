@@ -648,6 +648,25 @@ def create_app(
             "motion_only_spans": store.motion_only_spans(since_id, until_id),
         }
 
+    @app.get("/api/events")
+    def api_events(
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+        min_frames: int = Query(default=1),
+    ):
+        # The user-facing, oracle-free activity feed: motion frames clustered into
+        # "what happened at the door" events, newest-first (see the activity-page
+        # spec). Contrast /api/visits, which is oracle-driven and tuning-focused
+        # (missed/false/conflict against a YOLO/BSUV sweep) — this needs no sweep
+        # and is populated the moment any frames are collected. No motion_only_spans
+        # caveat: this page WANTS motion frames, so motion-only capture doesn't
+        # degrade it. The date filter is resolved to since_id/until_id client-side
+        # via /api/frames/resolve, the same scope every windowed read takes.
+        _validate_bounds(since_id, until_id)
+        # min_frames is clamped to >= 1 inside Store.events (the single source of
+        # truth for the clamp), so the route passes it straight through.
+        return store.events(since_id, until_id, min_frames=min_frames)
+
     @app.post("/api/collector/start")
     def api_collector_start():
         # The manager owns idempotency/thread-replacement; the route just toggles and

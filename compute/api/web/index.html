@@ -909,6 +909,72 @@
             color: var(--color-text);
         }
 
+        /* Oracle chooser (Tuning): a coverage-driven checkbox row per oracle, its
+           readout, and a focus radio (constrained to the checked set). Reuses the
+           .coverage-row shell; the readout floats between the two controls. */
+        #oracleChooser {
+            margin-top: var(--space-2);
+        }
+        .chooser-readout {
+            flex: 1;
+            text-align: right;
+            color: var(--color-text-muted);
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+        }
+        .chooser-readout.no-subjects {
+            color: var(--color-status-false);
+        }
+        .chooser-focus {
+            min-width: 68px;
+            justify-content: flex-end;
+        }
+
+        /* Comparison matrix (Tuning): gate-source rows × checked-oracle columns, each
+           cell a visit-recall %. Scrolls horizontally on narrow viewports. */
+        .matrix-wrap {
+            margin-top: var(--space-3);
+            overflow-x: auto;
+        }
+        table.matrix-table {
+            border-collapse: collapse;
+            font-size: 13px;
+            min-width: 100%;
+        }
+        table.matrix-table th,
+        table.matrix-table td {
+            border: 1px solid var(--color-border);
+            padding: 6px 12px;
+            text-align: center;
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+        }
+        table.matrix-table thead th,
+        table.matrix-table tbody th {
+            background: var(--color-surface-2);
+            color: var(--color-text-muted);
+            font-weight: 600;
+        }
+        table.matrix-table tbody th {
+            text-align: left;
+        }
+        table.matrix-table td.matrix-recall {
+            color: var(--color-status-caught);
+            font-weight: 700;
+        }
+        table.matrix-table td.matrix-pending {
+            color: var(--color-text-muted);
+        }
+        table.matrix-table td.matrix-error {
+            color: var(--color-status-missed);
+            font-weight: 700;
+        }
+        .matrix-empty {
+            color: var(--color-text-muted);
+            font-size: 13px;
+            margin-top: var(--space-3);
+        }
+
         /* Async-populated region floors — no collapse-then-expand on repopulate. */
         #viewerGrid { min-height: 160px; }
 
@@ -916,7 +982,7 @@
            Static/live readouts that were pills become muted, divider-led labels:
            same elements/ids, still class="badge" (so .badge.warn still fires amber),
            only restyled. Id specificity beats the base .badge; #id.warn beats #id. */
-        #motionScopeBadge,
+        #sweepsScopeBadge,
         #tuningScopeBadge,
         #tuningParamSource,
         #viewerPageLabel {
@@ -929,12 +995,12 @@
             font-family: var(--font-data);
             font-variant-numeric: tabular-nums;
         }
-        #motionScopeBadge.warn,
+        #sweepsScopeBadge.warn,
         #tuningScopeBadge.warn,
         #tuningParamSource.warn {
             color: var(--color-status-false);
         }
-        #motionScopeBadge { min-width: 150px; }
+        #sweepsScopeBadge { min-width: 150px; }
         #tuningScopeBadge { min-width: 150px; }
         #tuningParamSource { min-width: 150px; }
         #viewerPageLabel { min-width: 64px; text-align: center; }
@@ -951,7 +1017,8 @@
         <a href="#start" data-route="start" class="nav-link">Start</a>
         <a href="#activity" data-route="activity" class="nav-link">Activity</a>
         <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
-        <a href="#motion" data-route="motion" class="nav-link">Motion Detection</a>
+        <a href="#sweeps" data-route="sweeps" class="nav-link">Sweeps</a>
+        <a href="#tuning" data-route="tuning" class="nav-link">Tuning</a>
         </div>
     </nav>
 
@@ -1162,25 +1229,22 @@
         </div>
     </section>
 
-    <!-- ================= MOTION DETECTION VIEW ================= -->
-    <section id="view-motion" class="view hidden">
+    <!-- ================= SWEEPS VIEW ================= -->
+    <!-- Produce oracle verdicts (the "ruler"): pick a bucket, sweep an oracle over it,
+         and manage the walk-away job queue. Evaluation of the gate lives on Tuning. -->
+    <section id="view-sweeps" class="view hidden">
         <div class="panel">
             <div class="controls-row">
                 <div class="control-group">
-                    <label for="motionScopeSelect">Bucket</label>
-                    <select id="motionScopeSelect">
+                    <label for="sweepsScopeSelect">Bucket</label>
+                    <select id="sweepsScopeSelect">
                         <option value="">All frames</option>
                     </select>
                 </div>
-                <div class="control-group">
-                    <label for="motionOracleSelect">Oracle</label>
-                    <select id="motionOracleSelect"></select>
-                </div>
                 <div class="control-group push-end">
-                    <span id="motionScopeBadge" class="badge">Scope: All frames</span>
+                    <span id="sweepsScopeBadge" class="badge">Scope: All frames</span>
                 </div>
             </div>
-            <div id="motionOnlyBanner" class="banner-warn hidden"></div>
         </div>
 
         <!-- Oracle coverage + enqueue (walk-away sweeps). -->
@@ -1208,58 +1272,35 @@
             <div id="queueHistory"></div>
             <div id="analysisError" class="hidden analysis-error"></div>
         </div>
+    </section>
 
-        <!-- Density timeline overview. -->
+    <!-- ================= TUNING VIEW ================= -->
+    <!-- Evaluate the MOG2 gate against the swept verdicts: a coverage-driven oracle
+         chooser feeds a visit-recall matrix (multi-oracle) and a focus oracle drives
+         the density timeline, visit inbox, and detailed scorecard cards. -->
+    <section id="view-tuning" class="view hidden">
         <div class="panel">
-            <h2>Density timeline</h2>
             <div class="controls-row">
                 <div class="control-group">
-                    <label for="timelineBins">Bins</label>
-                    <input type="number" id="timelineBins" class="param-input" value="120" min="1" step="10">
-                </div>
-                <div class="control-group">
-                    <label>&nbsp;</label>
-                    <div class="btn-row">
-                        <button type="button" id="timelineReloadBtn" class="btn-secondary">Reload</button>
-                        <button type="button" id="timelineResetBtn" class="btn-secondary hidden">Reset drill</button>
-                    </div>
+                    <label for="tuningScopeSelect">Bucket</label>
+                    <select id="tuningScopeSelect">
+                        <option value="">All frames</option>
+                    </select>
                 </div>
                 <div class="control-group push-end">
-                    <span id="timelineScopeBadge" class="badge">—</span>
+                    <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
                 </div>
             </div>
-            <div id="timelineStrip" class="timeline-strip"></div>
-            <div id="timelineEmpty" class="empty hidden">No frames in this window.</div>
-            <div class="timeline-legend">
-                <span><span class="legend-swatch legend-swatch--missed"></span>Missed (gate still, oracle sees subject)</span>
-                <span><span class="legend-swatch legend-swatch--false"></span>False (gate fired, oracle sees nothing)</span>
-                <span><span class="legend-swatch legend-swatch--neutral"></span>Frame density</span>
-            </div>
+            <h2 style="margin-top: var(--space-4);">Oracles</h2>
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Check the oracles this bucket has verdicts for to compare the gate against each
+                (matrix below). The <em>focus</em> oracle drives the timeline, inbox, and detail
+                cards. No data here? Sweep one on the Sweeps page first.
+            </p>
+            <div id="oracleChooser"></div>
         </div>
 
-        <!-- Visit inbox. -->
-        <div class="panel">
-            <h2>Visit inbox</h2>
-            <div class="tabs">
-                <button type="button" class="tab" data-mode="missed">Missed</button>
-                <button type="button" class="tab" data-mode="false">False</button>
-                <button type="button" class="tab" data-mode="conflict">Conflict</button>
-            </div>
-            <div id="inboxMissesNote" class="banner-warn hidden"></div>
-            <div class="controls-row" style="align-items: center;">
-                <span id="inboxProgress" class="badge">— / —</span>
-                <div class="btn-row push-end">
-                    <button type="button" id="inboxPrevBtn" class="btn-secondary">← Prev (k)</button>
-                    <button type="button" id="inboxNextBtn" class="btn-secondary">Next (j) →</button>
-                </div>
-            </div>
-            <div id="inboxEmpty" class="empty hidden">No visits for this mode in the window.</div>
-            <div id="inboxRep"></div>
-            <div id="inboxMeta" class="inbox-meta"></div>
-            <div id="inboxFilmstrip" class="filmstrip"></div>
-        </div>
-
-        <!-- MOG2 tuning (relocated, window-scoped). -->
+        <!-- MOG2 tuning (relocated, window-scoped) + the multi-oracle comparison matrix. -->
         <div class="panel" id="tuningPanel">
             <h2>MOG2 Tuning</h2>
             <div class="controls-row">
@@ -1299,9 +1340,6 @@
                         <button type="button" id="tuningRefreshBtn" class="btn-secondary">Refresh compare</button>
                     </div>
                 </div>
-                <div class="control-group push-end">
-                    <span id="tuningScopeBadge" class="badge">Scope: All frames</span>
-                </div>
                 <div class="control-group">
                     <span id="tuningProgressBadge" class="badge">Tuning: —</span>
                 </div>
@@ -1309,7 +1347,11 @@
             <div id="tuningError" class="hidden analysis-error"></div>
             <div id="tuningOverlapNote" class="banner-warn hidden"></div>
 
-            <div id="tuningCompareEmpty" class="tuning-empty-note">Queue a baseline and a candidate, then compare against the Oracle selected above.</div>
+            <!-- Visit-recall matrix: gate-source rows × checked-oracle columns. -->
+            <div id="tuningMatrix" class="matrix-wrap"></div>
+
+            <!-- Detail cards for the focus oracle only (reuses renderTuningCompare). -->
+            <div id="tuningCompareEmpty" class="tuning-empty-note">Check an oracle above (and pick a focus) to see the full breakdown.</div>
             <div id="tuningCards" class="tuning-cards"></div>
             <div id="tuningFidelity" class="tuning-line"></div>
             <div id="tuningDeltas" class="tuning-line"></div>
@@ -1321,6 +1363,57 @@
                     <button type="button" id="tuningCopyBtn" class="btn-secondary">Copy</button>
                 </div>
             </div>
+        </div>
+
+        <!-- Density timeline overview. -->
+        <div class="panel">
+            <h2>Density timeline</h2>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="timelineBins">Bins</label>
+                    <input type="number" id="timelineBins" class="param-input" value="120" min="1" step="10">
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <div class="btn-row">
+                        <button type="button" id="timelineReloadBtn" class="btn-secondary">Reload</button>
+                        <button type="button" id="timelineResetBtn" class="btn-secondary hidden">Reset drill</button>
+                    </div>
+                </div>
+                <div class="control-group push-end">
+                    <span id="timelineScopeBadge" class="badge">—</span>
+                </div>
+            </div>
+            <div id="motionOnlyBanner" class="banner-warn hidden"></div>
+            <div id="timelineStrip" class="timeline-strip"></div>
+            <div id="timelineEmpty" class="empty hidden">No frames in this window.</div>
+            <div class="timeline-legend">
+                <span><span class="legend-swatch legend-swatch--missed"></span>Missed (gate still, oracle sees subject)</span>
+                <span><span class="legend-swatch legend-swatch--false"></span>False (gate fired, oracle sees nothing)</span>
+                <span><span class="legend-swatch legend-swatch--neutral"></span>Frame density</span>
+            </div>
+        </div>
+
+        <!-- Visit inbox. -->
+        <div class="panel">
+            <h2>Visit inbox</h2>
+            <div class="tabs">
+                <button type="button" class="tab" data-mode="missed">Missed</button>
+                <button type="button" class="tab" data-mode="false">False</button>
+                <button type="button" class="tab" data-mode="conflict">Conflict</button>
+            </div>
+            <div id="inboxMissesNote" class="banner-warn hidden"></div>
+            <div class="controls-row" style="align-items: center;">
+                <span id="inboxProgress" class="badge">— / —</span>
+                <div class="btn-row push-end">
+                    <button type="button" id="inboxPrevBtn" class="btn-secondary">← Prev (k)</button>
+                    <button type="button" id="inboxNextBtn" class="btn-secondary">Next (j) →</button>
+                </div>
+            </div>
+            <div id="inboxEmpty" class="empty hidden">No visits for this mode in the window.</div>
+            <div id="inboxRep"></div>
+            <div id="inboxMeta" class="inbox-meta"></div>
+            <div id="inboxFilmstrip" class="filmstrip"></div>
         </div>
     </section>
 
@@ -1387,10 +1480,12 @@
         const viewerPageLabel = document.getElementById('viewerPageLabel');
         const viewerNextBtn = document.getElementById('viewerNextBtn');
         const bucketsListEl = document.getElementById('bucketsList');
-        // Motion view
-        const motionScopeSelect = document.getElementById('motionScopeSelect');
-        const motionOracleSelect = document.getElementById('motionOracleSelect');
-        const motionScopeBadge = document.getElementById('motionScopeBadge');
+        // Sweeps + Tuning views (two bucket selectors mirror one shared scope state)
+        const sweepsScopeSelect = document.getElementById('sweepsScopeSelect');
+        const tuningScopeSelect = document.getElementById('tuningScopeSelect');
+        const sweepsScopeBadge = document.getElementById('sweepsScopeBadge');
+        const oracleChooserEl = document.getElementById('oracleChooser');
+        const tuningMatrixEl = document.getElementById('tuningMatrix');
         const motionOnlyBanner = document.getElementById('motionOnlyBanner');
         const reanalyzeCheckbox = document.getElementById('reanalyzeCheckbox');
         const coverageListEl = document.getElementById('coverageList');
@@ -1435,7 +1530,7 @@
         const tuningCopyBtn = document.getElementById('tuningCopyBtn');
 
         // ================= shared constants + state =================
-        const ROUTES = ['start', 'activity', 'buckets', 'motion'];
+        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
@@ -1491,10 +1586,22 @@
         let playerTimer = null;           // setInterval handle — cleared on switch/close/leave (no leaks)
         let playerSeq = 0;                // stale-guard for per-event frame loads
 
-        // Motion-view scope: activeScope = the picked bucket; drillScope = a narrower
-        // window from clicking a timeline bin (null = the whole bucket).
+        // Shared Sweeps/Tuning scope: activeScope = the picked bucket; drillScope = a
+        // narrower window from clicking a timeline bin (Tuning-only; null = whole bucket).
+        // scopeValue is the mirrored <select> value ('' = all frames, else a group id
+        // string) both bucket selectors track.
         let activeScope = null;   // {since_id, until_id} | null
         let drillScope = null;    // {since_id, until_id} | null
+        let scopeValue = '';      // '' | group-id string
+
+        // Tuning oracle chooser: which oracles are checked (feed the matrix) and which
+        // single oracle is "focus" (drives the timeline, inbox, and detail cards).
+        let selectedOracles = new Set();   // set of oracle ids
+        let focusOracle = null;            // oracle id | null (fresh/unswept bucket)
+        // Compare responses cached by the matrix fan-out, reused for the focus detail
+        // cards so the focus oracle isn't fetched twice.
+        let compareCache = {};
+        let matrixSeq = 0;                 // stale-guard for the matrix fan-out
 
         // Inbox state.
         let inboxMode = 'missed';
@@ -1520,12 +1627,41 @@
         let viewerSeq = 0;
 
         // ================= build selects / static rows =================
-        function buildOracleSelect() {
+        // The Tuning oracle chooser: one row per oracle — a select checkbox, a coverage
+        // readout, and a focus radio. Built once; updateOracleChooser refreshes state per
+        // bucket/poll. Radios share a name so only one focus is active at a time.
+        function buildOracleChooser() {
+            oracleChooserEl.innerHTML = '';
             for (const a of ANALYZERS) {
-                const opt = document.createElement('option');
-                opt.value = a.id;
-                opt.textContent = a.label;
-                motionOracleSelect.appendChild(opt);
+                const row = document.createElement('div');
+                row.className = 'coverage-row';
+
+                const cbLabel = document.createElement('label');
+                cbLabel.className = 'checkbox-label';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.id = 'chooser-cb-' + a.id;
+                cb.dataset.oracle = a.id;
+                cb.addEventListener('change', () => onOracleToggle(a.id, cb.checked));
+                cbLabel.append(cb, document.createTextNode(' ' + a.label));
+
+                const readout = document.createElement('span');
+                readout.id = 'chooser-cov-' + a.id;
+                readout.className = 'chooser-readout';
+                readout.textContent = '—';
+
+                const focusLabel = document.createElement('label');
+                focusLabel.className = 'checkbox-label chooser-focus';
+                const radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = 'focusOracle';
+                radio.id = 'chooser-focus-' + a.id;
+                radio.dataset.oracle = a.id;
+                radio.addEventListener('change', () => onFocusChange(a.id));
+                focusLabel.append(radio, document.createTextNode(' focus'));
+
+                row.append(cbLabel, readout, focusLabel);
+                oracleChooserEl.appendChild(row);
             }
         }
 
@@ -1650,6 +1786,9 @@
 
         // ================= router =================
         function setRoute(r) {
+            // Retired #motion hash redirects to #sweeps (old bookmarks land on Sweeps
+            // rather than falling through to start). Normalize BEFORE the include check.
+            if (r === 'motion') r = 'sweeps';
             route = ROUTES.includes(r) ? r : 'start';
             for (const v of document.querySelectorAll('.view')) v.classList.add('hidden');
             document.getElementById('view-' + route).classList.remove('hidden');
@@ -1674,10 +1813,12 @@
             } else if (r === 'buckets') {
                 loadGroups();
                 populateClockDefaults();
-            } else if (r === 'motion') {
+            } else if (r === 'sweeps') {
+                loadGroups().then(() => reloadSweeps());
+            } else if (r === 'tuning') {
                 loadGroups().then(() => {
                     if (!tuningDefaultsLoaded) { loadTuningDefaults(); tuningDefaultsLoaded = true; }
-                    reloadMotionView();
+                    reloadTuning();
                 });
             }
         }
@@ -1734,21 +1875,25 @@
                 analysisStatus = data;
 
                 renderQueuePanel(data);
-                if (route === 'motion') loadCoverage();  // scoped to the picked bucket; live during a sweep
+                // Sweeps: refresh the coverage rows (scoped to the picked bucket) live
+                // during a sweep. Tuning: refresh the oracle chooser's coverage (no reset —
+                // preserve the user's selection) so checkboxes enable as a sweep completes.
+                if (route === 'sweeps') loadCoverage();
+                else if (route === 'tuning') loadTuningCoverage(false);
                 updateTuningStatusBadges(data);
 
                 analysisErrorEl.textContent = data.error ? `Last analysis run failed: ${data.error}` : '';
                 analysisErrorEl.classList.toggle('hidden', !data.error);
 
                 // A job just FINISHED (the most-recent history record changed) — refresh
-                // the window-scoped views so a drained sweep's verdicts show up without a
-                // manual click. Skip the very first poll (nothing changed yet).
+                // the window-scoped Tuning views so a drained sweep's verdicts show up
+                // without a manual click. Skip the very first poll (nothing changed yet).
                 const top = (data.history && data.history[0]) ? JSON.stringify(data.history[0]) : null;
                 if (top !== lastHistoryTop) {
                     const first = lastHistoryTop === undefined;
                     lastHistoryTop = top;
-                    if (!first && top !== null && route === 'motion') {
-                        loadTuningCompare();
+                    if (!first && top !== null && route === 'tuning') {
+                        renderScorecardMatrix(true);   // fresh: new verdicts → refetch matrix + detail
                         loadTimeline();
                         loadVisits();
                     }
@@ -1817,14 +1962,20 @@
                 // re-apply an old id window to brand-new frames. Reset every id-keyed bit.
                 activeScope = null;
                 drillScope = null;
-                motionScopeSelect.value = '';
+                scopeValue = '';
+                sweepsScopeSelect.value = '';
+                tuningScopeSelect.value = '';
+                selectedOracles = new Set();
+                focusOracle = null;
+                compareCache = {};
                 viewerScope = null;
                 clearPendingSelection();
                 viewerGrid.innerHTML = '';
                 viewerTiles.clear();
                 viewerEmpty.classList.remove('hidden');
                 await loadGroups();
-                if (route === 'motion') reloadMotionView();
+                if (route === 'sweeps') reloadSweeps();
+                else if (route === 'tuning') reloadTuning();
                 await pollStats();
             } catch (err) {
                 showError(`Clear failed: ${err.message}`);
@@ -2507,8 +2658,8 @@
                 const data = await res.json();
                 groups = data.groups || [];
                 renderBucketsList();
-                renderMotionScopeSelect();
-                updateMotionScopeBadge();
+                renderScopeSelects();
+                updateScopeBadge();
             } catch (err) {
                 showError(`Failed to load buckets: ${err.message}`);
             }
@@ -2549,48 +2700,56 @@
         async function deleteBucket(groupId) {
             try {
                 clearError();
-                const wasActive = motionScopeSelect.value === String(groupId);
+                const wasActive = scopeValue === String(groupId);
                 const res = await fetch('/api/groups/' + encodeURIComponent(groupId), { method: 'DELETE' });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
+                // loadGroups → renderScopeSelects auto-resets scopeValue/activeScope to
+                // "all frames" when the selected group vanished; also clear the drill so a
+                // stale sub-window can't survive the bucket it belonged to.
+                if (wasActive) drillScope = null;
                 await loadGroups();
-                if (wasActive) {
-                    motionScopeSelect.value = '';
-                    onMotionScopeChange();
-                }
             } catch (err) {
                 showError(`Delete bucket failed: ${err.message}`);
             }
         }
 
-        // ================= MOTION view: scope picker =================
-        function renderMotionScopeSelect() {
-            const prev = motionScopeSelect.value;
-            motionScopeSelect.innerHTML = '';
-            const allOpt = document.createElement('option');
-            allOpt.value = '';
-            allOpt.textContent = 'All frames';
-            motionScopeSelect.appendChild(allOpt);
-            for (const g of groups) {
-                const opt = document.createElement('option');
-                opt.value = String(g.id);
-                opt.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames`;
-                motionScopeSelect.appendChild(opt);
+        // ================= Sweeps + Tuning: shared scope picker =================
+        // Both pages' bucket <select>s track one scopeValue; renderScopeSelects repopulates
+        // BOTH from the current groups and mirrors the shared value into each.
+        function renderScopeSelects() {
+            // Drop a selection whose group was deleted (also clears its drill sub-window).
+            if (scopeValue && !groups.some(g => String(g.id) === scopeValue)) {
+                scopeValue = '';
+                drillScope = null;
             }
-            motionScopeSelect.value = [...motionScopeSelect.options].some(o => o.value === prev) ? prev : '';
+            for (const sel of [sweepsScopeSelect, tuningScopeSelect]) {
+                sel.innerHTML = '';
+                const allOpt = document.createElement('option');
+                allOpt.value = '';
+                allOpt.textContent = 'All frames';
+                sel.appendChild(allOpt);
+                for (const g of groups) {
+                    const opt = document.createElement('option');
+                    opt.value = String(g.id);
+                    opt.textContent = `${g.name} · ${formatSpan(g.start_ts, g.end_ts)} · ${g.count} frames`;
+                    sel.appendChild(opt);
+                }
+                sel.value = scopeValue;
+            }
             // Keep activeScope consistent with the (possibly reset) selection.
-            const g = motionScopeSelect.value ? groups.find(x => String(x.id) === motionScopeSelect.value) : null;
+            const g = scopeValue ? groups.find(x => String(x.id) === scopeValue) : null;
             activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
         }
 
-        function updateMotionScopeBadge() {
+        function updateScopeBadge() {
             let label = 'All frames';
             if (activeScope) {
-                const g = groups.find(x => String(x.id) === motionScopeSelect.value);
+                const g = groups.find(x => String(x.id) === scopeValue);
                 label = g ? g.name : `ids ${activeScope.since_id}–${activeScope.until_id}`;
             }
             const text = `Scope: ${label}`;
-            motionScopeBadge.textContent = text;
-            motionScopeBadge.classList.toggle('warn', !!activeScope);
+            sweepsScopeBadge.textContent = text;
+            sweepsScopeBadge.classList.toggle('warn', !!activeScope);
             tuningScopeBadgeEl.textContent = text;
             tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
         }
@@ -2600,32 +2759,279 @@
             return w ? { since_id: w.since_id, until_id: w.until_id } : { since_id: null, until_id: null };
         }
 
-        function onMotionScopeChange() {
-            const val = motionScopeSelect.value;
+        // Changing EITHER bucket selector updates the shared scope, mirrors to the other,
+        // and resets the Tuning-only drill window (so entering Tuning after a Sweeps-side
+        // change can't show a drill window outside the new bucket), then reloads the page
+        // the change was made on.
+        function onScopeChange(val) {
+            scopeValue = val;
+            sweepsScopeSelect.value = val;
+            tuningScopeSelect.value = val;
             const g = val ? groups.find(x => String(x.id) === val) : null;
             activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
             drillScope = null;
             timelineResetBtn.classList.add('hidden');
-            updateMotionScopeBadge();
-            reloadMotionView();
+            updateScopeBadge();
+            if (route === 'sweeps') reloadSweeps();
+            else if (route === 'tuning') reloadTuning();
         }
-        motionScopeSelect.addEventListener('change', onMotionScopeChange);
+        sweepsScopeSelect.addEventListener('change', () => onScopeChange(sweepsScopeSelect.value));
+        tuningScopeSelect.addEventListener('change', () => onScopeChange(tuningScopeSelect.value));
 
-        motionOracleSelect.addEventListener('change', () => {
-            loadTimeline();
-            loadVisits();
-            loadTuningCompare();
-        });
-
-        function reloadMotionView() {
-            updateMotionScopeBadge();
+        // Sweeps = produce verdicts: coverage rows + the queue panel.
+        function reloadSweeps() {
+            updateScopeBadge();
             loadCoverage();
-            loadTimeline();
-            loadVisits();
-            loadTuningCompare();
+            renderQueuePanel(analysisStatus);
         }
 
-        // ================= MOTION view: coverage + enqueue =================
+        // Tuning = evaluate the gate: rebuild the oracle chooser from this bucket's
+        // coverage (reset selection/focus), then the matrix + focus detail + timeline +
+        // inbox. Coverage must resolve before the matrix (it reads selectedOracles).
+        function reloadTuning() {
+            updateScopeBadge();
+            loadTuningCoverage(true).then(() => {
+                renderScorecardMatrix(true);   // fresh: bucket changed → refetch, also renders detail
+                loadTimeline();
+                loadVisits();
+            });
+        }
+
+        // ================= Tuning: oracle chooser =================
+        // The valid fallback oracle id for the timeline/inbox/compare requests, which all
+        // 400 on an empty/unknown oracle — used when no focus is set (a fresh, unswept
+        // bucket). ANALYZERS[0].id ('yolo') is always a registered id, so density still
+        // renders (its overlays just come back empty).
+        function focusOracleParam() {
+            return focusOracle || ANALYZERS[0].id;
+        }
+        function firstCheckedOracle() {
+            return ANALYZERS.map(a => a.id).find(id => selectedOracles.has(id)) || null;
+        }
+
+        // Fetch this bucket's per-oracle coverage and refresh the chooser. reset=true
+        // (bucket change / route enter) recomputes the selection; reset=false (poll)
+        // preserves it and only updates enable state + readouts.
+        async function loadTuningCoverage(reset) {
+            const scope = activeScope;
+            const params = new URLSearchParams();
+            if (scope) {
+                if (scope.since_id != null) params.set('since_id', String(scope.since_id));
+                if (scope.until_id != null) params.set('until_id', String(scope.until_id));
+            }
+            try {
+                const res = await fetch('/api/analysis/coverage?' + params.toString());
+                if (!res.ok) return;
+                updateOracleChooser(await res.json(), reset);
+            } catch (err) { /* keep the last chooser state on a transient failure */ }
+        }
+
+        function updateOracleChooser(coverage, reset) {
+            const total = (coverage && typeof coverage.total === 'number') ? coverage.total : '—';
+            const oracles = (coverage && coverage.oracles) || {};
+            if (reset) {
+                // Check every oracle the bucket has verdicts for; focus the first checked
+                // (ANALYZERS order). A fresh unswept bucket → empty set / null focus — the
+                // EXPECTED state, not an error.
+                selectedOracles = new Set();
+                for (const a of ANALYZERS) {
+                    const s = oracles[a.id] || { analyzed: 0, present: 0 };
+                    if (s.analyzed > 0) selectedOracles.add(a.id);
+                }
+                focusOracle = firstCheckedOracle();
+            } else {
+                // Preserve the user's selection; only drop an oracle that lost its data
+                // (e.g. a re-analyze cleared it), promoting focus if it was the focus.
+                for (const a of ANALYZERS) {
+                    const s = oracles[a.id] || { analyzed: 0, present: 0 };
+                    if (s.analyzed === 0 && selectedOracles.has(a.id)) selectedOracles.delete(a.id);
+                }
+                if (focusOracle && !selectedOracles.has(focusOracle)) focusOracle = firstCheckedOracle();
+            }
+            for (const a of ANALYZERS) {
+                const s = oracles[a.id] || { analyzed: 0, present: 0 };
+                const disabled = s.analyzed === 0;
+                const readout = document.getElementById('chooser-cov-' + a.id);
+                const cb = document.getElementById('chooser-cb-' + a.id);
+                const radio = document.getElementById('chooser-focus-' + a.id);
+                let text = `${s.analyzed}/${total} analyzed · ${s.present} present`;
+                if (disabled) text += ' · no data here';
+                else if (s.present === 0) text += ' · sees no subjects here';
+                readout.textContent = text;
+                readout.classList.toggle('no-subjects', !disabled && s.present === 0);
+                cb.disabled = disabled;
+                cb.checked = selectedOracles.has(a.id);
+                // Focus radio is only selectable within the checked set.
+                radio.disabled = !selectedOracles.has(a.id);
+                radio.checked = focusOracle === a.id;
+            }
+        }
+
+        // Reflect selectedOracles/focusOracle onto the checkbox/radio inputs without
+        // touching the coverage readouts (used after a live toggle, not a coverage fetch).
+        function syncOracleInputs() {
+            for (const a of ANALYZERS) {
+                const cb = document.getElementById('chooser-cb-' + a.id);
+                const radio = document.getElementById('chooser-focus-' + a.id);
+                if (cb) cb.checked = selectedOracles.has(a.id);
+                if (radio) {
+                    radio.disabled = !selectedOracles.has(a.id);
+                    radio.checked = focusOracle === a.id;
+                }
+            }
+        }
+
+        // Toggling a checkbox re-runs the matrix live. Checking with no focus set promotes
+        // the new one to focus; unchecking the focus promotes the next checked (null if it
+        // was the last) — a focus change also reloads the drill views + detail cards.
+        function onOracleToggle(id, checked) {
+            const prevFocus = focusOracle;
+            if (checked) {
+                selectedOracles.add(id);
+                if (focusOracle === null) focusOracle = id;
+            } else {
+                selectedOracles.delete(id);
+                if (focusOracle === id) focusOracle = firstCheckedOracle();
+            }
+            syncOracleInputs();
+            renderScorecardMatrix();
+            if (focusOracle !== prevFocus) { loadTimeline(); loadVisits(); }
+        }
+
+        // Changing the focus radio reloads the timeline, inbox, and focus detail cards.
+        function onFocusChange(id) {
+            if (!selectedOracles.has(id)) return;   // radio is disabled off-set; guard anyway
+            focusOracle = id;
+            syncOracleInputs();
+            loadTimeline();
+            loadVisits();
+            renderFocusDetail();   // detail cards follow focus, from the cached compare
+        }
+
+        // ================= Tuning: comparison matrix =================
+        // Fan out /api/tuning/compare per checked oracle (scoped to activeScope), build the
+        // visit-recall matrix, and render the focus oracle's detail cards from the same
+        // responses. allSettled — a failed column shows an error cell, never blanks the matrix.
+        // Only oracles not already in compareCache are fetched, so a checkbox/focus toggle
+        // reuses prior columns instead of re-running the gate for every column; the fresh-data
+        // callers (bucket change, job-complete, Refresh) pass refresh=true to force a re-fetch.
+        async function renderScorecardMatrix(refresh = false) {
+            if (refresh) compareCache = {};
+            const oracles = ANALYZERS.filter(a => selectedOracles.has(a.id));
+            if (!oracles.length) {
+                compareCache = {};
+                tuningMatrixEl.innerHTML =
+                    '<div class="matrix-empty">Check an oracle above to compare — sweep one first on the Sweeps page if none have data.</div>';
+                renderFocusDetail();   // → the detail empty state
+                return;
+            }
+            const missing = oracles.filter(a => !(a.id in compareCache));
+            const seq = ++matrixSeq;
+            const errors = {};
+            if (missing.length) {
+                const settled = await Promise.allSettled(missing.map(a => loadCompareFor(a.id)));
+                if (seq !== matrixSeq) return;   // a newer fan-out superseded this one
+                missing.forEach((a, i) => {
+                    const r = settled[i];
+                    if (r.status === 'fulfilled') compareCache[a.id] = r.value;
+                    else errors[a.id] = r.reason;   // not cached → retried on the next render
+                });
+            }
+            const byOracle = {};
+            for (const a of oracles) {
+                byOracle[a.id] = (a.id in compareCache)
+                    ? { ok: true, data: compareCache[a.id] }
+                    : { ok: false, err: errors[a.id] || new Error('compare failed') };
+            }
+            renderMatrixTable(oracles, byOracle);
+            renderFocusDetail();
+        }
+
+        async function loadCompareFor(oracle) {
+            const params = new URLSearchParams({ oracle });
+            if (activeScope) {
+                if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
+                if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
+            }
+            const res = await fetch('/api/tuning/compare?' + params.toString());
+            if (!res.ok) throw new Error(await errorFromResponse(res));
+            return res.json();
+        }
+
+        // A scorecard's visit-recall cell: "not yet run" for an unrun slot (needs_rerun),
+        // the caught/total percentage otherwise, "—" when there are no visits to score.
+        function visitRecallText(sc) {
+            if (!sc) return '—';
+            if (sc.needs_rerun) return 'not yet run';
+            const v = sc.visits || {};
+            if (typeof v.total === 'number' && v.total > 0 && typeof v.caught === 'number') {
+                return formatPct(v.caught / v.total);
+            }
+            return '—';
+        }
+
+        function renderMatrixTable(oracles, byOracle) {
+            tuningMatrixEl.innerHTML = '';
+            const table = document.createElement('table');
+            table.className = 'matrix-table';
+
+            const thead = document.createElement('thead');
+            const htr = document.createElement('tr');
+            const corner = document.createElement('th');
+            corner.textContent = 'Visit recall';
+            htr.appendChild(corner);
+            for (const a of oracles) {
+                const th = document.createElement('th');
+                th.textContent = a.label;
+                htr.appendChild(th);
+            }
+            thead.appendChild(htr);
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            for (const [key, label] of [['live', 'Live'], ['baseline', 'Baseline'], ['candidate', 'Candidate']]) {
+                const tr = document.createElement('tr');
+                const rh = document.createElement('th');
+                rh.textContent = label;
+                tr.appendChild(rh);
+                for (const a of oracles) {
+                    const td = document.createElement('td');
+                    const entry = byOracle[a.id];
+                    if (!entry.ok) {
+                        td.textContent = 'error';
+                        td.className = 'matrix-error';
+                        td.title = entry.err && entry.err.message ? entry.err.message : 'compare failed';
+                    } else {
+                        const sc = entry.data[key];
+                        const text = visitRecallText(sc);
+                        td.textContent = text;
+                        td.className = (text === 'not yet run' || text === '—') ? 'matrix-pending' : 'matrix-recall';
+                    }
+                    tr.appendChild(td);
+                }
+                tbody.appendChild(tr);
+            }
+            table.appendChild(tbody);
+            tuningMatrixEl.appendChild(table);
+        }
+
+        // Detail cards: the full Live/Baseline/Candidate breakdown for the FOCUS oracle
+        // only, reusing the focus oracle's already-fetched compare response.
+        function renderFocusDetail() {
+            const data = focusOracle ? compareCache[focusOracle] : null;
+            if (!data) {
+                tuningCompareEmptyEl.classList.remove('hidden');
+                tuningCardsEl.innerHTML = '';
+                tuningFidelityEl.textContent = '';
+                tuningDeltasEl.textContent = '';
+                tuningWarmupNoteEl.textContent = '';
+                tuningCopyRowEl.classList.add('hidden');
+                return;
+            }
+            renderTuningCompare(data);
+        }
+
+        // ================= Sweeps: coverage + enqueue =================
         // Coverage is scoped to activeScope (the picked bucket) — the SAME window enqueue
         // sweeps — so "X/N analyzed" reflects what a sweep will actually cover, not the
         // whole store. Fetched from /api/analysis/coverage (total = frames in the window).
@@ -2658,7 +3064,7 @@
         // is explicit whether a job runs over the picked bucket or the whole store.
         function motionScopeText() {
             if (!activeScope) return 'the whole store';
-            const g = groups.find(x => String(x.id) === motionScopeSelect.value);
+            const g = groups.find(x => String(x.id) === scopeValue);
             return g ? `bucket "${g.name}"` : `ids ${activeScope.since_id}–${activeScope.until_id}`;
         }
 
@@ -2824,7 +3230,7 @@
         // ================= MOTION view: density timeline =================
         async function loadTimeline() {
             const win = effectiveWindow();
-            const oracle = motionOracleSelect.value;
+            const oracle = focusOracleParam();
             const bins = Math.max(1, parseInt(timelineBinsEl.value, 10) || 120);
             timelineScopeBadge.textContent = `Window: ${windowLabel(win.since_id, win.until_id)}${drillScope ? ' (drilled)' : ''}`;
             try {
@@ -2919,7 +3325,7 @@
 
         async function loadVisits() {
             const win = effectiveWindow();
-            const oracle = motionOracleSelect.value;
+            const oracle = focusOracleParam();
             try {
                 const params = new URLSearchParams({ oracle, mode: inboxMode });
                 addBounds(params, win.since_id, win.until_id);
@@ -3045,9 +3451,9 @@
         inboxPrevBtn.addEventListener('click', () => moveVisit(-1));
         inboxNextBtn.addEventListener('click', () => moveVisit(1));
 
-        // Keyboard-first navigation, only on the Motion view and never while typing.
+        // Keyboard-first navigation, only on the Tuning view and never while typing.
         document.addEventListener('keydown', (e) => {
-            if (route !== 'motion') return;
+            if (route !== 'tuning') return;
             const tag = (e.target && e.target.tagName) || '';
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
             if (e.key === 'ArrowRight' || e.key === 'j') { moveVisit(1); e.preventDefault(); }
@@ -3136,7 +3542,9 @@
         }
         tuningRunBaselineBtn.addEventListener('click', () => runTuning('baseline'));
         tuningRunCandidateBtn.addEventListener('click', () => runTuning('candidate'));
-        tuningRefreshBtn.addEventListener('click', () => loadTuningCompare());
+        // Manual re-fetch: force a fresh matrix fan-out (which also re-renders the focus
+        // detail cards from the fresh responses).
+        tuningRefreshBtn.addEventListener('click', () => renderScorecardMatrix(true));
 
         function updateTuningStatusBadges(status) {
             // With the walk-away queue, enqueuing more work while a job runs is allowed,
@@ -3275,23 +3683,6 @@
                 tuningCopyRowEl.classList.add('hidden');
             }
         }
-        async function loadTuningCompare() {
-            try {
-                clearTuningError();
-                const oracle = motionOracleSelect.value;
-                const params = new URLSearchParams({ oracle });
-                if (activeScope) {
-                    if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
-                    if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
-                }
-                const res = await fetch('/api/tuning/compare?' + params.toString());
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const data = await res.json();
-                renderTuningCompare(data);
-            } catch (err) {
-                showTuningError(`Compare failed: ${err.message}`);
-            }
-        }
         tuningCopyBtn.addEventListener('click', async () => {
             try {
                 await navigator.clipboard.writeText(tuningCopyTextEl.value);
@@ -3305,9 +3696,9 @@
 
         // ================= init =================
         window.addEventListener('load', () => {
-            buildOracleSelect();
             buildTimeOptions();
             buildCoverageRows();
+            buildOracleChooser();
             setInboxMode('missed');
             pollStats();
             pollAnalysisStatus();

@@ -1,3 +1,5 @@
+- [x] Density timeline, Visit inbox and MOG2 Tuning, would it make sense to have a oracle check list on which to include? Lets say I have tested out 3 oracles, but find out that one of them is really bad, then I dont want the stats and the drill down to be poluted. Maybe we should have two pages, 1) Queue oracles and MOG2 base line and canidates. 2) For diving into the stats. On this one I select bucket (or all??) and can multi select between the oracles that the bucket have data on?
+
 - [ ] BSUV performance?
 - [ ] Bad UI in bucket, see screenshots
 - [ ] Edge errors and pictures with artifacts

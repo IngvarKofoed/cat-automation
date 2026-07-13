@@ -310,3 +310,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `store._SCORECARD_ORACLES` was a hardcoded second copy of the names that 500'd
     `/api/tuning/compare` for any newly registered oracle; it now derives from `ANALYZER_NAMES`.
 
+55. Motion workbench split into two hash-routed pages: #sweeps (oracle sweeps + job queue) and
+    #tuning (MOG2 tuning + timeline + inbox); #motion redirects to #sweeps.
+    On Tuning, a coverage-driven multi-select drives a visit-recall matrix comparing the gate
+    against multiple trusted oracles side-by-side (client-side fan-out, no backend change).
+    Bucket scope mirrors across both pages. Separates producing oracle verdicts from evaluating
+    the gate, enabling the YOLO vs YOLO-serial vs BSUV comparison (entry 54).
+

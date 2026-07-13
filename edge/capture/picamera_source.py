@@ -159,11 +159,29 @@ class PicameraCaptureSource(CaptureSource):
         from picamera2 import Picamera2  # lazy: Pi-only dependency
 
         cam = Picamera2(self._index)
+        # A VIDEO configuration for the continuous grab loop — NOT a still one.
+        # create_still_configuration allocates a SINGLE full-resolution buffer
+        # (stills are one-shot), so reading it in a ~5 fps loop starves the
+        # pipeline and libcamera hands back half-filled buffers: the green
+        # stripes / purple frames seen on the Module 3. A video config with
+        # several buffers keeps whole frames flowing.
+        #   * buffer_count=4 — enough queue depth that a grab never races the
+        #     sensor's DMA into the buffer it's handing us.
+        #   * size 2304x1296 — the IMX708's 2x2-binned full-FoV mode: far less
+        #     than the 4608x2592 full-res still default (which a ~640x480 door
+        #     ROI never needs), lighter on the Pi, and lower-noise at night.
+        #     Any CSI camera without this exact mode gets the nearest one
+        #     ISP-scaled; the clip is normalized, so resolution is transparent
+        #     downstream. It may also quiet the "PDAF data in unsupported
+        #     format" log spam, which rides the full-res mode.
         # Picamera2's format naming is inverted vs. the numpy byte order: asking
         # for "RGB888" yields a BGR-ordered array, which is exactly what cv2 and
         # the CaptureSource contract expect. If the preview colors look swapped
         # on your Pi, switch this one string to "BGR888".
-        cam.configure(cam.create_still_configuration(main={"format": "RGB888"}))
+        cam.configure(cam.create_video_configuration(
+            main={"size": (2304, 1296), "format": "RGB888"},
+            buffer_count=4,
+        ))
         cam.start()
         self._cam = cam
         # Apply the desired focus now that the camera is running (the default

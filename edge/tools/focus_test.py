@@ -58,8 +58,8 @@ def main() -> int:
     from picamera2 import Picamera2
 
     picam = Picamera2(args.camera)
-    # A light preview configuration (not the edge's full-res still config): fast,
-    # and manual LensPosition applies the same way on any configuration.
+    # A light preview configuration (independent of the edge's capture config):
+    # fast, and manual LensPosition applies the same way on any configuration.
     picam.configure(picam.create_preview_configuration(main={"size": (1280, 720)}))
     picam.start()
     time.sleep(1.0)

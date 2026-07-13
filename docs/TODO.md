@@ -1,7 +1,11 @@
-- [ ] Activity page, for now motion only, later we would add cat names etc. Bundle "events" and show iamges like a "video"
+- [ ] BSUV performance?
+- [ ] Bad UI in bucket, see screenshots
+- [ ] Edge errors and pictures with artifacts
+- [ ] Edge, show temperature? 
 
+- [x] Activity page, for now motion only, later we would add cat names etc. Bundle "events" and show iamges like a "video"
 - [x] Select all when creating buckets
-- [ ] Better UI in generel. Things are jumping around because of size and visiblity changes.
+- [x] Better UI in generel. Things are jumping around because of size and visiblity changes.
 
 
 [62:22:16.835345982] [5683] ERROR IPARPI cam_helper_imx708.cpp:262 PDAF data in unsupported format

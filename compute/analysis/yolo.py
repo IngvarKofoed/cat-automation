@@ -72,6 +72,14 @@ class YoloAnalyzer:
     the frames lacking a verdict (see ``Store.iter_unanalyzed``), making a sweep
     cheaply resumable. Construction takes optional overrides purely for tests
     (e.g. a tiny weights file); production callers rely on the env vars above.
+
+    The ``serial`` flag selects a second, name-distinct persona (``"yolo-serial"``):
+    identical model + params, but it predicts one BARE frame at a time — the
+    pre-batching call shape ``model.predict(image, …)`` — instead of a batched
+    list. It exists ONLY as an A/B baseline for the batched default: sweep both
+    over the same frames and a scorecard shows whether the batched path ever moves
+    a verdict. Because it writes under its own name, its verdicts land in their own
+    ``analysis`` rows and never overwrite the real ``"yolo"`` oracle's.
     """
 
     name = "yolo"
@@ -84,7 +92,13 @@ class YoloAnalyzer:
         conf: "float | None" = None,
         half: "bool | None" = None,
         batch_size: "int | None" = None,
+        serial: bool = False,
     ) -> None:
+        # ``serial`` picks the pre-optimization call shape (one bare-image predict
+        # per frame) and a distinct name, so it is a clean A/B counterpart to the
+        # batched default sharing every other setting. See the class docstring.
+        self._serial = bool(serial)
+        self.name = "yolo-serial" if self._serial else "yolo"
         # Explicit arg wins, then the env var, then the recall-first default —
         # the same precedence EdgeClient uses for its base URL.
         self._weights = weights if weights is not None else os.environ.get(_ENV_WEIGHTS, _DEFAULT_WEIGHTS)
@@ -98,8 +112,13 @@ class YoloAnalyzer:
             raw_half = os.environ.get(_ENV_HALF)
             self._half = _DEFAULT_HALF if raw_half is None else raw_half.strip().lower() in ("1", "true")
         # Batch size the runner reads to size its batches + prefetch queue; clamp
-        # to >= 1 so a stray 0/negative can't break the queue bound.
-        self.batch_size = max(1, int(batch_size if batch_size is not None else os.environ.get(_ENV_BATCH, _DEFAULT_BATCH)))
+        # to >= 1 so a stray 0/negative can't break the queue bound. The serial
+        # variant pins it to 1: it never makes a batched GPU call, so one frame per
+        # flush keeps its runner path a faithful one-at-a-time reproduction.
+        if self._serial:
+            self.batch_size = 1
+        else:
+            self.batch_size = max(1, int(batch_size if batch_size is not None else os.environ.get(_ENV_BATCH, _DEFAULT_BATCH)))
         # Populated by prepare(); analyze()/analyze_batch() before prepare() is a
         # caller bug, not a runtime condition to design around, so it fails loud.
         self._model = None
@@ -157,19 +176,17 @@ class YoloAnalyzer:
 
         self._model = YOLO(self._weights)
 
-    def _predict(self, images: "list"):
-        """The single model-call site: one predict over a list of BGR frames.
+    def _predict_kwargs(self) -> dict:
+        """The inference params shared by the batched and serial call sites.
 
-        Both ``analyze()`` and ``analyze_batch()`` route through here, so the
-        ``half`` regime (and every other inference param) is identical whether the
-        runner batches frames or a failed batch's per-image retry runs them one at a
-        time — an FP16 batch can never silently retry in FP32. Restricts detection to
-        the COCO 'cat' class up front
+        Single-sourced so the batched (``_predict``) and serial (``_predict_one``)
+        paths can differ ONLY in call shape — a list vs a bare image — and never
+        drift in imgsz / conf / class-filter / device / half. That invariant is what
+        lets the ``yolo`` vs ``yolo-serial`` A/B attribute any verdict difference to
+        batching alone. Restricts detection to the COCO 'cat' class up front
         (``classes=``) so the model does the minimum work this oracle needs.
-        Ultralytics returns one ``Results`` per input image, in order.
         """
-        return self._model.predict(
-            images,
+        return dict(
             imgsz=self._imgsz,
             conf=self._conf,
             classes=[_COCO_CAT_CLASS_ID],
@@ -177,6 +194,27 @@ class YoloAnalyzer:
             half=self._half,
             verbose=False,
         )
+
+    def _predict(self, images: "list"):
+        """One batched predict over a LIST of BGR frames — the default fast path.
+
+        Both ``analyze()`` and the batched ``analyze_batch()`` route through here, so
+        the ``half`` regime (and every other inference param) is identical whether the
+        runner batches frames or a failed batch's per-image retry runs them one at a
+        time — an FP16 batch can never silently retry in FP32. Ultralytics returns one
+        ``Results`` per input image, in order.
+        """
+        return self._model.predict(images, **self._predict_kwargs())
+
+    def _predict_one(self, image):
+        """One predict over a BARE single frame — the PRE-optimization call shape.
+
+        The serial variant's model-call site: ``model.predict(image, …)`` with a lone
+        ndarray, exactly as ``analyze`` did before the batched sweep landed, so
+        ``"yolo-serial"`` reproduces the old path bit-for-bit rather than as a batch
+        of one. Returns the single ``Results``.
+        """
+        return self._model.predict(image, **self._predict_kwargs())[0]
 
     def _result_from(self, result) -> AnalysisResult:
         """Reduce one ultralytics ``Results`` to the uniform cat-present verdict.
@@ -202,10 +240,15 @@ class YoloAnalyzer:
         The batched contract the runner's stateless sweep drives — semantically
         identical to calling ``analyze()`` on each frame, just in one GPU call.
         The pre-``prepare()`` guard lives here (not only in ``analyze()``) because
-        this is the shared entry both paths funnel through.
+        this is the shared entry both paths funnel through. In the ``serial`` variant
+        this deliberately does NOT batch: it predicts each frame as a bare image (the
+        old call shape), so ``"yolo-serial"`` stays a faithful one-at-a-time baseline
+        even when the runner hands it more than one frame.
         """
         if self._model is None:
             raise RuntimeError("YoloAnalyzer.analyze_batch() called before prepare()")
+        if self._serial:
+            return [self._result_from(self._predict_one(im)) for im in images]
         return [self._result_from(r) for r in self._predict(images)]
 
     def analyze(self, image: "np.ndarray") -> AnalysisResult:

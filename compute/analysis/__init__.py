@@ -33,7 +33,13 @@ if TYPE_CHECKING:
 # BSUV = deep background subtraction ("is there foreground?"). Adding a third oracle is
 # a new name here + a new branch in ``get_analyzer`` + a new backend module — no schema
 # migration, because verdicts are just new rows in the shared ``analysis`` table.
-ANALYZER_NAMES = ("yolo", "bsuv")
+#
+# ``yolo-serial`` is NOT a new detector: it is the SAME YOLO backend in its serial
+# (pre-batching) call shape, registered as a distinct oracle so its verdicts sit in
+# their own ``analysis`` rows. It exists to A/B the batched sweep — sweep both over the
+# same frames, then compare each against MOG2 in the scorecard — so a "did batching move
+# a verdict?" question is answerable in the existing UI instead of by argument.
+ANALYZER_NAMES = ("yolo", "yolo-serial", "bsuv")
 
 
 def get_analyzer(name: str) -> "Analyzer":
@@ -51,6 +57,11 @@ def get_analyzer(name: str) -> "Analyzer":
         from compute.analysis.yolo import YoloAnalyzer
 
         return YoloAnalyzer()
+    if name == "yolo-serial":
+        from compute.analysis.yolo import YoloAnalyzer
+
+        # Same backend, serial (bare-per-frame) call shape; its own name → own rows.
+        return YoloAnalyzer(serial=True)
     if name == "bsuv":
         from compute.analysis.bsuv import BsuvAnalyzer
 

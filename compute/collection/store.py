@@ -30,6 +30,8 @@ import threading
 import time
 from datetime import datetime
 
+from compute.analysis import ANALYZER_NAMES  # import-light registry (no ML); single source of oracle ids
+
 # Oldest-first eviction batch size: eviction selects and deletes rows in chunks
 # rather than one round-trip per row, so freeing space after a burst stays cheap.
 _EVICT_BATCH = 64
@@ -58,8 +60,11 @@ _NO_SCORE = object()
 
 # Oracles gate_scorecard scores a motion source against — the ground-truth
 # analyzers (see the motion-gate-oracles layer). A `source` is either the live
-# gate ("live") or an analysis slot name (e.g. "mog2:candidate").
-_SCORECARD_ORACLES = ("yolo", "bsuv")
+# gate ("live") or an analysis slot name (e.g. "mog2:candidate"). Derived from the
+# registry's ANALYZER_NAMES — the single source of truth — so a newly registered
+# oracle (e.g. "yolo-serial") is scoreable without a second list to keep in sync;
+# hardcoding these once let a new oracle 500 the scorecard endpoint.
+_SCORECARD_ORACLES = ANALYZER_NAMES
 
 # Visit clustering (gate_scorecard): consecutive oracle-present frames whose
 # recv_ts gap is within _VISIT_GAP_MS belong to the same visit; a visit counts

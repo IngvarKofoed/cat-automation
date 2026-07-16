@@ -629,6 +629,68 @@
             border: 3px solid var(--color-status-rep);
             background: var(--color-surface-2);
         }
+        /* Annotation rep stage: the full frame (with the detection box overlaid) beside
+           the tight crop — top-down scene context + scale next to the dorsal detail. */
+        .annotate-rep-pair {
+            display: flex;
+            gap: var(--space-3);
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+        }
+        /* The full-frame wrapper is given the image's EXACT aspect ratio (from its natural
+           dimensions, set in JS), with a fixed height — so its box always matches the
+           rendered image with no letterbox. That is what lets the percentage-positioned
+           .annotate-bbox overlay track the image pixels precisely. `aspect-ratio: 4/3` is
+           only the pre-load default, overwritten once the frame's real dimensions load. */
+        .annotate-fullframe {
+            position: relative;
+            height: 360px;
+            max-width: 58%;
+            aspect-ratio: 4 / 3;
+            flex: 0 1 auto;
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            border: 1px solid var(--color-border);
+            background: var(--color-surface-2);
+        }
+        /* Beat the `#annotateRep img` rule (id specificity). The full frame fills its
+           aspect-correct wrapper (no distortion — the box matches the image aspect); the
+           crop sizes to content under its own caps. */
+        #annotateRep .annotate-rep-pair .annotate-fullframe img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            max-width: none;
+            max-height: none;
+            /* contain, not fill: once JS matches the wrapper's aspect to the image there is
+               no letterbox so the two are identical, but BEFORE that (the 4/3 default) contain
+               keeps the frame undistorted rather than briefly stretched. The overlay stays
+               hidden until the aspect is corrected, so it never shows against a wrong box. */
+            object-fit: contain;
+            border: none;
+            border-radius: 0;
+        }
+        #annotateRep .annotate-rep-pair .annotate-rep-crop {
+            display: block;
+            width: auto;
+            height: auto;
+            max-height: 360px;
+            max-width: 40%;
+            object-fit: initial;
+            border: 3px solid var(--color-status-rep);
+            border-radius: var(--radius-md);
+            flex: 0 1 auto;
+        }
+        .annotate-bbox {
+            position: absolute;
+            box-sizing: border-box;
+            border: 2px solid var(--color-accent);
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+            pointer-events: none;
+        }
         .inbox-meta {
             font-size: 13px;
             color: var(--color-text-muted);
@@ -4181,6 +4243,54 @@
         function cropUrl(frameId, bbox) {
             return `/api/label/crop/${frameId}?box=${encodeURIComponent(bboxToParam(bbox))}`;
         }
+
+        // The rep stage: the full frame with the detection box drawn on it, beside the
+        // tight crop. Both come from the SAME stored frame + bbox the crop endpoint uses —
+        // full frame is /media/{id}, the box is positioned as a percentage of the frame's
+        // natural dimensions (bbox is in the stored JPEG's pixel space), so it tracks the
+        // image at any rendered size with no server work. Shared by Queue + Labelled modes.
+        function annotateRepStage(rep) {
+            const pair = document.createElement('div');
+            pair.className = 'annotate-rep-pair';
+
+            const fig = document.createElement('div');
+            fig.className = 'annotate-fullframe';
+            const full = document.createElement('img');
+            full.src = `/media/${rep.id}`;
+            full.alt = 'Full frame';
+            fig.appendChild(full);
+
+            const bb = Array.isArray(rep.bbox) && rep.bbox.length === 4 ? rep.bbox : null;
+            if (bb) {
+                const box = document.createElement('div');
+                box.className = 'annotate-bbox';
+                box.style.display = 'none';  // revealed once natural dimensions are known
+                const place = () => {
+                    const nw = full.naturalWidth, nh = full.naturalHeight;
+                    if (!nw || !nh) return;
+                    // Match the wrapper to the frame's true aspect so it can't letterbox —
+                    // then the percentage box below lands exactly on the image pixels.
+                    fig.style.aspectRatio = `${nw} / ${nh}`;
+                    const [x1, y1, x2, y2] = bb;
+                    box.style.left = (x1 / nw * 100) + '%';
+                    box.style.top = (y1 / nh * 100) + '%';
+                    box.style.width = ((x2 - x1) / nw * 100) + '%';
+                    box.style.height = ((y2 - y1) / nh * 100) + '%';
+                    box.style.display = '';
+                };
+                if (full.complete && full.naturalWidth) place();
+                else full.addEventListener('load', place);
+                fig.appendChild(box);
+            }
+            pair.appendChild(fig);
+
+            const crop = document.createElement('img');
+            crop.className = 'annotate-rep-crop';
+            crop.src = cropUrl(rep.id, rep.bbox);
+            crop.alt = 'Crop';
+            pair.appendChild(crop);
+            return pair;
+        }
         // Seed a per-crop quality from box area (relative to the visit's peak) and the
         // detector score. A full, confident view seeds `gallery`; a small/low-conf edge
         // crop seeds `poor`; the owner adjusts by eye before committing.
@@ -4259,15 +4369,11 @@
                 v._states = annFrameStates;
             }
 
-            // Rep crop = the peak-area frame (fullest view), independent of order.
+            // Rep = the peak-area frame (fullest view), independent of order — shown as the
+            // full frame (box overlaid) beside its crop.
             const rep = frames.find(f => f.id === v.rep_frame_id) || frames[0];
             annotateRepEl.innerHTML = '';
-            if (rep) {
-                const img = document.createElement('img');
-                img.src = cropUrl(rep.id, rep.bbox);
-                img.alt = 'Representative crop';
-                annotateRepEl.appendChild(img);
-            }
+            if (rep) annotateRepEl.appendChild(annotateRepStage(rep));
 
             const t0 = frames.length ? frames[0].recv_ts : null;
             const t1 = frames.length ? frames[frames.length - 1].recv_ts : null;
@@ -4445,12 +4551,7 @@
             const frames = (v.frames || []).slice().sort((a, b) => a.recv_ts - b.recv_ts);
             const rep = frames.find(f => f.id === v.rep_frame_id) || frames[0];
             annotateRepEl.innerHTML = '';
-            if (rep) {
-                const img = document.createElement('img');
-                img.src = cropUrl(rep.id, rep.bbox);
-                img.alt = 'Labelled crop';
-                annotateRepEl.appendChild(img);
-            }
+            if (rep) annotateRepEl.appendChild(annotateRepStage(rep));
 
             const t0 = frames.length ? frames[0].recv_ts : null;
             const t1 = frames.length ? frames[frames.length - 1].recv_ts : null;

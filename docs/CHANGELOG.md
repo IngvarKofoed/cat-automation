@@ -358,3 +358,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `TrainingManager` (own queue, separate from the sweep `AnalysisManager`), with a gallery/ok/poor A/B and the
     report in-page; runs persist to a durable `feasibility_runs` table. The probe pipeline moved to
     `compute/identification/probe.py` (CLI now a thin wrapper). Build/promote deferred. Spec: docs/specs/2026-07-16-training-page.md.
+
+62. Annotation tool (`#annotate`) rep stage now shows the **full frame with the detection box
+    overlaid** beside the tight crop, in both Queue and Labelled modes — top-down scene context and
+    cat scale (a resident-vs-foreign cue) alongside the dorsal-coat detail. Overlay is client-only:
+    the box is a percentage of the frame's natural dimensions (bbox is in stored-JPEG pixel space),
+    and the wrapper is pinned to the image's aspect ratio so it can't letterbox and mis-place the box.

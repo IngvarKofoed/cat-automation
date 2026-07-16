@@ -39,14 +39,15 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from compute.analysis import ANALYZER_NAMES
 from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.collection.collector import CollectorManager
-from compute.collection.store import Store
+from compute.collection.store import _QUALITIES, Store
+from compute.dataset import crops
 from shared.motion import MotionParams
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -193,6 +194,98 @@ class CollectorMotionOnlyRequest(BaseModel):
     motion_only: bool
 
 
+# The annotation tool labels the trustworthy serial-YOLO detections (see the memory
+# note that the batched ``yolo`` oracle over-detects), so the queue defaults to it.
+_LABEL_DEFAULT_ORACLE = "yolo-serial"
+# The three label decisions, which are ALSO the ``dataset_items.label_kind`` values —
+# the wire and the storage enum are the same set, so a decision maps to a label_kind
+# 1:1. Validated in the route (400) before any crop work; the store re-validates the
+# resulting ``label_kind`` as its own safety net.
+_LABEL_DECISIONS = ("identified", "unknown_cat", "not_cat")
+
+
+class CatCreateRequest(BaseModel):
+    """Body of ``POST /api/cats``: add a roster cat.
+
+    ``name`` is required and must be non-empty after stripping; a duplicate name is
+    a client error (``Store.create_cat`` raises ``ValueError`` → 400).
+    ``is_resident`` defaults False (a named neighbour/foreign cat).
+    """
+
+    name: str
+    is_resident: bool = False
+
+
+class CatUpdateRequest(BaseModel):
+    """Body of ``PATCH /api/cats/{id}``: a partial roster edit.
+
+    All three fields default ``None`` and only the ones the client actually SENT are
+    forwarded (via ``model_dump(exclude_unset=True)``), so PATCHing just ``active``
+    can't blank the name. An empty body, an empty ``name``, an unknown id, or a
+    duplicate ``name`` → ``ValueError`` → 400 (``Store.update_cat``). Retire a cat by
+    setting ``active`` False rather than deleting it, so its labels keep resolving.
+    """
+
+    name: "str | None" = None
+    is_resident: "bool | None" = None
+    active: "bool | None" = None
+
+
+class LabelFrame(BaseModel):
+    """One visit frame in a ``POST /api/label`` body: which frame, its box, its quality.
+
+    ``bbox`` is ``[x1,y1,x2,y2]`` in the stored JPEG's pixel space (what the crop is
+    cut to; ``None``/absent for a ``not_cat`` frame, which stores no crop).
+    ``quality`` is the per-crop signal (``gallery``/``ok``/``poor``, or ``None``);
+    the store validates it, so a bad value surfaces as a 400.
+    """
+
+    frame_id: int
+    bbox: "list[float] | None" = None
+    quality: "str | None" = None
+
+
+class LabelRequest(BaseModel):
+    """Body of ``POST /api/label``: assign ONE identity to a whole visit's frames.
+
+    ``decision`` ∈ ``identified`` | ``unknown_cat`` | ``not_cat``. ``cat_id`` is
+    required for ``identified`` (and must name a current roster cat) and ignored
+    otherwise. Each frame in ``frames`` becomes one durable ``dataset_items`` row;
+    for ``identified``/``unknown_cat`` its crop is materialised FIRST, then the row
+    written — so a crash orphans a harmless crop file, never a row without its crop.
+    """
+
+    decision: str
+    cat_id: "int | None" = None
+    frames: "list[LabelFrame]" = []
+
+
+class DeleteRequest(BaseModel):
+    """Body of ``POST /api/label/delete``: send labelled frames back to the queue.
+
+    ``frame_ids`` are source frame ids whose ``dataset_items`` rows (and materialised
+    crop files) are removed, so the frames re-enter the annotation queue (undecided).
+    """
+
+    frame_ids: "list[int]" = []
+
+
+def _parse_box(box: str) -> "list[float]":
+    """Parse a ``"x1,y1,x2,y2"`` query string to four floats; raise on bad input.
+
+    The crop endpoint's box comes from a stored detection the client round-trips, so
+    a malformed value is a client mistake — raised as ``ValueError`` for the route to
+    map to a 400 rather than a 500.
+    """
+    parts = str(box).split(",")
+    if len(parts) != 4:
+        raise ValueError(f"box must be 'x1,y1,x2,y2', got {box!r}")
+    try:
+        return [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(f"box coordinates must be numeric, got {box!r}")
+
+
 def _motion_params_from(params: dict) -> MotionParams:
     """Build a ``MotionParams`` from an edge-vocabulary param dict; raise on bad input.
 
@@ -333,6 +426,10 @@ def _store_from_env() -> Store:
         db_path=os.path.join(root, "index.db"),
         media_root=os.path.join(root, "media"),
         max_bytes=max_bytes,
+        # Durable annotation crops live in a sibling dir of media/ so they survive
+        # frame eviction/clear (see the annotation-tool spec). Passed explicitly
+        # rather than relying on Store's derived default, to document the layout.
+        dataset_root=os.path.join(root, "dataset"),
     )
 
 
@@ -932,5 +1029,213 @@ def create_app(
             "fidelity": fidelity,
             "deltas": _compare_deltas(baseline, candidate),
         }
+
+    # --- Cat-identity annotation tool (roster CRUD + label queue + crops) -----------
+    #
+    # Label WHO each detected cat is, per visit, over the trustworthy yolo-serial
+    # detections already in the store (see the cat-identity annotation-tool spec).
+    # The roster (cats) is editable mid-annotation; the queue is virtual (live
+    # oracle-present visits minus already-decided ones); a label commit materialises
+    # a durable crop per frame THEN records its dataset_items row. Both cats and
+    # dataset_items survive eviction/clear — they are the precious hand-made output.
+
+    @app.get("/api/cats")
+    def api_cats_list():
+        # The whole roster, id-ASC (creation order) so the UI's 1-9 digit binding is
+        # stable across a mid-session add; includes retired (active=0) cats.
+        return {"cats": store.list_cats()}
+
+    @app.post("/api/cats")
+    def api_cats_create(req: CatCreateRequest):
+        # A duplicate name is a client-input error (UNIQUE) → 400, the same mapping
+        # the rest of the app uses. Returns the created cat.
+        try:
+            return store.create_cat(req.name, req.is_resident)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.patch("/api/cats/{cat_id}")
+    def api_cats_update(cat_id: int, req: CatUpdateRequest):
+        # Only the fields the client actually sent are applied (exclude_unset), so a
+        # partial PATCH can't blank an omitted column. Empty body / empty name /
+        # unknown id / duplicate name all → ValueError → 400.
+        try:
+            return store.update_cat(cat_id, req.model_dump(exclude_unset=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/label/visits")
+    def api_label_visits(
+        oracle: str = Query(default=_LABEL_DEFAULT_ORACLE),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The virtual annotation queue: undecided oracle-present visits, chronological,
+        # plus a progress readout — all scoped to the same since_id/until_id bucket
+        # window every windowed read shares. Default oracle is yolo-serial (the
+        # trustworthy detector); an unknown oracle is a client mistake (400), the same
+        # gate the other oracle-taking endpoints use.
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        _validate_bounds(since_id, until_id)
+        # One combined store call: the queue and the progress readout share the
+        # same present-frames scan instead of each re-running the JOIN+EXISTS read.
+        return store.label_queue(oracle, since_id, until_id)
+
+    def _validate_label(req: LabelRequest) -> "int | None":
+        # Validate a label / re-label request and resolve cat_id — ALL before any crop
+        # I/O, so a bad request never leaves half-written crops. Decision must be one of
+        # the three; an 'identified' decision needs a cat_id naming a current roster cat
+        # (the fat-fingered-digit guard); every frame's quality must be a valid enum
+        # (add_dataset_items re-checks it, but only AFTER the materialise loop). Returns
+        # the resolved cat_id (None for unknown_cat/not_cat).
+        if req.decision not in _LABEL_DECISIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"decision must be one of {_LABEL_DECISIONS}, got {req.decision!r}",
+            )
+        cat_id = None
+        if req.decision == "identified":
+            if req.cat_id is None:
+                raise HTTPException(status_code=400, detail="cat_id is required for an 'identified' label")
+            if req.cat_id not in {c["id"] for c in store.list_cats()}:
+                raise HTTPException(status_code=400, detail=f"no such cat: {req.cat_id}")
+            cat_id = int(req.cat_id)
+        for fr in req.frames:
+            if fr.quality is not None and fr.quality not in _QUALITIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"quality must be one of {_QUALITIES} or None, got {fr.quality!r}",
+                )
+        return cat_id
+
+    def _commit_label(decision: str, cat_id: "int | None", frames: "list[LabelFrame]") -> "tuple[int, int]":
+        # Materialise each cat crop FIRST then record its row (the store's ordering
+        # contract: a crash orphans a harmless crop file, never a row without its crop),
+        # and write the dataset_items batch. Assumes the request was already validated
+        # by _validate_label. Returns (inserted_rows, crops_written).
+        dataset_root = store.dataset_root
+        subdir = f"cat_{cat_id}" if decision == "identified" else "cat_unknown_cat"
+        rows: "list[dict]" = []
+        crops_written = 0
+        for fr in frames:
+            row: dict = {
+                "frame_id": fr.frame_id,
+                "label_kind": decision,
+                "cat_id": cat_id,
+                "quality": fr.quality,
+                "bbox": fr.bbox,
+                "source": "detector",
+            }
+            if decision == "not_cat":
+                # A detector false positive: a row, but no crop/box/quality to keep.
+                row["quality"] = None
+                row["bbox"] = None
+                row["crop_path"] = None
+                rows.append(row)
+                continue
+            recv_ts = store.frame_recv_ts(fr.frame_id)
+            src_path = store.path_for(fr.frame_id)
+            if recv_ts is None or src_path is None or not os.path.isfile(src_path):
+                continue  # frame no longer live — skipped here AND by the store
+            rel_path = os.path.join(subdir, f"{fr.frame_id}_{recv_ts}.jpg")
+            dest_abs = os.path.join(dataset_root, rel_path)
+            if not crops.materialize(src_path, fr.bbox, dest_abs, root=dataset_root):
+                continue  # crop couldn't be cut (bad box / write error) — skip its row
+            crops_written += 1
+            row["crop_path"] = rel_path
+            rows.append(row)
+        try:
+            inserted = store.add_dataset_items(rows)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return inserted, crops_written
+
+    def _delete_crop_files(removed: "list[dict]") -> int:
+        # Best-effort remove the crop files for deleted dataset_items rows; return the
+        # count removed. crop_path is our own DB value, but realpath-contain it under
+        # dataset_root anyway before unlinking (defence in depth), and swallow OSError
+        # (an already-gone file is fine).
+        root = os.path.realpath(store.dataset_root)
+        removed_files = 0
+        for item in removed:
+            rel = item.get("crop_path")
+            if not rel:
+                continue
+            abs_path = os.path.realpath(os.path.join(store.dataset_root, rel))
+            if os.path.commonpath([root, abs_path]) != root:
+                continue
+            try:
+                os.remove(abs_path)
+                removed_files += 1
+            except OSError:
+                pass
+        return removed_files
+
+    @app.post("/api/label")
+    def api_label(req: LabelRequest):
+        # Assign ONE identity to a whole visit's frames (validate → commit).
+        cat_id = _validate_label(req)
+        inserted, crops_written = _commit_label(req.decision, cat_id, req.frames)
+        return {"inserted": inserted, "crops": crops_written}
+
+    @app.get("/api/label/labeled")
+    def api_label_labeled(
+        oracle: str = Query(default=_LABEL_DEFAULT_ORACLE),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The undo / re-label feed: already-decided visits for the window, newest-
+        # labelled first. Same oracle gate + bucket scope as the queue endpoint.
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        _validate_bounds(since_id, until_id)
+        visits = store.labeled_visits(oracle, since_id, until_id)
+        return {"visits": visits, "total": len(visits)}
+
+    @app.post("/api/label/relabel")
+    def api_label_relabel(req: LabelRequest):
+        # Change a labelled visit's decision: delete its existing rows + crop files,
+        # then commit the new label (re-materialising crops). Validated up front like
+        # /api/label. Deleting first keeps the (src_frame_id, src_recv_ts) UNIQUE
+        # slot free so the re-commit's INSERT isn't ignored as a duplicate.
+        cat_id = _validate_label(req)
+        removed = store.delete_dataset_items([fr.frame_id for fr in req.frames])
+        _delete_crop_files(removed)
+        inserted, crops_written = _commit_label(req.decision, cat_id, req.frames)
+        return {"deleted": len(removed), "inserted": inserted, "crops": crops_written}
+
+    @app.post("/api/label/delete")
+    def api_label_delete(req: DeleteRequest):
+        # Undo: drop the label rows for these frames and their crop files, so the
+        # frames return to the annotation queue.
+        removed = store.delete_dataset_items(req.frame_ids)
+        removed_files = _delete_crop_files(removed)
+        return {"deleted": len(removed), "crops_removed": removed_files}
+
+    @app.get("/api/label/crop/{frame_id}")
+    def api_label_crop(frame_id: int, box: str = Query(...)):
+        # Crop the stored JPEG to box on the fly (rep crop + filmstrip previews). The
+        # box is a "x1,y1,x2,y2" pixel-space string the client round-trips from the
+        # detection; a malformed one is a client error (400). An unknown row or an
+        # evicted/missing file → 404. A degenerate box (after clamping) → 400.
+        try:
+            coords = _parse_box(box)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        path = store.path_for(frame_id)
+        if path is None or not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="frame not found")
+        try:
+            data = crops.crop_bytes(path, coords)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return Response(content=data, media_type="image/jpeg")
 
     return app

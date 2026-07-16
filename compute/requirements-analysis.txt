@@ -29,3 +29,10 @@ ultralytics
 # Pinned when implemented; do not guess a fragile dependency here — leave as a note
 # until the real BSUV variant is tested on the NVIDIA hardware.
 # bsuv-net  # [pinned on integration]
+
+# Feasibility probe (compute/identification/): DINOv2 embeddings + the report's charts.
+# DINOv2 loads via torch.hub (facebookresearch/dinov2) AT RUNTIME — no pip package, it
+# rides the torch install above and downloads the backbone + weights on first use (like
+# YOLO's first run). Only matplotlib is a new dependency, for the report's PNG charts
+# (scatter / confusion matrix / distance histogram).
+matplotlib

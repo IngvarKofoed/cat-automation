@@ -323,3 +323,27 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     scores each oracle over only ITS OWN analyzed frames, so unequal coverage or cross-session
     `CAT_YOLO_*` drift (invisible — `detail` omits imgsz/conf) can move a matrix column ~15pt, no bug.
 
+57. Cat-identity annotation tool (compute `#annotate`) — first slice of the learning loop: per-visit keyboard
+    labelling of live `yolo-serial` detections (clustered via `_gap_split`) into per-frame `dataset_items` rows +
+    durable crops under `<CAT_COLLECT_DIR>/dataset/`, each tagged quality `gallery`/`ok`/`poor` for a future gallery.
+    New `cats` + `dataset_items` tables SURVIVE eviction AND `clear()` — labels are the precious output, decoupled
+    from the rolling frame buffer; dedup on `(src_frame_id, src_recv_ts)` defeats a `clear()`+rowid-reuse mislabel.
+    Deferred: training/gallery-build, in-tool undo/re-label, and `annotation_visits` pagination.
+    Spec: docs/specs/2026-07-15-annotation-tool.md.
+
+58. Annotation tool gains in-tool undo / re-label — a "Labelled" mode on `#annotate` (newest-labelled-first
+    review via new `Store.labeled_visits` + `GET /api/label/labeled`). Per visit: re-label with 1–9/u/x
+    (`POST /api/label/relabel`: delete rows+crop files, then re-commit) or send back to the queue with `d`
+    (`POST /api/label/delete` → `Store.delete_dataset_items`). A mislabel is now fixable without SQL, and both
+    paths delete the orphaned crop files so the durable set never drifts from the DB.
+    Also hardened: `POST /api/label` validates per-frame quality BEFORE any crop is written (a bad value
+    previously left orphan crop files); `*.pt` gitignored (ultralytics drops weights in the repo root).
+
+59. Feasibility probe (`compute/identification/` + `compute/tools/feasibility.py`) answers Phase-1's "can we
+    tell our cats apart?" over labelled crops — offline, read-only, NO training. Embeds `identified` crops
+    (new `Store.labeled_crops`) with a pretrained DINOv2 backbone (`torch.hub`, lazy/torch-gated like the YOLO
+    oracle — first run downloads it), then scores separability: leave-one-out kNN accuracy + confusion,
+    same-vs-different-cat cosine-distance AUC + a suggested confidence threshold, and a PCA-2D scatter — emitted
+    as a self-contained HTML report + JSON. Separability maths is pure-numpy (unit-tested with synthetic
+    vectors); DINOv2 + matplotlib are opt-in analysis extras. Runs on the compute PC (labels + net + GPU there).
+

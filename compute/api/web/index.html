@@ -607,7 +607,7 @@
            contained, so flipping visits never resizes the box and reflows the meta +
            filmstrip below it. Collapses (:empty) on visitless buckets so the empty state
            shows just the "no visits" message, not a large blank box. */
-        #inboxRep {
+        #inboxRep, #annotateRep {
             margin: 10px 0;
             height: 420px;
             display: flex;
@@ -617,10 +617,10 @@
             border-radius: var(--radius-md);
             overflow: hidden;
         }
-        #inboxRep:empty {
+        #inboxRep:empty, #annotateRep:empty {
             display: none;
         }
-        #inboxRep img {
+        #inboxRep img, #annotateRep img {
             box-sizing: border-box;
             max-width: 100%;
             max-height: 100%;
@@ -694,6 +694,74 @@
         .film-tile.film-current {
             outline: 3px solid var(--color-primary);
             outline-offset: -1px;
+        }
+
+        /* Annotate view: per-crop quality badge under each filmstrip tile. Not a gate
+           verdict, so it uses its own affordance (click to cycle) but borrows the
+           verdict palette — green = keep (gallery), amber = poor — so quality reads at
+           a glance without new hues. */
+        .film-qual {
+            display: block;
+            width: 96px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            text-align: center;
+            padding: 2px var(--space-1);
+            cursor: pointer;
+            user-select: none;
+            color: var(--color-text-muted);
+        }
+        .film-qual[data-q="gallery"] { color: var(--color-status-caught); }
+        .film-qual[data-q="poor"]    { color: var(--color-status-false); }
+
+        /* Roster: one row per named cat — its number-key chip, name (click to rename),
+           a resident toggle, and retire/restore. Reuses .coverage-row's shell feel. */
+        .roster-list {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-1);
+        }
+        .roster-row {
+            display: flex;
+            align-items: center;
+            gap: var(--space-3);
+            padding: 6px 10px;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            font-size: 13px;
+        }
+        .roster-row.roster-inactive { opacity: 0.5; }
+        .roster-key {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: var(--radius-sm);
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            font-family: var(--font-data);
+            font-weight: 700;
+            color: var(--color-primary);
+        }
+        .roster-name {
+            flex: 1;
+            cursor: text;
+            font-weight: 600;
+        }
+        .roster-name:hover { text-decoration: underline dotted; }
+        .roster-rename-input {
+            flex: 1;
+            padding: 2px var(--space-2);
+            border: 1px solid var(--color-primary);
+            border-radius: var(--radius-sm);
+            background: var(--color-surface);
+            color: var(--color-text);
+            font-size: 13px;
         }
 
         /* Activity view: event cards reuse .tile; the click affordance + selected ring
@@ -984,6 +1052,7 @@
            only restyled. Id specificity beats the base .badge; #id.warn beats #id. */
         #sweepsScopeBadge,
         #tuningScopeBadge,
+        #annotateScopeBadge,
         #tuningParamSource,
         #viewerPageLabel {
             background: none;
@@ -997,11 +1066,13 @@
         }
         #sweepsScopeBadge.warn,
         #tuningScopeBadge.warn,
+        #annotateScopeBadge.warn,
         #tuningParamSource.warn {
             color: var(--color-status-false);
         }
         #sweepsScopeBadge { min-width: 150px; }
         #tuningScopeBadge { min-width: 150px; }
+        #annotateScopeBadge { min-width: 150px; }
         #tuningParamSource { min-width: 150px; }
         #viewerPageLabel { min-width: 64px; text-align: center; }
 
@@ -1019,6 +1090,7 @@
         <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
         <a href="#sweeps" data-route="sweeps" class="nav-link">Sweeps</a>
         <a href="#tuning" data-route="tuning" class="nav-link">Tuning</a>
+        <a href="#annotate" data-route="annotate" class="nav-link">Annotate</a>
         </div>
     </nav>
 
@@ -1417,6 +1489,88 @@
         </div>
     </section>
 
+    <!-- ================= ANNOTATE VIEW ================= -->
+    <!-- Label WHO each detected cat is, one visit at a time, over the trusted
+         yolo-serial detections. Reuses the visit rep-frame + filmstrip layout and its
+         j/k navigation; keyboard-first (1–9 assign a roster cat, u/x/s). Bucket scope
+         mirrors #sweeps/#tuning. -->
+    <section id="view-annotate" class="view hidden">
+        <div class="panel">
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="annotateScopeSelect">Bucket</label>
+                    <select id="annotateScopeSelect">
+                        <option value="">All frames</option>
+                    </select>
+                </div>
+                <div class="control-group push-end">
+                    <span id="annotateScopeBadge" class="badge">Scope: All frames</span>
+                </div>
+            </div>
+            <p class="caveat text-muted" style="margin: var(--space-3) 0 0;">
+                The queue is live yolo-serial detections, clustered into visits, minus the ones
+                already labelled. Coverage is partial and concentrated early — grow the pool by
+                running more yolo-serial sweeps on the Sweeps page.
+            </p>
+        </div>
+
+        <!-- Roster: named individuals bound to number keys. -->
+        <div class="panel">
+            <h2>Roster</h2>
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Keys <strong>1–9</strong> assign that cat to the whole visit ·
+                <strong>u</strong> unknown cat · <strong>x</strong> not-a-cat ·
+                <strong>s</strong> skip · <strong>j</strong>/<strong>k</strong> next/prev.
+            </p>
+            <div id="rosterList" class="roster-list"></div>
+            <div class="controls-row" style="margin-top: var(--space-3); align-items: flex-end;">
+                <div class="control-group">
+                    <label for="rosterAddName">Add cat</label>
+                    <input type="text" id="rosterAddName" placeholder="Name" maxlength="60">
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="rosterAddResident" checked> Resident</label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="rosterAddBtn">Add cat</button>
+                </div>
+            </div>
+            <div id="rosterError" class="hidden analysis-error"></div>
+        </div>
+
+        <!-- Visit stage: rep crop + filmstrip of per-frame crops with click-to-cycle quality.
+             Two modes — Queue (label undecided visits) and Labelled (review → undo / re-label). -->
+        <div class="panel">
+            <h2>Visit</h2>
+            <div class="btn-row" style="margin-bottom: var(--space-3); align-items: center; flex-wrap: wrap;">
+                <button type="button" id="annotateModeQueueBtn">Queue</button>
+                <button type="button" id="annotateModeLabelledBtn" class="btn-secondary">Labelled</button>
+                <span id="annotateModeHint" class="text-muted hidden">Re-label with <strong>1–9</strong> / <strong>u</strong> / <strong>x</strong> · <strong>d</strong> sends the visit back to the queue</span>
+            </div>
+            <div class="controls-row" style="align-items: center;">
+                <span id="annotateProgress" class="badge">— / —</span>
+                <span id="annotateCropsBadge" class="badge">Labelled: —</span>
+                <span id="annotateIdentity" class="badge hidden">—</span>
+                <div class="btn-row push-end">
+                    <button type="button" id="annotatePrevBtn" class="btn-secondary">← Prev (k)</button>
+                    <button type="button" id="annotateNextBtn" class="btn-secondary">Skip / Next (j) →</button>
+                </div>
+            </div>
+            <div id="annotateEmpty" class="empty hidden">No undecided visits in this window. Sweep more yolo-serial on the Sweeps page, or pick another bucket.</div>
+            <div id="annotateRep"></div>
+            <div id="annotateMeta" class="inbox-meta"></div>
+            <div id="annotateFilmstrip" class="filmstrip"></div>
+            <div class="btn-row" style="margin-top: var(--space-3); flex-wrap: wrap;">
+                <button type="button" id="annotateUnknownBtn" class="btn-secondary">Unknown cat (u)</button>
+                <button type="button" id="annotateNotCatBtn" class="btn-secondary">Not a cat (x)</button>
+                <button type="button" id="annotateUndoBtn" class="btn-secondary hidden">Send back to queue (d)</button>
+            </div>
+            <div id="annotateError" class="hidden analysis-error"></div>
+        </div>
+    </section>
+
     </div>
 
     <script>
@@ -1528,9 +1682,33 @@
         const tuningCopyRowEl = document.getElementById('tuningCopyRow');
         const tuningCopyTextEl = document.getElementById('tuningCopyText');
         const tuningCopyBtn = document.getElementById('tuningCopyBtn');
+        // Annotate
+        const annotateScopeSelect = document.getElementById('annotateScopeSelect');
+        const annotateScopeBadge = document.getElementById('annotateScopeBadge');
+        const rosterListEl = document.getElementById('rosterList');
+        const rosterAddNameEl = document.getElementById('rosterAddName');
+        const rosterAddResidentEl = document.getElementById('rosterAddResident');
+        const rosterAddBtn = document.getElementById('rosterAddBtn');
+        const rosterErrorEl = document.getElementById('rosterError');
+        const annotateProgressEl = document.getElementById('annotateProgress');
+        const annotateCropsBadgeEl = document.getElementById('annotateCropsBadge');
+        const annotatePrevBtn = document.getElementById('annotatePrevBtn');
+        const annotateNextBtn = document.getElementById('annotateNextBtn');
+        const annotateEmptyEl = document.getElementById('annotateEmpty');
+        const annotateRepEl = document.getElementById('annotateRep');
+        const annotateMetaEl = document.getElementById('annotateMeta');
+        const annotateFilmstripEl = document.getElementById('annotateFilmstrip');
+        const annotateUnknownBtn = document.getElementById('annotateUnknownBtn');
+        const annotateNotCatBtn = document.getElementById('annotateNotCatBtn');
+        const annotateModeQueueBtn = document.getElementById('annotateModeQueueBtn');
+        const annotateModeLabelledBtn = document.getElementById('annotateModeLabelledBtn');
+        const annotateModeHint = document.getElementById('annotateModeHint');
+        const annotateIdentityEl = document.getElementById('annotateIdentity');
+        const annotateUndoBtn = document.getElementById('annotateUndoBtn');
+        const annotateErrorEl = document.getElementById('annotateError');
 
         // ================= shared constants + state =================
-        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning'];
+        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning', 'annotate'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
@@ -1609,6 +1787,19 @@
         let visitIndex = 0;
         let inboxMotionOnlySpans = [];
         let filmSeq = 0;
+
+        // Annotate state.
+        let cats = [];              // full roster from /api/cats
+        let rosterCats = [];        // active cats only, in display order (number-key targets)
+        let annVisits = [];         // the undecided visit queue (chronological)
+        let annIndex = 0;           // index into annVisits of the shown visit
+        let annTotal = 0;           // total visits in the window (decided + undecided)
+        let annDecided = 0;         // visits already labelled
+        let annCrops = 0;           // labelled frames so far (dataset_items rows, incl. not_cat — matches label_progress.crops_labeled)
+        let annFrameStates = [];    // per-frame editable {frame_id, bbox, recv_ts, quality} for the shown visit
+        let annMode = 'queue';      // 'queue' (label undecided) | 'labelled' (review → undo / re-label)
+        let labVisits = [];         // decided visits (newest-labelled first) for the Labelled view
+        let labIndex = 0;           // index into labVisits of the shown visit
 
         // Tuning state.
         let lastCandidateParams = null;
@@ -1820,6 +2011,9 @@
                     if (!tuningDefaultsLoaded) { loadTuningDefaults(); tuningDefaultsLoaded = true; }
                     reloadTuning();
                 });
+            } else if (r === 'annotate') {
+                loadCats();
+                loadGroups().then(() => reloadAnnotate());
             }
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -2722,7 +2916,7 @@
                 scopeValue = '';
                 drillScope = null;
             }
-            for (const sel of [sweepsScopeSelect, tuningScopeSelect]) {
+            for (const sel of [sweepsScopeSelect, tuningScopeSelect, annotateScopeSelect]) {
                 sel.innerHTML = '';
                 const allOpt = document.createElement('option');
                 allOpt.value = '';
@@ -2752,6 +2946,8 @@
             sweepsScopeBadge.classList.toggle('warn', !!activeScope);
             tuningScopeBadgeEl.textContent = text;
             tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
+            annotateScopeBadge.textContent = text;
+            annotateScopeBadge.classList.toggle('warn', !!activeScope);
         }
 
         function effectiveWindow() {
@@ -2767,6 +2963,7 @@
             scopeValue = val;
             sweepsScopeSelect.value = val;
             tuningScopeSelect.value = val;
+            annotateScopeSelect.value = val;
             const g = val ? groups.find(x => String(x.id) === val) : null;
             activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
             drillScope = null;
@@ -2774,9 +2971,11 @@
             updateScopeBadge();
             if (route === 'sweeps') reloadSweeps();
             else if (route === 'tuning') reloadTuning();
+            else if (route === 'annotate') reloadAnnotate();
         }
         sweepsScopeSelect.addEventListener('change', () => onScopeChange(sweepsScopeSelect.value));
         tuningScopeSelect.addEventListener('change', () => onScopeChange(tuningScopeSelect.value));
+        annotateScopeSelect.addEventListener('change', () => onScopeChange(annotateScopeSelect.value));
 
         // Sweeps = produce verdicts: coverage rows + the queue panel.
         function reloadSweeps() {
@@ -3691,6 +3890,572 @@
                 setTimeout(() => { tuningCopyBtn.textContent = original; }, 1500);
             } catch {
                 tuningCopyTextEl.select();
+            }
+        });
+
+        // ================= ANNOTATE view =================
+        // reloadAnnotate = re-derive the scope badge and reload the visit queue for the
+        // (mirrored) bucket. Roster loads independently on route enter — it is not
+        // scoped. Named reloadAnnotate to mirror reloadSweeps/reloadTuning.
+        function reloadAnnotate() {
+            updateScopeBadge();
+            if (annMode === 'labelled') loadLabelledVisits();
+            else loadAnnotateVisits();
+        }
+
+        function showRosterError(message) {
+            rosterErrorEl.textContent = message;
+            rosterErrorEl.classList.remove('hidden');
+        }
+        function clearRosterError() {
+            rosterErrorEl.classList.add('hidden');
+            rosterErrorEl.textContent = '';
+        }
+        function showAnnotateError(message) {
+            annotateErrorEl.textContent = message;
+            annotateErrorEl.classList.remove('hidden');
+        }
+        function clearAnnotateError() {
+            annotateErrorEl.classList.add('hidden');
+            annotateErrorEl.textContent = '';
+        }
+
+        // ---- roster ----
+        async function loadCats() {
+            try {
+                const res = await fetch('/api/cats');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                cats = data.cats || [];
+                renderRoster();
+            } catch (err) {
+                showRosterError(`Roster failed: ${err.message}`);
+            }
+        }
+
+        function renderRoster() {
+            rosterListEl.innerHTML = '';
+            // Only active cats are number-key targets; retired cats show dimmed at the
+            // end with a Restore button (never a hotkey), so labels for a retired cat
+            // survive without cluttering the shortcut set.
+            rosterCats = cats.filter(c => c.active);
+            const inactive = cats.filter(c => !c.active);
+            if (!cats.length) {
+                rosterListEl.innerHTML = '<div class="empty">No cats yet — add one below to start assigning identities.</div>';
+                return;
+            }
+            rosterCats.forEach((c, i) => rosterListEl.appendChild(rosterRow(c, i)));
+            inactive.forEach(c => rosterListEl.appendChild(rosterRow(c, -1)));
+        }
+
+        function rosterRow(c, i) {
+            const row = document.createElement('div');
+            row.className = 'roster-row' + (c.active ? '' : ' roster-inactive');
+
+            const key = document.createElement('span');
+            key.className = 'roster-key';
+            key.textContent = (i >= 0 && i < 9) ? String(i + 1) : '·';
+
+            const name = document.createElement('span');
+            name.className = 'roster-name';
+            name.textContent = c.name;
+            name.title = 'Click to rename';
+            name.addEventListener('click', () => startRename(row, c));
+
+            const resLabel = document.createElement('label');
+            resLabel.className = 'checkbox-label';
+            const resCb = document.createElement('input');
+            resCb.type = 'checkbox';
+            resCb.checked = !!c.is_resident;
+            resCb.addEventListener('change', () => patchCat(c.id, { is_resident: resCb.checked }));
+            resLabel.append(resCb, document.createTextNode(' resident'));
+
+            const retire = document.createElement('button');
+            retire.type = 'button';
+            retire.className = 'btn-secondary';
+            retire.textContent = c.active ? 'Retire' : 'Restore';
+            retire.addEventListener('click', () => patchCat(c.id, { active: !c.active }));
+
+            row.append(key, name, resLabel, retire);
+            return row;
+        }
+
+        // Inline rename: swap the name span for an input; Enter commits, Esc/blur cancel.
+        // A `settled` latch keeps Enter's commit and the ensuing blur from double-PATCHing.
+        function startRename(row, c) {
+            const nameEl = row.querySelector('.roster-name');
+            if (!nameEl) return;
+            let settled = false;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = c.name;
+            input.className = 'roster-rename-input';
+            input.maxLength = 60;
+            const commit = async () => {
+                if (settled) return;
+                settled = true;
+                const newName = input.value.trim();
+                if (newName && newName !== c.name) await patchCat(c.id, { name: newName });
+                else renderRoster();
+            };
+            const cancel = () => {
+                if (settled) return;
+                settled = true;
+                renderRoster();
+            };
+            input.addEventListener('keydown', (e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+            });
+            input.addEventListener('blur', commit);
+            nameEl.replaceWith(input);
+            input.focus();
+            input.select();
+        }
+
+        async function addCat() {
+            const name = rosterAddNameEl.value.trim();
+            if (!name) { showRosterError('Enter a name for the new cat.'); return; }
+            try {
+                clearRosterError();
+                const res = await fetch('/api/cats', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, is_resident: rosterAddResidentEl.checked }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                rosterAddNameEl.value = '';
+                await loadCats();
+            } catch (err) {
+                showRosterError(`Add cat failed: ${err.message}`);
+            }
+        }
+        rosterAddBtn.addEventListener('click', addCat);
+        rosterAddNameEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); addCat(); }
+        });
+
+        async function patchCat(id, fields) {
+            try {
+                clearRosterError();
+                const res = await fetch('/api/cats/' + encodeURIComponent(id), {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(fields),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                await loadCats();
+            } catch (err) {
+                showRosterError(`Update cat failed: ${err.message}`);
+            }
+        }
+
+        // ---- crops + quality ----
+        // Box may arrive as [x1,y1,x2,y2(,conf)] or a "x1,y1,x2,y2" string; normalize
+        // both to a numeric array and to the "x1,y1,x2,y2" query form the crop endpoint
+        // and the label POST expect. bbox is passed through to POST /api/label verbatim.
+        function bboxArray(bbox) {
+            if (Array.isArray(bbox)) return bbox.map(Number);
+            if (typeof bbox === 'string') return bbox.split(',').map(Number);
+            return null;
+        }
+        function bboxToParam(bbox) {
+            if (Array.isArray(bbox)) return bbox.slice(0, 4).join(',');
+            return String(bbox == null ? '' : bbox);
+        }
+        function bboxArea(bbox) {
+            const b = bboxArray(bbox);
+            if (!b || b.length < 4 || b.some(Number.isNaN)) return 0;
+            return Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+        }
+        function cropUrl(frameId, bbox) {
+            return `/api/label/crop/${frameId}?box=${encodeURIComponent(bboxToParam(bbox))}`;
+        }
+        // Seed a per-crop quality from box area (relative to the visit's peak) and the
+        // detector score. A full, confident view seeds `gallery`; a small/low-conf edge
+        // crop seeds `poor`; the owner adjusts by eye before committing.
+        function seedQuality(frame, visit) {
+            const area = bboxArea(frame.bbox);
+            const peak = (typeof visit.peak_area === 'number' && visit.peak_area > 0) ? visit.peak_area : area;
+            const ratio = peak > 0 ? area / peak : 1;
+            const score = typeof frame.score === 'number' ? frame.score : 0;
+            if (score >= 0.6 && ratio >= 0.7) return 'gallery';
+            if (score < 0.35 || ratio < 0.3) return 'poor';
+            return 'ok';
+        }
+        function nextQuality(q) {
+            return q === 'gallery' ? 'ok' : (q === 'ok' ? 'poor' : 'gallery');
+        }
+
+        // ---- visit queue ----
+        async function loadAnnotateVisits() {
+            const params = new URLSearchParams({ oracle: 'yolo-serial' });
+            if (activeScope) addBounds(params, activeScope.since_id, activeScope.until_id);
+            try {
+                clearAnnotateError();
+                const res = await fetch('/api/label/visits?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                annVisits = data.visits || [];
+                annTotal = typeof data.total_visits === 'number' ? data.total_visits : annVisits.length;
+                annDecided = typeof data.decided_visits === 'number' ? data.decided_visits : 0;
+                annCrops = typeof data.crops_labeled === 'number' ? data.crops_labeled : 0;
+                annIndex = 0;
+                renderAnnotateVisit();
+            } catch (err) {
+                annVisits = [];
+                annIndex = 0;
+                renderAnnotateVisit();
+                showAnnotateError(`Visits failed: ${err.message}`);
+            }
+        }
+
+        function renderAnnotateVisit() {
+            annotateProgressEl.textContent = `${annDecided} / ${annTotal} decided`;
+            annotateCropsBadgeEl.textContent = `Labelled: ${annCrops}`;
+            if (!annVisits.length) {
+                annotateEmptyEl.textContent = 'No undecided visits in this window. Sweep more yolo-serial on the Sweeps page, or pick another bucket.';
+                annotateEmptyEl.classList.remove('hidden');
+                annotateRepEl.innerHTML = '';
+                annotateMetaEl.textContent = '';
+                annotateFilmstripEl.innerHTML = '';
+                annFrameStates = [];
+                annotatePrevBtn.disabled = true;
+                annotateNextBtn.disabled = true;
+                annotateUnknownBtn.disabled = true;
+                annotateNotCatBtn.disabled = true;
+                return;
+            }
+            annotateEmptyEl.classList.add('hidden');
+            annotateUnknownBtn.disabled = false;
+            annotateNotCatBtn.disabled = false;
+            annotateUndoBtn.disabled = false;
+            annIndex = Math.max(0, Math.min(annIndex, annVisits.length - 1));
+            const v = annVisits[annIndex];
+            annotatePrevBtn.disabled = annIndex === 0;
+            annotateNextBtn.disabled = annIndex >= annVisits.length - 1;
+
+            // Per-frame editable state, chronological (frames may arrive unordered).
+            // Cached on the visit itself (v._states) so an owner's quality edits
+            // survive navigating away (j/k) and back — re-seeding on every render
+            // would silently discard a downgrade the moment the visit re-renders.
+            const frames = (v.frames || []).slice().sort((a, b) => a.recv_ts - b.recv_ts);
+            if (v._states && v._states.length === frames.length) {
+                annFrameStates = v._states;
+            } else {
+                annFrameStates = frames.map(f => ({
+                    frame_id: f.id, bbox: f.bbox, recv_ts: f.recv_ts, quality: seedQuality(f, v),
+                }));
+                v._states = annFrameStates;
+            }
+
+            // Rep crop = the peak-area frame (fullest view), independent of order.
+            const rep = frames.find(f => f.id === v.rep_frame_id) || frames[0];
+            annotateRepEl.innerHTML = '';
+            if (rep) {
+                const img = document.createElement('img');
+                img.src = cropUrl(rep.id, rep.bbox);
+                img.alt = 'Representative crop';
+                annotateRepEl.appendChild(img);
+            }
+
+            const t0 = frames.length ? frames[0].recv_ts : null;
+            const t1 = frames.length ? frames[frames.length - 1].recv_ts : null;
+            const parts = [];
+            if (t0 != null) parts.push(formatTime(t0));
+            parts.push(`span ${formatSpan(t0, t1)}`);
+            parts.push(`${frames.length} frames`);
+            if (typeof v.peak_score === 'number') parts.push(`peak score ${v.peak_score.toFixed(2)}`);
+            parts.push(`${annVisits.length} in queue`);
+            annotateMetaEl.textContent = parts.join(' · ');
+
+            annotateFilmstripEl.innerHTML = '';
+            annFrameStates.forEach((fs, i) => annotateFilmstripEl.appendChild(annotateFilmTile(fs, v.rep_frame_id)));
+        }
+
+        // A filmstrip crop with a click-to-cycle quality badge. Mutates the shared
+        // annFrameStates entry (`fs`) in place and updates only this tile, so cycling
+        // one crop never reloads the others.
+        function annotateFilmTile(fs, repId) {
+            const tile = document.createElement('div');
+            tile.className = 'film-tile' + (fs.frame_id === repId ? ' film-rep' : '');
+            const img = document.createElement('img');
+            img.src = cropUrl(fs.frame_id, fs.bbox);
+            img.loading = 'lazy';
+            img.alt = 'Crop';
+            const qual = document.createElement('div');
+            qual.className = 'film-qual';
+            qual.dataset.q = fs.quality;
+            qual.textContent = fs.quality;
+            qual.title = 'Click to cycle quality (gallery → ok → poor)';
+            qual.addEventListener('click', () => {
+                fs.quality = nextQuality(fs.quality);
+                qual.dataset.q = fs.quality;
+                qual.textContent = fs.quality;
+            });
+            tile.append(img, qual);
+            return tile;
+        }
+
+        function moveAnnotate(delta) {
+            if (!annVisits.length) return;
+            const next = annIndex + delta;
+            if (next < 0 || next >= annVisits.length) return;
+            annIndex = next;
+            renderAnnotateVisit();
+        }
+        // Mode-aware nav: prev/next drive the queue or the labelled feed.
+        function annNext() { annMode === 'labelled' ? moveLabelled(1) : moveAnnotate(1); }
+        function annPrev() { annMode === 'labelled' ? moveLabelled(-1) : moveAnnotate(-1); }
+        annotatePrevBtn.addEventListener('click', annPrev);
+        annotateNextBtn.addEventListener('click', annNext);
+
+        // Commit the current visit: bulk-label every frame with the decision and its
+        // per-frame quality, then drop it from the queue and advance. cat_id is set only
+        // for an 'identified' decision.
+        let annCommitting = false;
+        async function commitVisit(decision, catId) {
+            if (!annVisits.length || annCommitting) return;
+            annCommitting = true;
+            const frames = annFrameStates.map(fs => ({
+                frame_id: fs.frame_id, bbox: fs.bbox, quality: fs.quality,
+            }));
+            const body = { decision, cat_id: catId == null ? null : catId, frames };
+            try {
+                clearAnnotateError();
+                const res = await fetch('/api/label', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                annDecided += 1;
+                // `data.inserted` is the count of dataset_items rows actually written
+                // (identified/unknown_cat/not_cat alike) — the same definition
+                // label_progress's `crops_labeled` uses. `data.crops` is a DIFFERENT
+                // count (materialised crop FILES, so it excludes not_cat) and mixing
+                // the two here is what made this badge drift from the true progress
+                // after labelling a not_cat visit.
+                annCrops += (typeof data.inserted === 'number' ? data.inserted : 0);
+                // Drop the committed visit; keep annIndex pointing at what shifts into it
+                // (clamped in renderAnnotateVisit when it was the last one).
+                annVisits.splice(annIndex, 1);
+                renderAnnotateVisit();
+            } catch (err) {
+                showAnnotateError(`Label failed: ${err.message}`);
+            } finally {
+                annCommitting = false;
+            }
+        }
+        // A decision applies to the current visit: label it (queue) or re-label it (labelled).
+        function annDecide(decision, catId) {
+            if (annMode === 'labelled') relabelLabelled(decision, catId);
+            else commitVisit(decision, catId);
+        }
+        annotateUnknownBtn.addEventListener('click', () => annDecide('unknown_cat', null));
+        annotateNotCatBtn.addEventListener('click', () => annDecide('not_cat', null));
+        annotateUndoBtn.addEventListener('click', undoLabelled);
+        annotateModeQueueBtn.addEventListener('click', () => setAnnMode('queue'));
+        annotateModeLabelledBtn.addEventListener('click', () => setAnnMode('labelled'));
+
+        // ---- Labelled view: review → undo / re-label ----
+        // Switch between labelling the queue and reviewing already-labelled visits.
+        // The two share the rep/meta/filmstrip DOM; only the data source, the actions,
+        // and a few chrome bits (identity badge, undo button, hint) differ.
+        function setAnnMode(mode) {
+            annMode = mode;
+            const labelled = mode === 'labelled';
+            annotateModeQueueBtn.classList.toggle('btn-secondary', labelled);
+            annotateModeLabelledBtn.classList.toggle('btn-secondary', !labelled);
+            annotateModeHint.classList.toggle('hidden', !labelled);
+            annotateIdentityEl.classList.toggle('hidden', !labelled);
+            annotateCropsBadgeEl.classList.toggle('hidden', labelled);
+            annotateUndoBtn.classList.toggle('hidden', !labelled);
+            annotateUnknownBtn.textContent = labelled ? 'Re-label unknown (u)' : 'Unknown cat (u)';
+            annotateNotCatBtn.textContent = labelled ? 'Re-label not-a-cat (x)' : 'Not a cat (x)';
+            annotateNextBtn.textContent = labelled ? 'Next (j) →' : 'Skip / Next (j) →';
+            clearAnnotateError();
+            reloadAnnotate();
+        }
+
+        async function loadLabelledVisits() {
+            const params = new URLSearchParams({ oracle: 'yolo-serial' });
+            if (activeScope) addBounds(params, activeScope.since_id, activeScope.until_id);
+            try {
+                clearAnnotateError();
+                const res = await fetch('/api/label/labeled?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                labVisits = data.visits || [];
+                labIndex = 0;
+                renderLabelledVisit();
+            } catch (err) {
+                labVisits = [];
+                labIndex = 0;
+                renderLabelledVisit();
+                showAnnotateError(`Labelled failed: ${err.message}`);
+            }
+        }
+
+        function identityLabel(v) {
+            if (v.label_kind === 'identified') return v.cat_name || `cat #${v.cat_id}`;
+            if (v.label_kind === 'unknown_cat') return 'unknown cat';
+            if (v.label_kind === 'not_cat') return 'not a cat';
+            return v.label_kind || '—';
+        }
+
+        function renderLabelledVisit() {
+            annotateProgressEl.textContent = labVisits.length
+                ? `${labIndex + 1} / ${labVisits.length} labelled` : '0 labelled';
+            if (!labVisits.length) {
+                annotateEmptyEl.textContent = 'Nothing labelled in this window yet — label some visits in the Queue.';
+                annotateEmptyEl.classList.remove('hidden');
+                annotateRepEl.innerHTML = '';
+                annotateMetaEl.textContent = '';
+                annotateFilmstripEl.innerHTML = '';
+                annotateIdentityEl.textContent = '—';
+                annotatePrevBtn.disabled = true;
+                annotateNextBtn.disabled = true;
+                annotateUnknownBtn.disabled = true;
+                annotateNotCatBtn.disabled = true;
+                annotateUndoBtn.disabled = true;
+                return;
+            }
+            annotateEmptyEl.classList.add('hidden');
+            annotateUnknownBtn.disabled = false;
+            annotateNotCatBtn.disabled = false;
+            annotateUndoBtn.disabled = false;
+            labIndex = Math.max(0, Math.min(labIndex, labVisits.length - 1));
+            const v = labVisits[labIndex];
+            annotatePrevBtn.disabled = labIndex === 0;
+            annotateNextBtn.disabled = labIndex >= labVisits.length - 1;
+            annotateIdentityEl.textContent = (v.mixed ? 'mixed → ' : '→ ') + identityLabel(v);
+
+            const frames = (v.frames || []).slice().sort((a, b) => a.recv_ts - b.recv_ts);
+            const rep = frames.find(f => f.id === v.rep_frame_id) || frames[0];
+            annotateRepEl.innerHTML = '';
+            if (rep) {
+                const img = document.createElement('img');
+                img.src = cropUrl(rep.id, rep.bbox);
+                img.alt = 'Labelled crop';
+                annotateRepEl.appendChild(img);
+            }
+
+            const t0 = frames.length ? frames[0].recv_ts : null;
+            const t1 = frames.length ? frames[frames.length - 1].recv_ts : null;
+            const parts = [];
+            if (t0 != null) parts.push(formatTime(t0));
+            parts.push(`span ${formatSpan(t0, t1)}`);
+            parts.push(`${frames.length} frames`);
+            if (v.labeled_ts) parts.push(`labelled ${formatTime(v.labeled_ts)}`);
+            annotateMetaEl.textContent = parts.join(' · ');
+
+            annotateFilmstripEl.innerHTML = '';
+            frames.forEach(f => annotateFilmstripEl.appendChild(labelledFilmTile(f, v.rep_frame_id)));
+        }
+
+        // A labelled-view filmstrip tile: like the queue tile but the quality badge is
+        // READ-ONLY (labelled crops aren't re-graded in place; re-labelling re-seeds).
+        function labelledFilmTile(f, repId) {
+            const tile = document.createElement('div');
+            tile.className = 'film-tile' + (f.id === repId ? ' film-rep' : '');
+            const img = document.createElement('img');
+            img.src = cropUrl(f.id, f.bbox);
+            img.loading = 'lazy';
+            img.alt = 'Crop';
+            tile.appendChild(img);
+            if (f.quality) {
+                const qual = document.createElement('div');
+                qual.className = 'film-qual';
+                qual.dataset.q = f.quality;
+                qual.textContent = f.quality;
+                tile.appendChild(qual);
+            }
+            return tile;
+        }
+
+        function moveLabelled(delta) {
+            if (!labVisits.length) return;
+            const next = labIndex + delta;
+            if (next < 0 || next >= labVisits.length) return;
+            labIndex = next;
+            renderLabelledVisit();
+        }
+
+        // Re-label the current labelled visit: the server deletes its rows + crop files
+        // then re-commits under the new identity (re-materialising crops). Reuses each
+        // frame's stored bbox + quality; a not_cat re-label drops them server-side.
+        async function relabelLabelled(decision, catId) {
+            if (!labVisits.length || annCommitting) return;
+            annCommitting = true;
+            const v = labVisits[labIndex];
+            const frames = (v.frames || []).map(f => ({ frame_id: f.id, bbox: f.bbox, quality: f.quality }));
+            const body = { decision, cat_id: catId == null ? null : catId, frames };
+            try {
+                clearAnnotateError();
+                const res = await fetch('/api/label/relabel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                // Update the identity in place (display crops are cut on the fly, so the
+                // moved crop files need no path refresh); keep the visit in view.
+                v.label_kind = decision;
+                v.cat_id = decision === 'identified' ? catId : null;
+                v.cat_name = decision === 'identified' ? ((cats.find(c => c.id === catId) || {}).name || null) : null;
+                v.mixed = false;
+                renderLabelledVisit();
+            } catch (err) {
+                showAnnotateError(`Re-label failed: ${err.message}`);
+            } finally {
+                annCommitting = false;
+            }
+        }
+
+        // Undo: send the current labelled visit's frames back to the queue (delete their
+        // dataset_items rows + crop files), then drop it from the labelled feed.
+        async function undoLabelled() {
+            if (!labVisits.length || annCommitting) return;
+            annCommitting = true;
+            const v = labVisits[labIndex];
+            const frame_ids = (v.frames || []).map(f => f.id);
+            try {
+                clearAnnotateError();
+                const res = await fetch('/api/label/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ frame_ids }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                labVisits.splice(labIndex, 1);
+                renderLabelledVisit();
+            } catch (err) {
+                showAnnotateError(`Undo failed: ${err.message}`);
+            } finally {
+                annCommitting = false;
+            }
+        }
+
+        // Keyboard-first, only on the Annotate view and never while typing (add-cat /
+        // rename inputs). Mode-aware: in Queue the decision keys label; in Labelled they
+        // re-label, and d / Backspace sends the visit back to the queue. Mirrors the
+        // inbox's j/k handling.
+        document.addEventListener('keydown', (e) => {
+            if (route !== 'annotate') return;
+            const tag = (e.target && e.target.tagName) || '';
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            const k = e.key;
+            if (k === 'j' || k === 'ArrowRight' || k === 's') { annNext(); e.preventDefault(); }
+            else if (k === 'k' || k === 'ArrowLeft') { annPrev(); e.preventDefault(); }
+            else if (k === 'u') { annDecide('unknown_cat', null); e.preventDefault(); }
+            else if (k === 'x') { annDecide('not_cat', null); e.preventDefault(); }
+            else if (annMode === 'labelled' && (k === 'd' || k === 'Backspace')) { undoLabelled(); e.preventDefault(); }
+            else if (k >= '1' && k <= '9') {
+                const cat = rosterCats[Number(k) - 1];
+                if (cat) { annDecide('identified', cat.id); e.preventDefault(); }
             }
         });
 

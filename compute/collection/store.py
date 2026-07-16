@@ -94,6 +94,15 @@ _MAX_EVENTS = 500
 # (YOLO vs BSUV) and ignores the ``oracle`` argument.
 _VISIT_MODES = ("missed", "false", "conflict")
 
+# Annotation-tool enums for the durable ``dataset_items`` table (see the
+# cat-identity annotation-tool spec). ``label_kind`` is the NOT NULL discriminator
+# (``cat_id`` set only for ``identified``); ``quality`` is the per-crop signal a
+# future gallery build filters on (NULL for a ``not_cat`` row, which has no crop).
+# Both are validated in ``add_dataset_items`` so a typo can never silently poison
+# the precious, eviction-surviving label set.
+_LABEL_KINDS = ("identified", "unknown_cat", "not_cat")
+_QUALITIES = ("gallery", "ok", "poor")
+
 
 def _parse_id_cursor(cursor: str) -> int:
     """Decode a time-order cursor (an id). Raises ValueError if malformed."""
@@ -147,11 +156,21 @@ def _range_bounds(col: str, since_id: "int | None", until_id: "int | None") -> "
 class Store:
     """SQLite index + media dir + size-based retention for collected frames."""
 
-    def __init__(self, db_path: str, media_root: str, max_bytes: int) -> None:
+    def __init__(
+        self, db_path: str, media_root: str, max_bytes: int, dataset_root: "str | None" = None
+    ) -> None:
         self._media_root = media_root
         self._max_bytes = max_bytes
+        # Durable annotation crops live in a dir SIBLING to the rolling media/ (a
+        # default derived from db_path's parent — ``<root>/dataset`` — so existing
+        # three-arg callers and tests keep working). Kept separate from media/ so
+        # crops persist when the frames they came from age out or ``clear``. The
+        # store itself never writes crop files here (that is the dataset/crops
+        # module's job); it only makes the root exist and hands out its path.
+        self._dataset_root = dataset_root or os.path.join(os.path.dirname(db_path) or ".", "dataset")
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         os.makedirs(media_root, exist_ok=True)
+        os.makedirs(self._dataset_root, exist_ok=True)
         # One shared connection across the collector and API threads; the lock
         # (not sqlite's own thread check) is what makes that safe, so disable the
         # check. A short busy_timeout is belt-and-braces against any stray lock.
@@ -215,6 +234,22 @@ class Store:
         # `clear` (which reuses rowids from 1) drops it too, or stale boundaries
         # would misalign against new frames. `idx_frames_recv_ts` makes the clock→id
         # resolution and the density timeline's recv_ts binning indexed lookups.
+        #
+        # The `cats` + `dataset_items` tables back the cat-identity annotation tool
+        # (see its spec). `cats` is the editable roster (residents + named
+        # neighbours); `dataset_items` is one self-contained labelled crop per row
+        # (`cat_id`/`label_kind`/`quality`/`bbox`/`crop_path` + the source frame
+        # linkage). Unlike every frame-keyed table above, NEITHER is touched by
+        # `_evict_locked` OR `clear` — they hold hand-made labels, the precious
+        # output, and carry no FK to `frames` (only a `src_frame_id`/`src_recv_ts`
+        # snapshot), so they outlive the rolling buffer exactly like `settings`.
+        # The queue's "already decided" check keys on BOTH `src_frame_id` AND
+        # `src_recv_ts` (idx_dataset_src), so a `clear` + rowid-reuse can't make an
+        # old label mask a brand-new frame that reused its id: recv_ts won't match.
+        # idx_dataset_src is UNIQUE (not just an index): the dedup key is enforced at
+        # WRITE time, not only read time, so a double-submit / stale second tab can't
+        # insert a second, possibly-conflicting row for the same crop (see add_dataset_items).
+        # idx_dataset_cat serves the per-cat label rollups a later gallery build wants.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS frames (
@@ -258,6 +293,28 @@ class Store:
               motion_only INTEGER NOT NULL    -- 1 = motion-only capture on, 0 = full capture
             );
             CREATE INDEX IF NOT EXISTS idx_frames_recv_ts ON frames(recv_ts);
+            CREATE TABLE IF NOT EXISTS cats (
+              id          INTEGER PRIMARY KEY,
+              name        TEXT    NOT NULL UNIQUE,
+              is_resident INTEGER NOT NULL DEFAULT 0,   -- 1 = our cat, 0 = named foreign/neighbour
+              active      INTEGER NOT NULL DEFAULT 1,   -- retire without deleting labels
+              notes       TEXT,
+              created_ts  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dataset_items (
+              id           INTEGER PRIMARY KEY,
+              cat_id       INTEGER,                     -- set iff label_kind = 'identified'
+              label_kind   TEXT    NOT NULL,            -- 'identified' | 'unknown_cat' | 'not_cat'
+              quality      TEXT,                        -- 'gallery' | 'ok' | 'poor' (NULL for not_cat)
+              bbox         TEXT,                        -- "x1,y1,x2,y2" px in the source frame (NULL for not_cat)
+              crop_path    TEXT,                        -- dataset-media-relative jpg (NULL for not_cat)
+              src_frame_id INTEGER NOT NULL,            -- frames.id at label time (linkage only)
+              src_recv_ts  INTEGER NOT NULL,            -- frames.recv_ts, the clear()-safe dedup guard
+              source       TEXT    NOT NULL DEFAULT 'detector',
+              labeled_ts   INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_src ON dataset_items(src_frame_id, src_recv_ts);
+            CREATE INDEX IF NOT EXISTS idx_dataset_cat ON dataset_items(cat_id);
             """
         )
         self._conn.commit()
@@ -487,6 +544,16 @@ class Store:
             return None
         return os.path.join(self._media_root, row[0])
 
+    @property
+    def dataset_root(self) -> str:
+        """Root dir for durable annotation crops (sibling of ``media/``).
+
+        The dataset/crops module materialises labelled crops under here and stores
+        their ``crop_path`` relative to it; the store only guarantees the dir
+        exists (``__init__``) and never writes into it itself.
+        """
+        return self._dataset_root
+
     def stats(self) -> dict:
         """Store summary: counts, size vs cap, and the recv_ts time span.
 
@@ -537,7 +604,12 @@ class Store:
             # EMPTY log, so re-seeding the current mode (latest id after the wipe)
             # is the caller's job (the /api/clear route) — NOT clear()'s, which
             # doesn't know whether collection is live. `settings` is deliberately
-            # NOT dropped — it is config, so `motion_only` survives the wipe.
+            # NOT dropped — it is config, so `motion_only` survives the wipe. For the
+            # SAME reason, `cats` and `dataset_items` are NOT dropped here (nor by
+            # `_evict_locked`): they are the annotation tool's precious hand-made
+            # output, self-contained (no FK to `frames`), and their queue-dedup keys
+            # on (`src_frame_id`, `src_recv_ts`) so a post-clear rowid reuse can't
+            # collide (recv_ts advances) — see the annotation-tool spec.
             self._conn.execute("DELETE FROM mode_changes")
             self._conn.commit()
             self._total_bytes = 0
@@ -1879,3 +1951,585 @@ class Store:
         events.sort(key=lambda e: (e["start_ts"], e["start_id"]), reverse=True)
         truncated = len(events) > limit
         return {"events": events[:limit], "truncated": truncated}
+
+    # --- Cat-identity annotation tool: roster + dataset items --------------
+    #
+    # The label surface (see the cat-identity annotation-tool spec). It reuses the
+    # store's building blocks — the ``_gap_split``/``_VISIT_GAP_MS`` visit
+    # primitive, the ``analysis`` verdicts, the id-range scope — over two NEW,
+    # eviction- and ``clear``-surviving tables (`cats`, `dataset_items`). The store
+    # stays cv2-free and stdlib-only: it reads the stored ``yolo-serial`` boxes out
+    # of ``analysis.detail`` and records label rows, but NEVER crops or writes an
+    # image (the dataset/crops module owns crop file I/O). The virtual annotation
+    # queue is derived, not materialised: a ``dataset_items`` row exists only once
+    # the owner has decided on a frame, and its absence is what keeps the frame in
+    # the queue. All ops go through the single connection + single lock like the
+    # rest of the store.
+
+    @staticmethod
+    def _best_box(detail_text: "str | None") -> "tuple[list[float], float] | None":
+        """The highest-confidence box in an ``analysis.detail`` JSON, or ``None``.
+
+        ``detail`` is a YOLO analyzer's ``{"boxes": [[x1,y1,x2,y2,conf], ...], ...}``
+        in the STORED JPEG's own pixel space (so a crop of that JPEG is
+        coordinate-consistent). Returns ``([x1,y1,x2,y2], conf)`` for the box with
+        the max ``conf``, or ``None`` when the detail is missing, malformed, or has
+        no usable box — so a present verdict whose detail can't yield a box is
+        skipped rather than crashing the queue (in practice ``yolo-serial`` always
+        writes a box when its verdict is present, so this is a defensive guard).
+        """
+        if not detail_text:
+            return None
+        try:
+            detail = json.loads(detail_text)
+        except (ValueError, TypeError):
+            return None
+        boxes = detail.get("boxes") if isinstance(detail, dict) else None
+        if not boxes:
+            return None
+        usable = [b for b in boxes if isinstance(b, (list, tuple)) and len(b) >= 5]
+        if not usable:
+            return None
+        best = max(usable, key=lambda b: b[4])
+        return [float(best[0]), float(best[1]), float(best[2]), float(best[3])], float(best[4])
+
+    @staticmethod
+    def _bbox_area(bbox: "list[float]") -> float:
+        """Pixel area of an ``[x1,y1,x2,y2]`` box (clamped at 0 for a degenerate box)."""
+        return max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
+
+    @staticmethod
+    def _bbox_text(bbox) -> "str | None":
+        """Serialize a bbox to the ``"x1,y1,x2,y2"`` text the column stores.
+
+        Accepts an ``[x1,y1,x2,y2]`` list/tuple (joined, matching how ``frames``
+        stores its motion bbox), an already-formatted string (passed through), or
+        ``None`` (a not_cat row has no box) → ``None``.
+        """
+        if bbox is None:
+            return None
+        if isinstance(bbox, str):
+            return bbox
+        return ",".join(str(v) for v in bbox)
+
+    def _present_frames(
+        self, oracle: str, since_id: "int | None", until_id: "int | None"
+    ) -> "list[dict]":
+        """Live ``oracle``-present frames in the window, chronological, box-parsed.
+
+        The shared universe BOTH ``annotation_visits`` (undecided subset →
+        queue) and ``label_progress`` (whole set → progress) cluster, so the two
+        can never disagree on which frames exist or how they group. One JOINed read
+        (frames × ``analysis`` verdict-1 rows for ``oracle``, scoped to the id
+        window) plus an ``EXISTS`` probe of ``dataset_items`` keyed on BOTH
+        (``src_frame_id``, ``src_recv_ts``) — the ``clear``-safe "already decided"
+        predicate. Each surviving frame is ``{id, recv_ts, bbox, score, decided}``;
+        a present frame whose ``detail`` yields no box (see ``_best_box``) is
+        dropped, so it never enters a visit nor the progress count. Ordered by
+        ``recv_ts`` ASC (id ASC tie-break) so ``_gap_split`` can consume it directly.
+        """
+        frags, params = _range_bounds("f.id", since_id, until_id)
+        and_sql = "".join(" AND " + frag for frag in frags)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.id, f.recv_ts, o.detail,"
+                " EXISTS (SELECT 1 FROM dataset_items d"
+                "   WHERE d.src_frame_id = f.id AND d.src_recv_ts = f.recv_ts)"
+                " FROM frames f"
+                " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                " WHERE o.verdict = 1" + and_sql +
+                " ORDER BY f.recv_ts ASC, f.id ASC",
+                [oracle] + params,
+            ).fetchall()
+        # Box-parse outside the lock (pure Python over the fetched rows).
+        frames: "list[dict]" = []
+        for row_id, recv_ts, detail, decided in rows:
+            box = self._best_box(detail)
+            if box is None:
+                continue
+            bbox, score = box
+            frames.append(
+                {
+                    "id": int(row_id),
+                    "recv_ts": recv_ts,
+                    "bbox": bbox,
+                    "score": score,
+                    "decided": bool(decided),
+                }
+            )
+        return frames
+
+    def annotation_visits(
+        self,
+        oracle: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        *,
+        _frames: "list[dict] | None" = None,
+    ) -> "list[dict]":
+        """The virtual annotation queue: undecided ``oracle``-present visits, chronological.
+
+        Takes the live ``oracle`` (``yolo-serial``)-present frames in the window
+        whose (``id``, ``recv_ts``) has NO ``dataset_items`` row, clusters them by
+        ``recv_ts`` with the shared ``_gap_split``/``_VISIT_GAP_MS`` primitive (the
+        same one ``visits``/``events`` use, so the grouping can't drift), and
+        returns one record per visit in ``recv_ts`` order::
+
+            {frames: [{id, recv_ts, bbox: [x1,y1,x2,y2], score, url}, ...],
+             rep_frame_id, peak_area, peak_score, span: [lo_ts, hi_ts]}
+
+        ``rep_frame_id`` is the peak box-AREA frame (the fullest dorsal view, best
+        for the roster), tie-broken by id, independent of queue order; ``peak_area``
+        is that area and ``peak_score`` the best detection confidence in the visit;
+        ``span`` is the visit's first/last ``recv_ts``. ``since_id``/``until_id`` are
+        the same inclusive id-range scope every windowed read shares (``None`` =
+        unbounded), so a bucket scopes the queue exactly like every other tool.
+
+        ``_frames`` is a private hook: pass an already-fetched ``_present_frames``
+        result (see ``label_queue``) to skip a second identical JOIN+EXISTS read
+        when the caller also needs ``label_progress`` over the same window; omit it
+        (the default) to fetch fresh, as every direct/test caller does.
+
+        NOTE: like the disagreement inbox this returns EVERY visit's EVERY frame
+        inline, unpaginated — bounded by today's ``yolo-serial`` coverage but a
+        known scaling limit as that coverage grows (see the spec's Open questions).
+        """
+        frames = self._present_frames(oracle, since_id, until_id) if _frames is None else _frames
+        queue = [fr for fr in frames if not fr["decided"]]
+        visits: "list[dict]" = []
+        for cluster in self._gap_split(queue, _VISIT_GAP_MS, lambda fr: fr["recv_ts"]):
+            out_frames = [
+                {
+                    "id": fr["id"],
+                    "recv_ts": fr["recv_ts"],
+                    "bbox": fr["bbox"],
+                    "score": fr["score"],
+                    "url": f"/media/{fr['id']}",
+                }
+                for fr in cluster
+            ]
+            rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            visits.append(
+                {
+                    "frames": out_frames,
+                    "rep_frame_id": rep["id"],
+                    "peak_area": self._bbox_area(rep["bbox"]),
+                    "peak_score": max(fr["score"] for fr in cluster),
+                    "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
+                }
+            )
+        return visits
+
+    def label_progress(
+        self,
+        oracle: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        *,
+        _frames: "list[dict] | None" = None,
+    ) -> dict:
+        """``{total_visits, decided_visits, crops_labeled}`` for the window.
+
+        Clusters ALL ``oracle``-present frames in the window (the same universe and
+        gap primitive as ``annotation_visits``, but INCLUDING already-decided ones)
+        so the readout stays consistent with the queue. ``total_visits`` = clusters;
+        ``decided_visits`` = clusters whose every frame already has a
+        ``dataset_items`` row; ``crops_labeled`` = present frames in the window that
+        carry a label row. Because the queue only ever labels present-with-box
+        frames, ``crops_labeled`` counts exactly this window's durable label rows
+        (label crops whose source frame later evicted fall out of scope, matching
+        the queue's live-frame universe).
+
+        ``_frames`` is the same private reuse hook ``annotation_visits`` takes (see
+        ``label_queue``); omit it to fetch fresh, as every direct/test caller does.
+        """
+        frames = self._present_frames(oracle, since_id, until_id) if _frames is None else _frames
+        total_visits = 0
+        decided_visits = 0
+        crops_labeled = 0
+        for cluster in self._gap_split(frames, _VISIT_GAP_MS, lambda fr: fr["recv_ts"]):
+            total_visits += 1
+            decided_flags = [fr["decided"] for fr in cluster]
+            crops_labeled += sum(1 for d in decided_flags if d)
+            if all(decided_flags):
+                decided_visits += 1
+        return {
+            "total_visits": total_visits,
+            "decided_visits": decided_visits,
+            "crops_labeled": crops_labeled,
+        }
+
+    def label_queue(
+        self, oracle: str, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> dict:
+        """``{visits, total_visits, decided_visits, crops_labeled}`` in ONE scan.
+
+        ``GET /api/label/visits`` needs both ``annotation_visits`` (the queue) and
+        ``label_progress`` (the readout) for the SAME window every call; called
+        independently they each run their own ``_present_frames`` — the full
+        frames×analysis JOIN plus a per-row ``dataset_items`` EXISTS probe — so the
+        route paid that cost twice. This runs ``_present_frames`` once and feeds the
+        same list to both via their private ``_frames`` hook; the two return the
+        exact values they always did (they still each derive their own subset/gap-
+        split from it), just from a shared read.
+        """
+        frames = self._present_frames(oracle, since_id, until_id)
+        return {
+            "visits": self.annotation_visits(oracle, since_id, until_id, _frames=frames),
+            **self.label_progress(oracle, since_id, until_id, _frames=frames),
+        }
+
+    def labeled_visits(
+        self, oracle: str, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> "list[dict]":
+        """Already-decided ``oracle``-present visits, newest-labelled first — the undo/re-label feed.
+
+        The mirror of ``annotation_visits`` over the DECIDED subset: live ``oracle``
+        (``yolo-serial``)-present frames in the window that HAVE a ``dataset_items``
+        row, INNER-JOINed to that row for the current identity (``cat_id`` /
+        ``label_kind`` / ``quality`` / ``crop_path``) and the cat name, clustered by
+        the shared ``_gap_split`` / ``_VISIT_GAP_MS`` primitive so the grouping
+        matches the queue's exactly. Each cluster is one past labelling gesture and
+        its rows share a decision, so the visit identity is taken from them;
+        ``mixed`` flags the rare case where two adjacent-in-time gestures merged into
+        one recv_ts cluster. The display ``bbox`` per frame comes from
+        ``analysis.detail`` (the same box the queue showed), so a crop renders via
+        the same ``/api/label/crop`` path even for a ``not_cat`` row (whose stored
+        bbox is NULL). Returned newest-labelled first (max ``labeled_ts`` per
+        cluster, DESC) so the most recent mistake is on top. Per visit::
+
+            {frames: [{id, recv_ts, bbox, quality, crop_path, url}, ...],
+             rep_frame_id, span: [lo_ts, hi_ts], label_kind, cat_id, cat_name,
+             mixed, labeled_ts}
+
+        ``since_id`` / ``until_id`` are the same inclusive id-range scope every
+        windowed read shares. Like ``annotation_visits`` it is unpaginated (a known
+        scaling limit); the labelled set is bounded by how much has been labelled.
+        """
+        frags, params = _range_bounds("f.id", since_id, until_id)
+        and_sql = "".join(" AND " + frag for frag in frags)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.id, f.recv_ts, o.detail, d.cat_id, d.label_kind, d.quality,"
+                " d.crop_path, d.labeled_ts, c.name"
+                " FROM frames f"
+                " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                " JOIN dataset_items d ON d.src_frame_id = f.id AND d.src_recv_ts = f.recv_ts"
+                " LEFT JOIN cats c ON c.id = d.cat_id"
+                " WHERE o.verdict = 1" + and_sql +
+                " ORDER BY f.recv_ts ASC, f.id ASC",
+                [oracle] + params,
+            ).fetchall()
+        # Box-parse + assemble outside the lock (pure Python over fetched rows).
+        decided: "list[dict]" = []
+        for row_id, recv_ts, detail, cat_id, label_kind, quality, crop_path, labeled_ts, cat_name in rows:
+            box = self._best_box(detail)
+            if box is None:
+                continue  # defensive: a decided frame should still parse a box
+            bbox, _score = box
+            decided.append(
+                {
+                    "id": int(row_id),
+                    "recv_ts": recv_ts,
+                    "bbox": bbox,
+                    "quality": quality,
+                    "crop_path": crop_path,
+                    "cat_id": cat_id,
+                    "label_kind": label_kind,
+                    "cat_name": cat_name,
+                    "labeled_ts": labeled_ts,
+                }
+            )
+        visits: "list[dict]" = []
+        for cluster in self._gap_split(decided, _VISIT_GAP_MS, lambda fr: fr["recv_ts"]):
+            out_frames = [
+                {
+                    "id": fr["id"],
+                    "recv_ts": fr["recv_ts"],
+                    "bbox": fr["bbox"],
+                    "quality": fr["quality"],
+                    "crop_path": fr["crop_path"],
+                    "url": f"/media/{fr['id']}",
+                }
+                for fr in cluster
+            ]
+            rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            mixed = len({(fr["label_kind"], fr["cat_id"]) for fr in cluster}) > 1
+            visits.append(
+                {
+                    "frames": out_frames,
+                    "rep_frame_id": rep["id"],
+                    "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
+                    "label_kind": rep["label_kind"],
+                    "cat_id": rep["cat_id"],
+                    "cat_name": rep["cat_name"],
+                    "mixed": mixed,
+                    "labeled_ts": max(fr["labeled_ts"] for fr in cluster),
+                }
+            )
+        visits.sort(key=lambda v: v["labeled_ts"], reverse=True)
+        return visits
+
+    def add_dataset_items(self, rows: "list[dict]") -> int:
+        """Bulk-insert one ``dataset_items`` row per labelled crop; return the count.
+
+        ``rows`` is a list of dicts — the wire contract the label route builds — one
+        per visit frame, each with keys::
+
+            frame_id     (int, required)  the source frames.id
+            label_kind   (str, required)  'identified' | 'unknown_cat' | 'not_cat'
+            cat_id       (int|None)       set iff label_kind == 'identified'
+            quality      (str|None)       'gallery'|'ok'|'poor' (None for not_cat)
+            bbox         (list|str|None)  [x1,y1,x2,y2] or "x1,y1,x2,y2" (None for not_cat)
+            crop_path    (str|None)       dataset-root-relative jpg (None for not_cat)
+            source       (str, optional)  defaults to 'detector'
+
+        ``src_recv_ts`` is resolved from ``frames`` by ``frame_id`` AT INSERT, so it
+        snapshots the frame the label was made against; a ``frame_id`` no longer
+        live (evicted / cleared) is SKIPPED, not inserted (its frame is gone, so a
+        (frame_id, recv_ts) dedup key would be meaningless). A (``src_frame_id``,
+        ``src_recv_ts``) pair that ALREADY has a row is also SKIPPED — ``idx_dataset_src``
+        is a UNIQUE index and the insert is ``INSERT OR IGNORE``, so a double-submit,
+        a stale duplicate request, or a second labeller can never create a second,
+        possibly-conflicting ``dataset_items`` row for the same crop; the first write
+        wins and the return count reflects only rows genuinely inserted (a caller
+        that needs to know about a rejected duplicate would see a lower count than
+        ``len(rows)``). ``label_kind`` and ``quality`` are validated for the WHOLE
+        batch BEFORE any write, so a bad row raises ``ValueError`` without touching
+        the DB. Runs under one lock hold, one commit; any exception during the
+        write loop rolls back the transaction (mirroring ``add``'s discipline) so a
+        mid-batch failure (disk-full, a lock beyond ``busy_timeout``) can't leave
+        partial rows sitting uncommitted on the shared connection to be silently
+        flushed by the next unrelated commit elsewhere.
+
+        CONTRACT for the caller: materialise each crop FILE first, then call this to
+        record its row, so a crash orphans a (harmless) crop file rather than a
+        ``dataset_items`` row pointing at a missing crop.
+        """
+        if not rows:
+            return 0
+        # Validate + coerce the whole batch up front (no DB touched yet), so a bad
+        # enum can't abort mid-loop and strand uncommitted inserts on the connection.
+        prepared: "list[tuple]" = []
+        for row in rows:
+            label_kind = row["label_kind"]
+            if label_kind not in _LABEL_KINDS:
+                raise ValueError(f"label_kind must be one of {_LABEL_KINDS}, got {label_kind!r}")
+            quality = row.get("quality")
+            if quality is not None and quality not in _QUALITIES:
+                raise ValueError(f"quality must be one of {_QUALITIES} or None, got {quality!r}")
+            cat_id = row.get("cat_id")
+            prepared.append(
+                (
+                    int(row["frame_id"]),
+                    int(cat_id) if cat_id is not None else None,
+                    label_kind,
+                    quality,
+                    self._bbox_text(row.get("bbox")),
+                    row.get("crop_path"),
+                    row.get("source") or "detector",
+                )
+            )
+        labeled_ts = int(time.time() * 1000)
+        inserted = 0
+        with self._lock:
+            try:
+                for frame_id, cat_id, label_kind, quality, bbox_text, crop_path, source in prepared:
+                    r = self._conn.execute(
+                        "SELECT recv_ts FROM frames WHERE id = ?", (frame_id,)
+                    ).fetchone()
+                    if r is None:
+                        continue  # frame no longer live — nothing to anchor the label to
+                    cur = self._conn.execute(
+                        "INSERT OR IGNORE INTO dataset_items (cat_id, label_kind, quality, bbox, crop_path,"
+                        " src_frame_id, src_recv_ts, source, labeled_ts)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (cat_id, label_kind, quality, bbox_text, crop_path,
+                         frame_id, int(r[0]), source, labeled_ts),
+                    )
+                    inserted += cur.rowcount  # 0 when (frame_id, recv_ts) already has a row
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return inserted
+
+    def delete_dataset_items(self, frame_ids: "list[int]") -> "list[dict]":
+        """Delete label rows for these source frames; return their crop paths.
+
+        The undo / re-label primitive: drops the ``dataset_items`` rows for
+        ``frame_ids`` (matched on ``src_frame_id``) so those frames fall back into
+        the annotation queue (the queue's "undecided" predicate is the ABSENCE of a
+        row), and returns ``[{frame_id, crop_path}, ...]`` for the rows removed so
+        the caller — the API, which owns crop file I/O — can delete the now-orphaned
+        crop files. Matching on ``src_frame_id`` alone also sweeps any stale
+        pre-``clear`` orphan row for a reused id, which is harmless cleanup since
+        such a row's frame is long gone. Empty input is a no-op. One lock hold, one
+        commit, rollback on error (``add``'s discipline)."""
+        if not frame_ids:
+            return []
+        ids = [int(f) for f in frame_ids]
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    f"SELECT src_frame_id, crop_path FROM dataset_items"
+                    f" WHERE src_frame_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                self._conn.execute(
+                    f"DELETE FROM dataset_items WHERE src_frame_id IN ({placeholders})", ids
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return [{"frame_id": int(r[0]), "crop_path": r[1]} for r in rows]
+
+    def labeled_crops(self, label_kinds: "tuple[str, ...]" = ("identified",)) -> "list[dict]":
+        """Durable labelled crops for the feasibility / gallery experiments.
+
+        Returns one dict per ``dataset_items`` row whose ``label_kind`` is in
+        ``label_kinds`` AND which has a materialised crop file (``crop_path`` not
+        NULL), joined to ``cats`` for the display name::
+
+            {cat_id, cat_name, label_kind, quality, crop_path (ABSOLUTE), src_frame_id}
+
+        ``crop_path`` is joined to ``dataset_root`` so an OFFLINE reader (the
+        embedding/feasibility tool, which the lean collector never imports) opens
+        it directly without knowing the store layout. Ordered by ``cat_id`` then
+        ``id`` so same-cat crops are contiguous. Defaults to the ``identified``
+        crops (the ones with a known individual — what a separability probe or a
+        gallery is built from); pass more kinds (e.g. ``"unknown_cat"``) to include
+        the ambiguous set for threshold tuning. The store stays cv2-free: it hands
+        back paths, never pixels."""
+        kinds = tuple(label_kinds)
+        if not kinds:
+            return []
+        placeholders = ",".join("?" for _ in kinds)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id"
+                " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
+                f" WHERE d.label_kind IN ({placeholders}) AND d.crop_path IS NOT NULL"
+                " ORDER BY d.cat_id, d.id",
+                kinds,
+            ).fetchall()
+        return [
+            {
+                "cat_id": r[0],
+                "cat_name": r[1],
+                "label_kind": r[2],
+                "quality": r[3],
+                "crop_path": os.path.join(self._dataset_root, r[4]),
+                "src_frame_id": r[5],
+            }
+            for r in rows
+        ]
+
+    # --- Roster (cats) CRUD ------------------------------------------------
+
+    @staticmethod
+    def _cat_to_dict(row) -> dict:
+        """Map a ``cats`` row ``(id, name, is_resident, active, notes, created_ts)`` to the API shape.
+
+        ``is_resident``/``active`` surface as bools. Both ``create_cat`` and
+        ``list_cats``/``update_cat`` build the same column order, so the returned
+        key set can't drift (the discipline ``_group_to_dict`` gives groups).
+        """
+        cat_id, name, is_resident, active, notes, created_ts = row
+        return {
+            "id": cat_id,
+            "name": name,
+            "is_resident": bool(is_resident),
+            "active": bool(active),
+            "notes": notes,
+            "created_ts": created_ts,
+        }
+
+    def list_cats(self) -> "list[dict]":
+        """The whole roster, ordered by ``id`` ASC (creation order).
+
+        The order is stable and append-only, so the digit-key binding a caller
+        derives from it (``1``–``9`` → the first nine cats) never shifts under a
+        mid-session add — a rename changes a name in place, an add lands at the end.
+        Includes retired (``active = 0``) cats so the roster panel can show and
+        un-retire them; a caller that only wants pickable cats filters on ``active``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, is_resident, active, notes, created_ts FROM cats ORDER BY id ASC"
+            ).fetchall()
+        return [self._cat_to_dict(r) for r in rows]
+
+    def create_cat(self, name: str, is_resident: bool = False) -> dict:
+        """Add a roster cat and return it. Duplicate name → ``ValueError``.
+
+        ``name`` is stripped and must be non-empty; ``is_resident`` is coerced to
+        0/1 (``active`` starts 1, ``notes`` NULL). The UNIQUE constraint on ``name``
+        surfaces as ``ValueError`` (the API maps it to a 400), rolling back the
+        failed insert so the shared connection is left clean.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("cat name must be non-empty")
+        resident = 1 if is_resident else 0
+        created_ts = int(time.time() * 1000)
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "INSERT INTO cats (name, is_resident, active, notes, created_ts)"
+                    " VALUES (?, ?, 1, NULL, ?)",
+                    (name, resident, created_ts),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                raise ValueError(f"cat name already exists: {name!r}")
+            cat_id = int(cur.lastrowid)
+            self._conn.commit()
+        return self._cat_to_dict((cat_id, name, resident, 1, None, created_ts))
+
+    def update_cat(self, cat_id: int, fields: dict) -> dict:
+        """Update a roster cat's ``name`` / ``is_resident`` / ``active``; return the row.
+
+        ``fields`` is a partial dict — only the keys present are changed (retire by
+        setting ``active`` False without deleting the cat's labels; ``cat_id`` on
+        ``dataset_items`` keeps pointing at it). An empty/unknown-only ``fields``, an
+        empty ``name``, or an unknown ``cat_id`` → ``ValueError``; a duplicate
+        ``name`` → ``ValueError`` (UNIQUE), each rolling back so the connection stays
+        clean. ``is_resident``/``active`` are coerced to 0/1.
+        """
+        cat_id = int(cat_id)
+        sets: "list[str]" = []
+        params: list = []
+        if "name" in fields:
+            name = (fields["name"] or "").strip()
+            if not name:
+                raise ValueError("cat name must be non-empty")
+            sets.append("name = ?")
+            params.append(name)
+        if "is_resident" in fields:
+            sets.append("is_resident = ?")
+            params.append(1 if fields["is_resident"] else 0)
+        if "active" in fields:
+            sets.append("active = ?")
+            params.append(1 if fields["active"] else 0)
+        if not sets:
+            raise ValueError("no updatable fields provided (name / is_resident / active)")
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "UPDATE cats SET " + ", ".join(sets) + " WHERE id = ?", params + [cat_id]
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                raise ValueError(f"cat name already exists: {fields.get('name')!r}")
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ValueError(f"no such cat: {cat_id}")
+            row = self._conn.execute(
+                "SELECT id, name, is_resident, active, notes, created_ts FROM cats WHERE id = ?",
+                (cat_id,),
+            ).fetchone()
+            self._conn.commit()
+        return self._cat_to_dict(row)

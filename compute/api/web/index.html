@@ -1076,6 +1076,21 @@
         #tuningParamSource { min-width: 150px; }
         #viewerPageLabel { min-width: 64px; text-align: center; }
 
+        /* Training page: disabled "coming next" cards (Build gallery / Promote),
+           clickable run-history rows, and the embedded report iframe. */
+        .panel-disabled { opacity: 0.55; }
+        .train-run-row { cursor: pointer; }
+        .train-run-row.selected { border-color: var(--color-primary); }
+        .train-report-frame {
+            display: block;
+            width: 100%;
+            height: 640px;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            background: var(--color-surface-2);
+            margin-top: var(--space-2);
+        }
+
         /* Utilities (kept last so they win equal-specificity battles). */
         .push-end { margin-left: auto; }
         .text-muted { color: var(--color-text-muted); }
@@ -1091,6 +1106,7 @@
         <a href="#sweeps" data-route="sweeps" class="nav-link">Sweeps</a>
         <a href="#tuning" data-route="tuning" class="nav-link">Tuning</a>
         <a href="#annotate" data-route="annotate" class="nav-link">Annotate</a>
+        <a href="#train" data-route="train" class="nav-link">Training</a>
         </div>
     </nav>
 
@@ -1571,6 +1587,70 @@
         </div>
     </section>
 
+    <!-- ================= TRAIN VIEW ================= -->
+    <!-- The learning loop's Train stage: build gallery -> validate -> promote.
+         Only Validate (the feasibility probe) is live; Build/Promote are honest
+         "coming next" stubs so the page names the whole loop without overclaiming. -->
+    <section id="view-train" class="view hidden">
+        <div class="panel panel-disabled">
+            <h2>1. Build gallery</h2>
+            <p class="caveat text-muted" style="margin: 0;">
+                Coming next — rebuilding the resident gallery from labelled crops isn't wired up yet.
+            </p>
+        </div>
+
+        <div class="panel">
+            <h2>2. Validate</h2>
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Runs the feasibility probe over labelled, identified crops: embeds them, then
+                reports leave-one-out kNN accuracy, a same/different-cat distance AUC, and a
+                suggested confidence threshold. No model is built or promoted here.
+            </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="trainQualityGallery" checked> gallery</label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="trainQualityOk" checked> ok</label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="trainQualityPoor" checked> poor</label>
+                </div>
+                <div class="control-group push-end">
+                    <button type="button" id="trainRunBtn">Run</button>
+                </div>
+            </div>
+            <div id="trainEnoughNote" class="hidden banner-warn"></div>
+            <div id="trainProgress" class="queue-line">Idle.</div>
+            <div class="btn-row" style="margin-top: var(--space-2);">
+                <button type="button" id="trainCancelBtn" class="btn-secondary">Cancel current</button>
+                <button type="button" id="trainQueueClearBtn" class="btn-secondary">Clear pending</button>
+                <button type="button" id="trainStopAllBtn" class="btn-danger">Stop all</button>
+            </div>
+            <div id="trainQueuePending"></div>
+            <div id="trainQueueHistory"></div>
+            <div id="trainError" class="hidden analysis-error"></div>
+
+            <h2 style="margin-top: var(--space-4);">Recent runs</h2>
+            <div id="trainRunsList" class="queue-list"></div>
+            <div id="trainRunsEmpty" class="empty hidden">No validation runs yet — run one above.</div>
+
+            <h2 style="margin-top: var(--space-4);">Report</h2>
+            <div id="trainReportPruned" class="empty hidden">Report pruned — re-run to regenerate.</div>
+            <iframe id="trainReportFrame" class="train-report-frame hidden" title="Feasibility report"></iframe>
+        </div>
+
+        <div class="panel panel-disabled">
+            <h2>3. Promote</h2>
+            <p class="caveat text-muted" style="margin: 0;">
+                Coming next — promoting a validated model version to Run isn't wired up yet.
+            </p>
+        </div>
+    </section>
+
     </div>
 
     <script>
@@ -1707,8 +1787,26 @@
         const annotateUndoBtn = document.getElementById('annotateUndoBtn');
         const annotateErrorEl = document.getElementById('annotateError');
 
+        // Train view.
+        const trainQualityGalleryEl = document.getElementById('trainQualityGallery');
+        const trainQualityOkEl = document.getElementById('trainQualityOk');
+        const trainQualityPoorEl = document.getElementById('trainQualityPoor');
+        const trainRunBtn = document.getElementById('trainRunBtn');
+        const trainEnoughNoteEl = document.getElementById('trainEnoughNote');
+        const trainProgressEl = document.getElementById('trainProgress');
+        const trainCancelBtn = document.getElementById('trainCancelBtn');
+        const trainQueueClearBtn = document.getElementById('trainQueueClearBtn');
+        const trainStopAllBtn = document.getElementById('trainStopAllBtn');
+        const trainQueuePendingEl = document.getElementById('trainQueuePending');
+        const trainQueueHistoryEl = document.getElementById('trainQueueHistory');
+        const trainErrorEl = document.getElementById('trainError');
+        const trainRunsListEl = document.getElementById('trainRunsList');
+        const trainRunsEmptyEl = document.getElementById('trainRunsEmpty');
+        const trainReportPrunedEl = document.getElementById('trainReportPruned');
+        const trainReportFrameEl = document.getElementById('trainReportFrame');
+
         // ================= shared constants + state =================
-        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning', 'annotate'];
+        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning', 'annotate', 'train'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
@@ -1745,6 +1843,15 @@
         // first poll of a given job identity (re-anchored when that identity changes, and
         // dropped when idle), so a new sweep never inherits the prior job's rate.
         let etaAnchor = null;
+
+        // Training status (from /api/training/status) + its run history, rendered on
+        // the Train view. A SEPARATE anchor from the sweeps `etaAnchor` above — a
+        // concurrent oracle sweep and a training run must not clobber each other's ETA.
+        let trainingStatus = { running: false, queue: [], history: [], result: null };
+        let trainingEtaAnchor = null;
+        let trainRuns = [];             // feasibility_runs history, most-recent-first
+        let trainLastResultRunId = null; // dedupes the runs-list refresh to one per completed run
+        let trainSelectedRunId = null;   // which run's report is loaded in the iframe
 
         // Groups / buckets (from /api/groups), shared by both views.
         let groups = [];
@@ -2014,6 +2121,8 @@
             } else if (r === 'annotate') {
                 loadCats();
                 loadGroups().then(() => reloadAnnotate());
+            } else if (r === 'train') {
+                reloadTrain();
             }
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -4459,6 +4568,249 @@
             }
         });
 
+        // ================= TRAIN view =================
+        // The Validate panel: quality checkboxes -> POST /api/training/feasibility/run,
+        // then poll the dedicated training queue (its own manager/status endpoint, never
+        // the sweeps one) for progress/ETA, and render the durable run history + report.
+        function reloadTrain() {
+            pollTrainingStatus();
+            loadTrainRuns();
+        }
+
+        // A quality-tuple label matching the store's slug convention ('all' when the
+        // job ran with no filter — 0 or all 3 boxes checked collapse to that on submit).
+        function trainQualityLabel(params) {
+            if (!params || !params.length) return 'all';
+            return params.join('+');
+        }
+
+        // Same shape as the sweeps etaText (~line 3318) reused deliberately, but keyed
+        // off `trainingEtaAnchor` — its own anchor, so it can't be reset by a concurrent
+        // oracle sweep re-anchoring the shared `etaAnchor`, or vice versa.
+        function trainEtaText(status) {
+            if (!status.running || !status.total || status.total <= 0) { trainingEtaAnchor = null; return ''; }
+            const now = Date.now();
+            const key = [status.kind, trainQualityLabel(status.params), status.total].join('|');
+            if (!trainingEtaAnchor || trainingEtaAnchor.key !== key || status.done < trainingEtaAnchor.done0) {
+                trainingEtaAnchor = { key, t0: now, done0: status.done };
+                return '';
+            }
+            const dDone = status.done - trainingEtaAnchor.done0;
+            const dt = (now - trainingEtaAnchor.t0) / 1000;
+            const remaining = status.total - status.done;
+            if (dDone <= 0 || dt <= 0 || remaining <= 0) return '';
+            const rate = dDone / dt;
+            return ` · ${rate.toFixed(1)}/s · ~${formatDuration(remaining / rate)} left`;
+        }
+
+        function renderTrainQueuePanel(status) {
+            const running = !!status.running;
+            const queue = status.queue || [];
+            const history = status.history || [];
+
+            trainCancelBtn.disabled = !running;
+            trainQueueClearBtn.disabled = queue.length === 0;
+            trainStopAllBtn.disabled = !running && queue.length === 0;
+            trainRunBtn.disabled = running;
+
+            if (running) {
+                trainProgressEl.textContent = `Running feasibility (${trainQualityLabel(status.params)}) — ${status.done}/${status.total}${trainEtaText(status)}`;
+            } else {
+                trainingEtaAnchor = null;  // idle: drop the anchor so the next run re-anchors fresh
+                trainProgressEl.textContent = 'Idle.';
+            }
+
+            trainQueuePendingEl.innerHTML = '';
+            if (queue.length) {
+                const h = document.createElement('div');
+                h.className = 'queue-heading';
+                h.textContent = `Pending (${queue.length})`;
+                trainQueuePendingEl.appendChild(h);
+                const list = document.createElement('div');
+                list.className = 'queue-list';
+                queue.forEach((job, i) => {
+                    const item = document.createElement('div');
+                    item.className = 'queue-item';
+                    const left = document.createElement('span');
+                    left.textContent = `${i + 1}. ${kindLabel(job.kind)}`;
+                    const right = document.createElement('span');
+                    right.textContent = trainQualityLabel(job.params);
+                    item.append(left, right);
+                    list.appendChild(item);
+                });
+                trainQueuePendingEl.appendChild(list);
+            }
+
+            trainQueueHistoryEl.innerHTML = '';
+            if (history.length) {
+                const h = document.createElement('div');
+                h.className = 'queue-heading';
+                h.textContent = 'History (most recent first)';
+                trainQueueHistoryEl.appendChild(h);
+                const list = document.createElement('div');
+                list.className = 'queue-list';
+                for (const rec of history) {
+                    const item = document.createElement('div');
+                    item.className = 'queue-item';
+                    const left = document.createElement('span');
+                    left.textContent = `${kindLabel(rec.kind)} · ${trainQualityLabel(rec.params)}`;
+                    const right = document.createElement('span');
+                    const stateClass = rec.state === 'done' ? 'state-done' : (rec.state === 'failed' ? 'state-failed' : 'state-canceled');
+                    const stateText = rec.state === 'failed' ? `failed: ${rec.error || 'error'}` : rec.state;
+                    right.innerHTML = `<span class="${stateClass}">${escapeHtml(stateText)}</span>`;
+                    item.append(left, right);
+                    list.appendChild(item);
+                }
+                trainQueueHistoryEl.appendChild(list);
+            }
+
+            trainErrorEl.textContent = status.error ? `Last training run failed: ${status.error}` : '';
+            trainErrorEl.classList.toggle('hidden', !status.error);
+
+            // A poll that lands after completion carries `result` — jump the runs list +
+            // iframe to it without a second round trip, but only once per finished run
+            // (trainLastResultRunId dedupes repeat polls of the same terminal status) AND
+            // only while the Train view is actually showing: the global-interval poll fires
+            // on every route, and fetching /runs + loading the report into a hidden iframe
+            // off-route is wasted work — onRouteEnter('train') refreshes the list on arrival.
+            if (location.hash.slice(1) === 'train'
+                    && status.result && status.result.run_id != null
+                    && status.result.run_id !== trainLastResultRunId) {
+                trainLastResultRunId = status.result.run_id;
+                loadTrainRuns(status.result.run_id);
+            }
+        }
+
+        async function pollTrainingStatus() {
+            try {
+                const res = await fetch('/api/training/status');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                trainingStatus = data;
+                renderTrainQueuePanel(data);
+            } catch (err) {
+                console.warn('training status poll failed:', err);
+            }
+        }
+
+        async function runTraining() {
+            const checked = [];
+            if (trainQualityGalleryEl.checked) checked.push('gallery');
+            if (trainQualityOkEl.checked) checked.push('ok');
+            if (trainQualityPoorEl.checked) checked.push('poor');
+            // 0 or all 3 checked both mean "no filter" (all qualities).
+            const qualities = (checked.length === 0 || checked.length === 3) ? null : checked;
+
+            const label = trainRunBtn.textContent;
+            trainRunBtn.disabled = true;
+            trainRunBtn.textContent = 'Starting…';
+            try {
+                clearError();
+                trainEnoughNoteEl.classList.add('hidden');
+                const res = await fetch('/api/training/feasibility/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ qualities }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (data.enough === false) {
+                    trainEnoughNoteEl.textContent = data.message
+                        || `Not enough labelled data yet: ${data.n_crops} crops across ${data.n_cats} cat(s). Label at least two cats.`;
+                    trainEnoughNoteEl.classList.remove('hidden');
+                } else {
+                    trainingEtaAnchor = null;  // fresh job identity
+                }
+            } catch (err) {
+                showError(`Run failed: ${err.message}`);
+            } finally {
+                trainRunBtn.textContent = label;
+                await pollTrainingStatus();
+            }
+        }
+        trainRunBtn.addEventListener('click', runTraining);
+
+        async function trainQueueControl(endpoint, label) {
+            try {
+                clearError();
+                const res = await fetch(endpoint, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const status = await res.json();
+                renderTrainQueuePanel(status);
+            } catch (err) {
+                showError(`${label} failed: ${err.message}`);
+            } finally {
+                await pollTrainingStatus();
+            }
+        }
+        trainCancelBtn.addEventListener('click', () => trainQueueControl('/api/training/cancel', 'Cancel'));
+        trainQueueClearBtn.addEventListener('click', () => trainQueueControl('/api/training/queue/clear', 'Clear pending'));
+        trainStopAllBtn.addEventListener('click', () => trainQueueControl('/api/training/queue/stop-all', 'Stop all'));
+
+        function renderTrainRuns() {
+            trainRunsListEl.innerHTML = '';
+            trainRunsEmptyEl.classList.toggle('hidden', trainRuns.length > 0);
+            for (const r of trainRuns) {
+                const item = document.createElement('div');
+                item.className = 'queue-item train-run-row' + (r.run_id === trainSelectedRunId ? ' selected' : '');
+                item.dataset.runId = String(r.run_id);
+                const left = document.createElement('span');
+                left.textContent = `${formatTime(r.ts)} · ${r.quality} · ${r.n_crops} crops / ${r.n_cats} cats`;
+                const right = document.createElement('span');
+                const acc = typeof r.knn_accuracy === 'number' ? `${(r.knn_accuracy * 100).toFixed(1)}%` : '—';
+                const auc = typeof r.auc === 'number' ? r.auc.toFixed(3) : '—';
+                const thr = typeof r.threshold === 'number' ? r.threshold.toFixed(3) : '—';
+                right.textContent = `kNN ${acc} · AUC ${auc} · thr ${thr}` + (r.report_available ? '' : ' · pruned');
+                item.append(left, right);
+                item.addEventListener('click', () => loadTrainReport(r));
+                trainRunsListEl.appendChild(item);
+            }
+        }
+
+        function showNoTrainReport() {
+            trainSelectedRunId = null;
+            trainReportFrameEl.classList.add('hidden');
+            trainReportFrameEl.src = '';
+            trainReportPrunedEl.classList.add('hidden');
+        }
+
+        // A pruned run keeps its metrics row but its report dir is gone — show the
+        // placeholder rather than loading a 404 into the iframe (spec: report rendering).
+        function loadTrainReport(r) {
+            trainSelectedRunId = r.run_id;
+            for (const el of trainRunsListEl.querySelectorAll('.train-run-row')) {
+                el.classList.toggle('selected', Number(el.dataset.runId) === r.run_id);
+            }
+            if (!r.report_available) {
+                trainReportFrameEl.classList.add('hidden');
+                trainReportFrameEl.src = '';
+                trainReportPrunedEl.classList.remove('hidden');
+                return;
+            }
+            trainReportPrunedEl.classList.add('hidden');
+            trainReportFrameEl.classList.remove('hidden');
+            trainReportFrameEl.src = `/api/training/feasibility/report/${r.run_id}`;
+        }
+
+        // preferredRunId (the just-finished run from status().result) wins when present
+        // and still in the list; otherwise default to the newest run with a live report,
+        // falling back to the newest run overall (its tiles show even if pruned).
+        async function loadTrainRuns(preferredRunId) {
+            try {
+                const res = await fetch('/api/training/feasibility/runs');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                trainRuns = data.runs || [];
+                renderTrainRuns();
+                let target = null;
+                if (preferredRunId != null) target = trainRuns.find(r => r.run_id === preferredRunId);
+                if (!target) target = trainRuns.find(r => r.report_available) || trainRuns[0] || null;
+                if (target) loadTrainReport(target); else showNoTrainReport();
+            } catch (err) {
+                console.warn('training runs fetch failed:', err);
+            }
+        }
+
         // ================= init =================
         window.addEventListener('load', () => {
             buildTimeOptions();
@@ -4467,7 +4819,8 @@
             setInboxMode('missed');
             pollStats();
             pollAnalysisStatus();
-            setInterval(() => { pollStats(); pollAnalysisStatus(); }, STATS_POLL_MS);
+            pollTrainingStatus();
+            setInterval(() => { pollStats(); pollAnalysisStatus(); pollTrainingStatus(); }, STATS_POLL_MS);
             setRoute(location.hash ? location.hash.slice(1) : 'start');
         });
     </script>

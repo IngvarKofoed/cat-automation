@@ -103,3 +103,32 @@ def test_labeled_crops_filters_and_absolutizes(tmp_path):
     # not_cat (no crop file) is excluded; unknown_cat included only when asked for.
     both = store.labeled_crops(("identified", "unknown_cat"))
     assert len(both) == 3
+
+
+def test_labeled_crops_quality_filter(tmp_path):
+    store = _store(tmp_path)
+    a = store.create_cat("A")
+    b = store.create_cat("B")
+    f1, f2, f3 = (_add_frame(store, i) for i in (1, 2, 3))
+    store.add_dataset_items(
+        [
+            {"frame_id": f1, "label_kind": "identified", "cat_id": a["id"], "quality": "gallery",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{a['id']}/1.jpg"},
+            {"frame_id": f2, "label_kind": "identified", "cat_id": b["id"], "quality": "ok",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{b['id']}/2.jpg"},
+            {"frame_id": f3, "label_kind": "unknown_cat", "cat_id": None, "quality": "poor",
+             "bbox": [0, 0, 1, 1], "crop_path": "cat_unknown_cat/3.jpg"},
+        ]
+    )
+    # None (default) = no quality filter — every identified crop.
+    assert len(store.labeled_crops(("identified",))) == 2
+    # gallery-only drops the ok crop; the grades compose with label_kinds.
+    gallery = store.labeled_crops(("identified",), ("gallery",))
+    assert [r["cat_name"] for r in gallery] == ["A"]
+    assert len(store.labeled_crops(("identified",), ("gallery", "ok"))) == 2
+    assert len(store.labeled_crops(("identified", "unknown_cat"), ("poor",))) == 1
+    # An explicitly empty selection yields nothing (symmetric with empty label_kinds).
+    assert store.labeled_crops(("identified",), ()) == []
+    # A bad grade is rejected, never silently ignored.
+    with pytest.raises(ValueError):
+        store.labeled_crops(("identified",), ("mint",))

@@ -347,3 +347,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     as a self-contained HTML report + JSON. Separability maths is pure-numpy (unit-tested with synthetic
     vectors); DINOv2 + matplotlib are opt-in analysis extras. Runs on the compute PC (labels + net + GPU there).
 
+60. Feasibility probe gains a `--quality gallery[,ok[,poor]]` filter (new `qualities` arg on
+    `Store.labeled_crops`): A/B gallery-only vs all-crops to test whether crop quality — not the
+    cats — is the separability bottleneck, answering the report's "weak ≠ hopeless" hedge with a
+    measurement. Filtered runs write to `feasibility-<slug>` (grade stamped in report + console) and
+    exclude NULL-grade crops; default (no flag) unchanged. Grades still have no other consumer.
+
+61. Training page (`#train`) — the learning loop's Train stage in the compute UI; only "Validate" is built.
+    Validate runs the DINOv2 feasibility probe as a cancelable background job on a new dedicated
+    `TrainingManager` (own queue, separate from the sweep `AnalysisManager`), with a gallery/ok/poor A/B and the
+    report in-page; runs persist to a durable `feasibility_runs` table. The probe pipeline moved to
+    `compute/identification/probe.py` (CLI now a thin wrapper). Build/promote deferred. Spec: docs/specs/2026-07-16-training-page.md.

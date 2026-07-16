@@ -25,6 +25,7 @@ import bisect
 import json
 import math
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -159,6 +160,7 @@ class Store:
     def __init__(
         self, db_path: str, media_root: str, max_bytes: int, dataset_root: "str | None" = None
     ) -> None:
+        self._db_path = db_path
         self._media_root = media_root
         self._max_bytes = max_bytes
         # Durable annotation crops live in a dir SIBLING to the rolling media/ (a
@@ -250,6 +252,17 @@ class Store:
         # WRITE time, not only read time, so a double-submit / stale second tab can't
         # insert a second, possibly-conflicting row for the same crop (see add_dataset_items).
         # idx_dataset_cat serves the per-cat label rollups a later gallery build wants.
+        #
+        # The `feasibility_runs` table is one row per validation (feasibility-probe)
+        # run from the Training page (see the training-page spec): the separability
+        # metrics (kNN accuracy, same-vs-different-cat AUC, suggested threshold) over
+        # the labelled crops of a chosen `quality` selection, plus the `report_dir`
+        # basename of the run's rendered HTML report. Like `cats`/`dataset_items` it is
+        # precious hand-derived output, so — unlike every frame-keyed table above —
+        # NEITHER `_evict_locked` NOR `clear` touches it: run history is decoupled from
+        # the rolling frame buffer and survives a wipe. Rows are kept indefinitely (a
+        # row is tiny); only the on-disk report DIRS are bounded (prune_feasibility_reports),
+        # so an aged-out run keeps its metrics row while its report endpoint 404s.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS frames (
@@ -315,6 +328,18 @@ class Store:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_src ON dataset_items(src_frame_id, src_recv_ts);
             CREATE INDEX IF NOT EXISTS idx_dataset_cat ON dataset_items(cat_id);
+            CREATE TABLE IF NOT EXISTS feasibility_runs (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts           INTEGER NOT NULL,          -- ms epoch at the run's completion
+              quality      TEXT    NOT NULL,          -- slug: 'all' | 'gallery' | 'gallery+ok' | ...
+              n_crops      INTEGER NOT NULL,
+              n_cats       INTEGER NOT NULL,
+              knn_accuracy REAL,
+              auc          REAL,
+              threshold    REAL,
+              report_dir   TEXT    NOT NULL,          -- training_root-relative basename of the report dir
+              notes        TEXT
+            );
             """
         )
         self._conn.commit()
@@ -605,11 +630,12 @@ class Store:
             # is the caller's job (the /api/clear route) — NOT clear()'s, which
             # doesn't know whether collection is live. `settings` is deliberately
             # NOT dropped — it is config, so `motion_only` survives the wipe. For the
-            # SAME reason, `cats` and `dataset_items` are NOT dropped here (nor by
-            # `_evict_locked`): they are the annotation tool's precious hand-made
-            # output, self-contained (no FK to `frames`), and their queue-dedup keys
-            # on (`src_frame_id`, `src_recv_ts`) so a post-clear rowid reuse can't
-            # collide (recv_ts advances) — see the annotation-tool spec.
+            # SAME reason, `cats`, `dataset_items`, and `feasibility_runs` are NOT
+            # dropped here (nor by `_evict_locked`): they are precious hand-made output
+            # (the annotation tool's labels and the Training page's validation history),
+            # self-contained (no FK to `frames`), and the annotation tables' queue-dedup
+            # keys on (`src_frame_id`, `src_recv_ts`) so a post-clear rowid reuse can't
+            # collide (recv_ts advances) — see the annotation-tool + training-page specs.
             self._conn.execute("DELETE FROM mode_changes")
             self._conn.commit()
             self._total_bytes = 0
@@ -2386,7 +2412,11 @@ class Store:
                 raise
         return [{"frame_id": int(r[0]), "crop_path": r[1]} for r in rows]
 
-    def labeled_crops(self, label_kinds: "tuple[str, ...]" = ("identified",)) -> "list[dict]":
+    def labeled_crops(
+        self,
+        label_kinds: "tuple[str, ...]" = ("identified",),
+        qualities: "tuple[str, ...] | None" = None,
+    ) -> "list[dict]":
         """Durable labelled crops for the feasibility / gallery experiments.
 
         Returns one dict per ``dataset_items`` row whose ``label_kind`` is in
@@ -2401,19 +2431,39 @@ class Store:
         ``id`` so same-cat crops are contiguous. Defaults to the ``identified``
         crops (the ones with a known individual — what a separability probe or a
         gallery is built from); pass more kinds (e.g. ``"unknown_cat"``) to include
-        the ambiguous set for threshold tuning. The store stays cv2-free: it hands
-        back paths, never pixels."""
+        the ambiguous set for threshold tuning.
+
+        ``qualities`` optionally restricts to crops whose ``quality`` is in the
+        given set — e.g. ``("gallery",)`` for a gallery-only separability run, or
+        ``("gallery", "ok")`` to drop only the poor crops. ``None`` (default)
+        applies NO quality filter, matching the prior behaviour (every crop of the
+        requested kinds). A quality filter excludes NULL-``quality`` rows — a crop
+        with no grade can't satisfy ``IN (...)``, which is correct: an un-graded
+        crop is not gallery-grade. An explicitly empty tuple selects nothing
+        (``[]``), symmetric with an empty ``label_kinds``. The store stays cv2-free:
+        it hands back paths, never pixels."""
         kinds = tuple(label_kinds)
         if not kinds:
             return []
-        placeholders = ",".join("?" for _ in kinds)
+        quals = tuple(qualities) if qualities is not None else None
+        if quals is not None:
+            for q in quals:
+                if q not in _QUALITIES:
+                    raise ValueError(f"quality must be one of {_QUALITIES}, got {q!r}")
+            if not quals:
+                return []
+        where = "d.label_kind IN (%s) AND d.crop_path IS NOT NULL" % ",".join("?" for _ in kinds)
+        params: "list" = list(kinds)
+        if quals is not None:
+            where += " AND d.quality IN (%s)" % ",".join("?" for _ in quals)
+            params += list(quals)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id"
                 " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
-                f" WHERE d.label_kind IN ({placeholders}) AND d.crop_path IS NOT NULL"
+                f" WHERE {where}"
                 " ORDER BY d.cat_id, d.id",
-                kinds,
+                params,
             ).fetchall()
         return [
             {
@@ -2426,6 +2476,198 @@ class Store:
             }
             for r in rows
         ]
+
+    def count_identified_crops(
+        self, qualities: "tuple[str, ...] | None"
+    ) -> "tuple[int, int]":
+        """The (crop count, distinct-cat count) of ``identified`` crops for a quality filter.
+
+        The cheap pre-check the Training page runs BEFORE enqueuing a feasibility
+        run: it answers "is there enough labelled data yet?" (at least 2 crops
+        across at least 2 distinct cats) with two aggregate COUNTs, loading no rows
+        or paths — unlike ``labeled_crops``, which materialises every row for the
+        embedder. Counts ``dataset_items`` rows whose ``label_kind = 'identified'``
+        AND which have a materialised crop file (``crop_path`` not NULL), applying
+        the SAME ``qualities`` semantics as ``labeled_crops``: ``None`` applies NO
+        quality filter; a tuple restricts to ``quality IN (...)`` (excluding
+        NULL-``quality`` rows, which can't be gallery-grade); an explicitly empty
+        tuple selects nothing (``(0, 0)``). A grade outside ``_QUALITIES`` raises
+        ``ValueError``, exactly as ``labeled_crops`` does, so a bad request is a 400,
+        not a silent empty result. Returns ``(n_crops, n_cats)``.
+        """
+        quals = tuple(qualities) if qualities is not None else None
+        if quals is not None:
+            for q in quals:
+                if q not in _QUALITIES:
+                    raise ValueError(f"quality must be one of {_QUALITIES}, got {q!r}")
+            if not quals:
+                return (0, 0)
+        where = "label_kind = 'identified' AND crop_path IS NOT NULL"
+        params: "list" = []
+        if quals is not None:
+            where += " AND quality IN (%s)" % ",".join("?" for _ in quals)
+            params += list(quals)
+        with self._lock:
+            n_crops, n_cats = self._conn.execute(
+                f"SELECT COUNT(*), COUNT(DISTINCT cat_id) FROM dataset_items WHERE {where}",
+                params,
+            ).fetchone()
+        return (int(n_crops), int(n_cats))
+
+    # --- Feasibility (validation) run history ------------------------------
+    #
+    # One row per Training-page validation run (see the training-page spec). The
+    # store persists the metrics + the report-dir basename; it never runs the probe
+    # (that is the identification orchestrator's job, kept heavy-dep-free of the
+    # store) and never touches the report FILES except to prune old dirs. Same
+    # single connection + single lock as every other op.
+
+    @property
+    def training_root(self) -> str:
+        """Root dir for Training-page artifacts (feasibility reports), under the collection root.
+
+        ``os.path.join(os.path.dirname(self._db_path), 'training')`` — a SIBLING of
+        ``media/`` and the dataset root, so validation reports persist alongside the
+        labels they measure and outlive the rolling frame buffer. Unlike ``media/``
+        and the dataset root, the store does NOT create this eagerly in ``__init__``:
+        reports are rare, so the dir is made lazily where a report is written (the
+        orchestrator ``os.makedirs`` its per-run subdir). This only hands out the
+        path.
+        """
+        return os.path.join(os.path.dirname(self._db_path) or ".", "training")
+
+    def add_feasibility_run(
+        self,
+        quality: str,
+        n_crops: int,
+        n_cats: int,
+        knn_accuracy: "float | None",
+        auc: "float | None",
+        threshold: "float | None",
+        report_dir: str,
+        notes: "str | None" = None,
+    ) -> int:
+        """Record one completed validation run; return its new row id.
+
+        ``report_dir`` is the ``training_root``-relative BASENAME of the run's
+        report directory (e.g. ``'1721136000000-gallery'``), NOT an absolute path —
+        so a store whose collection root moves keeps resolving its reports. ``ts`` is
+        stamped here as the compute wall clock in epoch ms (``int(time.time() *
+        1000)``), the same axis ``recv_ts`` / ``ran_at`` use. Any of ``knn_accuracy``
+        / ``auc`` / ``threshold`` may be ``None`` (a metric the probe couldn't
+        compute — e.g. a single-cat degenerate case the caller still chose to
+        record). One lock hold, one commit.
+        """
+        ts = int(time.time() * 1000)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO feasibility_runs (ts, quality, n_crops, n_cats, knn_accuracy, auc,"
+                " threshold, report_dir, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ts,
+                    quality,
+                    int(n_crops),
+                    int(n_cats),
+                    float(knn_accuracy) if knn_accuracy is not None else None,
+                    float(auc) if auc is not None else None,
+                    float(threshold) if threshold is not None else None,
+                    report_dir,
+                    notes,
+                ),
+            )
+            run_id = int(cur.lastrowid)
+            self._conn.commit()
+        return run_id
+
+    def feasibility_runs(self, limit: "int | None" = None) -> "list[dict]":
+        """Validation runs, most-recent-first (``id DESC``), each with a report-availability flag.
+
+        One dict per ``feasibility_runs`` row::
+
+            {run_id, ts, quality, n_crops, n_cats, knn_accuracy, auc, threshold,
+             report_available, notes}
+
+        ``report_available`` is computed at read time — whether
+        ``<training_root>/<report_dir>/feasibility.html`` still exists on disk — so a
+        run whose report dir has been pruned (see ``prune_feasibility_reports``) still
+        lists its metrics but is flagged ``False`` (the UI shows a "report pruned"
+        placeholder instead of loading a 404 into the iframe). ``limit`` optionally
+        caps the number of rows returned (``None`` = all).
+        """
+        sql = "SELECT id, ts, quality, n_crops, n_cats, knn_accuracy, auc, threshold, report_dir, notes" \
+              " FROM feasibility_runs ORDER BY id DESC"
+        params: "list" = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        root = self.training_root
+        return [
+            {
+                "run_id": r[0],
+                "ts": r[1],
+                "quality": r[2],
+                "n_crops": r[3],
+                "n_cats": r[4],
+                "knn_accuracy": r[5],
+                "auc": r[6],
+                "threshold": r[7],
+                "report_available": os.path.isfile(os.path.join(root, r[8], "feasibility.html")),
+                "notes": r[9],
+            }
+            for r in rows
+        ]
+
+    def feasibility_run_report_path(self, run_id: int) -> "str | None":
+        """Absolute path to a run's ``feasibility.html``, or ``None`` if it isn't on disk.
+
+        Resolves the run's ``report_dir`` basename against ``training_root`` and
+        returns the report path only when the file actually exists — so a pruned (or
+        never-written) report resolves to ``None``, which the report endpoint maps to
+        a 404 while the run's metrics row keeps listing. An unknown ``run_id`` also
+        returns ``None``.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT report_dir FROM feasibility_runs WHERE id = ?", (int(run_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        path = os.path.join(self.training_root, row[0], "feasibility.html")
+        return path if os.path.isfile(path) else None
+
+    def prune_feasibility_reports(self, keep: int) -> int:
+        """Delete all but the newest ``keep`` runs' report DIRS from disk; return dirs removed.
+
+        Bounds the on-disk report footprint while leaving ALL ``feasibility_runs``
+        rows intact — an aged-out run keeps its (tiny) metrics row and simply reports
+        ``report_available = False``. Keeps the report dirs of the newest ``keep``
+        runs by ``id DESC`` and ``shutil.rmtree``s each older run's dir under
+        ``training_root``. Each per-dir delete swallows ``OSError`` (mirroring
+        ``_unlink``): on the Windows compute PC, removing a report file currently open
+        in a served ``FileResponse`` raises a sharing violation that must not crash the
+        run that triggered the prune. Only dirs that actually existed and were removed
+        are counted. ``keep <= 0`` prunes every run's dir; a store with ``keep`` or
+        fewer runs removes nothing.
+        """
+        keep = max(0, int(keep))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT report_dir FROM feasibility_runs ORDER BY id DESC"
+            ).fetchall()
+        root = self.training_root
+        removed = 0
+        for (report_dir,) in rows[keep:]:
+            path = os.path.join(root, report_dir)
+            if not os.path.isdir(path):
+                continue
+            try:
+                shutil.rmtree(path)
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     # --- Roster (cats) CRUD ------------------------------------------------
 

@@ -20,6 +20,8 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from typing import Callable
+
     import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,12 @@ _DEFAULT_MODEL = "dinov2_vits14"
 _DEFAULT_IMGSZ = 224
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class EmbedCancelled(Exception):
+    """Raised by ``Embedder.embed_paths`` when its ``progress`` callback asks it to
+    stop — the cooperative-cancel signal a long embedding phase honors at the next
+    batch boundary, so Cancel/Stop actually interrupts rather than no-op'ing."""
 
 
 class Embedder:
@@ -76,7 +84,12 @@ class Embedder:
         self._model = torch.hub.load("facebookresearch/dinov2", self.model_name)
         self._model.eval().to(self._device)
 
-    def embed_paths(self, paths: "list[str]", batch_size: int = 32) -> "tuple[np.ndarray, list[int]]":
+    def embed_paths(
+        self,
+        paths: "list[str]",
+        batch_size: int = 32,
+        progress: "Callable[[int, int], bool] | None" = None,
+    ) -> "tuple[np.ndarray, list[int]]":
         """Embed crop files → ``(embeddings (M,D) float32, kept_indices)``.
 
         A path that fails to decode (missing/corrupt file) is SKIPPED, so ``M`` may
@@ -85,6 +98,14 @@ class Embedder:
         Decodes via ``np.fromfile`` + ``cv2.imdecode`` (Windows-path-safe, matching
         ``ingest.client``), converts BGR→RGB, resizes to the patch-aligned square,
         and ImageNet-normalises. Runs under ``torch.no_grad`` in batches.
+
+        ``progress``, when given, is called ``progress(done, total)`` — once with
+        ``(0, len(paths))`` before the loop to set the denominator, then after every
+        batch with the cumulative count of input paths consumed so far (reaching
+        ``len(paths)`` at the end) — driving the ETA UI. If a call returns a FALSY
+        value the run aborts at that batch boundary by raising ``EmbedCancelled``,
+        so a Cancel interrupts the long phase instead of running to completion.
+        ``progress=None`` leaves behavior byte-identical to a plain embed.
         """
         if self._model is None:
             raise RuntimeError("Embedder.embed_paths() called before prepare()")
@@ -94,10 +115,21 @@ class Embedder:
 
         mean = torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1)
         std = torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1)
+        total = len(paths)
         vecs: "list[np.ndarray]" = []
         kept: "list[int]" = []
         buf: "list[torch.Tensor]" = []
         buf_idx: "list[int]" = []
+
+        def report(done: int, allow_cancel: bool = True) -> None:
+            if progress is None:
+                return
+            cont = progress(done, total)
+            # Only the in-progress reports honor cancellation. The final report (after the
+            # last flush) is purely informational — all forward passes are done — so a cancel
+            # arriving at that instant must NOT discard the completed embeddings.
+            if allow_cancel and not cont:
+                raise EmbedCancelled(f"embedding cancelled at {done}/{total} crops")
 
         def flush() -> None:
             if not buf:
@@ -110,6 +142,7 @@ class Embedder:
             buf.clear()
             buf_idx.clear()
 
+        report(0)
         for i, path in enumerate(paths):
             try:
                 data = np.fromfile(path, dtype=np.uint8)
@@ -126,7 +159,9 @@ class Embedder:
             buf_idx.append(i)
             if len(buf) >= batch_size:
                 flush()
+                report(i + 1)
         flush()
+        report(total, allow_cancel=False)
 
         emb = np.concatenate(vecs, axis=0) if vecs else np.zeros((0, 0), dtype="float32")
         return emb, kept

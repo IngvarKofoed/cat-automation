@@ -48,6 +48,7 @@ from compute.analysis.runner import AnalysisManager
 from compute.collection.collector import CollectorManager
 from compute.collection.store import _QUALITIES, Store
 from compute.dataset import crops
+from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -270,6 +271,19 @@ class DeleteRequest(BaseModel):
     frame_ids: "list[int]" = []
 
 
+class FeasibilityRunRequest(BaseModel):
+    """Body of ``POST /api/training/feasibility/run``: which crop grades to embed.
+
+    ``qualities`` is ``null`` (or ``[]``) for "all grades", or a subset of
+    ``_QUALITIES`` (``gallery``/``ok``/``poor``) to A/B whether crop quality is the
+    separability bottleneck. A grade outside ``_QUALITIES`` is a client mistake (400).
+    Both ``null`` and ``[]`` collapse to ``None`` (no filter) at the store/manager
+    boundary, so the two spell the same "all crops" request.
+    """
+
+    qualities: "list[str] | None" = None
+
+
 def _parse_box(box: str) -> "list[float]":
     """Parse a ``"x1,y1,x2,y2"`` query string to four floats; raise on bad input.
 
@@ -434,7 +448,13 @@ def _store_from_env() -> Store:
 
 
 def create_app(
-    *, store=None, client=None, start_collector: bool = True, autostart: "bool | None" = None, analysis_manager=None
+    *,
+    store=None,
+    client=None,
+    start_collector: bool = True,
+    autostart: "bool | None" = None,
+    analysis_manager=None,
+    training_manager=None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -452,6 +472,13 @@ def create_app(
     ``analysis_manager`` defaults to a fresh ``AnalysisManager()`` (whose resolver
     is the package registry ``get_analyzer``); a test injects one whose resolver
     returns a fake analyzer, exercising the analysis routes with no real model.
+
+    ``training_manager`` defaults to a fresh ``TrainingManager()`` (whose probe
+    runner is the real feasibility orchestrator); a test injects one with a fake
+    probe runner, exercising the ``/api/training/*`` routes with no torch. It is a
+    SEPARATE instance from ``analysis_manager`` on purpose — training and oracle
+    sweeps are unrelated workflows and may run concurrently, so they must not share
+    a dedup namespace or contend for one queue slot.
     """
     store = store if store is not None else _store_from_env()
     autostart = _autostart_from_env() if autostart is None else autostart
@@ -491,24 +518,30 @@ def create_app(
     analysis_manager = analysis_manager if analysis_manager is not None else AnalysisManager()
     app.state.analysis_manager = analysis_manager
 
+    training_manager = training_manager if training_manager is not None else TrainingManager()
+    app.state.training_manager = training_manager
+
     @app.on_event("shutdown")
     def _shutdown() -> None:
         # Wind everything down between frames/batches on process exit, THEN close the
-        # store. Order is load-bearing: BOTH the collector and the analysis worker write
-        # through the store's single shared connection, so both must be stopped AND joined
-        # before close() checkpoints+closes it — otherwise an in-flight write (a collector
-        # add, or a sweep's write_analysis_batch / iter_unanalyzed fetch) races a closed DB.
-        # stop() only signals; the bounded join() waits for the thread to actually leave its
-        # write path. Threads are daemons, so the timeouts just bound how long exit blocks —
-        # a still-running sweep's verdicts are resumable via iter_unanalyzed, and its write
-        # is itself log-and-skip, so the residual race is a no-op, not a lost/failed job.
-        # Registered UNCONDITIONALLY (not gated on start_collector) so the WAL
-        # checkpoint-on-close always runs — otherwise an analysis-only / test app would
+        # store. Order is load-bearing: the collector, the analysis worker, AND the
+        # training worker all write through the store's single shared connection, so all
+        # three must be stopped AND joined before close() checkpoints+closes it —
+        # otherwise an in-flight write (a collector add, a sweep's write_analysis_batch /
+        # iter_unanalyzed fetch, or a training run's add_feasibility_run) races a closed
+        # DB. stop() only signals; the bounded join() waits for the thread to actually
+        # leave its write path. Threads are daemons, so the timeouts just bound how long
+        # exit blocks — a still-running sweep's verdicts are resumable via iter_unanalyzed,
+        # and its write is itself log-and-skip, so the residual race is a no-op, not a
+        # lost/failed job. Registered UNCONDITIONALLY (not gated on start_collector) so the
+        # WAL checkpoint-on-close always runs — otherwise an analysis-only / test app would
         # never checkpoint.
         collector_manager.stop()
         collector_manager.join(timeout=5.0)
         analysis_manager.stop_all()
         analysis_manager.join(timeout=10.0)
+        training_manager.stop_all()
+        training_manager.join(timeout=10.0)
         store.close()
 
     @app.get("/")
@@ -1237,5 +1270,115 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return Response(content=data, media_type="image/jpeg")
+
+    # --- Training page: feasibility validation (learning-loop Train stage) ----------
+    #
+    # The Train stage's Validate step, run as a background job on a SECOND, dedicated
+    # queue (``training_manager``), sibling to ``analysis_manager`` but never sharing
+    # its dedup namespace or queue slot — training and oracle sweeps are unrelated
+    # workflows and may run concurrently (see the training-page spec). Error mapping
+    # mirrors ``/api/analysis/*``: a bad grade is a client mistake (400) and the missing
+    # embed deps (torch/torchvision/OpenCV) surface SYNCHRONOUSLY as a 503 with the
+    # install hint, not as a delayed ``status().error``. ``Embedder`` is imported LAZILY
+    # inside the run endpoint so this module stays torch-free at import.
+
+    @app.post("/api/training/feasibility/run")
+    def api_training_feasibility_run(req: FeasibilityRunRequest):
+        # Validate the grade selection FIRST (400) — a client mistake, before any deps
+        # or store work. ``null`` and ``[]`` both mean "all grades" → ``None`` at the
+        # store/manager boundary (no filter), so the two spell the same request.
+        if req.qualities is not None:
+            bad = [q for q in req.qualities if q not in _QUALITIES]
+            if bad:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
+                )
+        qualities = list(req.qualities) if req.qualities else None
+
+        # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
+        # (seconds-long, torch-importing) ensure_available. Fewer than 2 crops or 2 distinct
+        # cats is the empty-state (nothing separable to measure yet), so return the friendly
+        # "label at least two cats" next-step WITHOUT enqueuing (HTTP 200, enough=False).
+        # Ordering this ABOVE the dep check matters: on a box without the analysis extras a
+        # first-run operator with no labels should be told to LABEL DATA (the real next step),
+        # not to install torch — the dependency only blocks once there is data to embed.
+        n_crops, n_cats = store.count_identified_crops(tuple(qualities) if qualities else None)
+        if n_crops < 2 or n_cats < 2:
+            return {
+                "enough": False,
+                "n_crops": n_crops,
+                "n_cats": n_cats,
+                "message": (
+                    f"Not enough labelled data yet: {n_crops} crop(s) across {n_cats} "
+                    "cat(s). Label at least two cats before validating."
+                ),
+            }
+
+        # There IS data to embed — now check the heavy embed deps SYNCHRONOUSLY (mirroring
+        # /api/analysis/run's ensure_available), so a missing-torch environment fails at
+        # request time with the install hint (503) rather than as a delayed status().error.
+        # Import Embedder here (not at module scope) so app import stays torch-free.
+        from compute.identification.embed import Embedder
+
+        try:
+            Embedder().ensure_available()
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        # Enough to run: enqueue on the training queue. The manager dedups only a
+        # double-click of the currently-RUNNING job, never a pending re-run — a
+        # feasibility run reads the growing labelled set, so a deliberate re-run after
+        # more labelling is not a duplicate and must enqueue.
+        return {**training_manager.enqueue_feasibility(store, qualities), "enough": True}
+
+    @app.post("/api/training/cancel")
+    def api_training_cancel():
+        # Cancel the RUNNING feasibility job → the embed loop aborts at the next batch
+        # boundary (the probe honours the manager's stop signal), the worker's finally
+        # records it "canceled" with NO feasibility_runs row, and promotes the next
+        # pending job. Idempotent no-op when idle.
+        training_manager.cancel()
+        return training_manager.status()
+
+    @app.post("/api/training/queue/clear")
+    def api_training_queue_clear():
+        # Drop every PENDING training job; the running one finishes normally then, finding
+        # an empty deque, promotes nothing and the manager goes idle.
+        training_manager.clear_pending()
+        return training_manager.status()
+
+    @app.post("/api/training/queue/stop-all")
+    def api_training_queue_stop_all():
+        # Clear pending AND cancel the running job, atomically under the manager lock so no
+        # pending job is promoted between the two — "stop everything".
+        training_manager.stop_all()
+        return training_manager.status()
+
+    @app.get("/api/training/status")
+    def api_training_status():
+        # The poll the Training page renders: the running job's kind/params + done/total
+        # for the progress+ETA line, the pending queue, the finished-job history, and the
+        # last successful run's summary (incl run_id) so a poll arriving after completion
+        # can point the iframe at its report without a second fetch.
+        return training_manager.status()
+
+    @app.get("/api/training/feasibility/runs")
+    def api_training_feasibility_runs():
+        # The durable validation-run history, most-recent-first, each with its metrics,
+        # run_id, and a report_available flag (false once its report dir was pruned) — the
+        # source for the panel's recent-runs list. Capped at 100 rows.
+        return {"runs": store.feasibility_runs(limit=100)}
+
+    @app.get("/api/training/feasibility/report/{run_id}")
+    def api_training_feasibility_report(run_id: int):
+        # Serve a run's self-contained feasibility.html into the page's iframe. 404 once
+        # that run's report dir has been pruned (its metrics row still lists, flagged
+        # report_available=false) — the page shows a "re-run to regenerate" placeholder
+        # rather than loading a 404 into the iframe.
+        path = store.feasibility_run_report_path(run_id)
+        if path is None:
+            return Response(status_code=404)
+        return FileResponse(path, media_type="text/html")
 
     return app

@@ -1628,6 +1628,12 @@
                 <span id="annotateModeHint" class="text-muted hidden">Re-label with <strong>1–9</strong> / <strong>u</strong> / <strong>x</strong> · <strong>d</strong> sends the visit back to the queue</span>
             </div>
             <div class="controls-row" style="align-items: center;">
+                <div id="annotateLabelFilterWrap" class="control-group hidden">
+                    <label for="annotateLabelFilter">Show label</label>
+                    <select id="annotateLabelFilter">
+                        <option value="all">All labels</option>
+                    </select>
+                </div>
                 <span id="annotateProgress" class="badge">— / —</span>
                 <span id="annotateCropsBadge" class="badge">Labelled: —</span>
                 <span id="annotateIdentity" class="badge hidden">—</span>
@@ -1847,6 +1853,8 @@
         const annotateModeHint = document.getElementById('annotateModeHint');
         const annotateIdentityEl = document.getElementById('annotateIdentity');
         const annotateUndoBtn = document.getElementById('annotateUndoBtn');
+        const annotateLabelFilterWrap = document.getElementById('annotateLabelFilterWrap');
+        const annotateLabelFilterEl = document.getElementById('annotateLabelFilter');
         const annotateErrorEl = document.getElementById('annotateError');
 
         // Train view.
@@ -1967,7 +1975,8 @@
         let annCrops = 0;           // labelled frames so far (dataset_items rows, incl. not_cat — matches label_progress.crops_labeled)
         let annFrameStates = [];    // per-frame editable {frame_id, bbox, recv_ts, quality} for the shown visit
         let annMode = 'queue';      // 'queue' (label undecided) | 'labelled' (review → undo / re-label)
-        let labVisits = [];         // decided visits (newest-labelled first) for the Labelled view
+        let labVisitsAll = [];      // ALL decided visits fetched for the window (unfiltered)
+        let labVisits = [];         // decided visits after the "Show label" filter — what's shown
         let labIndex = 0;           // index into labVisits of the shown visit
 
         // Tuning state.
@@ -4486,6 +4495,7 @@
             annotateModeLabelledBtn.classList.toggle('btn-secondary', !labelled);
             annotateModeHint.classList.toggle('hidden', !labelled);
             annotateIdentityEl.classList.toggle('hidden', !labelled);
+            annotateLabelFilterWrap.classList.toggle('hidden', !labelled);
             annotateCropsBadgeEl.classList.toggle('hidden', labelled);
             annotateUndoBtn.classList.toggle('hidden', !labelled);
             annotateUnknownBtn.textContent = labelled ? 'Re-label unknown (u)' : 'Unknown cat (u)';
@@ -4503,16 +4513,60 @@
                 const res = await fetch('/api/label/labeled?' + params.toString());
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
-                labVisits = data.visits || [];
-                labIndex = 0;
-                renderLabelledVisit();
+                labVisitsAll = data.visits || [];
+                populateLabelFilter();
+                applyLabelFilter();  // resets labIndex + renders the filtered subset
             } catch (err) {
+                labVisitsAll = [];
                 labVisits = [];
                 labIndex = 0;
+                populateLabelFilter();
                 renderLabelledVisit();
                 showAnnotateError(`Labelled failed: ${err.message}`);
             }
         }
+
+        // The value a visit maps to in the "Show label" filter: a cat key, or the kind.
+        function labelFilterKey(v) {
+            if (v.label_kind === 'identified') return `cat:${v.cat_id}`;
+            return v.label_kind;  // 'unknown_cat' | 'not_cat'
+        }
+
+        // Rebuild the "Show label" options from the labels actually PRESENT in the fetched
+        // set (so it only ever offers labels that have events, with counts), preserving the
+        // current selection when it still exists. Ordered: cats (by name) → unknown → not-cat.
+        function populateLabelFilter() {
+            const prev = annotateLabelFilterEl.value || 'all';
+            const counts = new Map();  // key -> {label, count}
+            for (const v of labVisitsAll) {
+                const key = labelFilterKey(v);
+                const label = identityLabel(v);
+                const e = counts.get(key) || { label, count: 0 };
+                e.count += 1;
+                counts.set(key, e);
+            }
+            const order = (k) => (k.startsWith('cat:') ? 0 : k === 'unknown_cat' ? 1 : 2);
+            const entries = [...counts.entries()].sort((a, b) =>
+                order(a[0]) - order(b[0]) || a[1].label.localeCompare(b[1].label));
+            const opts = [`<option value="all">All labels (${labVisitsAll.length})</option>`];
+            for (const [key, { label, count }] of entries) {
+                opts.push(`<option value="${escapeHtml(key)}">${escapeHtml(label)} (${count})</option>`);
+            }
+            annotateLabelFilterEl.innerHTML = opts.join('');
+            // Keep the prior filter if it still has events; otherwise fall back to All.
+            annotateLabelFilterEl.value =
+                [...annotateLabelFilterEl.options].some(o => o.value === prev) ? prev : 'all';
+        }
+
+        // Derive the shown subset from the current filter, reset to its first visit, render.
+        function applyLabelFilter() {
+            const key = annotateLabelFilterEl.value || 'all';
+            labVisits = key === 'all' ? labVisitsAll.slice()
+                : labVisitsAll.filter(v => labelFilterKey(v) === key);
+            labIndex = 0;
+            renderLabelledVisit();
+        }
+        annotateLabelFilterEl.addEventListener('change', applyLabelFilter);
 
         function identityLabel(v) {
             if (v.label_kind === 'identified') return v.cat_name || `cat #${v.cat_id}`;
@@ -4525,7 +4579,10 @@
             annotateProgressEl.textContent = labVisits.length
                 ? `${labIndex + 1} / ${labVisits.length} labelled` : '0 labelled';
             if (!labVisits.length) {
-                annotateEmptyEl.textContent = 'Nothing labelled in this window yet — label some visits in the Queue.';
+                // Distinguish "nothing labelled at all" from "the chosen label has no events".
+                annotateEmptyEl.textContent = labVisitsAll.length
+                    ? `No visits labelled "${annotateLabelFilterEl.options[annotateLabelFilterEl.selectedIndex]?.text || '—'}" in this window — pick another label.`
+                    : 'Nothing labelled in this window yet — label some visits in the Queue.';
                 annotateEmptyEl.classList.remove('hidden');
                 annotateRepEl.innerHTML = '';
                 annotateMetaEl.textContent = '';
@@ -4640,7 +4697,13 @@
                     body: JSON.stringify({ frame_ids }),
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
+                // Drop it from BOTH the filtered view AND the unfiltered backing set — else
+                // re-deriving on the next filter change (applyLabelFilter reads labVisitsAll)
+                // would resurrect the visit we just sent back to the queue. (Option counts
+                // refresh on the next reload, as with re-label — a cosmetic lag, not a resurrection.)
                 labVisits.splice(labIndex, 1);
+                const gi = labVisitsAll.indexOf(v);
+                if (gi >= 0) labVisitsAll.splice(gi, 1);
                 renderLabelledVisit();
             } catch (err) {
                 showAnnotateError(`Undo failed: ${err.message}`);

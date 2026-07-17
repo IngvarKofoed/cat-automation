@@ -32,6 +32,7 @@
             /* RGB channels for alpha-blended fills (timeline cells, washes) */
             --v-missed-rgb:  229 72 77;
             --v-false-rgb:   245 165 36;
+            --v-caught-rgb:  63 185 80;
             --v-neutral-rgb: 139 152 166;
             --accent-rgb:    74 179 255;
 
@@ -62,7 +63,6 @@
 
             --radius-sm:   4px;
             --radius-md:   8px;
-            --radius-chip: 999px;
 
             --shadow-1: 0 1px 3px rgba(0, 0, 0, .35);
 
@@ -92,6 +92,7 @@
             /* alpha-blend channels re-declared per theme, else washes keep dark triples */
             --v-missed-rgb:  209 36 47;
             --v-false-rgb:   191 135 0;
+            --v-caught-rgb:  26 127 55;
             --v-neutral-rgb: 107 114 128;
             --accent-rgb:    31 111 235;
 
@@ -180,19 +181,75 @@
             /* Each view is a plain container; the router toggles .hidden. */
         }
 
-        /* Stats header: a row of chips summarizing the store, refreshed by polling. */
-        #stats {
+        /* ---- metric: the one caption-over-value readout ----
+           A single pattern for every on-screen value: a small-caps CAPTION over a mono VALUE,
+           so the eye lands on the number. Use `.metric` bare for a lone reading, or wrap
+           several in `.metrics` to get one hairline-divided instrument strip (the store-stats
+           header) rather than N separate boxes. No second "inline" variant — one class. */
+        .metric {
             display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            align-items: center;
+            flex-direction: column;
+            gap: 2px;
         }
+        .metric__cap {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: var(--color-text-muted);
+        }
+        .metric__val {
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--color-text);
+        }
+        .metric.warn .metric__val { color: var(--color-status-false); }
+        /* A metric whose value is a STATE, not a number: a leading dot + coloured word. */
+        .metric__val.status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .metric__val.status::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--color-text-muted);
+        }
+        .metric__val.status.on { color: var(--color-status-caught); }
+        .metric__val.status.on::before { background: var(--color-status-caught); }
+        .metric__val.status.off { color: var(--color-status-false); }
+        .metric__val.status.off::before { background: var(--color-status-false); }
 
-        /* ---- chips (state badges) ---- */
+        /* Cluster: several metrics as one bordered, hairline-divided strip. The border and
+           dividers live here, on the container — so a bare `.metric` outside a cluster has
+           no box. */
+        .metrics {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: stretch;
+            background: var(--color-surface-2);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+        .metrics .metric {
+            padding: var(--space-2) var(--space-4);
+            border-left: 1px solid var(--color-border);
+        }
+        .metrics .metric:first-child { border-left: none; }
+
+        /* ---- readouts (state badges) ----
+           Squared, not pill-shaped: these are instrument readouts (frame counts, spans,
+           scopes), so they read as small mono displays rather than pills. The pill radius
+           is reserved for genuine capsule affordances, of which the UI now has none. */
         .badge {
             display: inline-block;
             padding: var(--space-1) 10px;
-            border-radius: var(--radius-chip);
+            border-radius: var(--radius-sm);
             background: var(--color-surface-2);
             border: 1px solid var(--color-border);
             color: var(--color-text);
@@ -206,13 +263,9 @@
             border-color: rgb(var(--v-false-rgb) / .5);
             color: var(--color-status-false);
         }
-        /* Live-updating counters: fixed width so a growing number never widens the row. */
-        #statCount { min-width: 168px; }
-        #statSize { min-width: 120px; }
-        #statMotion { min-width: 120px; }
-        #statSpan { min-width: 150px; }
-        #collectorBadge { min-width: 128px; }
-        #inboxProgress { min-width: 84px; text-align: center; }
+        /* Live-updating counters: fixed width so a growing number never widens the row.
+           (The store-stats readouts moved to the metric cluster above; tabular-nums keeps
+           their values from reflowing until the digit count changes.) */
         #tuningProgressBadge { min-width: 120px; }
 
         .controls-row {
@@ -230,7 +283,7 @@
             font-weight: 600;
             font-size: 13px;
         }
-        select, input[type="date"] {
+        select, input[type="date"], .text-field {
             padding: var(--space-2) var(--space-3);
             border: 1px solid var(--color-border);
             border-radius: var(--radius-sm);
@@ -239,63 +292,95 @@
             background: var(--color-surface);
             color: var(--color-text);
         }
+        /* Buttons — one geometry, a calm hierarchy. The DEFAULT button is a neutral
+           surface control; the saturated accent fill is spent only on .btn-primary (the
+           single main action in a group). Danger is a red *tint*, never a solid fill, so
+           a destructive button can't be mistaken for — or compete with — the red "missed"
+           verdict. Shared min-width + height keep a row/column of buttons from reading as
+           ragged different-width blobs. */
         button {
             box-sizing: border-box;
-            background: var(--color-primary);
-            color: var(--color-on-accent);
-            /* 1px *transparent* border (not `none`): variants/disabled only recolor it,
-               so toggling disabled never changes an auto-width button's box — no jitter
-               while typing in a field that re-disables its Save button per keystroke. */
-            border: 1px solid transparent;
-            padding: 9px var(--space-4);
+            min-width: 76px;
+            background: var(--color-surface-2);
+            color: var(--color-text);
+            /* 1px border always present (variants/disabled only recolor it), so toggling
+               disabled never resizes an auto-width button's box — no jitter while typing
+               in a field that re-disables its Save button per keystroke. */
+            border: 1px solid var(--color-border);
+            padding: 8px var(--space-4);
             border-radius: var(--radius-sm);
-            font-size: 14px;
+            font-size: 13px;
+            font-weight: 600;
             font-family: var(--font-ui);
             cursor: pointer;
         }
         @media (prefers-reduced-motion: no-preference) {
             button {
-                transition: background 0.2s;
+                transition: background 0.15s, border-color 0.15s;
             }
         }
         button:hover {
-            background: color-mix(in srgb, var(--color-primary) 85%, black);
+            background: var(--color-surface);
+            border-color: var(--color-text-muted);
         }
         button:active {
-            background: color-mix(in srgb, var(--color-primary) 65%, black);
+            background: var(--color-border);
         }
         button:disabled {
             background: var(--color-surface-2);
             color: var(--color-text-muted);
-            border: 1px solid var(--color-border);
+            border-color: var(--color-border);
+            opacity: 0.55;
             cursor: default;
         }
+        button:disabled:hover {
+            background: var(--color-surface-2);
+            border-color: var(--color-border);
+        }
+
+        /* The one loud button per group — the main action. */
+        .btn-primary {
+            background: var(--color-primary);
+            color: var(--color-on-accent);
+            border-color: transparent;
+        }
+        .btn-primary:hover {
+            background: color-mix(in srgb, var(--color-primary) 85%, black);
+            border-color: transparent;
+        }
+        .btn-primary:active {
+            background: color-mix(in srgb, var(--color-primary) 68%, black);
+        }
+
+        /* .btn-secondary is now identical to the base neutral button — kept as an alias
+           so existing markup (and the mode-toggle JS) keeps working unchanged. */
+        .btn-secondary {
+            background: var(--color-surface-2);
+            color: var(--color-text);
+            border-color: var(--color-border);
+        }
+        .btn-secondary:hover {
+            background: var(--color-surface);
+            border-color: var(--color-text-muted);
+        }
+
+        .btn-danger {
+            background: rgb(var(--v-missed-rgb) / .14);
+            color: var(--color-status-missed);
+            border-color: rgb(var(--v-missed-rgb) / .5);
+        }
+        .btn-danger:hover {
+            background: rgb(var(--v-missed-rgb) / .24);
+            border-color: rgb(var(--v-missed-rgb) / .7);
+        }
+
         .btn-row {
             display: flex;
             gap: var(--space-2);
             flex-wrap: wrap;
         }
-        .btn-preset {
-            background: var(--color-status-caught);
-        }
-        .btn-preset:hover {
-            background: color-mix(in srgb, var(--color-status-caught) 80%, black);
-        }
-        .btn-danger {
-            background: var(--color-status-missed);
-        }
-        .btn-danger:hover {
-            background: color-mix(in srgb, var(--color-status-missed) 80%, black);
-        }
-        .btn-secondary {
-            background: var(--color-surface-2);
-            color: var(--color-text);
-            border: 1px solid var(--color-border);
-        }
-        .btn-secondary:hover {
-            background: var(--color-border);
-        }
         .btn-tiny {
+            min-width: 0;
             padding: var(--space-1) var(--space-2);
             font-size: 11px;
         }
@@ -443,6 +528,73 @@
             font-size: 13px;
             cursor: pointer;
         }
+        /* Custom checkbox / radio — the default browser control is the one element that
+           never picks up the dark theme (it stays a light native box). Styled here once,
+           globally, so every checkbox/radio matches whether written in markup or created
+           in JS (the oracle chooser, roster resident toggle). Checked = accent fill. */
+        .checkbox-label input[type="checkbox"],
+        .checkbox-label input[type="radio"] {
+            appearance: none;
+            -webkit-appearance: none;
+            margin: 0;
+            width: 16px;
+            height: 16px;
+            flex: none;
+            display: inline-grid;
+            place-content: center;
+            background: var(--color-surface);
+            border: 1px solid var(--color-border);
+            cursor: pointer;
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            .checkbox-label input[type="checkbox"],
+            .checkbox-label input[type="radio"] { transition: background .12s, border-color .12s; }
+        }
+        .checkbox-label input[type="checkbox"] { border-radius: var(--radius-sm); }
+        .checkbox-label input[type="radio"]    { border-radius: 50%; }
+        /* Checkmark drawn as an SVG mask (not a rotated border) so it's crisp and reliably
+           centred; the mask's alpha is the tick shape, --color-on-accent supplies the colour. */
+        .checkbox-label input[type="checkbox"]::after {
+            content: "";
+            width: 12px;                      /* fixed, not %, so it can't collapse in the grid */
+            height: 12px;
+            transform: scale(0);
+            background-color: var(--color-on-accent);
+            -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M13 4.5L6.5 11L3 7.5' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+                    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M13 4.5L6.5 11L3 7.5' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+        }
+        .checkbox-label input[type="radio"]::after {
+            content: "";
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--color-on-accent);
+            transform: scale(0);
+        }
+        @media (prefers-reduced-motion: no-preference) {
+            .checkbox-label input[type="checkbox"]::after,
+            .checkbox-label input[type="radio"]::after { transition: transform .12s; }
+        }
+        .checkbox-label input:checked {
+            background: var(--color-primary);
+            border-color: var(--color-primary);
+        }
+        .checkbox-label input[type="checkbox"]:checked::after { transform: scale(1); }
+        .checkbox-label input[type="radio"]:checked::after     { transform: scale(1); }
+        .checkbox-label input:hover:not(:checked) { border-color: var(--color-text-muted); }
+        .checkbox-label input:focus-visible {
+            outline: 2px solid var(--color-primary);
+            outline-offset: 2px;
+        }
+        /* When a checkbox shares a .control-group row with inputs/buttons (Add cat, the
+           train-quality filters), give its label the same ~35px control height as an input
+           so the row's flex-end alignment centres the 16px box on the input/button mid-line
+           — otherwise the short label bottom-aligns and the box sits ~10px low. The base
+           .checkbox-label is already display:flex + align-items:center, so it just needs
+           the height. */
+        .control-group > .checkbox-label {
+            min-height: 35px;
+        }
         .analysis-error {
             box-sizing: border-box;
             margin-top: 10px;
@@ -471,17 +623,24 @@
             gap: 6px;
             margin-top: var(--space-3);
         }
-        .group-row {
+        /* Record rows — saved buckets, oracle coverage, and queue items all share one row
+           shell: a surface-2 strip, a border, even padding, and mono meta on the trailing
+           edge. One look for every "row of records" in the app (was three near-identical
+           copies that drifted in padding/font). */
+        .group-row,
+        .coverage-row,
+        .queue-item {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: var(--space-2);
+            gap: var(--space-3);
             font-size: 13px;
-            padding: 6px 10px;
+            padding: 8px 12px;
             background: var(--color-surface-2);
             border: 1px solid var(--color-border);
             border-radius: var(--radius-md);
         }
+        .coverage-row { margin-top: var(--space-2); }
         .group-row .group-actions {
             display: flex;
             gap: 6px;
@@ -491,49 +650,87 @@
             font-size: 13px;
             margin-top: var(--space-2);
         }
-        /* Oracle coverage rows on the Motion view: coverage text + an enqueue button. */
-        .coverage-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: var(--space-2);
-            padding: 6px 10px;
-            background: var(--color-surface-2);
-            border: 1px solid var(--color-border);
-            border-radius: var(--radius-md);
-            margin-top: var(--space-2);
-            font-size: 13px;
-        }
-        /* Job queue panel lines. */
-        .queue-line {
-            font-size: 13px;
-            padding: var(--space-1) 0;
-        }
+        /* Equal-width enqueue buttons so the three coverage rows line up as a column
+           rather than ragged content-width buttons. */
+        .enqueue-btn { min-width: 184px; }
         .queue-list {
             display: flex;
             flex-direction: column;
             gap: var(--space-1);
             margin-top: var(--space-2);
         }
-        .queue-item {
-            font-size: 12px;
-            padding: 5px 10px;
+        /* A queue item's trailing cell is data (a window range, a verdict count, a state) —
+           mono + tabular + muted + right-aligned, so stacked rows read as an aligned log;
+           the leading cell (the label) ellipsizes rather than pushing the data out. */
+        .queue-item > span:first-child {
+            min-width: 0;                     /* let the flex child shrink so ellipsis can trigger */
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .queue-item > span:last-child {
+            flex: none;
+            text-align: right;
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+            color: var(--color-text-muted);
+        }
+        .queue-heading {
+            font-weight: 700;
+            font-size: 11px;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            color: var(--color-text-muted);
+            margin-top: var(--space-3);
+            margin-bottom: var(--space-1);
+        }
+        /* The running/idle status strip (job queue + training). A bordered surface line led
+           by a state dot — grey at idle, a pulsing green while a job runs — so "is anything
+           happening?" reads at a glance instead of from prose alone. */
+        .queue-line {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+            font-size: 13px;
+            padding: 8px 12px;
             background: var(--color-surface-2);
             border: 1px solid var(--color-border);
             border-radius: var(--radius-md);
-            display: flex;
-            justify-content: space-between;
-            gap: var(--space-2);
         }
-        .queue-heading {
-            font-weight: 600;
-            font-size: 12px;
-            color: var(--color-text-muted);
-            margin-top: var(--space-3);
+        .queue-line::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            flex: none;
+            border-radius: 50%;
+            background: var(--color-text-muted);
         }
-        .state-done { color: var(--color-status-caught); font-weight: 700; }
-        .state-failed { color: var(--color-status-missed); font-weight: 700; }
-        .state-canceled { color: var(--color-text-muted); font-weight: 700; }
+        .queue-line.is-running::before { background: var(--color-status-caught); }
+        @media (prefers-reduced-motion: no-preference) {
+            .queue-line.is-running::before { animation: dotPulse 1.8s ease-in-out infinite; }
+        }
+        @keyframes dotPulse {
+            0%   { box-shadow: 0 0 0 0 rgb(var(--v-caught-rgb) / .5); }
+            70%  { box-shadow: 0 0 0 5px rgb(var(--v-caught-rgb) / 0); }
+            100% { box-shadow: 0 0 0 0 rgb(var(--v-caught-rgb) / 0); }
+        }
+        /* Terminal-state labels in the history list: a leading dot + coloured text reads as
+           a status-log line (kept as text, not a boxed chip, since messages vary in length). */
+        .state-done, .state-failed, .state-canceled { font-weight: 700; }
+        .state-done { color: var(--color-status-caught); }
+        .state-failed { color: var(--color-status-missed); }
+        .state-canceled { color: var(--color-text-muted); }
+        .state-done::before, .state-failed::before, .state-canceled::before {
+            content: "";
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            margin-right: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
         /* Density timeline: a horizontal strip of bins, one cell per bin, colored by
            disagreement (missed = red, false = amber, else neutral) with intensity by
            count. Clicking a bin narrows the drill-down. */
@@ -585,23 +782,34 @@
         .legend-swatch--neutral { background: rgb(var(--v-neutral-rgb)); }
         /* Visit inbox: one visit at a time — a large representative frame + a
            horizontal filmstrip of the visit's frames and preceding context. */
+        /* Segmented control (visit-inbox mode + annotate Queue/Labelled). Equal-width
+           segments; the active one is an accent-soft wash + accent text, not a loud full
+           fill — a selected state, not a call-to-action. */
         .tabs {
             display: flex;
             gap: 6px;
             margin-bottom: 10px;
         }
         .tab {
+            min-width: 104px;
+            text-align: center;
             background: var(--color-surface-2);
-            color: var(--color-text);
+            color: var(--color-text-muted);
             border: 1px solid var(--color-border);
         }
         .tab:hover {
-            background: var(--color-border);
+            background: var(--color-surface);
+            color: var(--color-text);
+            border-color: var(--color-text-muted);
         }
         .tab.active {
-            background: var(--color-primary);
+            background: rgb(var(--accent-rgb) / .16);
             border-color: var(--color-primary);
-            color: var(--color-on-accent);
+            color: var(--color-primary);
+        }
+        .tab.active:hover {
+            background: rgb(var(--accent-rgb) / .22);
+            color: var(--color-primary);
         }
         /* Fixed-height review stage: the visit frame is centered and object-fit
            contained, so flipping visits never resizes the box and reflows the meta +
@@ -789,13 +997,15 @@
             display: flex;
             align-items: center;
             gap: var(--space-3);
-            padding: 6px 10px;
+            padding: 8px 12px;
             background: var(--color-surface-2);
             border: 1px solid var(--color-border);
             border-radius: var(--radius-md);
             font-size: 13px;
         }
         .roster-row.roster-inactive { opacity: 0.5; }
+        /* Equal-width action so Retire/Restore line up down the roster column. */
+        .roster-row button { min-width: 88px; }
         .roster-key {
             flex: 0 0 auto;
             display: inline-flex;
@@ -897,6 +1107,7 @@
         /* Bare × glyph — overrides the base button chrome (border/bg/padding). */
         .modal-close {
             appearance: none;
+            min-width: 0;
             background: transparent;
             border: none;
             color: var(--color-text-muted);
@@ -1116,6 +1327,9 @@
         #tuningScopeBadge,
         #annotateScopeBadge,
         #tuningParamSource,
+        #tuningProgressBadge,
+        #timelineScopeBadge,
+        #viewerInfoBadge,
         #viewerPageLabel {
             background: none;
             border: none;
@@ -1136,6 +1350,8 @@
         #tuningScopeBadge { min-width: 150px; }
         #annotateScopeBadge { min-width: 150px; }
         #tuningParamSource { min-width: 150px; }
+        #timelineScopeBadge { min-width: 150px; }
+        #viewerInfoBadge { min-width: 150px; }
         #viewerPageLabel { min-width: 64px; text-align: center; }
 
         /* Training page: disabled "coming next" cards (Build gallery / Promote),
@@ -1179,15 +1395,15 @@
     <section id="view-start" class="view">
         <div class="panel">
             <h2>Collection</h2>
-            <div id="stats">
-                <span id="statCount" class="badge">Frames: —</span>
-                <span id="statSize" class="badge">Size: —</span>
-                <span id="statMotion" class="badge">Motion: —</span>
-                <span id="statSpan" class="badge">Span: —</span>
-                <span id="collectorBadge" class="badge">Collecting: —</span>
+            <div id="stats" class="metrics">
+                <div class="metric"><span class="metric__cap">Frames</span><span id="statCount" class="metric__val">—</span></div>
+                <div class="metric"><span class="metric__cap">Size</span><span id="statSize" class="metric__val">—</span></div>
+                <div class="metric"><span class="metric__cap">Motion</span><span id="statMotion" class="metric__val">—</span></div>
+                <div class="metric"><span class="metric__cap">Span</span><span id="statSpan" class="metric__val">—</span></div>
+                <div class="metric"><span class="metric__cap">Collecting</span><span id="collectorBadge" class="metric__val status">—</span></div>
             </div>
             <div class="controls-row" style="margin-top: 14px;">
-                <button type="button" id="collectorToggleBtn"
+                <button type="button" id="collectorToggleBtn" class="btn-primary"
                     title="Start or stop the always-on collector. Stop it to freeze the store for a clean offline analysis pass.">Start</button>
                 <label class="checkbox-label" style="align-self: center;"
                     title="Only persist frames the edge flagged as motion. Compact false-triggers-only / cat-crop capture.">
@@ -1209,7 +1425,7 @@
                 Collection was running before the last restart. It is currently stopped — a bare
                 launch never silently writes to the store. Resume it to continue collecting.
             </p>
-            <button type="button" id="resumeBtn" class="btn-preset">Resume collection</button>
+            <button type="button" id="resumeBtn" class="btn-primary">Resume collection</button>
         </div>
 
         <div class="panel">
@@ -1240,10 +1456,10 @@
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
-                    <button type="button" id="activityLoadBtn">Load</button>
+                    <button type="button" id="activityLoadBtn" class="btn-primary">Load</button>
                 </div>
                 <div class="control-group push-end">
-                    <span id="activityStoreRange" class="badge">Store: —</span>
+                    <div class="metrics"><div id="activityStoreRange" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div></div>
                 </div>
             </div>
             <div id="activityTruncated" class="banner-warn hidden"></div>
@@ -1265,8 +1481,11 @@
                 </div>
                 <div class="modal-body">
                     <div class="controls-row" style="align-items: center;">
-                        <button type="button" id="playerPlayBtn">Play</button>
-                        <span id="playerTs" class="badge">—</span>
+                        <button type="button" id="playerPlayBtn" class="btn-primary">Play</button>
+                        <div class="metrics">
+                            <div id="playerTs" class="metric"><span class="metric__cap">Time</span><span class="metric__val">—</span></div>
+                            <div id="playerFrameNo" class="metric"><span class="metric__cap">Frame</span><span class="metric__val">—</span></div>
+                        </div>
                         <div class="btn-row push-end">
                             <button type="button" id="playerPrevBtn" class="btn-secondary">← Prev event</button>
                             <button type="button" id="playerNextBtn" class="btn-secondary">Next event →</button>
@@ -1311,14 +1530,14 @@
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
-                    <button type="button" id="loadWindowBtn">Load window</button>
+                    <button type="button" id="loadWindowBtn" class="btn-primary">Load window</button>
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
                     <button type="button" id="clearWindowBtn" class="btn-secondary">Clear window</button>
                 </div>
                 <div class="control-group push-end">
-                    <span id="storeRangeBadge" class="badge">Store: —</span>
+                    <div class="metrics"><div id="storeRangeBadge" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div></div>
                 </div>
             </div>
             <div class="controls-row" style="margin-top: 12px;">
@@ -1340,15 +1559,11 @@
             </div>
 
             <div class="controls-row" id="pickToolbar" style="margin-top: 12px;">
-                <div class="control-group">
-                    <label>Start frame</label>
-                    <span id="pickStartTs" class="badge">—</span>
+                <div class="metrics">
+                    <div id="pickStartTs" class="metric"><span class="metric__cap">Start frame</span><span class="metric__val">—</span></div>
+                    <div id="pickEndTs" class="metric"><span class="metric__cap">End frame</span><span class="metric__val">—</span></div>
+                    <div id="viewerRangeCount" class="metric"><span class="metric__cap">In range</span><span class="metric__val">—</span></div>
                 </div>
-                <div class="control-group">
-                    <label>End frame</label>
-                    <span id="pickEndTs" class="badge">—</span>
-                </div>
-                <span id="viewerRangeCount" class="badge">Frames in range: —</span>
                 <div class="control-group">
                     <label for="bucketNameInput">Bucket name</label>
                     <input type="text" id="bucketNameInput" class="param-input" placeholder="e.g. dusk rain">
@@ -1357,7 +1572,7 @@
                     <div class="btn-row">
                         <button type="button" id="pickAllBtn" class="btn-secondary" disabled
                                 title="Select the whole loaded window as the bucket — no need to click a start and end frame.">Select all</button>
-                        <button type="button" id="bucketSaveBtn" disabled>Save bucket</button>
+                        <button type="button" id="bucketSaveBtn" class="btn-primary" disabled>Save bucket</button>
                         <button type="button" id="pickClearBtn" class="btn-secondary">Clear selection</button>
                     </div>
                 </div>
@@ -1554,7 +1769,7 @@
             </div>
             <div id="inboxMissesNote" class="banner-warn hidden"></div>
             <div class="controls-row" style="align-items: center;">
-                <span id="inboxProgress" class="badge">— / —</span>
+                <div class="metrics"><div id="inboxProgress" class="metric"><span class="metric__cap">Visit</span><span class="metric__val">— / —</span></div></div>
                 <div class="btn-row push-end">
                     <button type="button" id="inboxPrevBtn" class="btn-secondary">← Prev (k)</button>
                     <button type="button" id="inboxNextBtn" class="btn-secondary">Next (j) →</button>
@@ -1604,7 +1819,7 @@
             <div class="controls-row" style="margin-top: var(--space-3); align-items: flex-end;">
                 <div class="control-group">
                     <label for="rosterAddName">Add cat</label>
-                    <input type="text" id="rosterAddName" placeholder="Name" maxlength="60">
+                    <input type="text" id="rosterAddName" class="text-field" placeholder="Name" maxlength="60">
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
@@ -1612,7 +1827,7 @@
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
-                    <button type="button" id="rosterAddBtn">Add cat</button>
+                    <button type="button" id="rosterAddBtn" class="btn-primary">Add cat</button>
                 </div>
             </div>
             <div id="rosterError" class="hidden analysis-error"></div>
@@ -1623,8 +1838,10 @@
         <div class="panel">
             <h2>Visit</h2>
             <div class="btn-row" style="margin-bottom: var(--space-3); align-items: center; flex-wrap: wrap;">
-                <button type="button" id="annotateModeQueueBtn">Queue</button>
-                <button type="button" id="annotateModeLabelledBtn" class="btn-secondary">Labelled</button>
+                <div class="tabs" style="margin-bottom: 0;">
+                    <button type="button" id="annotateModeQueueBtn" class="tab active">Queue</button>
+                    <button type="button" id="annotateModeLabelledBtn" class="tab">Labelled</button>
+                </div>
                 <span id="annotateModeHint" class="text-muted hidden">Re-label with <strong>1–9</strong> / <strong>u</strong> / <strong>x</strong> · <strong>d</strong> sends the visit back to the queue</span>
             </div>
             <div class="controls-row" style="align-items: center;">
@@ -1634,9 +1851,11 @@
                         <option value="all">All labels</option>
                     </select>
                 </div>
-                <span id="annotateProgress" class="badge">— / —</span>
-                <span id="annotateCropsBadge" class="badge">Labelled: —</span>
-                <span id="annotateIdentity" class="badge hidden">—</span>
+                <div class="metrics">
+                    <div id="annotateProgress" class="metric"><span class="metric__cap">Decided</span><span class="metric__val">— / —</span></div>
+                    <div id="annotateCropsBadge" class="metric"><span class="metric__cap">Labelled</span><span class="metric__val">—</span></div>
+                    <div id="annotateIdentity" class="metric hidden"><span class="metric__cap">Identity</span><span class="metric__val">—</span></div>
+                </div>
                 <div class="btn-row push-end">
                     <button type="button" id="annotatePrevBtn" class="btn-secondary">← Prev (k)</button>
                     <button type="button" id="annotateNextBtn" class="btn-secondary">Skip / Next (j) →</button>
@@ -1688,7 +1907,7 @@
                     <label class="checkbox-label"><input type="checkbox" id="trainQualityPoor" checked> poor</label>
                 </div>
                 <div class="control-group push-end">
-                    <button type="button" id="trainRunBtn">Run</button>
+                    <button type="button" id="trainRunBtn" class="btn-primary">Run</button>
                 </div>
             </div>
             <div id="trainEnoughNote" class="hidden banner-warn"></div>
@@ -1748,6 +1967,7 @@
         const playerCloseBtn = document.getElementById('playerCloseBtn');
         const playerPlayBtn = document.getElementById('playerPlayBtn');
         const playerTsEl = document.getElementById('playerTs');
+        const playerFrameNoEl = document.getElementById('playerFrameNo');
         const playerPrevBtn = document.getElementById('playerPrevBtn');
         const playerNextBtn = document.getElementById('playerNextBtn');
         const playerImgEl = document.getElementById('playerImg');
@@ -1919,6 +2139,11 @@
         // concurrent oracle sweep and a training run must not clobber each other's ETA.
         let trainingStatus = { running: false, queue: [], history: [], result: null };
         let trainingEtaAnchor = null;
+        // True from the Run click until the enqueue POST resolves. The server spends the
+        // first seconds importing torch (ensure_available) BEFORE it enqueues, so a periodic
+        // pollTrainingStatus firing in that window would otherwise see running=false and
+        // re-enable the button mid-submit — this flag keeps it disabled until the job exists.
+        let trainSubmitting = false;
         let trainRuns = [];             // feasibility_runs history, most-recent-first
         let trainLastResultRunId = null; // dedupes the runs-list refresh to one per completed run
         let trainSelectedRunId = null;   // which run's report is loaded in the iframe
@@ -2205,16 +2430,19 @@
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
 
-                statCountEl.textContent = `Frames: ${data.count}`;
+                statCountEl.textContent = data.count;
                 if (typeof data.count === 'number') lastStoreCount = data.count;
-                statSizeEl.textContent = `Size: ${formatBytes(data.bytes)} / ${formatBytes(data.cap_bytes)}`;
-                statSizeEl.classList.toggle('warn', data.cap_bytes > 0 && data.bytes / data.cap_bytes > 0.9);
-                statMotionEl.textContent = `Motion: ${data.motion_count}`;
-                statSpanEl.textContent = `Span: ${formatSpan(data.oldest_ts, data.newest_ts)}`;
+                statSizeEl.textContent = `${formatBytes(data.bytes)} / ${formatBytes(data.cap_bytes)}`;
+                // Warn colours the whole cell (caption + value) via .metric.warn; toggle it
+                // on the metric cell, which is the value span's parent.
+                statSizeEl.parentElement.classList.toggle('warn', data.cap_bytes > 0 && data.bytes / data.cap_bytes > 0.9);
+                statMotionEl.textContent = data.motion_count;
+                statSpanEl.textContent = formatSpan(data.oldest_ts, data.newest_ts);
 
                 collectorRunning = !!data.collector_running;
-                collectorBadge.textContent = `Collecting: ${collectorRunning ? 'on' : 'off'}`;
-                collectorBadge.classList.toggle('warn', !collectorRunning);
+                collectorBadge.textContent = collectorRunning ? 'On' : 'Off';
+                collectorBadge.classList.toggle('on', collectorRunning);
+                collectorBadge.classList.toggle('off', !collectorRunning);
                 collectorToggleBtn.textContent = collectorRunning ? 'Stop' : 'Start';
 
                 // Reflect the persisted collection mode + resume prompt.
@@ -2364,9 +2592,9 @@
         // mirroring populateClockDefaults.
         function populateActivityDefaults() {
             const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
-            activityStoreRangeEl.textContent = hasRange
-                ? `Store: ${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
-                : 'Store: empty';
+            activityStoreRangeEl.querySelector('.metric__val').textContent = hasRange
+                ? `${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
+                : 'empty';
             activityLoadBtn.disabled = !hasRange;
             if (!hasRange) return;
             const minD = dateInputValue(storeOldestTs);
@@ -2482,7 +2710,8 @@
             playerFrames = []; playerImages = []; playerTiles = [];
             playerIndex = 0;
             playerImgEl.removeAttribute('src');
-            playerTsEl.textContent = '—';
+            playerTsEl.querySelector('.metric__val').textContent = '—';
+            playerFrameNoEl.querySelector('.metric__val').textContent = '—';
             playerFilmstripEl.innerHTML = '<div class="empty" style="padding:12px;">Loading…</div>';
             playerPlayBtn.disabled = true;
             playerScrubEl.disabled = true;
@@ -2555,7 +2784,8 @@
             preloadAround(idx);        // keep the look-ahead window primed as we advance/scrub
             const f = playerFrames[idx];
             playerImgEl.src = f.url;   // preloaded -> served from cache, no flicker
-            playerTsEl.textContent = `${formatTime(f.recv_ts)} · frame ${idx + 1} / ${playerFrames.length}`;
+            playerTsEl.querySelector('.metric__val').textContent = formatTime(f.recv_ts);
+            playerFrameNoEl.querySelector('.metric__val').textContent = `${idx + 1} / ${playerFrames.length}`;
             if (playerScrubEl.value !== String(idx)) playerScrubEl.value = String(idx);
             // Highlight the current tile and keep it in view — scrolling ONLY the filmstrip
             // (never the page) so playback can't make the whole view jump.
@@ -2648,9 +2878,9 @@
         // ================= BUCKETS view: clock pickers =================
         function populateClockDefaults() {
             const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
-            storeRangeBadge.textContent = hasRange
-                ? `Store: ${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
-                : 'Store: empty';
+            storeRangeBadge.querySelector('.metric__val').textContent = hasRange
+                ? `${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
+                : 'empty';
             loadWindowBtn.disabled = !hasRange;
             if (!hasRange) return;
             const minD = dateInputValue(storeOldestTs);
@@ -2926,8 +3156,8 @@
         }
 
         function updatePickReadout() {
-            pickStartTsEl.textContent = pickStartTs != null ? formatTime(pickStartTs) : '—';
-            pickEndTsEl.textContent = pickEndTs != null ? formatTime(pickEndTs) : '—';
+            pickStartTsEl.querySelector('.metric__val').textContent = pickStartTs != null ? formatTime(pickStartTs) : '—';
+            pickEndTsEl.querySelector('.metric__val').textContent = pickEndTs != null ? formatTime(pickEndTs) : '—';
             bucketSaveBtn.disabled = !(pickStartId != null && pickEndId != null && bucketNameInput.value.trim() !== '');
             refreshViewerRangeCount();
         }
@@ -2935,7 +3165,7 @@
         let rangeCountSeq = 0;
         async function refreshViewerRangeCount() {
             if (pickStartId == null && pickEndId == null) {
-                viewerRangeCountEl.textContent = 'Frames in range: —';
+                viewerRangeCountEl.querySelector('.metric__val').textContent = '—';
                 return;
             }
             const seq = ++rangeCountSeq;
@@ -2950,10 +3180,10 @@
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
                 if (seq !== rangeCountSeq) return;
-                viewerRangeCountEl.textContent = `Frames in range: ${data.count}`;
+                viewerRangeCountEl.querySelector('.metric__val').textContent = data.count;
             } catch (err) {
                 if (seq !== rangeCountSeq) return;
-                viewerRangeCountEl.textContent = 'Frames in range: —';
+                viewerRangeCountEl.querySelector('.metric__val').textContent = '—';
             }
         }
 
@@ -3530,6 +3760,7 @@
             queueClearBtn.disabled = queue.length === 0;
             queueStopAllBtn.disabled = !running && queue.length === 0;
 
+            queueRunningEl.classList.toggle('is-running', running);
             if (running) {
                 queueRunningEl.textContent = `Running ${kindLabel(status.analyzer)} — ${status.done}/${status.total}${etaText(status)} · ${windowLabel(status.since_id, status.until_id)}`;
             } else {
@@ -3693,12 +3924,12 @@
         // ================= MOTION view: visit inbox =================
         function setInboxMode(mode) {
             inboxMode = mode;
-            for (const t of document.querySelectorAll('.tab')) {
+            for (const t of document.querySelectorAll('.tab[data-mode]')) {
                 t.classList.toggle('active', t.dataset.mode === mode);
             }
             loadVisits();
         }
-        for (const t of document.querySelectorAll('.tab')) {
+        for (const t of document.querySelectorAll('.tab[data-mode]')) {
             t.addEventListener('click', () => setInboxMode(t.dataset.mode));
         }
 
@@ -3734,7 +3965,7 @@
                 inboxRepEl.innerHTML = '';
                 inboxMetaEl.textContent = '';
                 inboxFilmstripEl.innerHTML = '';
-                inboxProgressEl.textContent = '0 / 0';
+                inboxProgressEl.querySelector('.metric__val').textContent = '0 / 0';
                 inboxPrevBtn.disabled = true;
                 inboxNextBtn.disabled = true;
                 return;
@@ -3742,7 +3973,7 @@
             inboxEmptyEl.classList.add('hidden');
             visitIndex = Math.max(0, Math.min(visitIndex, visits.length - 1));
             const v = visits[visitIndex];
-            inboxProgressEl.textContent = `${visitIndex + 1} / ${visits.length}`;
+            inboxProgressEl.querySelector('.metric__val').textContent = `${visitIndex + 1} / ${visits.length}`;
             inboxPrevBtn.disabled = visitIndex === 0;
             inboxNextBtn.disabled = visitIndex >= visits.length - 1;
 
@@ -4340,8 +4571,9 @@
         }
 
         function renderAnnotateVisit() {
-            annotateProgressEl.textContent = `${annDecided} / ${annTotal} decided`;
-            annotateCropsBadgeEl.textContent = `Labelled: ${annCrops}`;
+            annotateProgressEl.querySelector('.metric__cap').textContent = 'Decided';
+            annotateProgressEl.querySelector('.metric__val').textContent = `${annDecided} / ${annTotal}`;
+            annotateCropsBadgeEl.querySelector('.metric__val').textContent = annCrops;
             if (!annVisits.length) {
                 annotateEmptyEl.textContent = 'No undecided visits in this window. Sweep more yolo-serial on the Sweeps page, or pick another bucket.';
                 annotateEmptyEl.classList.remove('hidden');
@@ -4491,8 +4723,8 @@
         function setAnnMode(mode) {
             annMode = mode;
             const labelled = mode === 'labelled';
-            annotateModeQueueBtn.classList.toggle('btn-secondary', labelled);
-            annotateModeLabelledBtn.classList.toggle('btn-secondary', !labelled);
+            annotateModeQueueBtn.classList.toggle('active', !labelled);
+            annotateModeLabelledBtn.classList.toggle('active', labelled);
             annotateModeHint.classList.toggle('hidden', !labelled);
             annotateIdentityEl.classList.toggle('hidden', !labelled);
             annotateLabelFilterWrap.classList.toggle('hidden', !labelled);
@@ -4576,8 +4808,9 @@
         }
 
         function renderLabelledVisit() {
-            annotateProgressEl.textContent = labVisits.length
-                ? `${labIndex + 1} / ${labVisits.length} labelled` : '0 labelled';
+            annotateProgressEl.querySelector('.metric__cap').textContent = 'Labelled';
+            annotateProgressEl.querySelector('.metric__val').textContent = labVisits.length
+                ? `${labIndex + 1} / ${labVisits.length}` : '0';
             if (!labVisits.length) {
                 // Distinguish "nothing labelled at all" from "the chosen label has no events".
                 annotateEmptyEl.textContent = labVisitsAll.length
@@ -4587,7 +4820,7 @@
                 annotateRepEl.innerHTML = '';
                 annotateMetaEl.textContent = '';
                 annotateFilmstripEl.innerHTML = '';
-                annotateIdentityEl.textContent = '—';
+                annotateIdentityEl.querySelector('.metric__val').textContent = '—';
                 annotatePrevBtn.disabled = true;
                 annotateNextBtn.disabled = true;
                 annotateUnknownBtn.disabled = true;
@@ -4603,7 +4836,7 @@
             const v = labVisits[labIndex];
             annotatePrevBtn.disabled = labIndex === 0;
             annotateNextBtn.disabled = labIndex >= labVisits.length - 1;
-            annotateIdentityEl.textContent = (v.mixed ? 'mixed → ' : '→ ') + identityLabel(v);
+            annotateIdentityEl.querySelector('.metric__val').textContent = (v.mixed ? 'mixed · ' : '') + identityLabel(v);
 
             const frames = (v.frames || []).slice().sort((a, b) => a.recv_ts - b.recv_ts);
             const rep = frames.find(f => f.id === v.rep_frame_id) || frames[0];
@@ -4775,10 +5008,18 @@
             trainCancelBtn.disabled = !running;
             trainQueueClearBtn.disabled = queue.length === 0;
             trainStopAllBtn.disabled = !running && queue.length === 0;
-            trainRunBtn.disabled = running;
+            // Disabled while a run is in flight OR already running; a mid-submit poll can't
+            // re-enable it. The label reflects the state on the button itself.
+            trainRunBtn.disabled = running || trainSubmitting;
+            trainRunBtn.textContent = trainSubmitting ? 'Starting…' : (running ? 'Running…' : 'Run');
 
+            trainProgressEl.classList.toggle('is-running', running || trainSubmitting);
             if (running) {
                 trainProgressEl.textContent = `Running feasibility (${trainQualityLabel(status.params)}) — ${status.done}/${status.total}${trainEtaText(status)}`;
+            } else if (trainSubmitting) {
+                // Enqueue POST in flight (before the job exists) — keep the progress line in
+                // step with the button rather than flashing "Idle." under a "Starting…" button.
+                trainProgressEl.textContent = 'Starting…';
             } else {
                 trainingEtaAnchor = null;  // idle: drop the anchor so the next run re-anchors fresh
                 trainProgressEl.textContent = 'Idle.';
@@ -4865,9 +5106,11 @@
             // 0 or all 3 checked both mean "no filter" (all qualities).
             const qualities = (checked.length === 0 || checked.length === 3) ? null : checked;
 
-            const label = trainRunBtn.textContent;
-            trainRunBtn.disabled = true;
-            trainRunBtn.textContent = 'Starting…';
+            // Reflect the submit immediately (disabled + "Starting…") and hold that state —
+            // renderTrainQueuePanel keys off trainSubmitting, so the periodic poll can't
+            // re-enable the button before the server has actually enqueued the job.
+            trainSubmitting = true;
+            renderTrainQueuePanel(trainingStatus);
             try {
                 clearError();
                 trainEnoughNoteEl.classList.add('hidden');
@@ -4888,7 +5131,10 @@
             } catch (err) {
                 showError(`Run failed: ${err.message}`);
             } finally {
-                trainRunBtn.textContent = label;
+                // Clear the flag, then re-sync from the server: by now the POST has returned,
+                // so a running job reports running=true (button stays disabled → "Running…"),
+                // and an enough=false / failed submit reports idle (button back to "Run").
+                trainSubmitting = false;
                 await pollTrainingStatus();
             }
         }

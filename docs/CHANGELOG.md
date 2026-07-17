@@ -369,3 +369,23 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     resident cat, unknown cat, or not-a-cat (or all). Client-only: options are built from the labels
     actually present in the fetched set, with per-label counts. Undo now removes the visit from the
     unfiltered backing set too, so a sent-back visit can't reappear when the filter changes.
+
+64. Training-page Run button no longer gets stuck. It's driven by a `trainSubmitting` flag from click
+    until the enqueue POST resolves, so the periodic status poll — which fires during the seconds the
+    server spends importing torch BEFORE the job exists — can no longer see `running=false` and re-enable
+    a mid-submit button. Button + progress now read Starting… → Running… → Run/Idle from one source.
+
+65. Motion-workbench UI coherence pass (compute/api/web, presentation only).
+    Buttons now share one geometry with a calm hierarchy: neutral surface default, saturated accent
+    fill reserved for a single `.btn-primary` per group; the green `.btn-preset` is retired and danger
+    is a red *tint* — so no button competes with the red "missed" verdict (upholds #43's "color = verdict").
+    Badges are squared, not pills; checkboxes and radios are custom-styled (native controls never took the
+    dark theme). Job/queue lists are now real record rows — uppercase headings, mono right-aligned meta, a
+    live green-dot status strip, dot-led terminal-state log; Annotate's Queue/Labelled toggle is a segmented control.
+
+66. Replaced the single catch-all `.badge` with ONE readout: the `.metrics`/`.metric` cluster
+    (small-caps caption over mono value, in a bordered hairline-divided strip). EVERY data reading
+    is a cluster — multi-cell where related (store-stats header; bucket start/end/in-range; playback
+    time+frame; annotate decided/labelled/identity), single-cell otherwise (store range, visit
+    position). State is a status chip (dot + word, Collecting); scope/params/window/page/status
+    context stay quiet divider-labels. `.badge` backs only those; Activity has no badges.

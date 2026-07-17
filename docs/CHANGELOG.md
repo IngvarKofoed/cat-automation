@@ -389,3 +389,28 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     time+frame; annotate decided/labelled/identity), single-cell otherwise (store range, visit
     position). State is a status chip (dot + word, Collecting); scope/params/window/page/status
     context stay quiet divider-labels. `.badge` backs only those; Activity has no badges.
+
+67. Gallery-build + promote: new `model_versions` table (survives eviction/clear like `cats`/`dataset_items`)
+    versioning k-NN galleries built from labelled crops. `gallery-build` is a TrainingManager job embedding
+    selected-quality `identified` crops and writing their vectors+cat_ids to `<CAT_COLLECT_DIR>/models/<ts>/gallery.npz`.
+    `promote` is synchronous (flips target→active, current-active→retired, one active at a time — rollback by promoting retired).
+    Spec: docs/specs/2026-07-17-identification-gallery-activity.md.
+
+68. Identification pass: new frame-keyed `identifications` table (evicts with frames, like `analysis`)
+    storing per-frame nearest-neighbour match to active gallery. `identify` TrainingManager job embeds
+    yolo-serial-detected crops from live frames, matches to gallery, stores cat_id+distance (no threshold baked).
+    Threshold lives on model_versions row, applied only at read—always tunable without re-identify.
+    Resumable, idempotent per model.
+
+69. Activity feed now shows resident/neighbour name or "unknown cat" on event cards, derived from aggregated
+    identifications within each event's frame span. Vote among below-threshold frames; unknown when nearest cat's distance > threshold,
+    or null when no active model/identifications. Additive: base feed (motion clusters, no names) unchanged without a promoted model.
+
+70. Uncalibrated identification fails safe: a model whose threshold is NULL (uncomputable — e.g. one crop
+    per cat, no same-cat pair) resolves EVERY event to "unknown cat" rather than naming the nearest
+    resident. An uncalibrated model must never admit a foreign cat as a resident.
+
+71. Identify pass now converges and counts truthfully: a detected frame it can't embed (no yolo-serial
+    box, or an undecodable/degenerate crop) gets a marker row (`cat_id` NULL, ignored at read) so it's
+    recorded processed and never re-attempted, and iter/count agree so progress reaches 100%.
+    `n_identified` counts only rows that actually persisted (frames evicted mid-pass excluded).

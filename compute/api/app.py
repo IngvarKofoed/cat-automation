@@ -284,6 +284,33 @@ class FeasibilityRunRequest(BaseModel):
     qualities: "list[str] | None" = None
 
 
+class GalleryBuildRequest(BaseModel):
+    """Body of ``POST /api/training/gallery/build``: which crop grades to enroll.
+
+    ``qualities`` is ``null`` (or ``[]``) for "all grades", or a subset of
+    ``_QUALITIES`` (``gallery``/``ok``/``poor``) — the UI defaults the checkboxes to
+    ``gallery`` only (protect-the-gallery: enroll clean, representative crops and
+    keep hard ones for threshold-tuning; see ``compute/CLAUDE.md``), but a build may
+    widen the selection per run. A grade outside ``_QUALITIES`` is a client mistake
+    (400). Both ``null`` and ``[]`` collapse to ``None`` (no filter) at the
+    store/manager boundary, mirroring ``FeasibilityRunRequest``.
+    """
+
+    qualities: "list[str] | None" = None
+
+
+class IdentifyRunRequest(BaseModel):
+    """Body of ``POST /api/identify/run``: the id-window to identify over.
+
+    ``since_id``/``until_id`` are the same optional inclusive bounds every windowed
+    read/run takes (``None`` on a side = unbounded); the pass runs against whatever
+    model is currently ``active`` — there is no model selector in the body.
+    """
+
+    since_id: "int | None" = None
+    until_id: "int | None" = None
+
+
 def _parse_box(box: str) -> "list[float]":
     """Parse a ``"x1,y1,x2,y2"`` query string to four floats; raise on bad input.
 
@@ -1380,5 +1407,110 @@ def create_app(
         if path is None:
             return Response(status_code=404)
         return FileResponse(path, media_type="text/html")
+
+    # --- Training page: gallery build + promote; Activity/Training: identify -------
+    #
+    # The learning loop's remaining Train -> Run surface (see the
+    # identification-gallery-activity spec): build a versioned gallery from labelled
+    # crops, promote one version active, and run identify passes against it. Error
+    # mapping mirrors the feasibility block above and ``/api/analysis/run``: a bad
+    # grade/window is a client mistake (400/409) and the missing embed deps surface
+    # SYNCHRONOUSLY as a 503 with the install hint, not a delayed ``status().error``.
+    # ``Embedder`` is imported LAZILY inside each endpoint so this module stays
+    # torch-free at import. Promotion itself is a synchronous status flip on the
+    # store — not a queued job (see the spec's "promote is synchronous" decision).
+
+    @app.post("/api/training/gallery/build")
+    def api_training_gallery_build(req: GalleryBuildRequest):
+        # Validate the grade selection FIRST (400) — a client mistake, before any
+        # deps or store work. ``null``/``[]`` both mean "all grades" -> ``None`` at
+        # the store/manager boundary, exactly like ``/api/training/feasibility/run``.
+        if req.qualities is not None:
+            bad = [q for q in req.qualities if q not in _QUALITIES]
+            if bad:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
+                )
+        qualities = list(req.qualities) if req.qualities else None
+
+        # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
+        # (seconds-long, torch-importing) ensure_available. Same ordering rationale
+        # as feasibility: an operator with no labels yet should be told to LABEL
+        # DATA, not to install torch.
+        n_crops, n_cats = store.count_identified_crops(tuple(qualities) if qualities else None)
+        if n_crops < 2 or n_cats < 2:
+            return {
+                "enough": False,
+                "n_crops": n_crops,
+                "n_cats": n_cats,
+                "message": (
+                    f"Not enough labelled data: {n_crops} crop(s) across {n_cats} "
+                    "cat(s). Grade representative crops as gallery, or widen the "
+                    "selection."
+                ),
+            }
+
+        # There IS data to embed — check the heavy embed deps SYNCHRONOUSLY (mirroring
+        # /api/training/feasibility/run), so a missing-torch environment fails at
+        # request time with the install hint (503) rather than as a delayed
+        # status().error. Import Embedder here (not at module scope) so app import
+        # stays torch-free.
+        from compute.identification.embed import Embedder
+
+        try:
+            Embedder().ensure_available()
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        # Enough to run: enqueue on the training queue (same dedup-running-only
+        # semantics as the other training enqueues — see TrainingManager).
+        return {**training_manager.enqueue_gallery_build(store, qualities), "enough": True}
+
+    @app.get("/api/training/models")
+    def api_training_models():
+        # The Promote panel's list (newest-first, each flagging gallery_available)
+        # plus the Activity/Training "active model" readout (None if nothing has
+        # been promoted yet).
+        return {"models": store.list_model_versions(), "active": store.active_model()}
+
+    @app.post("/api/training/models/{model_id}/promote")
+    def api_training_models_promote(model_id: int):
+        # Synchronous status flip, not a queued job — promote is a trivial single-row
+        # transaction (see the spec). Accepts any existing version, including a
+        # retired one (that's the rollback path). An unknown id is a 404 (nothing to
+        # promote); a known id whose gallery.npz has gone missing from disk is a 409
+        # (a real conflict — the artifact this row names no longer exists).
+        try:
+            return store.promote_model(model_id)
+        except ValueError as exc:
+            msg = str(exc)
+            status_code = 404 if "no such model" in msg else 409
+            raise HTTPException(status_code=status_code, detail=msg)
+
+    @app.post("/api/identify/run")
+    def api_identify_run(req: IdentifyRunRequest):
+        # No active model -> 409: nothing to identify against. This is the same
+        # "build & promote a gallery first" guard the Activity/Training UI shows as
+        # a disabled control with a note, checked again here for a direct API caller.
+        if store.active_model() is None:
+            raise HTTPException(
+                status_code=409, detail="no active model; build & promote a gallery first"
+            )
+        _validate_bounds(req.since_id, req.until_id)
+
+        # Same synchronous embed-deps check as gallery/build — 503 with the install
+        # hint rather than a delayed status().error.
+        from compute.identification.embed import Embedder
+
+        try:
+            Embedder().ensure_available()
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        return {
+            **training_manager.enqueue_identify(store, req.since_id, req.until_id),
+            "enough": True,
+        }
 
     return app

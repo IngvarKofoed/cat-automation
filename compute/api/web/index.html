@@ -465,6 +465,7 @@
             font-size: 12px;
             color: var(--color-text-muted);
             display: flex;
+            flex-wrap: wrap;
             justify-content: space-between;
             gap: 6px;
         }
@@ -731,6 +732,24 @@
             border-radius: 50%;
             background: currentColor;
         }
+        /* Promote panel: a model version's status word — same dot+colour mechanic as
+           .state-*, a distinct name because it labels a row's PERSISTENT state (draft /
+           active / retired), not a one-shot job outcome. .missing flags a version whose
+           gallery.npz has gone from disk (promote-blocked). */
+        .model-status { font-weight: 700; }
+        .model-status::before {
+            content: "";
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            margin-right: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .model-status.active  { color: var(--color-status-caught); }
+        .model-status.draft   { color: var(--color-text-muted); }
+        .model-status.retired { color: rgb(var(--v-neutral-rgb)); }
+        .model-status.missing { color: var(--color-status-false); }
         /* Density timeline: a horizontal strip of bins, one cell per bin, colored by
            disagreement (missed = red, false = amber, else neutral) with intensity by
            count. Clicking a bin narrows the drill-down. */
@@ -1041,6 +1060,32 @@
            .tile border (no layout shift). */
         .activity-card { cursor: pointer; }
         .activity-card.selected { border-color: var(--color-primary); }
+        /* Event-card identity chip (identification-gallery-activity spec): a named cat is
+           a confident, positive match (caught-green); "unknown cat" means frames WERE
+           identified but none matched closely enough (false-amber — worth a second look,
+           same tone the false-trigger swatch uses elsewhere). No chip at all when the
+           event carries no identification. flex-basis 100% drops it to its own line below
+           the time/span row rather than being squeezed into the caption's space-between. */
+        .identity-chip {
+            flex-basis: 100%;
+            display: inline-block;
+            width: fit-content;
+            margin-top: 2px;
+            padding: 1px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .identity-chip.known {
+            background: rgb(var(--v-caught-rgb) / .18);
+            color: var(--color-status-caught);
+            border: 1px solid rgb(var(--v-caught-rgb) / .45);
+        }
+        .identity-chip.unknown {
+            background: rgb(var(--v-false-rgb) / .18);
+            color: var(--color-status-false);
+            border: 1px solid rgb(var(--v-false-rgb) / .45);
+        }
         /* Player stage: a fixed-height contained frame, mirroring #inboxRep so flipping
            events or scrubbing never resizes the box and reflows the strip below. */
         #playerStage {
@@ -1326,6 +1371,7 @@
         #sweepsScopeBadge,
         #tuningScopeBadge,
         #annotateScopeBadge,
+        #trainScopeBadge,
         #tuningParamSource,
         #tuningProgressBadge,
         #timelineScopeBadge,
@@ -1343,20 +1389,21 @@
         #sweepsScopeBadge.warn,
         #tuningScopeBadge.warn,
         #annotateScopeBadge.warn,
+        #trainScopeBadge.warn,
         #tuningParamSource.warn {
             color: var(--color-status-false);
         }
         #sweepsScopeBadge { min-width: 150px; }
         #tuningScopeBadge { min-width: 150px; }
         #annotateScopeBadge { min-width: 150px; }
+        #trainScopeBadge { min-width: 150px; }
         #tuningParamSource { min-width: 150px; }
         #timelineScopeBadge { min-width: 150px; }
         #viewerInfoBadge { min-width: 150px; }
         #viewerPageLabel { min-width: 64px; text-align: center; }
 
-        /* Training page: disabled "coming next" cards (Build gallery / Promote),
-           clickable run-history rows, and the embedded report iframe. */
-        .panel-disabled { opacity: 0.55; }
+        /* Training page: clickable run-history rows, the embedded report iframe, and the
+           Promote panel's model-version status word (dot + colour, mirroring .state-*). */
         .train-run-row { cursor: pointer; }
         .train-run-row.selected { border-color: var(--color-primary); }
         .train-report-frame {
@@ -1458,10 +1505,15 @@
                     <label>&nbsp;</label>
                     <button type="button" id="activityLoadBtn" class="btn-primary">Load</button>
                 </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="activityIdentifyBtn" class="btn-secondary">Identify</button>
+                </div>
                 <div class="control-group push-end">
                     <div class="metrics"><div id="activityStoreRange" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div></div>
                 </div>
             </div>
+            <div id="activityIdentifyNote" class="hidden banner-warn"></div>
             <div id="activityTruncated" class="banner-warn hidden"></div>
             <div id="activityEmpty" class="empty hidden">No activity in this range.</div>
             <div id="activityGrid" class="grid"></div>
@@ -1875,15 +1927,38 @@
     </section>
 
     <!-- ================= TRAIN VIEW ================= -->
-    <!-- The learning loop's Train stage: build gallery -> validate -> promote.
-         Only Validate (the feasibility probe) is live; Build/Promote are honest
-         "coming next" stubs so the page names the whole loop without overclaiming. -->
+    <!-- The learning loop's Train stage: build gallery -> validate -> promote -> identify.
+         Build, Validate, and Identify all run on the ONE shared training queue (only one
+         job runs at a time; see /api/training/status) — the progress/cancel/history block
+         under "2. Validate" is that shared status, not Validate-specific. -->
     <section id="view-train" class="view hidden">
-        <div class="panel panel-disabled">
+        <div class="panel">
             <h2>1. Build gallery</h2>
-            <p class="caveat text-muted" style="margin: 0;">
-                Coming next — rebuilding the resident gallery from labelled crops isn't wired up yet.
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Embeds labelled, identified crops into a new versioned gallery (a
+                <code>draft</code> model version). Defaults to gallery-grade crops only —
+                protect the gallery; widen to ok/poor to A/B whether crop quality is the
+                bottleneck. Building alone changes nothing live — Promote below makes a
+                version active.
             </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="buildQualityGallery" checked> gallery</label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="buildQualityOk"> ok</label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label"><input type="checkbox" id="buildQualityPoor"> poor</label>
+                </div>
+                <div class="control-group push-end">
+                    <button type="button" id="buildRunBtn" class="btn-primary">Build</button>
+                </div>
+            </div>
+            <div id="buildEnoughNote" class="hidden banner-warn"></div>
         </div>
 
         <div class="panel">
@@ -1891,7 +1966,9 @@
             <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
                 Runs the feasibility probe over labelled, identified crops: embeds them, then
                 reports leave-one-out kNN accuracy, a same/different-cat distance AUC, and a
-                suggested confidence threshold. No model is built or promoted here.
+                suggested confidence threshold. No model is built or promoted here. The
+                progress, cancel, and history below are shared with Build gallery and
+                Identify — one job runs at a time; the others queue behind it.
             </p>
             <div class="controls-row">
                 <div class="control-group">
@@ -1930,11 +2007,42 @@
             <iframe id="trainReportFrame" class="train-report-frame hidden" title="Feasibility report"></iframe>
         </div>
 
-        <div class="panel panel-disabled">
+        <div class="panel">
             <h2>3. Promote</h2>
-            <p class="caveat text-muted" style="margin: 0;">
-                Coming next — promoting a validated model version to Run isn't wired up yet.
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Make one built version the active gallery — the one Identify matches against
+                and Activity names cats from. Any version can be promoted, including a
+                <code>retired</code> one (that's the rollback path).
             </p>
+            <div id="modelsEmpty" class="empty hidden">No gallery versions yet — build one above.</div>
+            <div id="modelsList" class="queue-list"></div>
+            <div id="promoteNote" class="hidden banner-warn"></div>
+            <div id="promoteError" class="hidden analysis-error"></div>
+        </div>
+
+        <div class="panel">
+            <h2>4. Identify</h2>
+            <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
+                Matches yolo-serial-detected crops in the scoped bucket against the active
+                gallery and writes per-frame identifications — the names Activity then shows.
+                Runs on the shared training queue above.
+            </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="trainScopeSelect">Bucket</label>
+                    <select id="trainScopeSelect">
+                        <option value="">All frames</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="trainIdentifyBtn" class="btn-primary">Identify</button>
+                </div>
+                <div class="control-group push-end">
+                    <span id="trainScopeBadge" class="badge">Scope: All frames</span>
+                </div>
+            </div>
+            <div id="trainIdentifyNote" class="hidden banner-warn"></div>
         </div>
     </section>
 
@@ -1962,6 +2070,8 @@
         const activityTruncatedEl = document.getElementById('activityTruncated');
         const activityEmptyEl = document.getElementById('activityEmpty');
         const activityGridEl = document.getElementById('activityGrid');
+        const activityIdentifyBtn = document.getElementById('activityIdentifyBtn');
+        const activityIdentifyNoteEl = document.getElementById('activityIdentifyNote');
         const activityModalEl = document.getElementById('activityModal');
         const playerDialogEl = document.getElementById('playerDialog');
         const playerCloseBtn = document.getElementById('playerCloseBtn');
@@ -2094,6 +2204,19 @@
         const trainRunsEmptyEl = document.getElementById('trainRunsEmpty');
         const trainReportPrunedEl = document.getElementById('trainReportPruned');
         const trainReportFrameEl = document.getElementById('trainReportFrame');
+        const buildQualityGalleryEl = document.getElementById('buildQualityGallery');
+        const buildQualityOkEl = document.getElementById('buildQualityOk');
+        const buildQualityPoorEl = document.getElementById('buildQualityPoor');
+        const buildRunBtn = document.getElementById('buildRunBtn');
+        const buildEnoughNoteEl = document.getElementById('buildEnoughNote');
+        const modelsListEl = document.getElementById('modelsList');
+        const modelsEmptyEl = document.getElementById('modelsEmpty');
+        const promoteNoteEl = document.getElementById('promoteNote');
+        const promoteErrorEl = document.getElementById('promoteError');
+        const trainScopeSelect = document.getElementById('trainScopeSelect');
+        const trainScopeBadge = document.getElementById('trainScopeBadge');
+        const trainIdentifyBtn = document.getElementById('trainIdentifyBtn');
+        const trainIdentifyNoteEl = document.getElementById('trainIdentifyNote');
 
         // ================= shared constants + state =================
         const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning', 'annotate', 'train'];
@@ -2144,9 +2267,22 @@
         // pollTrainingStatus firing in that window would otherwise see running=false and
         // re-enable the button mid-submit — this flag keeps it disabled until the job exists.
         let trainSubmitting = false;
+        // Same submit-in-flight guard as trainSubmitting, one per shared-queue action —
+        // Build and Identify each POST to a different endpoint but land on the SAME queue,
+        // so each needs its own flag (a single shared one would mislabel the other's button).
+        let buildSubmitting = false;
+        let identifySubmitting = false;
         let trainRuns = [];             // feasibility_runs history, most-recent-first
         let trainLastResultRunId = null; // dedupes the runs-list refresh to one per completed run
+        let trainLastGalleryResultSig = null; // dedupes the models-list refresh to one per completed build
+        let trainLastIdentifyResultSig = null; // dedupes the Activity-grid refresh to one per completed identify
         let trainSelectedRunId = null;   // which run's report is loaded in the iframe
+
+        // model_versions (from /api/training/models), shared by the Train "Promote" list
+        // and the Identify gate on both Train and Activity — one fetch, one state, so the
+        // two pages can't disagree about which model is active.
+        let trainModels = [];        // all versions, newest-first
+        let activeModel = null;      // the single active row (+ gallery_path), or null
 
         // Groups / buckets (from /api/groups), shared by both views.
         let groups = [];
@@ -2398,6 +2534,7 @@
             if (r !== 'activity') closePlayer();
             if (r === 'activity') {
                 populateActivityDefaults();
+                loadModels();   // the Identify gate (active model) + button state
                 // Fetch on entry when a date range is available; when stats haven't landed
                 // yet (dates empty on first load) pollStats kicks the initial load once.
                 if (activityFromDateEl.value && activityToDateEl.value) {
@@ -2418,7 +2555,7 @@
                 loadCats();
                 loadGroups().then(() => reloadAnnotate());
             } else if (r === 'train') {
-                reloadTrain();
+                loadGroups().then(() => reloadTrain());
             }
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -2678,11 +2815,31 @@
             // counts reading as a bug when they differ.
             right.textContent = `${formatSpan(ev.start_ts, ev.end_ts)} · ${ev.n_frames} motion frames`;
             cap.append(left, right);
+            const chip = identityChip(ev.identity);
+            if (chip) cap.append(chip);
             tile.append(img, cap);
             // Double-click / double-tap opens the playback modal (single click is a no-op,
             // so a stray tap while scanning the grid doesn't launch the player).
             tile.addEventListener('dblclick', () => openEvent(i));
             return tile;
+        }
+
+        // The event-card name chip (identification-gallery-activity spec): a named
+        // resident/neighbour cat is a confident match; identity.cat_id === null means
+        // frames WERE identified but none matched closely enough ("unknown cat"); no
+        // `identity` at all (no active model, or nothing identified in the span) shows
+        // no chip — the card renders exactly as it did before identification existed.
+        function identityChip(identity) {
+            if (!identity) return null;
+            const chip = document.createElement('span');
+            if (identity.cat_id == null) {
+                chip.className = 'identity-chip unknown';
+                chip.textContent = 'unknown cat';
+            } else {
+                chip.className = 'identity-chip known';
+                chip.textContent = identity.cat_name || `cat #${identity.cat_id}`;
+            }
+            return chip;
         }
 
         function highlightSelectedCard() {
@@ -3317,16 +3474,19 @@
             }
         }
 
-        // ================= Sweeps + Tuning: shared scope picker =================
-        // Both pages' bucket <select>s track one scopeValue; renderScopeSelects repopulates
-        // BOTH from the current groups and mirrors the shared value into each.
+        // ================= Sweeps + Tuning + Annotate + Train: shared scope picker =====
+        // All four pages' bucket <select>s track one scopeValue; renderScopeSelects repopulates
+        // every one from the current groups and mirrors the shared value into each. Train's
+        // Identify is the only Train control that is window-scoped (Build/Validate always run
+        // over ALL identified crops), so it joins the same shared bucket rather than getting
+        // its own.
         function renderScopeSelects() {
             // Drop a selection whose group was deleted (also clears its drill sub-window).
             if (scopeValue && !groups.some(g => String(g.id) === scopeValue)) {
                 scopeValue = '';
                 drillScope = null;
             }
-            for (const sel of [sweepsScopeSelect, tuningScopeSelect, annotateScopeSelect]) {
+            for (const sel of [sweepsScopeSelect, tuningScopeSelect, annotateScopeSelect, trainScopeSelect]) {
                 sel.innerHTML = '';
                 const allOpt = document.createElement('option');
                 allOpt.value = '';
@@ -3358,6 +3518,8 @@
             tuningScopeBadgeEl.classList.toggle('warn', !!activeScope);
             annotateScopeBadge.textContent = text;
             annotateScopeBadge.classList.toggle('warn', !!activeScope);
+            trainScopeBadge.textContent = text;
+            trainScopeBadge.classList.toggle('warn', !!activeScope);
         }
 
         function effectiveWindow() {
@@ -3374,6 +3536,7 @@
             sweepsScopeSelect.value = val;
             tuningScopeSelect.value = val;
             annotateScopeSelect.value = val;
+            trainScopeSelect.value = val;
             const g = val ? groups.find(x => String(x.id) === val) : null;
             activeScope = g ? { since_id: g.start_id, until_id: g.end_id } : null;
             drillScope = null;
@@ -3382,10 +3545,13 @@
             if (route === 'sweeps') reloadSweeps();
             else if (route === 'tuning') reloadTuning();
             else if (route === 'annotate') reloadAnnotate();
+            // Train: nothing else depends on scope (Identify reads activeScope at click
+            // time) — the badge update above is enough.
         }
         sweepsScopeSelect.addEventListener('change', () => onScopeChange(sweepsScopeSelect.value));
         tuningScopeSelect.addEventListener('change', () => onScopeChange(tuningScopeSelect.value));
         annotateScopeSelect.addEventListener('change', () => onScopeChange(annotateScopeSelect.value));
+        trainScopeSelect.addEventListener('change', () => onScopeChange(trainScopeSelect.value));
 
         // Sweeps = produce verdicts: coverage rows + the queue panel.
         function reloadSweeps() {
@@ -4972,6 +5138,7 @@
         function reloadTrain() {
             pollTrainingStatus();
             loadTrainRuns();
+            loadModels();   // Promote list + the Identify gate (active model)
         }
 
         // A quality-tuple label matching the store's slug convention ('all' when the
@@ -4981,13 +5148,36 @@
             return params.join('+');
         }
 
+        // The queue/history/running-line trailing label for ONE training job: qualities
+        // for feasibility/gallery-build (trainQualityLabel), the id-window for identify
+        // (windowLabel — the same text Sweeps/Tuning show for a bucket).
+        function trainParamsLabel(kind, params) {
+            if (kind === 'identify') {
+                const since = params ? params[0] : null;
+                const until = params ? params[1] : null;
+                return windowLabel(since, until);
+            }
+            return trainQualityLabel(params);
+        }
+
+        // The running-line's leading verb + params, one per job kind — Build/Validate/
+        // Identify all share this one progress line (one training queue, one job at a time).
+        function trainRunningVerb(kind) {
+            if (kind === 'gallery-build') return 'Building gallery';
+            if (kind === 'identify') return 'Identifying';
+            if (kind === 'feasibility') return 'Running feasibility';
+            return `Running ${kindLabel(kind)}`;
+        }
+
         // Same shape as the sweeps etaText (~line 3318) reused deliberately, but keyed
         // off `trainingEtaAnchor` — its own anchor, so it can't be reset by a concurrent
-        // oracle sweep re-anchoring the shared `etaAnchor`, or vice versa.
+        // oracle sweep re-anchoring the shared `etaAnchor`, or vice versa. The key only
+        // needs to be a stable, unique-per-job string — trainParamsLabel already is one
+        // for every kind (a quality slug or a window label), so it's reused as-is here.
         function trainEtaText(status) {
             if (!status.running || !status.total || status.total <= 0) { trainingEtaAnchor = null; return ''; }
             const now = Date.now();
-            const key = [status.kind, trainQualityLabel(status.params), status.total].join('|');
+            const key = [status.kind, trainParamsLabel(status.kind, status.params), status.total].join('|');
             if (!trainingEtaAnchor || trainingEtaAnchor.key !== key || status.done < trainingEtaAnchor.done0) {
                 trainingEtaAnchor = { key, t0: now, done0: status.done };
                 return '';
@@ -5000,26 +5190,44 @@
             return ` · ${rate.toFixed(1)}/s · ~${formatDuration(remaining / rate)} left`;
         }
 
+        // One shared status snapshot drives three buttons (Validate Run, Build, Identify)
+        // across two views — all three enqueue onto the SAME TrainingManager queue, so
+        // `running` is true whenever ANY of them (or another) is the active job. A button
+        // is disabled whenever the queue is busy at all (simplest correct rule: only one
+        // job runs at a time regardless of kind); its own label additionally reads "Running…"
+        // only when IT is the job actually running, so an unrelated job's button doesn't
+        // falsely claim to be running.
         function renderTrainQueuePanel(status) {
             const running = !!status.running;
             const queue = status.queue || [];
             const history = status.history || [];
+            const anyBusy = running || trainSubmitting || buildSubmitting || identifySubmitting;
 
             trainCancelBtn.disabled = !running;
             trainQueueClearBtn.disabled = queue.length === 0;
             trainStopAllBtn.disabled = !running && queue.length === 0;
             // Disabled while a run is in flight OR already running; a mid-submit poll can't
             // re-enable it. The label reflects the state on the button itself.
-            trainRunBtn.disabled = running || trainSubmitting;
-            trainRunBtn.textContent = trainSubmitting ? 'Starting…' : (running ? 'Running…' : 'Run');
+            trainRunBtn.disabled = anyBusy;
+            trainRunBtn.textContent = trainSubmitting ? 'Starting…'
+                : (running && status.kind === 'feasibility' ? 'Running…' : 'Run');
+            buildRunBtn.disabled = anyBusy;
+            buildRunBtn.textContent = buildSubmitting ? 'Starting…'
+                : (running && status.kind === 'gallery-build' ? 'Running…' : 'Build');
 
-            trainProgressEl.classList.toggle('is-running', running || trainSubmitting);
+            trainProgressEl.classList.toggle('is-running', anyBusy);
             if (running) {
-                trainProgressEl.textContent = `Running feasibility (${trainQualityLabel(status.params)}) — ${status.done}/${status.total}${trainEtaText(status)}`;
+                trainProgressEl.textContent =
+                    `${trainRunningVerb(status.kind)} (${trainParamsLabel(status.kind, status.params)})`
+                    + ` — ${status.done}/${status.total}${trainEtaText(status)}`;
             } else if (trainSubmitting) {
                 // Enqueue POST in flight (before the job exists) — keep the progress line in
                 // step with the button rather than flashing "Idle." under a "Starting…" button.
-                trainProgressEl.textContent = 'Starting…';
+                trainProgressEl.textContent = 'Starting validation…';
+            } else if (buildSubmitting) {
+                trainProgressEl.textContent = 'Starting gallery build…';
+            } else if (identifySubmitting) {
+                trainProgressEl.textContent = 'Starting identify…';
             } else {
                 trainingEtaAnchor = null;  // idle: drop the anchor so the next run re-anchors fresh
                 trainProgressEl.textContent = 'Idle.';
@@ -5039,7 +5247,7 @@
                     const left = document.createElement('span');
                     left.textContent = `${i + 1}. ${kindLabel(job.kind)}`;
                     const right = document.createElement('span');
-                    right.textContent = trainQualityLabel(job.params);
+                    right.textContent = trainParamsLabel(job.kind, job.params);
                     item.append(left, right);
                     list.appendChild(item);
                 });
@@ -5058,7 +5266,7 @@
                     const item = document.createElement('div');
                     item.className = 'queue-item';
                     const left = document.createElement('span');
-                    left.textContent = `${kindLabel(rec.kind)} · ${trainQualityLabel(rec.params)}`;
+                    left.textContent = `${kindLabel(rec.kind)} · ${trainParamsLabel(rec.kind, rec.params)}`;
                     const right = document.createElement('span');
                     const stateClass = rec.state === 'done' ? 'state-done' : (rec.state === 'failed' ? 'state-failed' : 'state-canceled');
                     const stateText = rec.state === 'failed' ? `failed: ${rec.error || 'error'}` : rec.state;
@@ -5084,6 +5292,41 @@
                 trainLastResultRunId = status.result.run_id;
                 loadTrainRuns(status.result.run_id);
             }
+
+            // A finished gallery-build carries no run_id (that's feasibility-only) — dedupe
+            // on the whole result payload instead, then refresh the Promote list on success
+            // (a fresh draft appeared) or surface the cold-start message on the rare race
+            // where the build itself found too few labels (the common case is caught
+            // synchronously by the endpoint before this ever enqueues — see runGalleryBuild).
+            if (status.result && status.result.kind === 'gallery-build') {
+                const sig = JSON.stringify(status.result);
+                if (sig !== trainLastGalleryResultSig) {
+                    trainLastGalleryResultSig = sig;
+                    if (status.result.enough) {
+                        loadModels();
+                    } else if (status.result.message) {
+                        buildEnoughNoteEl.textContent = status.result.message;
+                        buildEnoughNoteEl.classList.remove('hidden');
+                    }
+                }
+            }
+
+            // A finished identify pass has written names for its window — reload the
+            // Activity grid so the chips actually appear (the promote note promised
+            // this), but only when the Activity view is showing and only once per
+            // completed pass (the global poll fires on every route). onRouteEnter
+            // ('activity') reloads on arrival otherwise.
+            if (status.result && status.result.kind === 'identify') {
+                const sig = JSON.stringify(status.result);
+                if (sig !== trainLastIdentifyResultSig) {
+                    trainLastIdentifyResultSig = sig;
+                    if (location.hash.slice(1) === 'activity') {
+                        loadActivityEvents();
+                    }
+                }
+            }
+
+            renderIdentifyControls();
         }
 
         async function pollTrainingStatus() {
@@ -5220,6 +5463,234 @@
                 console.warn('training runs fetch failed:', err);
             }
         }
+
+        // ================= Train "1. Build gallery" =================
+        // Mirrors runTraining exactly (same shared queue, same submit-flag discipline),
+        // POSTing to the gallery-build endpoint instead of feasibility/run.
+        async function runGalleryBuild() {
+            const checked = [];
+            if (buildQualityGalleryEl.checked) checked.push('gallery');
+            if (buildQualityOkEl.checked) checked.push('ok');
+            if (buildQualityPoorEl.checked) checked.push('poor');
+            // 0 or all 3 checked both mean "no filter" (all qualities) — same convention
+            // runTraining uses, so the two panels can't disagree about what "all" means.
+            const qualities = (checked.length === 0 || checked.length === 3) ? null : checked;
+
+            buildSubmitting = true;
+            renderTrainQueuePanel(trainingStatus);
+            try {
+                clearError();
+                buildEnoughNoteEl.classList.add('hidden');
+                const res = await fetch('/api/training/gallery/build', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ qualities }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (data.enough === false) {
+                    buildEnoughNoteEl.textContent = data.message
+                        || `Not enough labelled data: ${data.n_crops} crops across ${data.n_cats} cat(s).`;
+                    buildEnoughNoteEl.classList.remove('hidden');
+                } else {
+                    trainingEtaAnchor = null;  // fresh job identity
+                }
+            } catch (err) {
+                showError(`Build failed: ${err.message}`);
+            } finally {
+                buildSubmitting = false;
+                await pollTrainingStatus();
+            }
+        }
+        buildRunBtn.addEventListener('click', runGalleryBuild);
+
+        // ================= Train "3. Promote" + the Identify gate =================
+        // GET /api/training/models backs BOTH the Promote list (here) and the "is a
+        // gallery active?" gate the Identify control (here AND on Activity) reads — one
+        // fetch, one `trainModels`/`activeModel` state, so the two pages can't disagree.
+        async function loadModels() {
+            try {
+                const res = await fetch('/api/training/models');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                trainModels = data.models || [];
+                activeModel = data.active || null;
+                renderModelsList();
+                renderIdentifyControls();
+            } catch (err) {
+                console.warn('models fetch failed:', err);
+            }
+        }
+
+        function renderModelsList() {
+            modelsListEl.innerHTML = '';
+            modelsEmptyEl.classList.toggle('hidden', trainModels.length > 0);
+            // Clear the transient post-promote "re-run Identify" note on ANY model-list
+            // refresh — otherwise it lingers forever (nothing else hides it), staying on
+            // screen even after the operator has re-run Identify. promoteModel re-shows it
+            // AFTER its loadModels() call, so a genuine promote still surfaces it.
+            promoteNoteEl.classList.add('hidden');
+            for (const m of trainModels) modelsListEl.appendChild(buildModelRow(m));
+        }
+
+        // One model-version row: v<id> · status · n_cats · n_vectors · threshold · quality ·
+        // time, with a Promote button on every NON-active version — a retired one included,
+        // that's the rollback path (ARCHITECTURE.md) — disabled when its gallery.npz has
+        // gone missing from disk (the store's promote_model would 409 on it anyway).
+        function buildModelRow(m) {
+            const row = document.createElement('div');
+            row.className = 'group-row';
+            const info = document.createElement('span');
+            const thr = typeof m.threshold === 'number' ? m.threshold.toFixed(3) : '—';
+            const bits = [
+                `v${m.id}`,
+                `<span class="model-status ${escapeHtml(m.status)}">${escapeHtml(m.status)}</span>`,
+                `${m.n_cats} cats`,
+                `${m.n_vectors} vectors`,
+                `thr ${thr}` + (m.threshold == null ? ' <span class="text-muted">(no calibrated threshold)</span>' : ''),
+                escapeHtml(m.quality),
+                formatTime(m.created_ts),
+            ];
+            if (!m.gallery_available) bits.push('<span class="model-status missing">artifact missing</span>');
+            info.innerHTML = bits.join(' · ');
+            const actions = document.createElement('div');
+            actions.className = 'group-actions';
+            if (m.status !== 'active') {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'btn-secondary btn-tiny';
+                btn.textContent = m.status === 'retired' ? 'Promote (rollback)' : 'Promote';
+                btn.disabled = !m.gallery_available;
+                btn.addEventListener('click', () => promoteModel(m.id));
+                actions.appendChild(btn);
+            }
+            row.append(info, actions);
+            return row;
+        }
+
+        async function promoteModel(id) {
+            try {
+                clearError();
+                promoteErrorEl.classList.add('hidden');
+                const res = await fetch(`/api/training/models/${id}/promote`, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                await loadModels();
+                // Identify persists per-frame results keyed to the model that ran, so a
+                // promote doesn't retroactively rename anything already-identified crops
+                // were matched against — Activity needs a fresh Identify pass to catch up.
+                promoteNoteEl.textContent =
+                    'Promoted. Names in Activity will not update until you re-run Identify for this model.';
+                promoteNoteEl.classList.remove('hidden');
+            } catch (err) {
+                promoteErrorEl.textContent = `Promote failed: ${err.message}`;
+                promoteErrorEl.classList.remove('hidden');
+            }
+        }
+
+        // ================= Identify (shared by Train "4." and Activity) =================
+        // One gate, one trigger, one submit flag for both call sites — they hit the exact
+        // same endpoint and the exact same training queue, so a single implementation is
+        // what keeps their disabled/label state from drifting apart.
+        function renderIdentifyControls() {
+            const status = trainingStatus;
+            const running = !!status.running;
+            const hasModel = !!activeModel;
+            // Busy whenever the shared queue is doing ANYTHING (any kind, any submit-in-
+            // flight) — same "one thing at a time" rule renderTrainQueuePanel applies to
+            // the Validate/Build buttons, so all four triggers agree on when it's safe to click.
+            const busy = running || identifySubmitting || trainSubmitting || buildSubmitting;
+            for (const btn of [trainIdentifyBtn, activityIdentifyBtn]) {
+                btn.disabled = !hasModel || busy;
+                btn.textContent = identifySubmitting ? 'Starting…'
+                    : (running && status.kind === 'identify' ? 'Identifying…' : 'Identify');
+            }
+            // The "no active model" note is the ONLY thing this function manages on the
+            // note elements — a transient "no detections in this window" message (set by
+            // triggerIdentify via the shared error banner, not here) is left alone so a
+            // routine re-render can't clobber it mid-read.
+            for (const note of [trainIdentifyNoteEl, activityIdentifyNoteEl]) {
+                if (!hasModel) {
+                    note.textContent = 'Build & promote a gallery first.';
+                    note.classList.remove('hidden');
+                } else {
+                    note.classList.add('hidden');
+                }
+            }
+        }
+
+        // Shared trigger: pre-checks yolo-serial coverage over the window (reusing the
+        // existing analysis-coverage read), declines with a heads-up instead of enqueuing
+        // an identify pass that would complete "successfully" having written zero rows,
+        // then POSTs /api/identify/run and lets the shared training-status poll show progress.
+        async function triggerIdentify(sinceId, untilId) {
+            if (!activeModel) return;   // guarded by the disabled button; defensive no-op
+            try {
+                clearError();
+                const cp = new URLSearchParams();
+                addBounds(cp, sinceId, untilId);
+                const cres = await fetch('/api/analysis/coverage?' + cp.toString());
+                if (!cres.ok) throw new Error(await errorFromResponse(cres));
+                const cdata = await cres.json();
+                const serial = cdata.oracles && cdata.oracles['yolo-serial'];
+                const present = serial ? serial.present : 0;
+                if (!present) {
+                    showError('Identify: no detections in this window — run a yolo-serial sweep first.');
+                    return;
+                }
+                identifySubmitting = true;
+                renderIdentifyControls();
+                const res = await fetch('/api/identify/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ since_id: sinceId, until_id: untilId }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                trainingEtaAnchor = null;  // fresh job identity
+            } catch (err) {
+                showError(`Identify failed: ${err.message}`);
+            } finally {
+                identifySubmitting = false;
+                await pollTrainingStatus();   // also re-renders the Identify controls
+            }
+        }
+
+        trainIdentifyBtn.addEventListener('click', () => {
+            const w = activeScope || { since_id: null, until_id: null };
+            triggerIdentify(w.since_id, w.until_id);
+        });
+
+        // Resolves the Activity date pickers to id bounds — deliberately a separate,
+        // small duplicate of loadActivityEvents's own resolution rather than a shared
+        // helper: the two call sites react differently to an inverted/empty window
+        // (Activity shows the empty grid; this just declines to enqueue Identify).
+        async function resolveActivityWindow() {
+            const fromTs = tsFromControls(activityFromDateEl.value, 0);
+            const toTs = tsFromControls(activityToDateEl.value, 24);
+            if (fromTs == null || toTs == null) return null;
+            const lo = Math.min(fromTs, toTs), hi = Math.max(fromTs, toTs);
+            try {
+                const rp = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi) });
+                const rres = await fetch('/api/frames/resolve?' + rp.toString());
+                if (!rres.ok) throw new Error(await errorFromResponse(rres));
+                const rdata = await rres.json();
+                // A one-sided-null (a bound matched no frame) OR inverted resolution means
+                // the date range holds no frames. DECLINE — never pass null bounds to
+                // Identify, which the store would read as "whole store" and run an identify
+                // pass over every frame collected, far outside the selected window.
+                if (rdata.since_id == null || rdata.until_id == null || rdata.since_id > rdata.until_id) {
+                    showError('Identify: no frames in the selected date range.');
+                    return null;
+                }
+                return { since_id: rdata.since_id, until_id: rdata.until_id };
+            } catch (err) {
+                showError(`Identify failed: ${err.message}`);
+                return null;
+            }
+        }
+        activityIdentifyBtn.addEventListener('click', async () => {
+            const w = await resolveActivityWindow();
+            if (w) triggerIdentify(w.since_id, w.until_id);
+        });
 
         // ================= init =================
         window.addEventListener('load', () => {

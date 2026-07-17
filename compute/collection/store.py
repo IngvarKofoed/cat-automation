@@ -263,6 +263,27 @@ class Store:
         # the rolling frame buffer and survives a wipe. Rows are kept indefinitely (a
         # row is tiny); only the on-disk report DIRS are bounded (prune_feasibility_reports),
         # so an aged-out run keeps its metrics row while its report endpoint 404s.
+        #
+        # The `model_versions` + `identifications` tables back the runtime
+        # identification pass (see the identification-gallery-activity spec).
+        # `model_versions` is one row per built gallery: `id` IS the human-facing
+        # version number (`v<id>`, AUTOINCREMENT so it is never reused even across
+        # deletes), `status` is draft|active|retired with EXACTLY ONE active enforced
+        # by `promote_model`, and `gallery_dir` is the `models_root`-relative basename
+        # holding the on-disk `gallery.npz` (vectors live on the filesystem, not in the
+        # row — mirroring the architecture's file-based model store). Like
+        # `cats`/`dataset_items`/`feasibility_runs` it is PRECIOUS hand-derived output:
+        # NEITHER `_evict_locked` NOR `clear` touches it, so a promoted model is
+        # decoupled from the rolling frame buffer and survives a wipe.
+        # `identifications` is one row per (frame, model): the NEAREST gallery cat and
+        # its cosine `distance`, ALWAYS stored — "unknown" is derived at READ time by
+        # `events()` comparing that distance to the model's tunable `threshold`, never
+        # baked into the row (so editing the threshold re-renders the feed with no
+        # re-identify). `PRIMARY KEY (frame_id, model_version_id)` makes an identify
+        # re-run an INSERT OR REPLACE; and — exactly like `analysis` — it is
+        # FRAME-KEYED with no FK to `frames`, so BOTH `_evict_locked` and `clear`
+        # cascade-delete it in code under the same lock (an identification about a gone
+        # frame is meaningless and cheaply recomputed from the durable gallery).
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS frames (
@@ -339,6 +360,30 @@ class Store:
               threshold    REAL,
               report_dir   TEXT    NOT NULL,          -- training_root-relative basename of the report dir
               notes        TEXT
+            );
+            CREATE TABLE IF NOT EXISTS model_versions (
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- IS the version number ("v3"); never reused (precious)
+              status      TEXT    NOT NULL,        -- 'draft' | 'active' | 'retired'
+              kind        TEXT    NOT NULL,        -- 'gallery' (only kind for now)
+              backbone    TEXT    NOT NULL,        -- resolved embedder backbone, e.g. 'dinov2_vits14'
+              imgsz       INTEGER NOT NULL,        -- resolved embedder input side
+              n_cats      INTEGER NOT NULL,
+              n_vectors   INTEGER NOT NULL,
+              threshold   REAL,                    -- suggested same/different cutoff; NULL when uncomputable
+              quality     TEXT    NOT NULL,        -- slug: 'all' | 'gallery' | 'gallery+ok' | ...
+              metrics     TEXT,                    -- JSON: per-cat counts + build separability
+              gallery_dir TEXT    NOT NULL,        -- models_root-relative basename holding gallery.npz
+              created_ts  INTEGER NOT NULL,
+              notes       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS identifications (
+              frame_id         INTEGER NOT NULL,   -- frames.id (the identified frame)
+              model_version_id INTEGER NOT NULL,   -- which gallery produced this
+              cat_id           INTEGER,            -- NEAREST gallery cat (match); NULL = "processed, un-embeddable" marker
+              distance         REAL,               -- cosine distance to that nearest vector; NULL for a marker row
+              bbox             TEXT,               -- "x1,y1,x2,y2" the crop was cut from (audit)
+              ran_at           INTEGER NOT NULL,
+              PRIMARY KEY (frame_id, model_version_id)
             );
             """
         )
@@ -432,6 +477,10 @@ class Store:
                 # locked section, so retention can never leave an analysis row
                 # pointing at a frame (and its file) that no longer exists.
                 self._conn.execute("DELETE FROM analysis WHERE frame_id = ?", (row_id,))
+                # Same frame-keyed cascade for identifications (identification-gallery
+                # spec): an identification describes a frame, so it evicts with it —
+                # cheap to recompute from the durable gallery, so never precious.
+                self._conn.execute("DELETE FROM identifications WHERE frame_id = ?", (row_id,))
                 self._total_bytes -= int(n_bytes)
                 if self._total_bytes <= self._max_bytes:
                     break
@@ -614,6 +663,10 @@ class Store:
             # Cascade: wiping the frames wipes every oracle verdict too, so a
             # cleared store starts with no analysis rows dangling.
             self._conn.execute("DELETE FROM analysis")
+            # Same frame-keyed cascade for identifications: they describe frames, so a
+            # full wipe drops them alongside the analysis verdicts (identification-
+            # gallery spec). `model_versions` is NOT dropped — see the note below.
+            self._conn.execute("DELETE FROM identifications")
             # Also drop every saved group — unlike eviction, which leaves groups
             # alone. ``_evict_locked`` only removes the OLDEST rows while ids keep
             # advancing monotonically, so a surviving group's [start_id, end_id]
@@ -630,12 +683,14 @@ class Store:
             # is the caller's job (the /api/clear route) — NOT clear()'s, which
             # doesn't know whether collection is live. `settings` is deliberately
             # NOT dropped — it is config, so `motion_only` survives the wipe. For the
-            # SAME reason, `cats`, `dataset_items`, and `feasibility_runs` are NOT
-            # dropped here (nor by `_evict_locked`): they are precious hand-made output
-            # (the annotation tool's labels and the Training page's validation history),
+            # SAME reason, `cats`, `dataset_items`, `feasibility_runs`, and
+            # `model_versions` are NOT dropped here (nor by `_evict_locked`): they are
+            # precious hand-made output (the annotation tool's labels, the Training
+            # page's validation history, and the built/promoted gallery versions),
             # self-contained (no FK to `frames`), and the annotation tables' queue-dedup
             # keys on (`src_frame_id`, `src_recv_ts`) so a post-clear rowid reuse can't
-            # collide (recv_ts advances) — see the annotation-tool + training-page specs.
+            # collide (recv_ts advances) — see the annotation-tool + training-page +
+            # identification-gallery specs.
             self._conn.execute("DELETE FROM mode_changes")
             self._conn.commit()
             self._total_bytes = 0
@@ -1976,7 +2031,124 @@ class Store:
         # stable across calls.
         events.sort(key=lambda e: (e["start_ts"], e["start_id"]), reverse=True)
         truncated = len(events) > limit
-        return {"events": events[:limit], "truncated": truncated}
+        events = events[:limit]
+
+        # --- Active-model identity join (identification-gallery-activity spec).
+        # Annotate each RETURNED event with the active gallery's aggregated identity
+        # (or None). Runs AFTER the cap so the join is bounded by `limit` events, and
+        # with the store lock free (clustering released it above) — `active_model()`
+        # and the reads below each re-acquire it per the single-lock discipline. With
+        # no active model, every event's `identity` is None, so the feed renders
+        # exactly like the oracle-free base feed did.
+        model = self.active_model()
+        if model is None or not events:
+            for event in events:
+                event["identity"] = None
+            return {"events": events, "truncated": truncated}
+
+        # One indexed read of the active model's identifications across the returned
+        # events' overall id span, plus one cats lookup — then aggregate per event in
+        # pure Python (no numpy). Idents in the gaps between events match no event's
+        # [start_id, end_id] and are simply ignored.
+        lo = min(e["start_id"] for e in events)
+        hi = max(e["end_id"] for e in events)
+        with self._lock:
+            # frame_id-ORDERED so each event's span is a contiguous slice found by
+            # bisect (below) — O(events·log N) instead of a full re-scan per event.
+            # `cat_id IS NOT NULL` drops the "processed but un-embeddable" marker rows
+            # (see write_identifications_batch): they mark a frame done so the identify
+            # pass doesn't re-attempt it, but they carry no identity to aggregate.
+            ident_rows = self._conn.execute(
+                "SELECT frame_id, cat_id, distance FROM identifications"
+                " WHERE model_version_id = ? AND frame_id BETWEEN ? AND ? AND cat_id IS NOT NULL"
+                " ORDER BY frame_id ASC",
+                (int(model["id"]), int(lo), int(hi)),
+            ).fetchall()
+            cat_names = dict(self._conn.execute("SELECT id, name FROM cats").fetchall())
+
+        threshold = model["threshold"]
+        ident_fids = [r[0] for r in ident_rows]
+        for event in events:
+            e_lo, e_hi = event["start_id"], event["end_id"]
+            # Contiguous slice of idents whose frame_id ∈ [e_lo, e_hi]; events are
+            # disjoint motion clusters, so slices never overlap.
+            lo_i = bisect.bisect_left(ident_fids, e_lo)
+            hi_i = bisect.bisect_right(ident_fids, e_hi)
+            span = [(int(cid), float(dist)) for _fid, cid, dist in ident_rows[lo_i:hi_i]]
+            event["identity"] = self._aggregate_identity(span, threshold, cat_names)
+        return {"events": events, "truncated": truncated}
+
+    @staticmethod
+    def _aggregate_identity(
+        span_idents: "list[tuple[int, float]]", threshold: "float | None", cat_names: dict
+    ) -> "dict | None":
+        """Aggregate one event span's ``(cat_id, distance)`` identifications into an identity.
+
+        The pure-Python voter behind ``events()``'s identity join (no numpy, no DB).
+        ``span_idents`` is every identification whose frame fell inside the event's
+        id span; ``threshold`` is the active model's cutoff. A ``None`` threshold
+        means the model is UNCALIBRATED, and the fail-safe rule applies: nothing is
+        "below", so every event degrades to "unknown cat" rather than confidently
+        naming a resident (see the ``threshold is None`` branch). ``cat_names`` maps
+        ``cat_id`` → name. Returns::
+
+            {cat_id, cat_name, distance, n_identified, n_frames_voted} | None
+
+        Outcomes (per the spec):
+
+        - **no identifications in the span** → ``None`` (renders as today).
+        - **some frame below threshold** → the cat with the most below-threshold
+          frames wins (ties broken by that cat's MINIMUM distance); ``distance`` is
+          the winner's min distance, ``n_frames_voted`` its below-threshold count,
+          ``n_identified`` all identified frames in the span.
+        - **identified but none below threshold** → ``{cat_id: None, cat_name:
+          None, ...}`` (an *unknown cat* was seen — nearest match too far);
+          ``distance`` is the nearest (min) distance any frame reached,
+          ``n_frames_voted`` 0.
+        """
+        if not span_idents:
+            return None
+        n_identified = len(span_idents)
+        if threshold is None:
+            # An uncomputable threshold means the gallery could not be calibrated
+            # (e.g. one crop per cat → no same-cat pairs). Per CONCEPT/CLAUDE.md the
+            # safe default is to DEGRADE TO UNKNOWN rather than confidently name — an
+            # uncalibrated model must never label a foreign cat as a resident. So
+            # nothing counts as "below": every event resolves to "unknown cat" until a
+            # calibrated model is promoted (the UI flags such a model).
+            below: "list[tuple[int, float]]" = []
+        else:
+            below = [(cid, dist) for cid, dist in span_idents if dist <= threshold]
+        if not below:
+            # Identified, but nothing near enough → an unknown cat; report the
+            # nearest distance any frame reached.
+            return {
+                "cat_id": None,
+                "cat_name": None,
+                "distance": min(dist for _cid, dist in span_idents),
+                "n_identified": n_identified,
+                "n_frames_voted": 0,
+            }
+        # Vote among below-threshold frames: per-cat (count, min-distance).
+        per_cat: "dict[int, list]" = {}
+        for cid, dist in below:
+            entry = per_cat.get(cid)
+            if entry is None:
+                per_cat[cid] = [1, dist]
+            else:
+                entry[0] += 1
+                if dist < entry[1]:
+                    entry[1] = dist
+        # Winner: most below-threshold frames, tie-broken by that cat's min distance.
+        winner_id = min(per_cat, key=lambda cid: (-per_cat[cid][0], per_cat[cid][1]))
+        count, min_dist = per_cat[winner_id]
+        return {
+            "cat_id": winner_id,
+            "cat_name": cat_names.get(winner_id),
+            "distance": min_dist,
+            "n_identified": n_identified,
+            "n_frames_voted": count,
+        }
 
     # --- Cat-identity annotation tool: roster + dataset items --------------
     #
@@ -2668,6 +2840,338 @@ class Store:
             except OSError:
                 pass
         return removed
+
+    # --- Identification: model versions + identifications ------------------
+    #
+    # The runtime side of the learning loop's Train → Run (see the
+    # identification-gallery-activity spec). `model_versions` is a precious,
+    # eviction-/clear-surviving registry of built galleries (vectors themselves
+    # live on disk as `<models_root>/<gallery_dir>/gallery.npz`); `identifications`
+    # is a frame-keyed, cascade-evicting record of the nearest gallery cat per
+    # frame per model. The store stays numpy-/torch-free: `add_model_version`
+    # records what the gallery builder computed, and the identify pass hands
+    # `write_identifications_batch` raw (frame, model, cat, distance, bbox) tuples —
+    # the store never embeds or matches. The iterator mirrors `iter_unanalyzed`'s
+    # keyset-batch-yield-outside-the-lock discipline so a long identify pass never
+    # starves the collector. Every op goes through the single connection + lock.
+
+    @property
+    def models_root(self) -> str:
+        """Root dir for versioned gallery artifacts (``gallery.npz`` per version).
+
+        ``os.path.join(os.path.dirname(self._db_path), 'models')`` — a SIBLING of
+        ``media/``, the dataset root, and ``training/``, so promoted galleries persist
+        alongside the labels they were built from and outlive the rolling frame
+        buffer. Like ``training_root`` the store does NOT create this eagerly in
+        ``__init__``; the gallery builder ``os.makedirs`` its per-version subdir where
+        it writes. This only hands out the path.
+        """
+        return os.path.join(os.path.dirname(self._db_path) or ".", "models")
+
+    @staticmethod
+    def _model_row_to_dict(row) -> dict:
+        """Map a ``model_versions`` row to the API dict, ``metrics`` JSON-parsed.
+
+        ``row`` is the fixed column order every model-versions SELECT below builds —
+        ``(id, status, kind, backbone, imgsz, n_cats, n_vectors, threshold, quality,
+        metrics, gallery_dir, created_ts, notes)`` — so the returned key set can't
+        drift across ``list_model_versions`` / ``active_model`` / ``promote_model``
+        (the discipline ``_group_to_dict`` / ``_cat_to_dict`` give). ``metrics`` is
+        decoded back from its stored JSON (``None`` when NULL or unparsable, mirroring
+        ``latest_analysis_detail``'s defensive decode). Callers add their own extra
+        keys (``gallery_available`` / ``gallery_path``).
+        """
+        (mid, status, kind, backbone, imgsz, n_cats, n_vectors, threshold,
+         quality, metrics, gallery_dir, created_ts, notes) = row
+        parsed_metrics = None
+        if metrics is not None:
+            try:
+                parsed_metrics = json.loads(metrics)
+            except (ValueError, TypeError):
+                parsed_metrics = None
+        return {
+            "id": mid,
+            "status": status,
+            "kind": kind,
+            "backbone": backbone,
+            "imgsz": imgsz,
+            "n_cats": n_cats,
+            "n_vectors": n_vectors,
+            "threshold": threshold,
+            "quality": quality,
+            "metrics": parsed_metrics,
+            "gallery_dir": gallery_dir,
+            "created_ts": created_ts,
+            "notes": notes,
+        }
+
+    # The fixed column order _model_row_to_dict unpacks; kept next to it so the
+    # SELECT list and the unpack can never drift (as _ROW_COLUMNS does for frames).
+    _MODEL_COLUMNS = (
+        "id, status, kind, backbone, imgsz, n_cats, n_vectors, threshold,"
+        " quality, metrics, gallery_dir, created_ts, notes"
+    )
+
+    def add_model_version(
+        self,
+        status: str,
+        kind: str,
+        backbone: str,
+        imgsz: int,
+        n_cats: int,
+        n_vectors: int,
+        threshold: "float | None",
+        quality: str,
+        metrics: "dict | None",
+        gallery_dir: str,
+        notes: "str | None" = None,
+    ) -> int:
+        """Insert one ``model_versions`` row and return its new id (the version number).
+
+        ``metrics`` is JSON-serialized (NULL when ``None``); ``threshold`` may be
+        ``None`` (uncomputable — e.g. one crop per cat, so no same-cat pair);
+        ``created_ts`` is stamped here as the compute wall clock in epoch ms (the same
+        axis ``recv_ts`` / ``ran_at`` use). ``gallery_dir`` is the ``models_root``-
+        relative basename holding the version's ``gallery.npz`` (written by the caller
+        BEFORE this insert, so a failed insert orphans a harmless artifact dir rather
+        than a row without its file). One lock hold, one commit.
+        """
+        metrics_text = json.dumps(metrics) if metrics is not None else None
+        created_ts = int(time.time() * 1000)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO model_versions (status, kind, backbone, imgsz, n_cats, n_vectors,"
+                " threshold, quality, metrics, gallery_dir, created_ts, notes)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    status,
+                    kind,
+                    backbone,
+                    int(imgsz),
+                    int(n_cats),
+                    int(n_vectors),
+                    float(threshold) if threshold is not None else None,
+                    quality,
+                    metrics_text,
+                    gallery_dir,
+                    created_ts,
+                    notes,
+                ),
+            )
+            version_id = int(cur.lastrowid)
+            self._conn.commit()
+        return version_id
+
+    def list_model_versions(self) -> "list[dict]":
+        """All model versions, newest-first (``id DESC``), each with a ``gallery_available`` flag.
+
+        One dict per ``model_versions`` row (see ``_model_row_to_dict``) plus
+        ``gallery_available`` — whether ``<models_root>/<gallery_dir>/gallery.npz``
+        still exists on disk, computed at read time (like ``feasibility_runs``'s
+        ``report_available``) so a version whose artifact was lost still lists but
+        flags its missing file. Backs the Promote panel and the Activity "active
+        model" readout.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._MODEL_COLUMNS} FROM model_versions ORDER BY id DESC"
+            ).fetchall()
+        root = self.models_root
+        result: "list[dict]" = []
+        for row in rows:
+            model = self._model_row_to_dict(row)
+            model["gallery_available"] = os.path.isfile(
+                os.path.join(root, model["gallery_dir"], "gallery.npz")
+            )
+            result.append(model)
+        return result
+
+    def active_model(self) -> "dict | None":
+        """The single ``status='active'`` version + its ``gallery_path``, or ``None``.
+
+        Returns the active row (see ``_model_row_to_dict``) with an added
+        ``gallery_path`` = the ABSOLUTE path to its ``gallery.npz``. Returns ``None``
+        when there is no active version OR its ``gallery.npz`` is missing on disk — so
+        the identify pass and ``events()`` treat a lost artifact exactly like "no
+        model promoted yet" rather than failing later on a missing file.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._MODEL_COLUMNS} FROM model_versions WHERE status = 'active' LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        model = self._model_row_to_dict(row)
+        gallery_path = os.path.join(self.models_root, model["gallery_dir"], "gallery.npz")
+        if not os.path.isfile(gallery_path):
+            return None
+        model["gallery_path"] = gallery_path
+        return model
+
+    def promote_model(self, version_id: int) -> dict:
+        """Make ``version_id`` the sole active version; return its row dict.
+
+        One locked transaction flips any current ``active`` → ``retired`` and the
+        target → ``active``, so EXACTLY ONE active version exists. Accepts any
+        existing version — promoting a ``retired`` one back is how a bad model is
+        rolled back (``ARCHITECTURE.md``). Promoting the already-active version is a
+        no-op success. Raises ``ValueError("no such model version: ...")`` for an
+        unknown id and ``ValueError("gallery artifact missing: ...")`` when the
+        target's ``gallery.npz`` is gone (checked in-txn, so a lost artifact can never
+        be promoted live). Returns the promoted row dict (``status='active'``).
+        """
+        version_id = int(version_id)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._MODEL_COLUMNS} FROM model_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such model version: {version_id}")
+            model = self._model_row_to_dict(row)
+            gallery_path = os.path.join(self.models_root, model["gallery_dir"], "gallery.npz")
+            if not os.path.isfile(gallery_path):
+                raise ValueError(f"gallery artifact missing: {gallery_path}")
+            if model["status"] != "active":
+                # Retire the incumbent, then activate the target — one txn so there is
+                # never a moment with zero or two active versions.
+                self._conn.execute(
+                    "UPDATE model_versions SET status = 'retired' WHERE status = 'active'"
+                )
+                self._conn.execute(
+                    "UPDATE model_versions SET status = 'active' WHERE id = ?", (version_id,)
+                )
+                self._conn.commit()
+                model["status"] = "active"
+        return model
+
+    def iter_unidentified(
+        self,
+        model_version_id: int,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        batch: int = 512,
+    ):
+        """Yield ``(frame_id, abs_path, bbox)`` for detected frames not yet identified for a model.
+
+        The identify pass's driver, mirroring ``iter_unanalyzed``: a frame qualifies
+        when it has a ``yolo-serial`` present verdict (``verdict = 1``, its
+        ``detail`` carrying the detection box) AND has NO ``identifications`` row for
+        ``model_version_id`` (the LEFT JOIN ... IS NULL resume shape) — so a re-run
+        resumes cheaply and promoting a new model makes its rows a fresh un-identified
+        set. ``bbox`` is the highest-confidence box (``[x1,y1,x2,y2]``) parsed from
+        ``analysis.detail`` via ``_best_box``, in the STORED JPEG's pixel space, OR
+        ``None`` when the detail yields no usable box (defensive — yolo-serial always
+        writes one when present). A no-box frame is still YIELDED (with ``bbox =
+        None``) rather than skipped, so it matches ``count_unidentified`` exactly (the
+        SQL count can't parse boxes) — the caller writes it a "processed" marker row
+        so the pass reaches 100% and never re-attempts it, instead of it lingering
+        un-identified forever. Oldest-first (id ASC), fetched in keyset batches
+        (``f.id > last`` under the lock, rows box-parsed + yielded OUTSIDE it) so slow
+        embedding between rows never blocks the collector. ``until_id`` caps the pass
+        to frames present at start and ``since_id`` is the symmetric floor scoping it
+        to a window; both ``None`` sweeps the whole store.
+        """
+        last_id = 0
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
+        while True:
+            params: list = ["yolo-serial", int(model_version_id), last_id] + range_params + [int(batch)]
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT f.id, f.path, a.detail FROM frames f"
+                    " JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1"
+                    " LEFT JOIN identifications i ON i.frame_id = f.id AND i.model_version_id = ?"
+                    " WHERE i.frame_id IS NULL AND f.id > ?" + range_sql +
+                    " ORDER BY f.id ASC LIMIT ?",
+                    params,
+                ).fetchall()
+            if not rows:
+                return
+            for row_id, rel_path, detail in rows:
+                box = self._best_box(detail)
+                bbox = box[0] if box is not None else None  # None → caller markers it done
+                yield int(row_id), os.path.join(self._media_root, rel_path), bbox
+            last_id = rows[-1][0]
+
+    def count_unidentified(
+        self,
+        model_version_id: int,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ) -> int:
+        """Count of ``yolo-serial``-detected frames not yet identified for ``model_version_id``.
+
+        The identify pass's progress denominator, with the SAME predicate as
+        ``iter_unidentified`` (a present ``yolo-serial`` verdict, no
+        ``identifications`` row for this model), ``until_id``-capped to frames present
+        at start and ``since_id``-floored for a scoped window. It does not parse
+        boxes, and neither does the iterator's yield-set: ``iter_unidentified`` now
+        yields no-box frames too (with ``bbox = None``), so this count matches the
+        iterator's yield exactly — the progress bar reaches 100%. Both bounds ``None``
+        counts the whole store.
+        """
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in range_frags)
+        params: list = ["yolo-serial", int(model_version_id)] + range_params
+        with self._lock:
+            (count,) = self._conn.execute(
+                "SELECT COUNT(*) FROM frames f"
+                " JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1"
+                " LEFT JOIN identifications i ON i.frame_id = f.id AND i.model_version_id = ?"
+                " WHERE i.frame_id IS NULL" + range_sql,
+                params,
+            ).fetchone()
+        return int(count)
+
+    def write_identifications_batch(
+        self, rows: "list[tuple[int, int, int | None, float | None, object]]"
+    ) -> int:
+        """Record many identifications at once; one lock hold, one commit. Returns rows inserted.
+
+        The identify pass's batched writer, the ``write_analysis_batch`` sibling.
+        ``rows`` is a list of ``(frame_id, model_version_id, cat_id, distance, bbox)``
+        tuples — a CONTRACT the identify orchestrator builds to. A MATCH row carries a
+        ``cat_id`` + ``distance``; a MARKER row (a present frame whose crop could not
+        be embedded — no box, or an undecodable/degenerate crop) carries ``cat_id =
+        None`` and ``distance = None`` so the pass records it as processed and never
+        re-attempts it, without inventing an identity. ``bbox`` is serialized via
+        ``_bbox_text``; ``ran_at`` is the compute wall clock in epoch ms. Under a
+        SINGLE lock hold it runs ONE ``executemany`` of an ``INSERT OR REPLACE``
+        guarded by ``WHERE EXISTS (frames row)`` then ONE commit — so it preserves
+        both idempotency (INSERT OR REPLACE on the ``(frame_id, model_version_id)``
+        key) and the eviction guard (a slow pass can't resurrect an evicted frame).
+
+        RETURNS the number of rows actually inserted — the ``total_changes`` delta
+        across the ``executemany`` — so a frame evicted between the iterator listing it
+        and this write (dropped by ``WHERE EXISTS``) is NOT counted, letting the caller
+        report a truthful identified-count instead of over-counting by the evicted
+        rows. Empty ``rows`` is a no-op returning 0.
+        """
+        if not rows:
+            return 0
+        ran_at = int(time.time() * 1000)
+        params = [
+            (
+                int(frame_id),
+                int(model_version_id),
+                int(cat_id) if cat_id is not None else None,
+                float(distance) if distance is not None else None,
+                self._bbox_text(bbox),
+                ran_at,
+                int(frame_id),
+            )
+            for frame_id, model_version_id, cat_id, distance, bbox in rows
+        ]
+        with self._lock:
+            before = self._conn.total_changes
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO identifications"
+                " (frame_id, model_version_id, cat_id, distance, bbox, ran_at)"
+                " SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM frames WHERE id = ?)",
+                params,
+            )
+            self._conn.commit()
+            return self._conn.total_changes - before
 
     # --- Roster (cats) CRUD ------------------------------------------------
 

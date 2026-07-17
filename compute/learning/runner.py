@@ -1,5 +1,7 @@
-"""The Training-page job queue: run the feasibility probe (later gallery-build /
-promote) in the background, one job at a time, cancelable.
+"""The Training-page job queue: run the feasibility probe, a gallery-build, or an
+identify pass in the background, one job at a time, cancelable. (Promotion is a
+synchronous status flip on the store, deliberately NOT a queued job — see the
+identification-gallery spec.)
 
 This is the direct sibling of the oracle-sweep runner
 (``compute/analysis/runner.AnalysisManager``): the two are structurally identical
@@ -15,11 +17,11 @@ internally; simultaneous GPU pressure is accepted for a manual, infrequent actio
 Where it DIVERGES from ``AnalysisManager``, all driven by the heterogeneous-job
 decision:
 
-- A ``_Job`` carries a ``kind`` (``'feasibility'`` now; ``'gallery-build'`` /
-  ``'promote'`` later) and a params payload, not a resolved ``Analyzer``. The
-  worker dispatches on ``kind`` to the right run function, and the per-run
-  timestamped report dir is assigned when the job *runs*, so it is NOT in the job
-  or its dedup key.
+- A ``_Job`` carries a ``kind`` (``'feasibility'`` | ``'gallery-build'`` |
+  ``'identify'``) and a params payload, not a resolved ``Analyzer``. The worker
+  dispatches on ``kind`` to the right run function, and the per-run timestamped
+  output dir (feasibility report / gallery artifact) is assigned when the job
+  *runs*, so it is NOT in the job or its dedup key.
 - ``_enqueue`` dedups ONLY against the currently-running job (a double-click
   guard), NEVER against pending jobs. A sweep is identical work over immutable
   frames, so an identical pending sweep is a duplicate; a feasibility run instead
@@ -36,11 +38,13 @@ decision:
   prunes old report dirs; the probe orchestrator itself stays a pure compute+report
   function that never touches the DB (so the CLI can reuse it without persisting).
 
-``run_feasibility_probe`` is the default injection seam: a test passes a fake
-``probe_runner`` so the whole queue/threading/lifecycle is exercisable with no
-torch/matplotlib and no real model. Importing this module stays cheap — the probe's
-matplotlib is lazy-imported inside its chart helpers, and the embedder's torch is
-lazy-imported inside its own methods.
+``probe_runner`` / ``gallery_builder`` / ``identifier`` are the three injection
+seams (defaulting to ``run_feasibility_probe`` / ``build_gallery`` /
+``run_identify``): a test passes fakes so the whole queue/threading/lifecycle is
+exercisable with no torch/matplotlib and no real model. Importing this module stays
+cheap — the probe's matplotlib is lazy-imported inside its chart helpers, and the
+embedder's torch is lazy-imported inside its own methods (``gallery`` reaches torch
+only through the ``Embedder``, so importing it here stays torch-free too).
 """
 from __future__ import annotations
 
@@ -54,6 +58,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from compute.identification.embed import EmbedCancelled
+from compute.identification.gallery import build_gallery, run_identify
 from compute.identification.probe import _quality_slug, run_feasibility_probe
 
 if TYPE_CHECKING:
@@ -83,9 +88,10 @@ class _Job:
     ``status()`` needs to describe it, but NOT the counters (those live on the manager
     and belong to whatever job is currently running) nor the store (a single instance
     shared by every job, held on the manager). ``kind`` selects the run function
-    (``'feasibility'`` now; ``'gallery-build'`` / ``'promote'`` later); ``params`` is the
-    hashable job payload — for ``'feasibility'`` the ``qualities`` tuple (``None`` = all
-    grades). The per-run timestamped report dir is assigned when the job *runs*, so it is
+    (``'feasibility'`` | ``'gallery-build'`` | ``'identify'``); ``params`` is the hashable
+    job payload — for ``'feasibility'`` / ``'gallery-build'`` the ``qualities`` tuple
+    (``None`` = all grades), for ``'identify'`` the ``(since_id, until_id)`` window bounds.
+    The per-run timestamped output dir is assigned when the job *runs*, so it is
     deliberately NOT part of the job or its dedup key. ``label`` is a human-readable name
     for the logs only.
     """
@@ -122,13 +128,21 @@ class TrainingManager:
     worker. ``cancel`` sets ``stop_event`` under the same lock, so it can never race the
     promotion's ``stop_event`` swap.
 
-    ``probe_runner`` is the injection seam: it defaults to ``run_feasibility_probe`` but a
-    test passes a fake, so the queue/threading/lifecycle can be exercised with no torch,
+    ``probe_runner`` / ``gallery_builder`` / ``identifier`` are the injection seams: they
+    default to the real ``run_feasibility_probe`` / ``build_gallery`` / ``run_identify`` but
+    a test passes fakes, so the queue/threading/lifecycle can be exercised with no torch,
     no matplotlib, and no real model.
     """
 
-    def __init__(self, probe_runner=run_feasibility_probe) -> None:
+    def __init__(
+        self,
+        probe_runner=run_feasibility_probe,
+        gallery_builder=build_gallery,
+        identifier=run_identify,
+    ) -> None:
         self._probe_runner = probe_runner
+        self._gallery_builder = gallery_builder
+        self._identifier = identifier
         # One lock guards every field below; taken briefly for reads (status) and writes
         # (enqueue / cancel / clear / _set_progress / _run's finally), NEVER held across the
         # heavy probe run itself.
@@ -184,6 +198,34 @@ class TrainingManager:
         params = tuple(qualities) if qualities else None
         label = "feasibility" if params is None else f"feasibility ({_quality_slug(params)})"
         job = _Job(kind="feasibility", params=params, label=label)
+        return self._enqueue(store, job)
+
+    def enqueue_gallery_build(self, store: "Store", qualities: "list | None") -> dict:
+        """Enqueue a gallery build over the ``identified`` crops of ``qualities``.
+
+        ``qualities`` is the crop-grade selection from the Build panel's checkboxes —
+        ``None`` (or empty) means "all grades", normalised to ``params=None`` so the dedup
+        key and the artifact-dir slug are stable regardless of how "all" was expressed. Like
+        ``enqueue_feasibility`` the heavy deps + labelled-crop pre-check are the *endpoint's*
+        concern; this just builds the job and dedups+appends under the lock (see
+        ``_enqueue``). Same ``{**status(), "position", "deduped"}`` return.
+        """
+        params = tuple(qualities) if qualities else None
+        label = "gallery-build" if params is None else f"gallery-build ({_quality_slug(params)})"
+        job = _Job(kind="gallery-build", params=params, label=label)
+        return self._enqueue(store, job)
+
+    def enqueue_identify(self, store: "Store", since_id: "int | None", until_id: "int | None") -> dict:
+        """Enqueue an identify pass over the active gallery for the ``[since_id, until_id]`` window.
+
+        ``params`` is the ``(since_id, until_id)`` bounds tuple (either may be ``None`` = open
+        end); the run resolves the active model itself. The endpoint guards "no active model"
+        (409) and the zero-detection window before calling here. Same dedup-against-running-only
+        semantics as the other enqueues — a re-run over the window is resumable work, deduped
+        only against a genuine double-click. Same ``{**status(), "position", "deduped"}`` return.
+        """
+        params = (since_id, until_id)
+        job = _Job(kind="identify", params=params, label="identify")
         return self._enqueue(store, job)
 
     def _enqueue(self, store: "Store", job: "_Job") -> dict:
@@ -308,13 +350,17 @@ class TrainingManager:
     def _run(self, job: "_Job", store: "Store") -> None:
         """Worker body: run one job, then atomically record its outcome + promote the next.
 
-        Dispatches on ``job.kind`` to the run function, which for ``'feasibility'`` also writes
-        the durable ``feasibility_runs`` row on success (persistence is the manager's concern,
-        not the probe's). Three terminal paths converge in the ``finally``:
+        Dispatches on ``job.kind`` to the run function. ``'feasibility'`` writes the durable
+        ``feasibility_runs`` row on success, ``'gallery-build'`` inserts the ``model_versions``
+        row after its artifact is on disk, and ``'identify'`` persists identifications per
+        batch — persistence is the manager's concern, not the pure compute functions'. Three
+        terminal paths converge in the ``finally``:
 
-        - ``EmbedCancelled`` (the probe's embed loop honored the stop signal) — the cancel
-          path: no ``error``, ``stop_event`` is set, so the state is recorded ``canceled`` and
-          NO row was written.
+        - ``EmbedCancelled`` (an embed loop honored the stop signal) — the cancel path: no
+          ``error``, ``stop_event`` is set, so the state is recorded ``canceled``. Feasibility
+          and gallery-build wrote no persistent record (the embed precedes both the report/
+          artifact write and the row insert); identify's per-batch writes are idempotent, so a
+          cancel simply stops early with a partial, re-runnable result — nothing to undo.
         - any other ``Exception`` — fatal to THIS job (missing deps slipped past the endpoint
           pre-check, an I/O error writing the report); caught, logged, turned into ``failed``.
         - normal return — ``done``.
@@ -331,7 +377,11 @@ class TrainingManager:
         try:
             if job.kind == "feasibility":
                 result_summary = self._run_feasibility(job, store)
-            else:  # pragma: no cover - gallery-build / promote land here in a later slice
+            elif job.kind == "gallery-build":
+                result_summary = self._run_gallery_build(job, store)
+            elif job.kind == "identify":
+                result_summary = self._run_identify(job, store)
+            else:  # pragma: no cover - defensive: enqueue only ever builds the three kinds above
                 raise ValueError(f"unknown training job kind: {job.kind!r}")
         except EmbedCancelled:
             # The probe's embed loop aborted at a batch boundary because the progress callback
@@ -447,6 +497,106 @@ class TrainingManager:
             "auc": result["auc"],
             "threshold": result["threshold"],
             "report_dir": os.path.basename(out_dir),
+        }
+
+    def _run_gallery_build(self, job: "_Job", store: "Store") -> "dict":
+        """Build one gallery and, on success, insert its ``model_versions`` row (as a draft).
+
+        Assigns the per-version artifact dir NOW (``<models_root>/<ts>-<slug>``, ts-named so it
+        is known BEFORE the row insert — the file-first ordering the store relies on: a crash
+        orphans a harmless artifact dir, never a row without its ``.npz``), builds the same
+        progress+cancel callback as ``_run_feasibility``, and calls the injected gallery builder
+        (which writes ``gallery.npz`` but never touches the DB). A not-``enough`` result (cold
+        start / decode failure) built no artifact, so it just ``rmtree``s the (possibly-absent)
+        dir and returns the friendly summary with NO row. On success it inserts a ``status=draft``
+        row and — mirroring ``_run_feasibility``'s orphan guard — ``rmtree``s the artifact if the
+        insert fails (WAL/locked/full) before re-raising, so a failed insert never leaves a dir
+        without its row. Returns the summary stashed into ``status().result``.
+        """
+        ts = int(time.time() * 1000)
+        slug = "all" if job.params is None else _quality_slug(job.params)
+        out_dir = os.path.join(store.models_root, f"{ts}-{slug}")
+
+        def progress(done: int, total: int) -> bool:
+            self._set_progress(done, total)
+            return not self.stop_event.is_set()
+
+        result = self._gallery_builder(
+            store,
+            out_dir,
+            qualities=(list(job.params) if job.params else None),
+            progress=progress,
+        )
+
+        if not result.get("enough"):
+            # No artifact was written (the builder short-circuits before makedirs on both
+            # insufficient-labels and decode-failure); rmtree is a defensive no-op here.
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return {
+                "kind": "gallery-build",
+                "enough": False,
+                "message": result.get("message"),
+                "n_crops": result.get("n_crops"),
+                "n_cats": result.get("n_cats"),
+                "quality": result.get("quality"),
+            }
+
+        try:
+            rid = store.add_model_version(
+                status="draft",
+                kind="gallery",
+                backbone=result["backbone"],
+                imgsz=result["imgsz"],
+                n_cats=result["n_cats"],
+                n_vectors=result["n_vectors"],
+                threshold=result["threshold"],
+                quality=result["quality"],
+                metrics=result["metrics"],
+                gallery_dir=os.path.basename(out_dir),
+            )
+        except Exception:
+            # Artifact is on disk but the row insert failed — nothing references the dir, so
+            # remove it before the failure propagates (mirrors _run_feasibility's report guard).
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise
+        return {
+            "kind": "gallery-build",
+            "enough": True,
+            "version_id": rid,
+            "n_crops": result["n_crops"],
+            "n_cats": result["n_cats"],
+            "n_vectors": result["n_vectors"],
+            "threshold": result["threshold"],
+            "quality": result["quality"],
+        }
+
+    def _run_identify(self, job: "_Job", store: "Store") -> "dict":
+        """Identify the ``[since_id, until_id]`` window against the ACTIVE gallery.
+
+        Resolves the active model (its stored ``backbone``/``imgsz``/``gallery_path``); a race
+        that leaves none active raises ``RuntimeError`` — the endpoint guards this too, but the
+        run must not silently no-op. Builds the same progress+cancel callback and calls the
+        injected identifier, which crops+embeds each detected frame, k=1-matches the gallery, and
+        persists per batch through the store's idempotent, eviction-guarded writer. A cancel
+        raises ``EmbedCancelled`` (handled by ``_run``'s finally) with no side-effect to undo —
+        the per-batch writes are idempotent and a re-run resumes from the unidentified frames.
+        Applies NO threshold; unknown is derived at read in ``events()``.
+        """
+        model = store.active_model()
+        if model is None:
+            raise RuntimeError("no active model")
+        since_id, until_id = job.params
+
+        def progress(done: int, total: int) -> bool:
+            self._set_progress(done, total)
+            return not self.stop_event.is_set()
+
+        result = self._identifier(store, model, model["gallery_path"], since_id, until_id, progress)
+        return {
+            "kind": "identify",
+            "n_identified": result["n_identified"],
+            "since_id": since_id,
+            "until_id": until_id,
         }
 
     # --- Progress hook (called by the probe via the run's callback) ----------------------

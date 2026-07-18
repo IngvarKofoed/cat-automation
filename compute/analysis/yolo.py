@@ -154,6 +154,13 @@ class YoloAnalyzer:
         module scope (see the module docstring).
         """
         del store, since_id  # unused: stateless — see the docstring above
+        if self._model is not None:
+            # Idempotent: a resident analyzer reused across calls (the live-identify
+            # worker holds one and detects a fresh visit every few seconds) must not
+            # reload the YOLO weights + re-select the device on every call — that reload
+            # is hundreds of ms and defeats the whole point of holding it resident. A
+            # manual sweep prepares once per job, so this guard is a no-op there.
+            return
         self.ensure_available()  # deps checked synchronously in start(); re-checked here
         import torch
         from ultralytics import YOLO

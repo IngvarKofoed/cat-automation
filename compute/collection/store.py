@@ -1985,6 +1985,62 @@ class Store:
         scored.sort(key=lambda x: x[0])
         return [rec for _, rec in scored]
 
+    def closed_visits(
+        self, since_id: "int | None", now_ms: int, *, gap_ms: int = _VISIT_GAP_MS
+    ) -> "list[tuple[int, int]]":
+        """The ``(start_id, end_id)`` spans of SETTLED motion clusters after ``since_id``.
+
+        The live-identify worker's read: it names each *closed* motion cluster —
+        the same visit unit ``events()`` renders — and must never touch one a later
+        frame could still extend. Clusters ``frames.motion = 1`` with ``id >
+        since_id`` (``since_id`` ``None`` = whole store) through the SAME
+        ``_gap_split`` recv_ts-gap primitive ``events()``/``visits()`` use, so the
+        worker's visit boundaries can never drift from the feed's, and returns
+        ``(start_id, end_id) = (min id, max id)`` of each cluster's motion frames.
+
+        A cluster is CLOSED only once its last (most recent) frame's ``recv_ts`` is
+        older than ``now_ms - gap_ms``: while still inside that trailing gap another
+        motion frame could arrive and merge into it, so the newest cluster is left
+        OUT until it settles — identifying an open visit would re-cluster (and
+        possibly re-name) it on a later tick. Returned oldest-first (``start_id``
+        ASC) so the worker can advance its watermark monotonically to the last
+        processed ``end_id``. ``gap_ms`` defaults to ``_VISIT_GAP_MS`` (matching the
+        feed, the production path) and governs BOTH the split and the settled cutoff
+        so the two can never disagree; it is a param only so the clustering is
+        drivable in a test.
+        """
+        where = ["motion = 1"]
+        params: list = []
+        if since_id is not None:
+            # Strict ``>`` (not the shared inclusive ``_range_bounds``): ``since_id``
+            # is the worker's watermark — the last ``end_id`` already processed — so a
+            # rescan must begin at the first UNSEEN frame and never re-emit that id.
+            where.append("id > ?")
+            params.append(int(since_id))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, recv_ts FROM frames WHERE " + " AND ".join(where) +
+                " ORDER BY recv_ts ASC, id ASC",
+                params,
+            ).fetchall()
+
+        # Cluster + filter outside the lock (pure Python over the recv_ts-ordered
+        # rows), exactly as events()/visits() do.
+        cutoff = int(now_ms) - int(gap_ms)
+        spans: "list[tuple[int, int]]" = []
+        for cluster in self._gap_split(rows, gap_ms, lambda r: r[1]):
+            # Rows are recv_ts-ascending, so cluster[-1] is the cluster's newest
+            # frame; a cluster whose newest frame is still within the trailing gap
+            # is open — skip it (only the last cluster in time can be open).
+            if int(cluster[-1][1]) >= cutoff:
+                continue
+            ids = [int(r[0]) for r in cluster]
+            spans.append((min(ids), max(ids)))
+        # recv_ts order already yields start_id ASC (id is assigned in recv order),
+        # but sort explicitly so the oldest-first contract holds unconditionally.
+        spans.sort()
+        return spans
+
     def events(
         self,
         since_id: "int | None",

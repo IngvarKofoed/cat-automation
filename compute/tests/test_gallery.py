@@ -435,3 +435,55 @@ def test_run_identify_is_idempotent_on_rerun(tmp_path, monkeypatch):
         "SELECT COUNT(*) FROM identifications WHERE model_version_id = ?", (model["id"],)
     ).fetchone()
     assert count == 2
+
+
+def test_run_identify_uses_injected_embedder_without_rebuild_or_reprepare(tmp_path, monkeypatch):
+    # The live worker hands run_identify a RESIDENT embedder it built + prepared once,
+    # so the DINOv2 weights aren't torch.hub.load'ed per cluster. run_identify must use
+    # it verbatim: never construct a fresh one, never call prepare() again.
+    store, model, f1, f2, cat_a, cat_b = _setup_identify_fixture(tmp_path, monkeypatch)
+
+    vectors_by_path = {store.path_for(f1): [1.0, 0.0], store.path_for(f2): [0.0, 1.0]}
+    injected = _stub_embedder_factory(vectors_by_path)(model="stub-backbone", imgsz=32)
+    assert injected.prepared is False  # caller "prepared" it out-of-band; the stub needs no real load
+    # If run_identify tried to REBUILD an embedder, constructing this stand-in would raise.
+    monkeypatch.setattr(gallery, "Embedder", _NeverConstructed)
+
+    result = run_identify(
+        store, model, model["gallery_path"], since_id=None, until_id=None, embedder=injected
+    )
+
+    assert result == {"n_identified": 2}
+    assert injected.prepared is False  # never re-prepared — the caller owns the embedder's lifecycle
+    rows = store._conn.execute(
+        "SELECT frame_id, cat_id FROM identifications WHERE model_version_id = ? ORDER BY frame_id",
+        (model["id"],),
+    ).fetchall()
+    # The injected embedder's vectors produced the matches — proof it was the one used.
+    assert [(r[0], r[1]) for r in rows] == [(f1, cat_a["id"]), (f2, cat_b["id"])]
+
+
+@pytest.mark.parametrize(
+    "backbone,imgsz",
+    [("other-backbone", 32), ("stub-backbone", 64)],  # mismatch on backbone / on imgsz
+)
+def test_run_identify_rejects_mismatched_injected_embedder(tmp_path, monkeypatch, backbone, imgsz):
+    # A resident embedder whose (backbone, imgsz) drifts from the active model's would
+    # embed queries in a different feature space than the gallery — a silent garbage
+    # match. run_identify must reject it hard rather than write wrong identities.
+    store, model, f1, f2, cat_a, cat_b = _setup_identify_fixture(tmp_path, monkeypatch)
+
+    injected = _stub_embedder_factory({})(model=backbone, imgsz=imgsz)
+    # A rebuild would mask the mismatch; _NeverConstructed proves the guard, not a fallback, fires.
+    monkeypatch.setattr(gallery, "Embedder", _NeverConstructed)
+
+    with pytest.raises(ValueError):
+        run_identify(
+            store, model, model["gallery_path"], since_id=None, until_id=None, embedder=injected
+        )
+
+    # The guard fires before load_gallery / any write, so no rows leak.
+    (count,) = store._conn.execute(
+        "SELECT COUNT(*) FROM identifications WHERE model_version_id = ?", (model["id"],)
+    ).fetchone()
+    assert count == 0

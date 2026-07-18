@@ -209,6 +209,8 @@ def run_identify(
     since_id: "int | None",
     until_id: "int | None",
     progress: "Callable[[int, int], bool] | None" = None,
+    embedder: "Embedder | None" = None,
+    gallery: "Gallery | None" = None,
 ) -> dict:
     """Identify not-yet-identified detected frames against ``model``'s gallery.
 
@@ -222,12 +224,28 @@ def run_identify(
     via ``store.write_identifications_batch``. No threshold is applied — the nearest
     cat + its distance are stored verbatim; "unknown" is derived at read.
 
+    ``embedder`` lets a long-lived caller (the ``LiveIdentifyManager``, which identifies
+    a fresh cluster every few seconds) inject a RESIDENT, already-``prepare()``d embedder
+    so the DINOv2 weights are not ``torch.hub.load``ed per call. Default ``None``
+    preserves the manual pass's behavior exactly — build + prepare a fresh one. When
+    supplied it is used verbatim (never rebuilt, never re-prepared: the caller owns its
+    lifecycle), guarded by ``backbone``/``imgsz`` matching ``model``: a mismatch would
+    embed queries in a different feature space than the gallery — the same silent
+    garbage-match the model-stamped rebuild exists to prevent — so it is a hard
+    ``ValueError`` rather than quiet wrong answers.
+
     Every visited frame gets a row so the pass converges and never re-attempts it:
     a MATCH row (nearest cat + distance) for a frame that embedded, or a MARKER row
     (``cat_id=None``) for a frame that could not be embedded — no ``yolo-serial`` box
     (``bbox is None``) or a crop ``embed_crops`` skipped (undecodable/degenerate). The
     marker records the frame as processed without inventing an identity, so
     ``count_unidentified`` reaches 0 and the progress bar reaches 100%.
+
+    ``gallery`` is the same optimization for the vector set: a resident caller passes an
+    already-``load_gallery``-ed ``Gallery`` so the (small) ``.npz`` is not re-read off disk
+    per call; ``None`` loads it from ``gallery_path`` as before. The caller is responsible
+    for passing the gallery that belongs to ``model`` (the worker keys its resident copy on
+    ``gallery_path``), so no separate guard is needed here.
 
     Resumable and idempotent: only frames without a row for this model are visited,
     and the batched writer ``INSERT OR REPLACE``s on the PK. ``progress`` drives the
@@ -237,9 +255,18 @@ def run_identify(
     inserted>}`` — the store's truthful insert count (markers and frames evicted
     mid-pass are excluded), so it never over-reports how many frames were named.
     """
-    embedder = Embedder(model=model["backbone"], imgsz=model["imgsz"])
-    embedder.prepare()
-    gallery = load_gallery(gallery_path)
+    if embedder is None:
+        embedder = Embedder(model=model["backbone"], imgsz=model["imgsz"])
+        embedder.prepare()
+    elif embedder.backbone != model["backbone"] or embedder.imgsz != model["imgsz"]:
+        raise ValueError(
+            "injected embedder does not match the model's feature space: embedder "
+            f"({embedder.backbone!r}, imgsz={embedder.imgsz}) vs model "
+            f"({model['backbone']!r}, imgsz={model['imgsz']}) — matching queries to a "
+            "gallery embedded differently is a silent garbage-match"
+        )
+    if gallery is None:
+        gallery = load_gallery(gallery_path)
     model_id = int(model["id"])
 
     total = store.count_unidentified(model_id, since_id, until_id)

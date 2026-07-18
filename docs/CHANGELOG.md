@@ -426,3 +426,20 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     (conf 0.15) no longer bloat the queue + progress with junk "not a cat" visits (an empty scene isn't a
     useful negative). Floors queue and progress together (shared universe); `labeled_visits` (undo/review)
     stays unfloored so a decision made before the floor stays reviewable. Fixed, not per-request.
+
+74. Activity page now names new visits automatically: `LiveIdentifyManager` (mirroring `CollectorManager`)
+    ticks every 5s over closed motion clusters (settled ≥ `_VISIT_GAP_MS`), running `yolo-serial` detect +
+    `run_identify` against the active gallery per cluster. Reads `active_model()` each tick (promotion live),
+    yields GPU to manual jobs, holds resident detector+embedder. `run_identify` accepts optional `embedder`
+    to avoid per-tick reload. Historical re-identification needs manual pass; worker runs only on compute PC.
+
+75. Hardened the live-identify worker (review). First enable seeds the watermark to the frame
+    horizon: it names only NEW visits, never back-identifies the whole store (history = manual pass).
+    Each tick re-checks stop/`is_busy` and caps spans (`_MAX_SPANS_PER_TICK`), so a manual job or a
+    backlog can't be starved or monopolize the GPU; a stop mid-detect/identify no longer advances the
+    watermark (idempotent resume finishes the span). Resident gallery + idempotent
+    `YoloAnalyzer.prepare()` end the last per-visit model/gallery reloads.
+
+76. Known limit of the live worker: it writes `yolo-serial` verdicts only within visit spans, so
+    gate-scorecard / annotation coverage over a live-populated window is non-uniform — tune the motion
+    gate from a full manual sweep, not a window the live worker has already touched.

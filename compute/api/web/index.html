@@ -1509,8 +1509,16 @@
                     <label>&nbsp;</label>
                     <button type="button" id="activityIdentifyBtn" class="btn-secondary">Identify</button>
                 </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="liveIdentifyToggleBtn" class="btn-secondary"
+                        title="Start or stop automatic naming of new visits as their motion cluster closes, using the active gallery.">Start live naming</button>
+                </div>
                 <div class="control-group push-end">
-                    <div class="metrics"><div id="activityStoreRange" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div></div>
+                    <div class="metrics">
+                        <div class="metric"><span class="metric__cap">Live naming</span><span id="liveIdentifyBadge" class="metric__val status">—</span></div>
+                        <div id="activityStoreRange" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div>
+                    </div>
                 </div>
             </div>
             <div id="activityIdentifyNote" class="hidden banner-warn"></div>
@@ -2078,6 +2086,8 @@
         const activityGridEl = document.getElementById('activityGrid');
         const activityIdentifyBtn = document.getElementById('activityIdentifyBtn');
         const activityIdentifyNoteEl = document.getElementById('activityIdentifyNote');
+        const liveIdentifyToggleBtn = document.getElementById('liveIdentifyToggleBtn');
+        const liveIdentifyBadge = document.getElementById('liveIdentifyBadge');
         const activityModalEl = document.getElementById('activityModal');
         const playerDialogEl = document.getElementById('playerDialog');
         const playerCloseBtn = document.getElementById('playerCloseBtn');
@@ -2251,6 +2261,10 @@
         let storeOldestTs = null;
         let storeNewestTs = null;
         let lastStoreCount = null;
+        // Live-identify worker state (from /api/stats' live_identify), shared with
+        // promoteModel's post-promote note (below) — both read this one polled flag
+        // rather than each polling /api/stats independently.
+        let liveIdentifyRunning = null;
 
         // Analysis status (from /api/analysis/status), rendered on the Motion view.
         let analysisStatus = { running: false, queue: [], history: [], summaries: {} };
@@ -2588,6 +2602,18 @@
                 collectorBadge.classList.toggle('on', collectorRunning);
                 collectorBadge.classList.toggle('off', !collectorRunning);
                 collectorToggleBtn.textContent = collectorRunning ? 'Stop' : 'Start';
+
+                // Live-identify worker (Activity page): same on/off status-chip idiom as
+                // the collector above. `live_identify` is present whenever the manager is
+                // wired (always, once app.py builds one), so no `|| {}` guard needed — but
+                // stay defensive since this key is new and older stats snapshots (tests,
+                // stale caches) may omit it.
+                const li = data.live_identify || {};
+                liveIdentifyRunning = !!li.running;
+                liveIdentifyBadge.textContent = liveIdentifyRunning ? 'On' : 'Off';
+                liveIdentifyBadge.classList.toggle('on', liveIdentifyRunning);
+                liveIdentifyBadge.classList.toggle('off', !liveIdentifyRunning);
+                liveIdentifyToggleBtn.textContent = liveIdentifyRunning ? 'Stop live naming' : 'Start live naming';
 
                 // Reflect the persisted collection mode + resume prompt.
                 motionOnlyToggle.checked = !!data.motion_only;
@@ -3010,6 +3036,25 @@
         }
 
         activityLoadBtn.addEventListener('click', loadActivityEvents);
+
+        // Live-identify worker toggle — same optimistic-disable / re-poll-to-confirm
+        // idiom as collectorToggleBtn above: disable, hit the endpoint, then let the
+        // next pollStats() (forced here, not just the interval) settle the true state.
+        liveIdentifyToggleBtn.addEventListener('click', async () => {
+            try {
+                clearError();
+                liveIdentifyToggleBtn.disabled = true;
+                const endpoint = liveIdentifyRunning ? '/api/live-identify/stop' : '/api/live-identify/start';
+                const res = await fetch(endpoint, { method: 'POST' });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+            } catch (err) {
+                showError(`Live naming toggle failed: ${err.message}`);
+            } finally {
+                await pollStats();
+                liveIdentifyToggleBtn.disabled = false;
+            }
+        });
+
         playerPlayBtn.addEventListener('click', togglePlayback);
         playerPrevBtn.addEventListener('click', () => moveEvent(-1));
         playerNextBtn.addEventListener('click', () => moveEvent(1));
@@ -5596,9 +5641,13 @@
                 await loadModels();
                 // Identify persists per-frame results keyed to the model that ran, so a
                 // promote doesn't retroactively rename anything already-identified crops
-                // were matched against — Activity needs a fresh Identify pass to catch up.
-                promoteNoteEl.textContent =
-                    'Promoted. Names in Activity will not update until you re-run Identify for this model.';
+                // were matched against. With the live-identify worker running, NEW visits
+                // pick up the freshly-promoted gallery on their own (it re-reads
+                // active_model() every tick) — only historical events still need a manual
+                // Identify pass. Read from the polled /api/stats flag, not a fresh fetch.
+                promoteNoteEl.textContent = liveIdentifyRunning
+                    ? 'Promoted. New visits are named automatically; run Identify to also re-name earlier events against this model.'
+                    : 'Promoted. Names in Activity will not update until you re-run Identify for this model.';
                 promoteNoteEl.classList.remove('hidden');
             } catch (err) {
                 promoteErrorEl.textContent = `Promote failed: ${err.message}`;

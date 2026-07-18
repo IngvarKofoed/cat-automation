@@ -482,6 +482,7 @@ def create_app(
     autostart: "bool | None" = None,
     analysis_manager=None,
     training_manager=None,
+    live_identify_manager=None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -506,6 +507,16 @@ def create_app(
     SEPARATE instance from ``analysis_manager`` on purpose — training and oracle
     sweeps are unrelated workflows and may run concurrently, so they must not share
     a dedup namespace or contend for one queue slot.
+
+    ``live_identify_manager`` defaults to a fresh ``LiveIdentifyManager`` (the
+    always-on worker that names new Activity visits — see the live-identify-worker
+    spec), built AFTER the analysis/training managers because it yields the shared
+    GPU to either while a manual job runs (its ``is_busy`` reads both managers'
+    ``running``). Built here — not at module scope — so a test that injects a fake
+    (with no thread and no torch) never imports the worker's ML deps, exactly as the
+    injected ``training_manager`` keeps the training routes torch-free. Its persisted
+    on/off intent is restored ONLY on a live app (``start_collector``): a test app
+    must never auto-start a GPU worker.
     """
     store = store if store is not None else _store_from_env()
     autostart = _autostart_from_env() if autostart is None else autostart
@@ -548,6 +559,29 @@ def create_app(
     training_manager = training_manager if training_manager is not None else TrainingManager()
     app.state.training_manager = training_manager
 
+    # The always-on live-identify worker. Built AFTER the analysis + training managers
+    # because it must yield the shared GPU/DB-connection to either while a manual job
+    # runs — ``is_busy`` reads both managers' ``running`` (a @property on each, so no
+    # call parens). Imported LAZILY (like ``EdgeClient`` above and ``Embedder`` in the
+    # training routes) so an injected fake manager keeps this module — and its tests —
+    # loadable without the worker's ML deps.
+    if live_identify_manager is None:
+        from compute.learning.live_identify import LiveIdentifyManager
+
+        live_identify_manager = LiveIdentifyManager(
+            store,
+            is_busy=(lambda: analysis_manager.running or training_manager.running),
+        )
+    app.state.live_identify_manager = live_identify_manager
+
+    # Restore the persisted live-naming intent — but ONLY on a live app. ``restore``
+    # start()s a GPU worker thread when the intent was on (the compute PC is the
+    # dedicated always-on box), which a test app (start_collector=False) must never do;
+    # so, unlike the collector's in-memory ``restore_motion_only``, this is gated on
+    # start_collector. Persisted under the "live_identify" settings key by start/stop.
+    if start_collector:
+        live_identify_manager.restore(store.get_setting("live_identify") == "1")
+
     @app.on_event("shutdown")
     def _shutdown() -> None:
         # Wind everything down between frames/batches on process exit, THEN close the
@@ -569,6 +603,11 @@ def create_app(
         analysis_manager.join(timeout=10.0)
         training_manager.stop_all()
         training_manager.join(timeout=10.0)
+        # The live-identify worker is a fourth writer of the shared connection (its
+        # detect/identify passes write the store), so it too is stopped AND joined
+        # before close() — same load-bearing ordering as the three above.
+        live_identify_manager.stop()
+        live_identify_manager.join(timeout=10.0)
         store.close()
 
     @app.get("/")
@@ -640,6 +679,10 @@ def create_app(
             "resume_available": (
                 store.get_setting("collector_running") == "1" and not collector_manager.running
             ),
+            # The live-identify worker's snapshot (running/watermark/last_tick_ts/
+            # last_error), so the Activity page's live-naming toggle renders from the
+            # same poll the rest of the UI already makes.
+            "live_identify": live_identify_manager.status(),
         }
 
     @app.get("/media/{frame_id}")
@@ -855,6 +898,21 @@ def create_app(
         # labels that caveat and shades any overlapping window (see Motion-only spans).
         collector_manager.set_motion_only(bool(req.motion_only))
         return {"motion_only": collector_manager.current_motion_only}
+
+    @app.post("/api/live-identify/start")
+    def api_live_identify_start():
+        # Turn on live naming of new Activity visits. The manager owns
+        # idempotency/thread-replacement and persists the on/off intent itself (unlike
+        # the collector, whose intent the route persists), so the route just toggles and
+        # reports the resulting state for the Activity page's badge to follow.
+        live_identify_manager.start()
+        return {"running": live_identify_manager.running}
+
+    @app.post("/api/live-identify/stop")
+    def api_live_identify_stop():
+        # Symmetric to start: stop the worker and report the resulting (stopped) state.
+        live_identify_manager.stop()
+        return {"running": live_identify_manager.running}
 
     @app.post("/api/analysis/run")
     def api_analysis_run(req: AnalysisRunRequest):

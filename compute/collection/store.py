@@ -104,6 +104,15 @@ _VISIT_MODES = ("missed", "false", "conflict")
 _LABEL_KINDS = ("identified", "unknown_cat", "not_cat")
 _QUALITIES = ("gallery", "ok", "poor")
 
+# Minimum yolo-serial detection confidence for a frame to enter the annotation
+# queue (see ``_present_frames``). The oracle runs recall-first at conf 0.15 and
+# hallucinates cats on empty frames (a bare tile floor reads as a low-conf "cat"),
+# so without a floor the queue fills with empty-scene phantoms the annotator would
+# just mark "not a cat" — pure noise, since an empty scene isn't a useful negative.
+# Mirrors the gate scorecard's default oracle floor; fixed (not per-request) because
+# the queue's clean-crop purpose wants a stable, meaningful universe, not a knob.
+_ANNOTATE_MIN_CONF = 0.3
+
 
 def _parse_id_cursor(cursor: str) -> int:
     """Decode a time-order cursor (an id). Raises ValueError if malformed."""
@@ -1429,6 +1438,7 @@ class Store:
         min_area: float,
         max_area: float,
         persistence: int,
+        oracle_floor: float = 0.0,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
     ) -> dict:
@@ -1452,6 +1462,18 @@ class Store:
         in-band bucket (misses with adequate area that the debounce dropped) and
         is not otherwise used in the computation — the source's motion flag
         already reflects the persistence it was produced with.
+
+        ``oracle_floor`` re-slices "present" to ``oracle verdict = 1 AND score >=
+        floor`` — the same stored verdicts, counted only where the oracle was at
+        least this sure. It exists because the YOLO oracle runs at a recall-first
+        ``conf 0.15`` and hallucinates cats on empty frames (an empty tile floor
+        reads as a low-conf "cat"), so those phantoms inflate ``present``, the
+        ``missed`` count, and — fragmenting into tiny clusters — the visit count,
+        making recall look far worse than the gate is. A floor of ~0.3 drops them
+        without re-running the oracle. ``<= 0`` disables the filter and the
+        scorecard is byte-for-byte the unfloored one. ``score`` semantics differ
+        per oracle (YOLO: detection confidence; BSUV: foreground fraction), so a
+        floor means "how sure", scaled to whichever oracle is scored.
 
         Returns a dict of the shape::
 
@@ -1495,7 +1517,19 @@ class Store:
         base_from = " FROM frames f JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?" + src_join
         join_params = [oracle] + src_params
         near_zero_area = min_area / 10.0
-        missed = f"({src_motion} = 0 AND o.verdict = 1)"
+        # "Present" = the oracle called the subject here AND (when a floor is set) it
+        # was at least this sure. The floor re-slices the SAME stored verdicts; a
+        # low-conf oracle (YOLO at conf 0.15, recall-first) hallucinates cats on empty
+        # frames, inflating present / missed / the visit count, and a floor of ~0.3
+        # drops those phantoms without a re-sweep. ``oracle_floor <= 0`` restores the
+        # exact unfloored predicate (byte-for-byte). Formatted as a validated float
+        # literal (never ``?``) so it needn't thread a param through the nine CASE arms
+        # that reference "present"; parenthesized so ``NOT {present_core}`` is safe.
+        if oracle_floor and oracle_floor > 0:
+            present_core = f"(o.verdict = 1 AND o.score >= {float(oracle_floor)!r})"
+        else:
+            present_core = "(o.verdict = 1)"
+        missed = f"({src_motion} = 0 AND {present_core})"
 
         # Optional id-range scope, applied to EVERY scored-set query below so a
         # scoped compare scores exactly the window. ``scope_where`` is the
@@ -1546,10 +1580,10 @@ class Store:
                 counts = list(
                     self._conn.execute(
                         "SELECT COUNT(*),"
-                        " COALESCE(SUM(o.verdict), 0),"
-                        f" SUM(CASE WHEN {src_motion} = 1 AND o.verdict = 1 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {present_core} THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {src_motion} = 1 AND {present_core} THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} THEN 1 ELSE 0 END),"
-                        f" SUM(CASE WHEN {src_motion} = 1 AND o.verdict = 0 THEN 1 ELSE 0 END),"
+                        f" SUM(CASE WHEN {src_motion} = 1 AND NOT {present_core} THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} AND o.score >= 0.5 THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} AND o.score >= 0.3 AND o.score < 0.5 THEN 1 ELSE 0 END),"
                         f" SUM(CASE WHEN {missed} AND {src_area} < ? THEN 1 ELSE 0 END),"
@@ -1561,12 +1595,14 @@ class Store:
                         + join_params + [threshold_id] + scope_params,
                     ).fetchone()
                 )
-                # Visit clustering needs only the "interesting" rows — oracle-present
-                # (to cluster into visits) or source-motion (to test each visit's
-                # window) — in time order, not the whole scored set.
+                # Visit clustering needs only the "interesting" rows — present
+                # (floored: seeds a visit) or source-motion (tests each visit's
+                # window) — in time order, not the whole scored set. The third column
+                # is the floored present flag, not the raw verdict, so a below-floor
+                # detection that coincides with motion can't masquerade as present.
                 interesting = self._conn.execute(
-                    f"SELECT f.recv_ts, {src_motion}, o.verdict" + base_from
-                    + " WHERE f.id >= ?" + scope_and + f" AND (o.verdict = 1 OR {src_motion} = 1)"
+                    f"SELECT f.recv_ts, {src_motion}, CASE WHEN {present_core} THEN 1 ELSE 0 END" + base_from
+                    + " WHERE f.id >= ?" + scope_and + f" AND ({present_core} OR {src_motion} = 1)"
                     " ORDER BY f.recv_ts ASC, f.id ASC",
                     join_params + [threshold_id] + scope_params,
                 ).fetchall()
@@ -1677,9 +1713,11 @@ class Store:
     def _cluster_visits(cls, interesting: "list") -> "tuple[int, int]":
         """Cluster oracle-present frames into visits and count how many were caught.
 
-        ``interesting`` is ``(recv_ts, source_motion, oracle_verdict)`` rows in
-        recv_ts order (only present-or-motion rows). Present frames split into a
-        new visit wherever the recv_ts gap exceeds ``_VISIT_GAP_MS``; a visit is
+        ``interesting`` is ``(recv_ts, source_motion, present_flag)`` rows in
+        recv_ts order (only present-or-motion rows), where ``present_flag`` is the
+        oracle verdict after ``gate_scorecard``'s ``oracle_floor`` (1 = present).
+        Present frames split into a new visit wherever the recv_ts gap exceeds
+        ``_VISIT_GAP_MS``; a visit is
         caught when any source-motion frame lands in its span ±``_VISIT_WINDOW_MS``.
         Returns ``(total_visits, caught_visits)`` — the counts ``gate_scorecard``
         reports, now computed over the shared ``_split_into_visits`` /
@@ -2218,13 +2256,22 @@ class Store:
         The shared universe BOTH ``annotation_visits`` (undecided subset →
         queue) and ``label_progress`` (whole set → progress) cluster, so the two
         can never disagree on which frames exist or how they group. One JOINed read
-        (frames × ``analysis`` verdict-1 rows for ``oracle``, scoped to the id
-        window) plus an ``EXISTS`` probe of ``dataset_items`` keyed on BOTH
-        (``src_frame_id``, ``src_recv_ts``) — the ``clear``-safe "already decided"
-        predicate. Each surviving frame is ``{id, recv_ts, bbox, score, decided}``;
-        a present frame whose ``detail`` yields no box (see ``_best_box``) is
-        dropped, so it never enters a visit nor the progress count. Ordered by
-        ``recv_ts`` ASC (id ASC tie-break) so ``_gap_split`` can consume it directly.
+        (frames × ``analysis`` verdict-1 rows for ``oracle`` **at or above
+        ``_ANNOTATE_MIN_CONF``**, scoped to the id window) plus an ``EXISTS`` probe
+        of ``dataset_items`` keyed on BOTH (``src_frame_id``, ``src_recv_ts``) — the
+        ``clear``-safe "already decided" predicate. Each surviving frame is
+        ``{id, recv_ts, bbox, score, decided}``; a present frame whose ``detail``
+        yields no box (see ``_best_box``) is dropped, so it never enters a visit nor
+        the progress count. Ordered by ``recv_ts`` ASC (id ASC tie-break) so
+        ``_gap_split`` can consume it directly.
+
+        The confidence floor drops the low-conf phantom detections the recall-first
+        oracle scatters on empty frames — otherwise the queue fills with empty-scene
+        noise. ``analysis.score`` is the max-box confidence ``_best_box`` also
+        surfaces (both from the analyzer's one reduce), so the SQL filter and the
+        per-frame ``score`` agree. This floors the queue and the progress readout
+        together; the labelled/undo mirror (``labeled_visits``) is deliberately NOT
+        floored, so a decision made before the floor stays reviewable.
         """
         frags, params = _range_bounds("f.id", since_id, until_id)
         and_sql = "".join(" AND " + frag for frag in frags)
@@ -2235,9 +2282,9 @@ class Store:
                 "   WHERE d.src_frame_id = f.id AND d.src_recv_ts = f.recv_ts)"
                 " FROM frames f"
                 " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
-                " WHERE o.verdict = 1" + and_sql +
+                " WHERE o.verdict = 1 AND o.score >= ?" + and_sql +
                 " ORDER BY f.recv_ts ASC, f.id ASC",
-                [oracle] + params,
+                [oracle, _ANNOTATE_MIN_CONF] + params,
             ).fetchall()
         # Box-parse outside the lock (pure Python over the fetched rows).
         frames: "list[dict]" = []

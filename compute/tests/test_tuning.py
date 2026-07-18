@@ -387,6 +387,17 @@ def test_tuning_compare_bad_oracle_is_400(make_app):
     assert resp.status_code == 400
 
 
+def test_tuning_compare_oracle_floor_out_of_range_is_400(make_app):
+    # The floor is a confidence in [0, 1]; anything outside is a client error, not a
+    # silently-clamped one (a caller who typed 1.5 wants to know it's wrong).
+    client, _store = make_app(client=None)
+    assert client.get("/api/tuning/compare", params={"oracle": "yolo", "oracle_floor": 1.5}).status_code == 400
+    assert client.get("/api/tuning/compare", params={"oracle": "yolo", "oracle_floor": -0.1}).status_code == 400
+    # In-range (and the boundaries) are accepted.
+    for f in (0.0, 0.3, 1.0):
+        assert client.get("/api/tuning/compare", params={"oracle": "yolo", "oracle_floor": f}).status_code == 200
+
+
 def _seed(store: Store, *, slots) -> "list[int]":
     """Add 4 frames + a 'yolo' oracle verdict each; optionally seed the named mog2 slots
     (verdict = frames.motion so fidelity is perfect, with MogAnalyzer-shaped detail).

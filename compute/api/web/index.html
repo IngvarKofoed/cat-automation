@@ -1751,6 +1751,12 @@
             </div>
             <div class="controls-row" style="margin-top: 12px;">
                 <div class="control-group">
+                    <label for="tuningOracleFloor">oracle conf ≥</label>
+                    <input type="number" id="tuningOracleFloor" step="0.05" min="0" max="1"
+                           value="0.30" class="param-input"
+                           title="Count a frame as 'present' only when the oracle scored it at or above this. Drops low-confidence phantom detections (YOLO runs at 0.15) that inflate the visit/miss counts. 0 = no floor.">
+                </div>
+                <div class="control-group">
                     <div class="btn-row">
                         <button type="button" id="tuningRunBaselineBtn">Queue baseline</button>
                         <button type="button" id="tuningRunCandidateBtn">Queue candidate</button>
@@ -2148,6 +2154,7 @@
         const tuningRunBaselineBtn = document.getElementById('tuningRunBaselineBtn');
         const tuningRunCandidateBtn = document.getElementById('tuningRunCandidateBtn');
         const tuningRefreshBtn = document.getElementById('tuningRefreshBtn');
+        const tuningOracleFloorEl = document.getElementById('tuningOracleFloor');
         const tuningScopeBadgeEl = document.getElementById('tuningScopeBadge');
         const tuningProgressBadge = document.getElementById('tuningProgressBadge');
         const tuningErrorEl = document.getElementById('tuningError');
@@ -3722,8 +3729,16 @@
             renderFocusDetail();
         }
 
+        // The oracle-confidence floor, clamped to [0, 1]; a blank/garbage field falls
+        // back to 0 (no floor) rather than erroring the whole matrix fan-out.
+        function oracleFloorValue() {
+            const v = parseFloat(tuningOracleFloorEl.value);
+            if (!Number.isFinite(v)) return 0;
+            return Math.min(1, Math.max(0, v));
+        }
+
         async function loadCompareFor(oracle) {
-            const params = new URLSearchParams({ oracle });
+            const params = new URLSearchParams({ oracle, oracle_floor: String(oracleFloorValue()) });
             if (activeScope) {
                 if (activeScope.since_id != null) params.set('since_id', String(activeScope.since_id));
                 if (activeScope.until_id != null) params.set('until_id', String(activeScope.until_id));
@@ -4321,6 +4336,10 @@
         // Manual re-fetch: force a fresh matrix fan-out (which also re-renders the focus
         // detail cards from the fresh responses).
         tuningRefreshBtn.addEventListener('click', () => renderScorecardMatrix(true));
+        // Changing the oracle floor changes the server query, so force a fresh fan-out
+        // (cached columns were sliced at the old floor). 'change' fires on blur/Enter —
+        // avoids a fetch per keystroke while typing a value like "0.35".
+        tuningOracleFloorEl.addEventListener('change', () => renderScorecardMatrix(true));
 
         function updateTuningStatusBadges(status) {
             // With the walk-away queue, enqueuing more work while a job runs is allowed,

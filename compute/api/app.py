@@ -1005,6 +1005,7 @@ def create_app(
     @app.get("/api/tuning/compare")
     def api_tuning_compare(
         oracle: str = Query(default="yolo"),
+        oracle_floor: float = Query(default=0.30),
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
     ):
@@ -1014,6 +1015,15 @@ def create_app(
             raise HTTPException(
                 status_code=400,
                 detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        # oracle_floor re-slices "present" to verdicts at or above this confidence,
+        # dropping the low-conf phantom detections that inflate visit/miss counts.
+        # Both oracle scores (YOLO confidence, BSUV foreground fraction) live in
+        # [0, 1]; default 0.30 excludes the phantoms out of the box, 0 disables it.
+        if not (0.0 <= oracle_floor <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"oracle_floor must be in [0, 1], got {oracle_floor}",
             )
         _validate_bounds(since_id, until_id)
         # Area-bucket thresholds are per-source: each scorecard buckets its misses by
@@ -1049,6 +1059,7 @@ def create_app(
             min_area=float(edge_params["min_area"]),
             max_area=float(edge_params["max_area_fraction"]),
             persistence=int(edge_params["persistence"]),
+            oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
         )
@@ -1060,6 +1071,7 @@ def create_app(
             min_area=b_min,
             max_area=b_max,
             persistence=b_pers,
+            oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
         )
@@ -1071,6 +1083,7 @@ def create_app(
             min_area=c_min,
             max_area=c_max,
             persistence=c_pers,
+            oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
         )

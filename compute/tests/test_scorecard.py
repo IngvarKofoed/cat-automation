@@ -110,6 +110,50 @@ def test_scorecard_live_full_breakdown(tmp_path):
     assert card["visits"] == {"total": 3, "caught": 2, "wholly_missed": 1}
 
 
+def test_scorecard_oracle_floor_drops_low_confidence_phantoms(tmp_path):
+    # A low-conf oracle (YOLO at conf 0.15) hallucinates cats on empty frames; those
+    # phantoms inflate present/missed and fragment into extra visits. ``oracle_floor``
+    # re-slices "present" to verdicts at/above the floor, over the SAME stored rows.
+    store = _store(tmp_path)
+    min_area, max_area = 0.01, 0.5
+
+    # Two low-conf phantoms, 10s apart (each its own visit), gate correctly silent.
+    _seed(store, 10_000, motion=False, area=0.0, yolo=(1, 0.2))
+    _seed(store, 20_000, motion=False, area=0.0, yolo=(1, 0.2))
+    # A real, high-conf visit the gate wholly missed (two frames close in time).
+    _seed(store, 50_000, motion=False, area=0.005, yolo=(1, 0.9))
+    _seed(store, 50_500, motion=False, area=0.005, yolo=(1, 0.8))
+    # A real, high-conf caught frame (gate fired).
+    _seed(store, 70_000, motion=True, area=0.05, yolo=(1, 0.85))
+    # A low-conf detection the gate DID fire on: present+caught below the floor, but a
+    # false trigger once floored out (gate fired where the oracle isn't sure).
+    _seed(store, 90_000, motion=True, area=0.03, yolo=(1, 0.2))
+
+    # Unfloored: every verdict==1 is present — phantoms and all.
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=min_area, max_area=max_area, persistence=3,
+        oracle_floor=0.0,
+    )
+    assert card["present"] == 6
+    assert card["recall"]["caught"] == 2 and card["recall"]["missed"] == 4
+    assert card["false_triggers"] == {"count": 0}
+    assert card["visits"] == {"total": 5, "caught": 2, "wholly_missed": 3}
+
+    # Floored at 0.3: the three score-0.2 rows are no longer "present". The two
+    # phantom visits vanish, the low-conf caught frame becomes a false trigger, and
+    # visit recall is now measured against the real cats only.
+    floored = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=min_area, max_area=max_area, persistence=3,
+        oracle_floor=0.3,
+    )
+    assert floored["present"] == 3
+    assert floored["recall"]["caught"] == 1 and floored["recall"]["missed"] == 2
+    assert floored["recall"]["rate"] == pytest.approx(1 / 3)
+    assert floored["false_triggers"] == {"count": 1}
+    assert floored["confidence"] == {"high": 2, "medium": 0, "low": 0}
+    assert floored["visits"] == {"total": 2, "caught": 1, "wholly_missed": 1}
+
+
 def test_scorecard_empty_present_has_zero_visit_rate(tmp_path):
     # Oracle sees nothing present anywhere: present == 0, recall rate degrades to
     # 0.0 (no ZeroDivisionError) and there are no visits to cluster.

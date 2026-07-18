@@ -414,3 +414,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     box, or an undecodable/degenerate crop) gets a marker row (`cat_id` NULL, ignored at read) so it's
     recorded processed and never re-attempted, and iter/count agree so progress reaches 100%.
     `n_identified` counts only rows that actually persisted (frames evicted mid-pass excluded).
+
+72. Gate scorecard gains a tunable oracle-confidence floor (`gate_scorecard(oracle_floor=)` store-default 0;
+    `/api/tuning/compare?oracle_floor=` default 0.30; "oracle conf ≥" field on #tuning). "Present" is now
+    verdict=1 AND score ≥ floor — re-slicing the SAME stored verdicts, no re-sweep; floor 0 = old scorecard.
+    Why: YOLO runs recall-first at conf 0.15 and hallucinates cats on empty frames, so phantoms inflated
+    present/missed and fragmented into thousands of bogus visits. Caveat: metrics below ~0.3 are phantom-dominated.
+
+73. Annotation queue (`#annotate`) now floors detections at `_ANNOTATE_MIN_CONF` (0.3): `_present_frames`
+    admits only yolo-serial verdicts with score ≥ floor, so the recall-first oracle's empty-frame phantoms
+    (conf 0.15) no longer bloat the queue + progress with junk "not a cat" visits (an empty scene isn't a
+    useful negative). Floors queue and progress together (shared universe); `labeled_visits` (undo/review)
+    stays unfloored so a decision made before the floor stays reviewable. Fixed, not per-request.

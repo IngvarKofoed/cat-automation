@@ -386,6 +386,30 @@ def test_annotation_visits_empty_when_no_boxes(tmp_path):
     assert store.annotation_visits("yolo-serial") == []
 
 
+def test_annotation_visits_excludes_low_confidence_phantoms(tmp_path):
+    # The recall-first oracle (conf 0.15) hallucinates cats on empty frames; those
+    # low-score detections must not bloat the queue. _present_frames floors at
+    # _ANNOTATE_MIN_CONF (0.3) inclusive, so a below-floor detection is excluded from
+    # the queue AND the progress total (they share the floored universe).
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    # A phantom (below floor), a boundary detection (exactly at the floor), and a
+    # clear one — spaced beyond _VISIT_GAP_MS so each would be its own visit.
+    f_phantom = store.add(_frame(frame_id=1), recv_ts_ms=base)
+    f_real = store.add(_frame(frame_id=2), recv_ts_ms=base + 10_000)
+    f_boundary = store.add(_frame(frame_id=3), recv_ts_ms=base + 20_000)
+    store.write_analysis(f_phantom, "yolo-serial", True, 0.2, _boxes_detail([[0, 0, 10, 10, 0.2]]))
+    store.write_analysis(f_real, "yolo-serial", True, 0.9, _boxes_detail([[0, 0, 20, 20, 0.9]]))
+    store.write_analysis(f_boundary, "yolo-serial", True, 0.3, _boxes_detail([[0, 0, 10, 10, 0.3]]))
+
+    visits = store.annotation_visits("yolo-serial")
+    got = sorted(fr["id"] for v in visits for fr in v["frames"])
+    assert got == sorted([f_real, f_boundary])  # 0.2 phantom excluded, 0.3 boundary kept
+    assert len(visits) == 2
+    # Progress shares the floored universe, so its total matches the queue (no phantom).
+    assert store.label_progress("yolo-serial")["total_visits"] == 2
+
+
 def test_annotation_visits_scoped_by_since_until_id(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000

@@ -592,6 +592,47 @@ def test_events_identity_none_when_span_has_no_identifications(tmp_path):
     assert ev["identity"] is None
 
 
+def test_events_identity_marks_resident_vs_non_resident(tmp_path):
+    # The activity feed distinguishes a resident match (our cat) from a named
+    # foreign/neighbour match so the UI can flag a known stranger differently.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    vid = _add_version(store, threshold=0.5)
+    store.promote_model(vid)
+    ours = store.create_cat("Mittens", is_resident=True)["id"]
+    neighbour = store.create_cat("Tom", is_resident=False)["id"]
+
+    # Event 1 (resident match), then event 2 far later (non-resident match).
+    e1 = [_add(store, base + 100 * i, motion=True, area=0.1) for i in range(2)]
+    e2 = [_add(store, base + 10 * _VISIT_GAP_MS + 100 * i, motion=True, area=0.1) for i in range(2)]
+    store.write_identifications_batch(
+        [
+            (e1[0], vid, ours, 0.2, [0, 0, 1, 1]),
+            (e2[0], vid, neighbour, 0.2, [0, 0, 1, 1]),
+        ]
+    )
+
+    events = store.events(None, None)["events"]  # newest-first: e2 then e1
+    by_cat = {ev["identity"]["cat_id"]: ev["identity"] for ev in events}
+    assert by_cat[ours]["is_resident"] is True
+    assert by_cat[neighbour]["is_resident"] is False
+
+
+def test_events_identity_unknown_cat_carries_null_is_resident(tmp_path):
+    # An "unknown cat" (identified but nothing near enough) has no matched cat, so
+    # is_resident is None — the UI renders it as unknown regardless.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    (f1,) = _one_event_ids(store, base, 1)
+    vid = _add_version(store, threshold=0.1)  # tight cutoff
+    store.promote_model(vid)
+    cat = store.create_cat("A", is_resident=True)["id"]
+    store.write_identifications_batch([(f1, vid, cat, 0.5, [0, 0, 1, 1])])
+    ident = store.events(None, None)["events"][0]["identity"]
+    assert ident["cat_id"] is None
+    assert ident["is_resident"] is None
+
+
 def test_events_identity_ignores_identifications_outside_event_spans(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000

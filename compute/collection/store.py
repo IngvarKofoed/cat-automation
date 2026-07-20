@@ -2158,7 +2158,12 @@ class Store:
                 " ORDER BY frame_id ASC",
                 (int(model["id"]), int(lo), int(hi)),
             ).fetchall()
-            cat_names = dict(self._conn.execute("SELECT id, name FROM cats").fetchall())
+            # Name AND resident flag per cat: the activity feed distinguishes a
+            # resident match (our cat — a "known" chip) from a named foreign/neighbour
+            # match (a stranger — flagged distinctly) via `is_resident`.
+            cat_rows = self._conn.execute("SELECT id, name, is_resident FROM cats").fetchall()
+            cat_names = {cid: name for cid, name, _res in cat_rows}
+            cat_residents = {cid: bool(res) for cid, _name, res in cat_rows}
 
         threshold = model["threshold"]
         ident_fids = [r[0] for r in ident_rows]
@@ -2169,12 +2174,15 @@ class Store:
             lo_i = bisect.bisect_left(ident_fids, e_lo)
             hi_i = bisect.bisect_right(ident_fids, e_hi)
             span = [(int(cid), float(dist)) for _fid, cid, dist in ident_rows[lo_i:hi_i]]
-            event["identity"] = self._aggregate_identity(span, threshold, cat_names)
+            event["identity"] = self._aggregate_identity(span, threshold, cat_names, cat_residents)
         return {"events": events, "truncated": truncated}
 
     @staticmethod
     def _aggregate_identity(
-        span_idents: "list[tuple[int, float]]", threshold: "float | None", cat_names: dict
+        span_idents: "list[tuple[int, float]]",
+        threshold: "float | None",
+        cat_names: dict,
+        cat_residents: dict,
     ) -> "dict | None":
         """Aggregate one event span's ``(cat_id, distance)`` identifications into an identity.
 
@@ -2184,9 +2192,10 @@ class Store:
         means the model is UNCALIBRATED, and the fail-safe rule applies: nothing is
         "below", so every event degrades to "unknown cat" rather than confidently
         naming a resident (see the ``threshold is None`` branch). ``cat_names`` maps
-        ``cat_id`` → name. Returns::
+        ``cat_id`` → name; ``cat_residents`` maps ``cat_id`` → whether that cat is a
+        resident (our cat) vs. a named foreign/neighbour cat. Returns::
 
-            {cat_id, cat_name, distance, n_identified, n_frames_voted} | None
+            {cat_id, cat_name, is_resident, distance, n_identified, n_frames_voted} | None
 
         Outcomes (per the spec):
 
@@ -2194,10 +2203,12 @@ class Store:
         - **some frame below threshold** → the cat with the most below-threshold
           frames wins (ties broken by that cat's MINIMUM distance); ``distance`` is
           the winner's min distance, ``n_frames_voted`` its below-threshold count,
-          ``n_identified`` all identified frames in the span.
+          ``n_identified`` all identified frames in the span. ``is_resident`` is the
+          winner's roster flag — the activity feed marks a non-resident match (a
+          named stranger) distinctly from a resident coming home.
         - **identified but none below threshold** → ``{cat_id: None, cat_name:
-          None, ...}`` (an *unknown cat* was seen — nearest match too far);
-          ``distance`` is the nearest (min) distance any frame reached,
+          None, is_resident: None, ...}`` (an *unknown cat* was seen — nearest match
+          too far); ``distance`` is the nearest (min) distance any frame reached,
           ``n_frames_voted`` 0.
         """
         if not span_idents:
@@ -2219,6 +2230,7 @@ class Store:
             return {
                 "cat_id": None,
                 "cat_name": None,
+                "is_resident": None,
                 "distance": min(dist for _cid, dist in span_idents),
                 "n_identified": n_identified,
                 "n_frames_voted": 0,
@@ -2239,6 +2251,7 @@ class Store:
         return {
             "cat_id": winner_id,
             "cat_name": cat_names.get(winner_id),
+            "is_resident": cat_residents.get(winner_id, False),
             "distance": min_dist,
             "n_identified": n_identified,
             "n_frames_voted": count,

@@ -1060,8 +1060,10 @@
            .tile border (no layout shift). */
         .activity-card { cursor: pointer; }
         .activity-card.selected { border-color: var(--color-primary); }
-        /* Event-card identity chip (identification-gallery-activity spec): a named cat is
-           a confident, positive match (caught-green); "unknown cat" means frames WERE
+        /* Event-card identity chip (identification-gallery-activity spec): a RESIDENT
+           (our cat) is a confident, positive match (caught-green); a named NON-resident
+           foreign/neighbour cat is a confident match too but an alert, so it takes the
+           missed-red tone (a known stranger at the door); "unknown cat" means frames WERE
            identified but none matched closely enough (false-amber — worth a second look,
            same tone the false-trigger swatch uses elsewhere). No chip at all when the
            event carries no identification. flex-basis 100% drops it to its own line below
@@ -1080,6 +1082,11 @@
             background: rgb(var(--v-caught-rgb) / .18);
             color: var(--color-status-caught);
             border: 1px solid rgb(var(--v-caught-rgb) / .45);
+        }
+        .identity-chip.foreign {
+            background: rgb(var(--v-missed-rgb) / .18);
+            color: var(--color-status-missed);
+            border: 1px solid rgb(var(--v-missed-rgb) / .45);
         }
         .identity-chip.unknown {
             background: rgb(var(--v-false-rgb) / .18);
@@ -1513,6 +1520,14 @@
                     <label>&nbsp;</label>
                     <button type="button" id="liveIdentifyToggleBtn" class="btn-secondary"
                         title="Start or stop automatic naming of new visits as their motion cluster closes, using the active gallery.">Start live naming</button>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label" style="align-self: center;"
+                        title="Hide events confidently identified as a resident (our cats). Shows only named non-resident cats, unknown cats, and unidentified visits — the events worth a look.">
+                        <input type="checkbox" id="activityStrangersOnly">
+                        Non-residents &amp; unidentified only
+                    </label>
                 </div>
                 <div class="control-group push-end">
                     <div class="metrics">
@@ -2084,6 +2099,7 @@
         const activityTruncatedEl = document.getElementById('activityTruncated');
         const activityEmptyEl = document.getElementById('activityEmpty');
         const activityGridEl = document.getElementById('activityGrid');
+        const activityStrangersOnlyEl = document.getElementById('activityStrangersOnly');
         const activityIdentifyBtn = document.getElementById('activityIdentifyBtn');
         const activityIdentifyNoteEl = document.getElementById('activityIdentifyNote');
         const liveIdentifyToggleBtn = document.getElementById('liveIdentifyToggleBtn');
@@ -2310,8 +2326,9 @@
 
         // Activity view state.
         let activityEvents = [];          // the loaded event list (newest-first from the backend)
+        let activityVisible = [];         // the subset actually rendered (after the strangers-only filter)
         let activityTruncated = false;    // the _MAX_EVENTS cap dropped events
-        let activitySelectedIndex = -1;   // index of the open event, or -1 when the player is closed
+        let activitySelectedIndex = -1;   // index into activityVisible of the open event, or -1 when closed
         let activityAutoLoaded = false;   // gates the one stats-driven initial fetch (see pollStats)
         let activitySeq = 0;              // stale-guard for event-list loads
         // Player (per-event) state.
@@ -2816,17 +2833,41 @@
             }
         }
 
+        // An event is a resident sighting only when it's a confident, named match to
+        // one of our cats. A named non-resident (foreign/neighbour), an "unknown cat"
+        // (identity.cat_id === null), and an unidentified visit (no identity) are all
+        // NOT residents — exactly what the strangers-only filter keeps.
+        function isResidentEvent(ev) {
+            const id = ev.identity;
+            return !!(id && id.cat_id != null && id.is_resident);
+        }
+
         function renderActivityGrid() {
             activityGridEl.innerHTML = '';
             activitySelectedIndex = -1;
+            const strangersOnly = activityStrangersOnlyEl.checked;
+            activityVisible = strangersOnly
+                ? activityEvents.filter(ev => !isResidentEvent(ev))
+                : activityEvents.slice();
             activityTruncatedEl.classList.toggle('hidden', !activityTruncated);
             if (activityTruncated) {
                 activityTruncatedEl.textContent =
                     `Showing the newest ${activityEvents.length} events — narrow the date range to see more.`;
             }
-            activityEmptyEl.classList.toggle('hidden', activityEvents.length > 0);
-            if (!activityEvents.length) { closePlayer(); return; }
-            activityEvents.forEach((ev, i) => activityGridEl.appendChild(activityCard(ev, i)));
+            const empty = activityVisible.length === 0;
+            activityEmptyEl.classList.toggle('hidden', !empty);
+            // Distinguish "nothing loaded" from "the filter hid everything" so the
+            // empty state doesn't read as a broken load when residents were filtered
+            // out. When the fetch was capped (truncated), the filter ran only over the
+            // newest batch, so non-residents may still exist earlier in the range —
+            // say so rather than implying none exist.
+            activityEmptyEl.textContent = (empty && activityEvents.length && strangersOnly)
+                ? (activityTruncated
+                    ? 'No non-resident or unidentified activity among the newest events — narrow the date range to check older ones.'
+                    : 'No non-resident or unidentified activity in this range.')
+                : 'No activity in this range.';
+            if (empty) { closePlayer(); return; }
+            activityVisible.forEach((ev, i) => activityGridEl.appendChild(activityCard(ev, i)));
         }
 
         function activityCard(ev, i) {
@@ -2858,10 +2899,12 @@
         }
 
         // The event-card name chip (identification-gallery-activity spec): a named
-        // resident/neighbour cat is a confident match; identity.cat_id === null means
-        // frames WERE identified but none matched closely enough ("unknown cat"); no
-        // `identity` at all (no active model, or nothing identified in the span) shows
-        // no chip — the card renders exactly as it did before identification existed.
+        // RESIDENT (our cat) is a confident match shown green; a named NON-resident
+        // (foreign/neighbour) cat is a confident match too but shown red (a known
+        // stranger at the door); identity.cat_id === null means frames WERE identified
+        // but none matched closely enough ("unknown cat", amber); no `identity` at all
+        // (no active model, or nothing identified in the span) shows no chip — the card
+        // renders exactly as it did before identification existed.
         function identityChip(identity) {
             if (!identity) return null;
             const chip = document.createElement('span');
@@ -2869,7 +2912,7 @@
                 chip.className = 'identity-chip unknown';
                 chip.textContent = 'unknown cat';
             } else {
-                chip.className = 'identity-chip known';
+                chip.className = 'identity-chip ' + (identity.is_resident ? 'known' : 'foreign');
                 chip.textContent = identity.cat_name || `cat #${identity.cat_id}`;
             }
             return chip;
@@ -2884,8 +2927,8 @@
         // Open the player on event `i`: sample its frames across the whole span
         // (chronological, evenly decimated when long), preload a window, then enable play.
         async function openEvent(i) {
-            if (i < 0 || i >= activityEvents.length) return;
-            const ev = activityEvents[i];
+            if (i < 0 || i >= activityVisible.length) return;
+            const ev = activityVisible[i];
             const seq = ++playerSeq;
             pausePlayback();                 // stop any timer from the previous event
             activitySelectedIndex = i;
@@ -3025,17 +3068,24 @@
         }
 
         function moveEvent(delta) {
-            if (!activityEvents.length) return;
+            if (!activityVisible.length) return;
             const next = activitySelectedIndex + delta;
-            if (next < 0 || next >= activityEvents.length) return;
+            if (next < 0 || next >= activityVisible.length) return;
             openEvent(next);
         }
         function updatePlayerNav() {
             playerPrevBtn.disabled = activitySelectedIndex <= 0;
-            playerNextBtn.disabled = activitySelectedIndex < 0 || activitySelectedIndex >= activityEvents.length - 1;
+            playerNextBtn.disabled = activitySelectedIndex < 0 || activitySelectedIndex >= activityVisible.length - 1;
         }
 
         activityLoadBtn.addEventListener('click', loadActivityEvents);
+        // Client-only re-render: the filter re-slices the already-loaded events, no
+        // refetch. Close the player first so a selection into the old (unfiltered)
+        // list can't dangle after the visible list shrinks.
+        activityStrangersOnlyEl.addEventListener('change', () => {
+            closePlayer();
+            renderActivityGrid();
+        });
 
         // Live-identify worker toggle — same optimistic-disable / re-poll-to-confirm
         // idiom as collectorToggleBtn above: disable, hit the endpoint, then let the

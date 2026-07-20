@@ -443,3 +443,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 76. Known limit of the live worker: it writes `yolo-serial` verdicts only within visit spans, so
     gate-scorecard / annotation coverage over a live-populated window is non-uniform — tune the motion
     gate from a full manual sweep, not a window the live worker has already touched.
+
+77. Activity feed distinguishes resident from foreign matches: the event identity now carries
+    `is_resident`, and a named NON-resident (neighbour) cat renders RED, not green — a green chip
+    always means one of our cats. Resident = green, non-resident = red, unknown cat = amber (unchanged).
+    Chose red for a known stranger over reusing amber so a confident foreign match reads as an alert,
+    not a "second look".
+
+78. Activity gained a "Non-residents & unidentified only" checkbox filter (client-only, no refetch):
+    hides events confidently identified as a resident, leaving foreign/unknown/unidentified visits —
+    the events worth a look. The player + Prev/Next now step the filtered subset, so navigation can't
+    land on a hidden resident.

@@ -56,7 +56,8 @@ esac
 export CAT_PI_URL
 echo "[compute] edge stream: ${CAT_PI_URL}"
 echo "[compute] store:       ${CAT_COLLECT_DIR:-./data/collection}  (cap ${CAT_COLLECT_MAX_BYTES:-5368709120} bytes)"
-echo "[compute] browse UI:   http://localhost:${PORT}   (Ctrl-C to stop)"
+echo "[compute] user page:   http://localhost:${PORT}   (blank placeholder)"
+echo "[compute] admin UI:    http://localhost:${PORT}/admin   (workbench; Ctrl-C to stop)"
 # --factory: create_app() builds the store and wires the collector (which stays
 # stopped until Started from the UI, unless CAT_COLLECT_AUTOSTART is set); there
 # is no module-level app that would start a thread on import. exec so Ctrl-C /

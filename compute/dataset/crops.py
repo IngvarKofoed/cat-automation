@@ -109,6 +109,43 @@ def materialize(jpeg_path: str, box, dest_abs: str, root: "str | None" = None) -
         return False
 
 
+def normalize_avatar_bytes(data: bytes, max_dim: int = 512) -> "bytes | None":
+    """Validate + downscale + re-encode an uploaded avatar image to JPEG bytes.
+
+    Backs the user-dashboard's raw-body avatar upload (see the user-activity-cats
+    spec): the household POSTs an arbitrary image as the request body and we store
+    a small, uniform JPEG rather than the original. Decodes ``data`` with the same
+    lazy-``cv2`` / ``cv2.imdecode`` path the rest of this module uses (robust to any
+    input format OpenCV can read, and — unlike ``cv2.imread`` — never touches the
+    filesystem). Returns ``None`` when ``data`` is empty or not a decodable image,
+    so the caller maps an undecodable upload to a 400 rather than writing garbage.
+
+    If the longest side exceeds ``max_dim`` the image is downscaled to fit
+    (aspect preserved, ``cv2.INTER_AREA`` — the right filter for shrinking); a
+    smaller image is left untouched. The result is re-encoded JPEG at the module's
+    q95. Note the re-encode drops any EXIF orientation tag, so a caller feeding
+    phone photos should normalise orientation before upload.
+    """
+    if not data:
+        return None
+    import cv2
+    import numpy as np
+
+    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    height, width = img.shape[:2]
+    longest = max(height, width)
+    if longest > max_dim:
+        scale = max_dim / float(longest)
+        new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+    if not ok:
+        return None
+    return buf.tobytes()
+
+
 def _within(dest_abs: str, root: str) -> bool:
     """Whether ``dest_abs`` resolves to a path at or under ``root`` (traversal guard).
 

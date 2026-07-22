@@ -459,3 +459,24 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     which way to turn it to detect more (↓ var_threshold/learning_rate/min_area/persistence,
     ↑ max_area_fraction/motion_downscale). persistence notes it's frames-not-seconds, so a higher
     capture fps shortens the same value's time window. Presentation only.
+
+80. Compute UI split into two independently-styled front doors: the workbench SPA moved to `/admin`,
+    a near-blank user page now serves `/`. Separate HTML files (own inline `<style>`) share NO CSS,
+    so the coming user dashboard styles free of the admin look; only `/api/*` + `/media/*` stay shared.
+    Admin moved verbatim (absolute API calls + hash routing → `/admin#activity`); user page has a
+    stopgap `/admin` link, legacy bookmarks not redirected, no auth. Spec: docs/specs/2026-07-22-admin-user-area-split.md.
+
+81. Built the real user dashboard at `/` (warm "Threshold" SPA, own CSS, no admin sharing): an Activity
+    feed and a Cats roster. Activity is a day-grouped time-rail of door events reusing `/api/events`
+    (no backend change) with identity chips (resident/neighbour/unknown) and click-to-play.
+    Cats shows residents-first cards; each cat's "last seen" is DERIVED from the same `events()` feed
+    (new `Store.cats_overview`), so Cats and Activity can never name the same moment differently, and it
+    inherits the uncalibrated fail-safe (an uncalibrated gallery names no resident).
+    Per-cat avatars are uploadable — a file convention `<dataset_root>/avatars/cat_<id>.jpg` (no schema
+    column; survives eviction/clear), served with an auto labelled-crop fallback; upload is a raw-body
+    POST re-encoded via base-dep cv2 (no new dependency). "Who's home" is a deferred placeholder — needs
+    direction detection. Spec: docs/specs/2026-07-22-user-activity-cats.md.
+
+82. Activity feed dropped its from/to date picker — it now just shows the recent visits, newest first
+    (`/api/events` unbounded, capped server-side). The user view is a glance at recent door activity,
+    not a searchable log (date-scoped browsing lives in `/admin`). The non-residents-only filter stays.

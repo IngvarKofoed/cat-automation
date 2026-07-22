@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
@@ -52,7 +52,12 @@ from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
-_INDEX_HTML = _WEB_DIR / "index.html"
+# Two independently-styled front doors sharing only the /api + /media backend:
+# the near-blank user page at `/`, the full workbench SPA at `/admin`. Separate
+# files (each its own inline <style>) are what keep their CSS isolated — see
+# docs/specs/2026-07-22-admin-user-area-split.md.
+_USER_HTML = _WEB_DIR / "user" / "index.html"
+_ADMIN_HTML = _WEB_DIR / "admin" / "index.html"
 
 # Config via environment variables (the edge's style; the compute tier has no
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
@@ -612,11 +617,19 @@ def create_app(
 
     @app.get("/")
     def index():
-        # Served by path (the frontend agent owns web/index.html); 404 until it
-        # exists so a missing frontend is an obvious not-found, not a crash.
-        if not _INDEX_HTML.is_file():
-            raise HTTPException(status_code=404, detail="browse UI not built")
-        return FileResponse(_INDEX_HTML, media_type="text/html")
+        # The user-facing dashboard (the "Threshold" Activity + Cats SPA). 404 until
+        # the file exists so a missing frontend is an obvious not-found, not a crash.
+        if not _USER_HTML.is_file():
+            raise HTTPException(status_code=404, detail="user UI not built")
+        return FileResponse(_USER_HTML, media_type="text/html")
+
+    @app.get("/admin")
+    def admin():
+        # The full workbench SPA (Start/Activity/Buckets/Sweeps/Tuning/Annotate/
+        # Training). Its own document, own CSS; hash routing → /admin#activity.
+        if not _ADMIN_HTML.is_file():
+            raise HTTPException(status_code=404, detail="admin UI not built")
+        return FileResponse(_ADMIN_HTML, media_type="text/html")
 
     @app.get("/api/frames")
     def api_frames(
@@ -1194,6 +1207,75 @@ def create_app(
             return store.update_cat(cat_id, req.model_dump(exclude_unset=True))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    # --- User-dashboard "Cats" view (user-activity-cats spec) -----------------------
+    # The roster + live last-seen + an uploadable per-cat avatar. Display-only here
+    # (add/rename/retire stays on the admin Annotate page); the one write is setting a
+    # cat's photo. Avatars are a file convention (<dataset_root>/avatars/cat_<id>.jpg),
+    # not a schema column — the file's presence IS the "manual avatar set" flag.
+
+    _AVATAR_MAX_BYTES = 10 * 1024 * 1024
+
+    @app.get("/api/cats/overview")
+    def api_cats_overview():
+        # Roster + per-cat last-seen (derived from the same events() feed the Activity
+        # view renders) + has_crop. has_avatar = an uploaded file exists OR a labelled
+        # crop does (either yields a real photo). active_model() read ONCE: has_model =
+        # a gallery is promoted; uncalibrated = that model's threshold is None (so
+        # identification can't yet name residents — the UI notes it).
+        rows = store.cats_overview()
+        for row in rows:
+            row["has_avatar"] = os.path.isfile(store.avatar_path(row["id"])) or bool(row["has_crop"])
+        model = store.active_model()
+        return {
+            "cats": rows,
+            "has_model": model is not None,
+            "uncalibrated": model is not None and model["threshold"] is None,
+        }
+
+    @app.get("/api/cats/{cat_id}/avatar")
+    def api_cats_avatar(cat_id: int):
+        # Precedence: uploaded file → representative labelled crop → 404 (the client
+        # then draws an initial-letter placeholder). Each candidate is isfile-guarded
+        # exactly like /media, so a labelled-crop row whose file was removed
+        # (relabel/undo) falls through to the next candidate rather than 500ing.
+        for candidate in (store.avatar_path(cat_id), store.cat_avatar_crop_path(cat_id)):
+            if candidate and os.path.isfile(candidate):
+                return FileResponse(candidate, media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="no avatar for this cat")
+
+    @app.post("/api/cats/{cat_id}/avatar")
+    async def api_cats_avatar_set(cat_id: int, request: Request):
+        # The image is the raw request body (no multipart dependency). Reject an
+        # oversized body (413) before decoding; 404 an unknown cat; normalize_avatar_bytes
+        # validates + downscales + re-encodes, returning None for an undecodable image
+        # (400). The file's presence at avatar_path is the "manual avatar set" flag.
+        data = await request.body()
+        if len(data) > _AVATAR_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="avatar image too large (max 10 MB)")
+        if cat_id not in {c["id"] for c in store.list_cats()}:
+            raise HTTPException(status_code=404, detail=f"no such cat: {cat_id}")
+        out = crops.normalize_avatar_bytes(data)
+        if out is None:
+            raise HTTPException(status_code=400, detail="not a decodable image")
+        dest = store.avatar_path(cat_id)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(out)
+        return {"ok": True}
+
+    @app.delete("/api/cats/{cat_id}/avatar")
+    def api_cats_avatar_delete(cat_id: int):
+        # Remove the uploaded override so the cat reverts to its auto crop (or the
+        # placeholder). Idempotent: a missing file is not an error.
+        path = store.avatar_path(cat_id)
+        deleted = False
+        try:
+            os.remove(path)
+            deleted = True
+        except OSError:
+            pass
+        return {"ok": True, "deleted": deleted}
 
     @app.get("/api/label/visits")
     def api_label_visits(

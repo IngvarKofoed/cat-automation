@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>The Cat Door</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%23cf801f'/%3E%3Crect%20x='11'%20y='8'%20width='10'%20height='17'%20rx='2'%20fill='%23fffcf6'/%3E%3Ccircle%20cx='18.4'%20cy='17'%20r='1.3'%20fill='%23cf801f'/%3E%3C/svg%3E">
+    <!--
+      The household-facing app, served at `/`. A single self-contained, hash-routed
+      SPA (own inline <style>/<script>): shares NO CSS with the admin workbench
+      (/admin) — upholding the admin/user split spec. Only /api/* and /media/* are
+      shared. Design: "The Threshold" — a warm, domestic view of cats crossing the
+      boundary between our inside and the outside night.
+      Spec: docs/specs/2026-07-22-user-activity-cats.md
+    -->
+    <style>
+        /* ============================================================
+           "The Threshold" — design tokens
+           Warm interior by day, the dark door-side at night. The porch
+           lamp (amber) is the accent; identity has its own three colors.
+           Theme-aware: both light and dark are intentional, because door
+           activity is nocturnal.
+           ============================================================ */
+        :root {
+            color-scheme: light dark;
+
+            /* interior (light) */
+            --interior:      #f7efe3;   /* warm room light */
+            --surface:       #fffcf6;   /* card / raised */
+            --surface-2:     #fbf4e9;   /* inset / rail well */
+            --ink:           #2a221c;   /* warm near-black text */
+            --muted:         #897a6b;   /* secondary text */
+            --hairline:      #e7dccb;   /* the threshold spine, borders */
+            --porch:         #cf801f;   /* porch-lamp amber accent */
+            --porch-soft:    #f3e4cb;   /* accent wash */
+            --on-porch:      #2a221c;   /* text on an amber fill */
+
+            /* identity */
+            --resident:      #2f8f5f;   /* one of ours — calm green */
+            --resident-bg:   #e2f2e8;
+            --neighbour:     #d0533b;   /* a known stranger — coral */
+            --neighbour-bg:  #f8e2dc;
+            --unknown:       #b9820f;   /* a cat, too far to name — honey */
+            --unknown-bg:    #f6eacb;
+            --unident:       #8c7d6e;   /* seen, but no model / no match */
+            --unident-bg:    #efe6d7;
+
+            --shadow:        0 1px 2px rgba(42,34,28,.06), 0 6px 20px rgba(42,34,28,.07);
+            --shadow-lift:   0 2px 6px rgba(42,34,28,.10), 0 16px 40px rgba(42,34,28,.14);
+            --radius:        16px;
+            --radius-sm:     10px;
+
+            --font-display: ui-rounded, "SF Pro Rounded", "Hiragino Maru Gothic ProN", "Nunito", system-ui, sans-serif;
+            --font-body:    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            --font-mono:    ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --interior:     #15110c;   /* the door at night */
+                --surface:      #1f1810;
+                --surface-2:    #191309;
+                --ink:          #f2e8da;
+                --muted:        #9a8a78;
+                --hairline:     #342b20;
+                --porch:        #f0a94e;    /* the porch lamp glows warmer */
+                --porch-soft:   #33260f;
+                --on-porch:     #1a1206;
+
+                --resident:     #58c089;
+                --resident-bg:  #16301f;
+                --neighbour:    #f0806a;
+                --neighbour-bg: #351712;
+                --unknown:      #e6b25a;
+                --unknown-bg:   #33260f;
+                --unident:      #9a8a78;
+                --unident-bg:   #241c12;
+
+                --shadow:       0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.5);
+                --shadow-lift:  0 2px 6px rgba(0,0,0,.5), 0 20px 48px rgba(0,0,0,.62);
+            }
+        }
+
+        * { box-sizing: border-box; }
+        html, body { margin: 0; }
+        html { -webkit-text-size-adjust: 100%; }
+        body {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--interior);
+            color: var(--ink);
+            font-family: var(--font-body);
+            font-size: 16px;
+            line-height: 1.5;
+            overflow-x: hidden;
+        }
+        body.modal-open { overflow: hidden; }
+
+        h1, h2, h3 { font-family: var(--font-display); font-weight: 700; letter-spacing: -.01em; }
+        a { color: inherit; }
+        img { max-width: 100%; display: block; }
+        button, input, select { font: inherit; color: inherit; }
+
+        :focus-visible {
+            outline: 2.5px solid var(--porch);
+            outline-offset: 2px;
+            border-radius: 4px;
+        }
+
+        .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+        /* ================= app bar ================= */
+        .appbar {
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: .7rem clamp(1rem, 4vw, 2.5rem);
+            background: color-mix(in srgb, var(--surface) 88%, transparent);
+            backdrop-filter: saturate(1.2) blur(10px);
+            border-bottom: 1px solid var(--hairline);
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: .55rem;
+            font-family: var(--font-display);
+            font-weight: 700;
+            font-size: 1.15rem;
+            letter-spacing: -.02em;
+            margin-right: auto;
+        }
+        .brand svg { width: 26px; height: 26px; display: block; flex: none; }
+        .brand .glow { color: var(--porch); }
+
+        .nav { display: flex; gap: .15rem; flex-wrap: wrap; }
+        .nav a {
+            text-decoration: none;
+            color: var(--muted);
+            font-weight: 600;
+            font-size: .93rem;
+            padding: .35rem .6rem;
+            border-radius: 999px;
+            white-space: nowrap;
+            transition: color .15s, background .15s;
+        }
+        .nav a:hover { color: var(--ink); background: var(--surface-2); }
+        .nav a.active { color: var(--porch); }
+        .nav a.active:hover { background: var(--porch-soft); }
+
+        /* ================= layout ================= */
+        .page {
+            width: 100%;
+            max-width: 860px;
+            margin: 0 auto;
+            padding: clamp(1rem, 3vw, 2rem) clamp(1rem, 4vw, 2rem) 3rem;
+            flex: 1 0 auto;
+        }
+        .view { display: none; }
+        .view.active { display: block; }
+
+        .view-head { margin-bottom: 1.25rem; }
+        .view-head h1 { margin: 0 0 .15rem; font-size: clamp(1.6rem, 5vw, 2.1rem); }
+        .view-head .sub { margin: 0; color: var(--muted); font-size: .95rem; }
+
+        /* ================= controls ================= */
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: .75rem 1rem;
+            padding: .9rem 1rem;
+            margin-bottom: 1.25rem;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+        }
+        .field { display: flex; flex-direction: column; gap: .25rem; }
+        .field label {
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+        .field input[type="date"] {
+            padding: .45rem .6rem;
+            background: var(--surface-2);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius-sm);
+            font-variant-numeric: tabular-nums;
+            min-width: 9.5rem;
+        }
+        .btn {
+            padding: .5rem 1rem;
+            font-weight: 700;
+            font-size: .92rem;
+            border-radius: 999px;
+            border: 1px solid transparent;
+            cursor: pointer;
+            background: var(--porch);
+            color: var(--on-porch);
+            transition: filter .15s, transform .05s;
+        }
+        .btn:hover { filter: brightness(1.05); }
+        .btn:active { transform: translateY(1px); }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+        .btn.ghost {
+            background: transparent;
+            color: var(--ink);
+            border-color: var(--hairline);
+        }
+        .btn.ghost:hover { background: var(--surface-2); filter: none; }
+
+        .toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: .5rem;
+            font-size: .9rem;
+            color: var(--muted);
+            cursor: pointer;
+            user-select: none;
+            margin-left: auto;
+        }
+        .toggle input { width: 1.05rem; height: 1.05rem; accent-color: var(--porch); cursor: pointer; }
+
+        .storerange {
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            font-size: .8rem;
+            color: var(--muted);
+            margin: 0 0 1rem;
+        }
+
+        /* ================= notes / states ================= */
+        .note {
+            padding: .7rem .9rem;
+            border-radius: var(--radius-sm);
+            font-size: .9rem;
+            margin-bottom: 1rem;
+        }
+        .note.info { background: var(--surface-2); color: var(--muted); border: 1px solid var(--hairline); }
+        .note.warn { background: var(--unknown-bg); color: var(--ink); border: 1px solid color-mix(in srgb, var(--unknown) 40%, transparent); }
+        .note.error { background: var(--neighbour-bg); color: var(--ink); border: 1px solid color-mix(in srgb, var(--neighbour) 45%, transparent); }
+        .note.hidden { display: none; }
+
+        .empty {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--muted);
+        }
+        .empty .big { font-family: var(--font-display); font-size: 1.15rem; color: var(--ink); margin-bottom: .25rem; }
+        .empty.hidden { display: none; }
+
+        /* ================= identity chip ================= */
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: .35rem;
+            padding: .18rem .55rem;
+            border-radius: 999px;
+            font-size: .78rem;
+            font-weight: 700;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+        .chip::before {
+            content: "";
+            width: .5rem; height: .5rem;
+            border-radius: 50%;
+            background: currentColor;
+            flex: none;
+        }
+        .chip.resident  { background: var(--resident-bg);  color: var(--resident); }
+        .chip.neighbour { background: var(--neighbour-bg); color: var(--neighbour); }
+        .chip.unknown   { background: var(--unknown-bg);   color: var(--unknown); }
+
+        /* ================= ACTIVITY: the threshold time-rail ================= */
+        .day-group { margin-bottom: 1.5rem; }
+        .day-header {
+            font-family: var(--font-display);
+            font-weight: 700;
+            font-size: 1rem;
+            color: var(--ink);
+            padding: .2rem 0 .55rem 2.1rem;
+            letter-spacing: -.01em;
+        }
+        .rail {
+            position: relative;
+            padding-left: 2.1rem;   /* room for the spine + dots */
+        }
+        /* the hairline spine — the threshold cats cross */
+        .rail::before {
+            content: "";
+            position: absolute;
+            left: .68rem;
+            top: .2rem;
+            bottom: .2rem;
+            width: 2px;
+            background: linear-gradient(var(--hairline), var(--hairline));
+            border-radius: 2px;
+        }
+        .event-row {
+            position: relative;
+            margin-bottom: .8rem;
+            cursor: pointer;
+            border-radius: var(--radius);
+        }
+        .event-row .dot {
+            position: absolute;
+            left: -1.76rem;   /* centers on the rail spine (rail padding 2.1rem, spine at .68rem) */
+            top: 1.4rem;
+            width: .82rem; height: .82rem;
+            border-radius: 50%;
+            background: var(--unident);
+            border: 3px solid var(--interior);
+            box-shadow: 0 0 0 1px var(--hairline);
+            z-index: 1;
+        }
+        .event-row .dot.resident  { background: var(--resident); }
+        .event-row .dot.neighbour { background: var(--neighbour); }
+        .event-row .dot.unknown   { background: var(--unknown); }
+
+        .event-card {
+            display: flex;
+            gap: .9rem;
+            align-items: center;
+            padding: .6rem;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            transition: box-shadow .15s, transform .05s, border-color .15s;
+        }
+        .event-row:hover .event-card { box-shadow: var(--shadow-lift); border-color: color-mix(in srgb, var(--porch) 35%, var(--hairline)); }
+        .event-row:active .event-card { transform: translateY(1px); }
+        .event-row.selected .event-card { border-color: var(--porch); box-shadow: 0 0 0 2px var(--porch-soft), var(--shadow-lift); }
+
+        /* the "porthole" — soft rounded frame that leans into the top-down view */
+        .porthole {
+            flex: none;
+            width: 92px;
+            aspect-ratio: 1 / 1;
+            border-radius: 40% / 40%;
+            overflow: hidden;
+            background: var(--surface-2);
+            box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--porch) 22%, transparent), inset 0 0 14px rgba(0,0,0,.18);
+            position: relative;
+        }
+        .porthole img { width: 100%; height: 100%; object-fit: cover; }
+        .event-meta { display: flex; flex-direction: column; gap: .28rem; min-width: 0; }
+        .event-time { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 1.15rem; font-weight: 600; letter-spacing: -.01em; }
+        .event-rel { font-size: .82rem; color: var(--muted); }
+        .event-meta .chip { align-self: flex-start; }
+
+        /* ================= CATS ================= */
+        .cats-section { margin-bottom: 2rem; }
+        .cats-section h2 {
+            font-size: 1.15rem;
+            margin: 0 0 .15rem;
+            display: flex;
+            align-items: baseline;
+            gap: .5rem;
+        }
+        .cats-section .kicker { color: var(--muted); font-weight: 600; font-size: .85rem; }
+        .cats-section .lead { margin: 0 0 1rem; color: var(--muted); font-size: .9rem; }
+        .cat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+        }
+        .cat-card {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            gap: .4rem;
+            padding: 1.1rem 1rem 1rem;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+        }
+        .avatar-wrap {
+            width: 88px; height: 88px;
+            border-radius: 50%;
+            overflow: hidden;
+            background: var(--porch-soft);
+            box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--porch) 30%, transparent);
+            position: relative;
+            display: grid;
+            place-items: center;
+        }
+        .avatar-wrap img { width: 100%; height: 100%; object-fit: cover; }
+        .avatar-fallback {
+            font-family: var(--font-display);
+            font-weight: 700;
+            font-size: 2.1rem;
+            color: var(--porch);
+        }
+        .cat-name { font-family: var(--font-display); font-weight: 700; font-size: 1.05rem; }
+        .cat-tag {
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            padding: .1rem .5rem;
+            border-radius: 999px;
+        }
+        .cat-tag.resident  { background: var(--resident-bg);  color: var(--resident); }
+        .cat-tag.neighbour { background: var(--neighbour-bg); color: var(--neighbour); }
+        .cat-seen {
+            font-size: .82rem;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+            min-height: 2.4em;
+        }
+        .cat-seen .never { font-style: italic; }
+        .set-photo {
+            margin-top: .25rem;
+            font-size: .8rem;
+            font-weight: 600;
+            color: var(--porch);
+            cursor: pointer;
+            border-bottom: 1px dashed color-mix(in srgb, var(--porch) 55%, transparent);
+            padding-bottom: 1px;
+        }
+        .set-photo:hover { color: color-mix(in srgb, var(--porch) 80%, var(--ink)); }
+        /* The file input is visually hidden but stays in tab order, so key the
+           visible focus ring off the label wrapping it — otherwise the ring lands
+           on the 1px input and tabbing to "Set photo" shows nothing. */
+        .set-photo:focus-within { outline: 2.5px solid var(--porch); outline-offset: 2px; border-radius: 4px; }
+        .set-photo input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+        .set-photo.busy { opacity: .6; pointer-events: none; }
+
+        /* ================= WHO'S HOME placeholder ================= */
+        .placeholder {
+            text-align: center;
+            padding: clamp(2rem, 8vw, 4.5rem) 1.5rem;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+        }
+        .placeholder .mark { color: var(--porch); margin-bottom: 1rem; }
+        .placeholder .mark svg { width: 52px; height: 52px; }
+        .placeholder h2 { margin: 0 0 .5rem; font-size: 1.3rem; }
+        .placeholder p { margin: 0 auto; max-width: 34ch; color: var(--muted); }
+
+        /* ================= footer ================= */
+        .foot {
+            flex: none;
+            text-align: center;
+            padding: 1.5rem 1rem 2rem;
+            border-top: 1px solid var(--hairline);
+            color: var(--muted);
+            font-size: .82rem;
+        }
+        .foot a { color: var(--muted); text-decoration: none; opacity: .8; border-bottom: 1px solid currentColor; padding-bottom: 1px; }
+        .foot a:hover { opacity: 1; color: var(--ink); }
+
+        /* ================= playback modal ================= */
+        .modal {
+            position: fixed;
+            inset: 0;
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: clamp(.5rem, 2vw, 1.5rem);
+            background: color-mix(in srgb, #100b06 72%, transparent);
+            backdrop-filter: blur(3px);
+        }
+        .modal.hidden { display: none; }
+        .dialog {
+            width: min(680px, 100%);
+            max-height: 94vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-lift);
+            overflow: hidden;
+        }
+        .dialog:focus { outline: none; }
+        .dialog-head {
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+            padding: .75rem 1rem;
+            border-bottom: 1px solid var(--hairline);
+        }
+        .dialog-head .when { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: .95rem; font-weight: 600; }
+        .dialog-head .x {
+            margin-left: auto;
+            background: var(--surface-2);
+            border: 1px solid var(--hairline);
+            border-radius: 999px;
+            width: 2rem; height: 2rem;
+            font-size: 1.1rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .dialog-head .x:hover { background: var(--porch-soft); }
+        .stage {
+            background: #0d0906;
+            aspect-ratio: 4 / 3;
+            display: grid;
+            place-items: center;
+        }
+        .stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .player-controls {
+            display: flex;
+            align-items: center;
+            gap: .6rem;
+            padding: .65rem 1rem;
+        }
+        .player-controls .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: .82rem; color: var(--muted); min-width: 5.5rem; }
+        .player-controls input[type="range"] { flex: 1; accent-color: var(--porch); cursor: pointer; }
+        .player-controls .btn { padding: .4rem .8rem; }
+        .filmstrip {
+            display: flex;
+            gap: .35rem;
+            padding: .55rem 1rem .8rem;
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+        .film-tile {
+            flex: none;
+            width: 60px;
+            aspect-ratio: 4 / 3;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid transparent;
+            cursor: pointer;
+            opacity: .7;
+            background: var(--surface-2);
+        }
+        .film-tile img { width: 100%; height: 100%; object-fit: cover; }
+        .film-tile:hover { opacity: 1; }
+        .film-tile.film-current { border-color: var(--porch); opacity: 1; }
+        .film-tile.film-rep { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--porch) 45%, transparent); }
+        .filmstrip .loading { padding: 1rem; color: var(--muted); font-size: .85rem; }
+
+        @media (max-width: 480px) {
+            .porthole { width: 76px; }
+            .event-time { font-size: 1.05rem; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+        }
+    </style>
+</head>
+<body>
+    <header class="appbar">
+        <div class="brand">
+            <!-- a lit doorway: the threshold -->
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M4 21V5a2 2 0 0 1 2-2h9l5 4v14" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                <rect class="glow" x="8" y="9" width="8" height="12" rx="1.2" fill="currentColor" opacity="0.9"/>
+                <circle cx="14" cy="15" r=".9" fill="var(--surface)"/>
+            </svg>
+            <span>The Cat Door</span>
+        </div>
+        <nav class="nav">
+            <a data-route="activity" href="#activity">Activity</a>
+            <a data-route="cats" href="#cats">Cats</a>
+            <a data-route="home" href="#home">Who's home</a>
+        </nav>
+    </header>
+
+    <main class="page">
+        <!-- ============ ACTIVITY ============ -->
+        <section id="view-activity" class="view">
+            <div class="view-head">
+                <h1>At the door</h1>
+                <p class="sub">Every cat that crossed the threshold, newest first.</p>
+            </div>
+
+            <div class="controls">
+                <label class="toggle">
+                    <input type="checkbox" id="strangersOnly">
+                    Non-residents &amp; unidentified only
+                </label>
+            </div>
+
+            <div class="note error hidden" id="activityError"></div>
+            <div class="note info hidden" id="activityTruncated"></div>
+            <div class="empty hidden" id="activityEmpty"></div>
+
+            <div id="activityRail"></div>
+        </section>
+
+        <!-- ============ CATS ============ -->
+        <section id="view-cats" class="view">
+            <div class="view-head">
+                <h1>The household</h1>
+                <p class="sub">Who lives here, who visits, and when we last saw them.</p>
+            </div>
+            <div class="note error hidden" id="catsError"></div>
+            <div class="note warn hidden" id="catsModelNote"></div>
+            <div id="catsBody"></div>
+        </section>
+
+        <!-- ============ WHO'S HOME ============ -->
+        <section id="view-home" class="view">
+            <div class="view-head">
+                <h1>Who's home</h1>
+                <p class="sub">The in-and-out board.</p>
+            </div>
+            <div class="placeholder">
+                <div class="mark">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                        <path d="M9 21v-6h6v6" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <h2>Coming once the door can tell in from out</h2>
+                <p>We can already see who came by. To say who's <em>home</em> we need to know
+                   which way each cat was heading through the door — that's next.</p>
+            </div>
+        </section>
+    </main>
+
+    <footer class="foot">
+        <span>The Cat Door · a home camera at the cat flap</span>
+        &nbsp;·&nbsp;
+        <a href="/admin">Admin console</a>
+    </footer>
+
+    <!-- ============ playback modal ============ -->
+    <div class="modal hidden" id="playerModal">
+        <div class="dialog" id="playerDialog" role="dialog" aria-modal="true" aria-label="Event playback" tabindex="-1">
+            <div class="dialog-head">
+                <span class="when mono" id="playerWhen">—</span>
+                <span id="playerChipSlot"></span>
+                <button class="x" id="playerClose" aria-label="Close playback">&times;</button>
+            </div>
+            <div class="stage"><img id="playerImg" alt="Event frame"></div>
+            <div class="player-controls">
+                <button class="btn" id="playerPlay" disabled>Play</button>
+                <button class="btn ghost" id="playerPrev" disabled>Prev</button>
+                <button class="btn ghost" id="playerNext" disabled>Next</button>
+                <input type="range" id="playerScrub" min="0" max="0" value="0" disabled aria-label="Scrub frames">
+                <span class="count mono" id="playerCount">—</span>
+            </div>
+            <div class="filmstrip" id="playerFilmstrip"></div>
+        </div>
+    </div>
+
+    <script>
+    "use strict";
+    (function () {
+        // ================= constants =================
+        const ROUTES = ['activity', 'cats', 'home'];
+        const DAY_MS = 86400000;
+        const MAX_PLAY_FRAMES = 240;           // cap sampled/played frames per event
+        const PLAYER_FPS_MS = 200;             // ~5 fps, matches the ~5 fps capture
+        const PRELOAD_AHEAD = 16;              // frames preloaded ahead of the current one
+
+        // ================= state =================
+        let route = 'activity';
+
+        let activityEvents = [], activityVisible = [], activityTruncated = false;
+        let activitySeq = 0, activitySelectedIndex = -1;
+        let strangersOnly = false;
+
+        // player
+        let playerSeq = 0;
+        let playerFrames = [], playerImages = [], playerTiles = [], playerIndex = 0;
+        let playerTimer = null, playerPlaying = false;
+
+        // cats
+        const avatarBust = {};   // per-cat cache-buster, bumped after an upload
+
+        // ================= element refs =================
+        const $ = (id) => document.getElementById(id);
+        const strangersOnlyEl = $('strangersOnly');
+        const activityErrorEl = $('activityError'), activityTruncatedEl = $('activityTruncated');
+        const activityEmptyEl = $('activityEmpty'), railEl = $('activityRail');
+        const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
+        const modalEl = $('playerModal'), dialogEl = $('playerDialog');
+        const playerImgEl = $('playerImg'), playerWhenEl = $('playerWhen'), playerChipSlotEl = $('playerChipSlot');
+        const playerPlayBtn = $('playerPlay'), playerPrevBtn = $('playerPrev'), playerNextBtn = $('playerNext');
+        const playerScrubEl = $('playerScrub'), playerCountEl = $('playerCount');
+        const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
+
+        // ================= helpers =================
+        function pad2(n) { return String(n).padStart(2, '0'); }
+
+        async function errorFromResponse(res) {
+            try {
+                const data = await res.json();
+                return data.error || data.detail || `HTTP ${res.status}`;
+            } catch {
+                return `HTTP ${res.status}`;
+            }
+        }
+
+        // Fixed dd/mm-yyyy, 24-hour clock — built by hand (local time) so the mixed
+        // "/" then "-" separators and the 24h clock hold regardless of locale.
+        function formatTime(ts) {
+            if (typeof ts !== 'number') return '—';
+            const d = new Date(ts);
+            const date = `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}-${d.getFullYear()}`;
+            const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+            return `${date}, ${time}`;
+        }
+        function timeOfDay(ts) {
+            if (typeof ts !== 'number') return '—';
+            const d = new Date(ts);
+            return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+        }
+        // Coarse "how long ago" for glanceable cards.
+        function relativeTime(ts) {
+            if (typeof ts !== 'number') return '';
+            const diff = Date.now() - ts;
+            if (diff < 45000) return 'just now';
+            const m = Math.floor(diff / 60000);
+            if (m < 60) return `${m}m ago`;
+            const h = Math.floor(m / 60);
+            if (h < 24) return `${h}h ago`;
+            const dd = Math.floor(h / 24);
+            if (dd < 7) return `${dd}d ago`;
+            const w = Math.floor(dd / 7);
+            if (w < 6) return `${w}w ago`;
+            const d = new Date(ts);
+            return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}-${d.getFullYear()}`;
+        }
+        function startOfDay(ts) {
+            const d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime();
+        }
+        function dayLabel(ts) {
+            const today = startOfDay(Date.now());
+            const day = startOfDay(ts);
+            if (day === today) return 'Today';
+            if (day === today - DAY_MS) return 'Yesterday';
+            const d = new Date(ts);
+            return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}-${d.getFullYear()}`;
+        }
+        function addBounds(params, sinceId, untilId) {
+            if (sinceId != null) params.set('since_id', String(sinceId));
+            if (untilId != null) params.set('until_id', String(untilId));
+        }
+
+        function showNote(el, msg) { el.textContent = msg; el.classList.remove('hidden'); }
+        function hideNote(el) { el.classList.add('hidden'); }
+
+        // ================= identity semantics =================
+        // resident   = confident, named, one of ours          -> green
+        // neighbour  = confident, named, NOT ours (foreign)    -> coral
+        // unknown    = a cat identified but too far to name    -> amber
+        // unidentified = no active model / nothing matched     -> no chip
+        function identityKind(identity) {
+            if (!identity) return 'unidentified';
+            if (identity.cat_id == null) return 'unknown';
+            return identity.is_resident ? 'resident' : 'neighbour';
+        }
+        function isResidentEvent(ev) { return identityKind(ev.identity) === 'resident'; }
+        function identityChip(identity) {
+            const kind = identityKind(identity);
+            if (kind === 'unidentified') return null;
+            const chip = document.createElement('span');
+            chip.className = 'chip ' + kind;
+            chip.textContent = kind === 'unknown'
+                ? 'unknown cat'
+                : (identity.cat_name || `cat #${identity.cat_id}`);
+            return chip;
+        }
+
+        // ================= router =================
+        function setRoute(r) {
+            route = ROUTES.includes(r) ? r : 'activity';
+            for (const v of document.querySelectorAll('.view')) v.classList.remove('active');
+            $('view-' + route).classList.add('active');
+            for (const a of document.querySelectorAll('.nav a')) {
+                a.classList.toggle('active', a.dataset.route === route);
+            }
+            onRouteEnter(route);
+        }
+        function onRouteEnter(r) {
+            // Leaving Activity fully closes the modal (stops the timer, releases the
+            // scroll-lock) so it can't tick in the background or reappear on return.
+            if (r !== 'activity') closePlayer();
+            if (r === 'activity') enterActivity();
+            else if (r === 'cats') loadCats();
+        }
+        window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
+
+        // ================= ACTIVITY view =================
+        // No date picker — just the recent visits, newest first. /api/events returns the
+        // newest events (clustered motion, capped server-side); the client renders them
+        // newest-first. Reloaded each time the view is entered so it stays fresh.
+        async function enterActivity() {
+            loadRecentActivity();
+        }
+
+        async function loadRecentActivity() {
+            const seq = ++activitySeq;
+            closePlayer();
+            try {
+                hideNote(activityErrorEl);
+                const eres = await fetch('/api/events');
+                if (!eres.ok) throw new Error(await errorFromResponse(eres));
+                const edata = await eres.json();
+                if (seq !== activitySeq) return;
+                activityEvents = edata.events || [];
+                activityTruncated = !!edata.truncated;
+                renderActivity();
+            } catch (err) {
+                if (seq === activitySeq) showNote(activityErrorEl, `Couldn't load activity: ${err.message}`);
+            }
+        }
+
+        function renderActivity() {
+            railEl.innerHTML = '';
+            activitySelectedIndex = -1;
+            activityVisible = strangersOnly
+                ? activityEvents.filter(ev => !isResidentEvent(ev))
+                : activityEvents.slice();
+
+            if (activityTruncated) {
+                showNote(activityTruncatedEl,
+                    `Showing the ${activityEvents.length} most recent visits.`);
+            } else {
+                hideNote(activityTruncatedEl);
+            }
+
+            const empty = activityVisible.length === 0;
+            activityEmptyEl.classList.toggle('hidden', !empty);
+            if (empty) {
+                let big = 'Quiet at the door', line = 'No cats have crossed recently.';
+                if (activityEvents.length && strangersOnly) {
+                    big = 'Only our own cats here';
+                    line = 'Every recent visit was one of our residents.';
+                }
+                activityEmptyEl.innerHTML = '';
+                const b = document.createElement('div'); b.className = 'big'; b.textContent = big;
+                const p = document.createElement('div'); p.textContent = line;
+                activityEmptyEl.append(b, p);
+                closePlayer();
+                return;
+            }
+
+            // Build the time-rail: one day-group per calendar day, events newest-first.
+            let lastDay = null, currentRail = null;
+            activityVisible.forEach((ev, i) => {
+                const dk = startOfDay(ev.start_ts);
+                if (dk !== lastDay) {
+                    lastDay = dk;
+                    const group = document.createElement('div');
+                    group.className = 'day-group';
+                    const h = document.createElement('div');
+                    h.className = 'day-header';
+                    h.textContent = dayLabel(ev.start_ts);
+                    const rail = document.createElement('div');
+                    rail.className = 'rail';
+                    group.append(h, rail);
+                    railEl.appendChild(group);
+                    currentRail = rail;
+                }
+                currentRail.appendChild(eventRow(ev, i));
+            });
+        }
+
+        function eventRow(ev, i) {
+            const kind = identityKind(ev.identity);
+            const row = document.createElement('div');
+            row.className = 'event-row';
+            row.dataset.index = String(i);
+            row.tabIndex = 0;
+            row.setAttribute('role', 'button');
+            const chipText = kind === 'resident' || kind === 'neighbour'
+                ? (ev.identity.cat_name || `cat #${ev.identity.cat_id}`)
+                : (kind === 'unknown' ? 'an unknown cat' : 'a cat');
+            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${chipText}. Open playback.`);
+
+            const dot = document.createElement('div');
+            dot.className = 'dot ' + kind;
+
+            const card = document.createElement('div');
+            card.className = 'event-card';
+
+            const port = document.createElement('div');
+            port.className = 'porthole';
+            const img = document.createElement('img');
+            img.src = `/media/${ev.rep_frame_id}`;
+            img.loading = 'lazy';
+            img.alt = '';
+            port.appendChild(img);
+
+            const meta = document.createElement('div');
+            meta.className = 'event-meta';
+            const time = document.createElement('div');
+            time.className = 'event-time';
+            time.textContent = timeOfDay(ev.start_ts);
+            const rel = document.createElement('div');
+            rel.className = 'event-rel';
+            rel.textContent = relativeTime(ev.start_ts);
+            meta.append(time, rel);
+            const chip = identityChip(ev.identity);
+            if (chip) meta.appendChild(chip);
+
+            card.append(port, meta);
+            row.append(dot, card);
+            return row;
+        }
+
+        function highlightSelectedRow() {
+            for (const el of railEl.querySelectorAll('.event-row')) {
+                el.classList.toggle('selected', Number(el.dataset.index) === activitySelectedIndex);
+            }
+        }
+
+        // Single click / tap opens playback; Enter or Space when a card is focused.
+        railEl.addEventListener('click', (e) => {
+            const row = e.target.closest('.event-row');
+            if (!row) return;
+            openEvent(Number(row.dataset.index));
+        });
+        railEl.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+            const row = e.target.closest('.event-row');
+            if (!row) return;
+            e.preventDefault();
+            openEvent(Number(row.dataset.index));
+        });
+
+        // Client-only re-slice — close the player first so a selection into the old
+        // (unfiltered) list can't dangle after the visible list shrinks.
+        strangersOnlyEl.addEventListener('change', () => {
+            strangersOnly = strangersOnlyEl.checked;
+            closePlayer();
+            renderActivity();
+        });
+
+        // ================= playback modal =================
+        async function openEvent(i) {
+            if (i < 0 || i >= activityVisible.length) return;
+            const ev = activityVisible[i];
+            const seq = ++playerSeq;
+            pausePlayback();
+            activitySelectedIndex = i;
+            highlightSelectedRow();
+
+            const wasHidden = modalEl.classList.contains('hidden');
+            modalEl.classList.remove('hidden');
+            document.body.classList.add('modal-open');
+            if (wasHidden) dialogEl.focus();
+
+            // Header: when + identity chip.
+            playerWhenEl.textContent = formatTime(ev.start_ts);
+            playerChipSlotEl.innerHTML = '';
+            const chip = identityChip(ev.identity);
+            if (chip) playerChipSlotEl.appendChild(chip);
+
+            // Reset to a loading state so a slow fetch never shows the previous event.
+            playerFrames = []; playerImages = []; playerTiles = [];
+            playerIndex = 0;
+            playerImgEl.removeAttribute('src');
+            playerCountEl.textContent = '—';
+            playerFilmstripEl.innerHTML = '<div class="loading">Loading frames…</div>';
+            playerPlayBtn.disabled = true;
+            playerScrubEl.disabled = true;
+            playerScrubEl.min = '0'; playerScrubEl.max = '0'; playerScrubEl.value = '0';
+            updatePlayerNav();
+            try {
+                // Sample the WHOLE span evenly (id ASC) so a long visit plays from its
+                // beginning; sample_frames returns every frame when short, an even spread
+                // when long — already chronological.
+                const sp = new URLSearchParams({ count: String(MAX_PLAY_FRAMES) });
+                addBounds(sp, ev.start_id, ev.end_id);
+                const sres = await fetch('/api/frames/sample?' + sp.toString());
+                if (!sres.ok) throw new Error(await errorFromResponse(sres));
+                const sdata = await sres.json();
+                if (seq !== playerSeq) return;
+                playerFrames = sdata.frames || [];
+                playerImages = [];
+                preloadAround(0);
+                buildFilmstrip(ev.rep_frame_id);
+                playerScrubEl.max = String(Math.max(0, playerFrames.length - 1));
+                playerScrubEl.disabled = playerFrames.length <= 1;
+                playerPlayBtn.disabled = playerFrames.length <= 1;
+                if (playerFrames.length) showPlayerFrame(0);
+                else playerFilmstripEl.innerHTML = '<div class="loading">No frames left for this event — they may have aged out.</div>';
+                updatePlayerNav();
+                startPlayback();
+            } catch (err) {
+                if (seq === playerSeq) {
+                    playerFilmstripEl.innerHTML = '<div class="loading">Couldn\'t load these frames.</div>';
+                }
+            }
+        }
+
+        function buildFilmstrip(repId) {
+            playerFilmstripEl.innerHTML = '';
+            playerTiles = playerFrames.map((f, idx) => {
+                const tile = document.createElement('div');
+                tile.className = 'film-tile' + (f.id === repId ? ' film-rep' : '');
+                const im = document.createElement('img');
+                im.src = f.url; im.loading = 'lazy'; im.alt = '';
+                tile.appendChild(im);
+                tile.addEventListener('click', () => { pausePlayback(); showPlayerFrame(idx); });
+                return tile;
+            });
+            for (const t of playerTiles) playerFilmstripEl.appendChild(t);
+        }
+
+        function preloadAround(idx) {
+            const end = Math.min(playerFrames.length, Math.max(0, idx) + PRELOAD_AHEAD);
+            for (let i = Math.max(0, idx); i < end; i++) {
+                if (!playerImages[i]) {
+                    const im = new Image();
+                    im.src = playerFrames[i].url;
+                    playerImages[i] = im;
+                }
+            }
+        }
+
+        function showPlayerFrame(idx) {
+            if (!playerFrames.length) return;
+            idx = Math.max(0, Math.min(idx, playerFrames.length - 1));
+            playerIndex = idx;
+            preloadAround(idx);
+            const f = playerFrames[idx];
+            playerImgEl.src = f.url;
+            playerCountEl.textContent = `${idx + 1} / ${playerFrames.length}`;
+            if (playerScrubEl.value !== String(idx)) playerScrubEl.value = String(idx);
+            playerTiles.forEach((t, j) => t.classList.toggle('film-current', j === idx));
+            const cur = playerTiles[idx];
+            if (cur) {
+                const cr = cur.getBoundingClientRect();
+                const sr = playerFilmstripEl.getBoundingClientRect();
+                if (cr.left < sr.left || cr.right > sr.right) {
+                    playerFilmstripEl.scrollLeft += (cr.left - sr.left) - (sr.width - cr.width) / 2;
+                }
+            }
+        }
+
+        function stopPlayerTimer() {
+            if (playerTimer !== null) { clearInterval(playerTimer); playerTimer = null; }
+        }
+        function startPlayback() {
+            if (playerFrames.length <= 1) return;
+            stopPlayerTimer();
+            playerPlaying = true;
+            playerPlayBtn.textContent = 'Pause';
+            playerTimer = setInterval(() => {
+                let next = playerIndex + 1;
+                if (next >= playerFrames.length) next = 0;   // loop
+                showPlayerFrame(next);
+            }, PLAYER_FPS_MS);
+        }
+        function pausePlayback() {
+            stopPlayerTimer();
+            playerPlaying = false;
+            playerPlayBtn.textContent = 'Play';
+        }
+        function togglePlayback() { if (playerPlaying) pausePlayback(); else startPlayback(); }
+
+        function closePlayer() {
+            pausePlayback();
+            modalEl.classList.add('hidden');
+            document.body.classList.remove('modal-open');
+            activitySelectedIndex = -1;
+            highlightSelectedRow();
+            playerFrames = []; playerImages = []; playerTiles = [];
+            playerIndex = 0;
+        }
+
+        function moveEvent(delta) {
+            if (!activityVisible.length) return;
+            const next = activitySelectedIndex + delta;
+            if (next < 0 || next >= activityVisible.length) return;
+            openEvent(next);
+        }
+        function updatePlayerNav() {
+            playerPrevBtn.disabled = activitySelectedIndex <= 0;
+            playerNextBtn.disabled = activitySelectedIndex < 0 || activitySelectedIndex >= activityVisible.length - 1;
+        }
+
+        playerPlayBtn.addEventListener('click', togglePlayback);
+        playerPrevBtn.addEventListener('click', () => moveEvent(-1));
+        playerNextBtn.addEventListener('click', () => moveEvent(1));
+        playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
+        playerCloseBtn.addEventListener('click', closePlayer);
+
+        // Backdrop close: only when BOTH press and release land on the overlay itself
+        // (never the dialog) — so a scrub/tile drag that releases over the backdrop
+        // doesn't close the modal.
+        let pressOnBackdrop = false;
+        modalEl.addEventListener('mousedown', (e) => { pressOnBackdrop = e.target === modalEl; });
+        modalEl.addEventListener('click', (e) => {
+            if (e.target === modalEl && pressOnBackdrop) closePlayer();
+        });
+
+        // Keyboard: only while the modal is open. Esc closes (checked before the typing
+        // guard); Space toggles play, arrows scrub (suppressed while focused in an input).
+        document.addEventListener('keydown', (e) => {
+            if (modalEl.classList.contains('hidden')) return;
+            if (e.key === 'Escape') { closePlayer(); e.preventDefault(); return; }
+            const tag = (e.target && e.target.tagName) || '';
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            if (e.key === ' ' || e.key === 'Spacebar') { togglePlayback(); e.preventDefault(); }
+            else if (e.key === 'ArrowRight') { pausePlayback(); showPlayerFrame(playerIndex + 1); e.preventDefault(); }
+            else if (e.key === 'ArrowLeft') { pausePlayback(); showPlayerFrame(playerIndex - 1); e.preventDefault(); }
+        });
+
+        // ================= CATS view =================
+        async function loadCats() {
+            hideNote(catsErrorEl);
+            try {
+                const res = await fetch('/api/cats/overview');
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                renderCats(data);
+            } catch (err) {
+                catsBodyEl.innerHTML = '';
+                showNote(catsErrorEl, `Couldn't load the cats: ${err.message}`);
+            }
+        }
+
+        function renderCats(data) {
+            const cats = (data.cats || []).filter(c => c.active !== 0);
+            const residents = cats.filter(c => c.is_resident);
+            const neighbours = cats.filter(c => !c.is_resident);
+
+            // Model note explains WHY last-seen may be blank — so "Not seen yet" never
+            // reads as "the camera saw nothing".
+            if (!data.has_model) {
+                showNote(catsModelNoteEl,
+                    "Identification isn't set up yet — build and promote a gallery in the Admin console to start naming cats.");
+            } else if (data.uncalibrated) {
+                showNote(catsModelNoteEl,
+                    "The model needs more labelled photos before it can name cats with confidence, so last-seen may be blank for now.");
+            } else {
+                hideNote(catsModelNoteEl);
+            }
+
+            catsBodyEl.innerHTML = '';
+            if (!cats.length) {
+                const empty = document.createElement('div');
+                empty.className = 'empty';
+                empty.innerHTML = '<div class="big">No cats yet</div><div>Add and label cats in the Admin console — they show up here.</div>';
+                catsBodyEl.appendChild(empty);
+                return;
+            }
+            if (residents.length) catsBodyEl.appendChild(catsSection('Our cats', 'The cats who live here.', residents));
+            if (neighbours.length) catsBodyEl.appendChild(catsSection('Neighbours', 'Named cats that visit but live elsewhere.', neighbours));
+        }
+
+        function catsSection(title, kicker, list) {
+            const sec = document.createElement('div');
+            sec.className = 'cats-section';
+            const h = document.createElement('h2');
+            h.textContent = title;
+            const k = document.createElement('span');
+            k.className = 'kicker';
+            k.textContent = `${list.length}`;
+            h.appendChild(k);
+            const grid = document.createElement('div');
+            grid.className = 'cat-grid';
+            for (const c of list) grid.appendChild(catCard(c));
+            sec.append(h, grid);
+            // secondary line describing the group
+            const lead = document.createElement('p');
+            lead.className = 'lead';
+            lead.textContent = kicker;
+            sec.insertBefore(lead, grid);
+            return sec;
+        }
+
+        function catCard(cat) {
+            const card = document.createElement('div');
+            card.className = 'cat-card';
+
+            const wrap = document.createElement('div');
+            wrap.className = 'avatar-wrap';
+            const initial = (cat.name || '?').trim().charAt(0).toUpperCase() || '?';
+            const fallback = document.createElement('div');
+            fallback.className = 'avatar-fallback';
+            fallback.textContent = initial;
+            fallback.style.display = 'none';
+            const img = document.createElement('img');
+            img.alt = cat.name || 'Cat';
+            // On load error (a crop file evicted between overview and this request)
+            // fall back to the initial — defensive; the has_avatar gate below means
+            // we normally never request an avatar that isn't there.
+            img.addEventListener('error', () => {
+                img.style.display = 'none';
+                fallback.style.display = 'flex';
+            });
+            // Only fetch when the roster says a photo exists (uploaded OR a labelled
+            // crop) — otherwise show the initial straight away, so a photoless cat
+            // never fires a 404 for its avatar.
+            if (cat.has_avatar) {
+                img.src = `/api/cats/${cat.id}/avatar?v=${avatarBust[cat.id] || 0}`;
+            } else {
+                img.style.display = 'none';
+                fallback.style.display = 'flex';
+            }
+            wrap.append(img, fallback);
+
+            const name = document.createElement('div');
+            name.className = 'cat-name';
+            name.textContent = cat.name || `Cat #${cat.id}`;
+
+            const tag = document.createElement('div');
+            tag.className = 'cat-tag ' + (cat.is_resident ? 'resident' : 'neighbour');
+            tag.textContent = cat.is_resident ? 'Resident' : 'Neighbour';
+
+            const seen = document.createElement('div');
+            seen.className = 'cat-seen';
+            if (typeof cat.last_seen_ts === 'number') {
+                seen.textContent = `Last seen ${formatTime(cat.last_seen_ts)} · ${relativeTime(cat.last_seen_ts)}`;
+            } else {
+                const span = document.createElement('span');
+                span.className = 'never';
+                span.textContent = 'Not seen yet.';
+                seen.appendChild(span);
+            }
+
+            // Quiet "Set photo" — a hidden file input behind a text control.
+            const label = document.createElement('label');
+            label.className = 'set-photo';
+            label.textContent = 'Set photo';
+            const file = document.createElement('input');
+            file.type = 'file';
+            file.accept = 'image/*';
+            file.addEventListener('change', () => {
+                const f = file.files && file.files[0];
+                if (f) uploadAvatar(cat.id, f, label);
+                file.value = '';   // let the same file be re-picked later
+            });
+            label.appendChild(file);
+
+            card.append(wrap, name, tag, seen, label);
+            return card;
+        }
+
+        // Normalize EXIF orientation client-side (the server's cv2 re-encode drops the
+        // EXIF tag, so a phone photo would otherwise land sideways), downscale, and
+        // export a JPEG blob to POST as the raw request body.
+        async function normalizeImage(file) {
+            const MAX_DIM = 1024;
+            let src, w, h;
+            try {
+                src = await createImageBitmap(file, { imageOrientation: 'from-image' });
+                w = src.width; h = src.height;
+            } catch {
+                src = await loadImageEl(file);
+                w = src.naturalWidth; h = src.naturalHeight;
+            }
+            if (!w || !h) throw new Error('that file is not an image we can read');
+            const scale = Math.min(1, MAX_DIM / Math.max(w, h));
+            const cw = Math.max(1, Math.round(w * scale));
+            const ch = Math.max(1, Math.round(h * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = cw; canvas.height = ch;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(src, 0, 0, cw, ch);
+            if (src.close) src.close();
+            return await new Promise((resolve, reject) => {
+                canvas.toBlob(b => b ? resolve(b) : reject(new Error('could not encode the image')), 'image/jpeg', 0.9);
+            });
+        }
+        function loadImageEl(file) {
+            return new Promise((resolve, reject) => {
+                const url = URL.createObjectURL(file);
+                const im = new Image();
+                im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+                im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('that file is not an image we can read')); };
+                im.src = url;
+            });
+        }
+
+        async function uploadAvatar(catId, file, labelEl) {
+            hideNote(catsErrorEl);
+            labelEl.classList.add('busy');
+            const prev = labelEl.firstChild;   // the text node
+            labelEl.firstChild.textContent = 'Uploading…';
+            try {
+                const blob = await normalizeImage(file);
+                const res = await fetch(`/api/cats/${catId}/avatar`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'image/jpeg' },
+                    body: blob,
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                avatarBust[catId] = Date.now();   // bust the cache so the new photo shows
+                await loadCats();                  // re-render (rebuilds this card)
+            } catch (err) {
+                showNote(catsErrorEl, `Couldn't set the photo: ${err.message}`);
+                labelEl.classList.remove('busy');
+                if (prev) prev.textContent = 'Set photo';
+            }
+        }
+
+        // ================= boot =================
+        setRoute(location.hash.slice(1) || 'activity');
+    })();
+    </script>
+</body>
+</html>

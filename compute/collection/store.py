@@ -3395,3 +3395,102 @@ class Store:
             ).fetchone()
             self._conn.commit()
         return self._cat_to_dict(row)
+
+    # --- User-dashboard "Cats" view (user-activity-cats spec) --------------
+
+    def cats_overview(self) -> "list[dict]":
+        """The roster plus per-cat live last-seen and whether a labelled crop exists.
+
+        Backs the user dashboard's Cats view. Starts from ``list_cats``/``_cat_to_dict``
+        (id-ASC roster order) and augments each cat dict with:
+
+        - ``last_seen_ts`` / ``last_seen_frame_id``: derived by REUSING ``events()``
+          — the same newest-first activity feed, each event already carrying its
+          aggregated ``identity``. Per cat we keep the FIRST (newest) event whose
+          ``identity`` is not ``None`` and names that cat, taking that event's
+          ``start_ts`` and ``rep_frame_id``. Deriving from the feed (rather than a
+          direct ``identifications`` query) means the Cats and Activity views can
+          never name a moment differently, and the uncalibrated fail-safe carries
+          over for free: an uncalibrated model resolves every event to "unknown", so
+          no cat matches and every last-seen is ``None``. A cat absent from the feed
+          (never positively matched in the retained window) → both ``None``. This is
+          "last matched in the recent feed", not the cat's whole history — the feed
+          clusters only retained motion frames and sees only identifications an
+          identify pass / the live worker wrote.
+        - ``has_crop``: from ONE grouped ``SELECT DISTINCT cat_id`` over the durable
+          ``identified`` crops (not a per-cat query), so the UI can show a photo the
+          moment a cat is annotated, before any gallery is promoted.
+        """
+        roster = self.list_cats()
+
+        # One grouped read: which cats have at least one durable labelled crop.
+        with self._lock:
+            crop_rows = self._conn.execute(
+                "SELECT DISTINCT cat_id FROM dataset_items"
+                " WHERE label_kind = 'identified' AND crop_path IS NOT NULL"
+            ).fetchall()
+        with_crop = {int(r[0]) for r in crop_rows if r[0] is not None}
+
+        # Reuse the whole activity feed (newest-first, identity-joined). Walk it once
+        # and record the newest matching event per cat — the first hit wins because
+        # events() is already sorted newest-first.
+        last_seen: "dict[int, dict]" = {}
+        for event in self.events(None, None)["events"]:
+            identity = event.get("identity")
+            if identity is None:
+                continue
+            cid = identity.get("cat_id")
+            if cid is None or cid in last_seen:
+                continue
+            last_seen[int(cid)] = {
+                "last_seen_ts": event["start_ts"],
+                "last_seen_frame_id": event["rep_frame_id"],
+            }
+
+        for cat in roster:
+            seen = last_seen.get(cat["id"])
+            cat["last_seen_ts"] = seen["last_seen_ts"] if seen else None
+            cat["last_seen_frame_id"] = seen["last_seen_frame_id"] if seen else None
+            cat["has_crop"] = cat["id"] in with_crop
+        return roster
+
+    def cat_avatar_crop_path(self, cat_id: int) -> "str | None":
+        """Absolute path of the representative durable labelled crop for ``cat_id``, or ``None``.
+
+        The auto-avatar fallback when the household hasn't uploaded a photo (see the
+        user-activity-cats spec). Among the cat's ``identified`` crops with a
+        materialised file, prefers ``quality='gallery'`` → ``'ok'`` → any other
+        grade, and within a grade the most recent by (``labeled_ts`` DESC, ``id``
+        DESC) — one indexed pick, no row materialised for the losers. The
+        ``crop_path`` is joined to ``dataset_root`` (absolute) exactly like
+        ``labeled_crops`` so the API opens it without knowing the store layout.
+        Returns ``None`` when the cat has no durable labelled crop.
+
+        Returns only the single top-ranked crop — no secondary-crop scan. If that
+        one row's file is gone the avatar route's ``isfile`` guard falls through to
+        404 (never a 500); it does NOT try the cat's next crop. That row-kept /
+        file-gone state is rare because relabel/undo deletes a crop's row and file
+        together (see the annotation-tool undo path), so a single pick is enough.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT crop_path FROM dataset_items"
+                " WHERE cat_id = ? AND label_kind = 'identified' AND crop_path IS NOT NULL"
+                " ORDER BY CASE quality WHEN 'gallery' THEN 0 WHEN 'ok' THEN 1 ELSE 2 END,"
+                " labeled_ts DESC, id DESC"
+                " LIMIT 1",
+                (int(cat_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return os.path.join(self._dataset_root, row[0])
+
+    def avatar_path(self, cat_id: int) -> str:
+        """The convention path for a cat's UPLOADED avatar: ``<dataset_root>/avatars/cat_<id>.jpg``.
+
+        One place owns the avatar file layout; the file's PRESENCE is the "manual
+        avatar set" flag (no ``cats``-table column). Existence is NOT guaranteed —
+        the caller checks ``os.path.isfile``. Under ``dataset_root`` it survives
+        eviction and ``clear()`` like the other durable labelled output.
+        """
+        return os.path.join(self._dataset_root, "avatars", f"cat_{int(cat_id)}.jpg")

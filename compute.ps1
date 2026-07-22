@@ -119,7 +119,8 @@ $AutoOn = $env:CAT_COLLECT_AUTOSTART -match '^\s*(1|true|yes|on)\s*$'
 Write-Host "[compute] edge stream: $PiUrl"
 Write-Host "[compute] store:       $StoreDir  (cap $MaxBytes bytes)"
 Write-Host "[compute] autostart:   $(if ($AutoOn) { 'ON  (collecting at launch)' } else { 'off (click Start in the UI)' })"
-Write-Host "[compute] browse UI:   http://localhost:$Port   (Ctrl-C to stop)"
+Write-Host "[compute] user page:   http://localhost:$Port   (blank placeholder)"
+Write-Host "[compute] admin UI:    http://localhost:$Port/admin   (workbench; Ctrl-C to stop)"
 
 # --factory: create_app() builds the store and wires the collector; it begins at
 # launch because CAT_COLLECT_AUTOSTART is defaulted on above (set it to 0 to stay

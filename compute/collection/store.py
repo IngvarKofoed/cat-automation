@@ -1187,7 +1187,12 @@ class Store:
                 pass
 
     def iter_unanalyzed(
-        self, analyzer: str, batch: int = 512, since_id: "int | None" = None, until_id: "int | None" = None
+        self,
+        analyzer: str,
+        batch: int = 512,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        motion_only: bool = False,
     ):
         """Yield ``(frame_id, abs_path)`` for frames lacking a verdict for ``analyzer``.
 
@@ -1206,17 +1211,24 @@ class Store:
         pushing ``done`` past ``total``. ``since_id`` is the symmetric floor
         (``f.id >= since_id``) that scopes the sweep to a group's window; both
         ``None`` sweeps the whole store exactly as before.
+
+        ``motion_only`` (opt-in, default off) additionally restricts the sweep to
+        ``frames.motion = 1`` — the tight/fast path the Activity "Analyze" button
+        uses: at continuous ~5 fps capture the non-motion frames are the vast
+        majority, so a motion-only re-detect over a visit window costs a fraction of
+        a full sweep. Off, every frame is a candidate exactly as before.
         """
         last_id = 0
         range_frags, range_params = _range_bounds("f.id", since_id, until_id)
         range_sql = "".join(" AND " + frag for frag in range_frags)
+        motion_sql = " AND f.motion = 1" if motion_only else ""
         while True:
             params: list = [analyzer, last_id] + range_params + [int(batch)]
             with self._lock:
                 rows = self._conn.execute(
                     "SELECT f.id, f.path FROM frames f"
                     " LEFT JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ?"
-                    " WHERE a.frame_id IS NULL AND f.id > ?" + range_sql +
+                    " WHERE a.frame_id IS NULL AND f.id > ?" + range_sql + motion_sql +
                     " ORDER BY f.id ASC LIMIT ?",
                     params,
                 ).fetchall()
@@ -1292,7 +1304,11 @@ class Store:
         ]
 
     def count_unanalyzed(
-        self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
+        self,
+        analyzer: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        motion_only: bool = False,
     ) -> int:
         """Count of frames with no verdict for ``analyzer`` — a stateless sweep's TODO.
 
@@ -1300,16 +1316,19 @@ class Store:
         matching ``iter_unanalyzed``'s cap so this count is the true denominator
         for exactly the frames that pass will visit; ``since_id`` (``f.id >=
         since_id``) is the symmetric floor for a scoped sweep. Both ``None`` counts
-        the whole store's un-analyzed frames exactly as before.
+        the whole store's un-analyzed frames exactly as before. ``motion_only`` mirrors
+        ``iter_unanalyzed``'s opt-in ``frames.motion = 1`` restriction so the progress
+        denominator matches exactly what a motion-only pass will visit.
         """
         range_frags, range_params = _range_bounds("f.id", since_id, until_id)
         range_sql = "".join(" AND " + frag for frag in range_frags)
+        motion_sql = " AND f.motion = 1" if motion_only else ""
         params: list = [analyzer] + range_params
         with self._lock:
             (count,) = self._conn.execute(
                 "SELECT COUNT(*) FROM frames f"
                 " LEFT JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ?"
-                " WHERE a.frame_id IS NULL" + range_sql,
+                " WHERE a.frame_id IS NULL" + range_sql + motion_sql,
                 params,
             ).fetchone()
         return int(count)
@@ -1401,7 +1420,11 @@ class Store:
         return {"total": int(total), "analyzed": int(analyzed), "present": int(present)}
 
     def clear_analysis(
-        self, analyzer: str, since_id: "int | None" = None, until_id: "int | None" = None
+        self,
+        analyzer: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        motion_only: bool = False,
     ) -> int:
         """Delete verdicts for ``analyzer``; return the rowcount.
 
@@ -1415,12 +1438,23 @@ class Store:
         group re-verdicts just that window instead of discarding every verdict
         OUTSIDE it — the whole-store clear a scoped run does NOT want. Unscoped
         (both ``None``) it clears the analyzer's whole slot exactly as before.
+
+        ``motion_only`` (opt-in) further restricts the delete to MOTION frames'
+        verdicts, so a motion-only reanalyze (the Activity "Analyze" button) re-detects
+        the visit's motion frames WITHOUT wiping the non-motion frames' verdicts a
+        breadth sweep produced — the tight button must not degrade the store's wider
+        coverage. Paired with ``iter_unanalyzed(motion_only=True)`` so cleared and
+        re-visited frames are the same set.
         """
         range_frags, range_params = _range_bounds("frame_id", since_id, until_id)
         range_sql = "".join(" AND " + frag for frag in range_frags)
+        # Motion scoping is enforced via the shared frames.motion flag: only rows whose
+        # frame is a motion frame are cleared (the range on frame_id already bounds it).
+        motion_sql = " AND frame_id IN (SELECT id FROM frames WHERE motion = 1)" if motion_only else ""
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM analysis WHERE analyzer = ?" + range_sql, [analyzer] + range_params
+                "DELETE FROM analysis WHERE analyzer = ?" + range_sql + motion_sql,
+                [analyzer] + range_params,
             )
             self._conn.commit()
             return cur.rowcount

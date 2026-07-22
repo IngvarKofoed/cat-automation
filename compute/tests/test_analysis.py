@@ -367,6 +367,39 @@ def test_clear_analysis_scoped_to_id_range_preserves_out_of_window(tmp_path):
         assert store.count_unanalyzed("yolo", since_id=fid, until_id=fid) == 0  # verdict kept
 
 
+def test_iter_and_count_unanalyzed_motion_only(tmp_path):
+    # The tight Activity "Analyze" path: motion_only restricts the stateless sweep to
+    # frames.motion=1, so at continuous capture it skips the non-motion majority.
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i, ts=i, motion=(i % 2 == 0), area=0.1), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(6)
+    ]
+    motion_ids = [ids[i] for i in range(6) if i % 2 == 0]
+    assert [fid for fid, _ in store.iter_unanalyzed("yolo", motion_only=True)] == motion_ids
+    assert store.count_unanalyzed("yolo", motion_only=True) == len(motion_ids)
+    # Default (off) still sees every frame, exactly as before.
+    assert [fid for fid, _ in store.iter_unanalyzed("yolo")] == ids
+    assert store.count_unanalyzed("yolo") == 6
+
+
+def test_clear_analysis_motion_only_spares_non_motion_verdicts(tmp_path):
+    # A motion-only reanalyze clear drops MOTION frames' verdicts (so they re-detect) but
+    # SPARES non-motion verdicts a breadth sweep produced — the tight button must not
+    # degrade the store's wider coverage.
+    store = _store(tmp_path)
+    m = store.add(_frame(frame_id=1, ts=1, motion=True, area=0.1), recv_ts_ms=1_700_000_000_001)
+    n = store.add(_frame(frame_id=2, ts=2, motion=False, area=0.0), recv_ts_ms=1_700_000_000_002)
+    store.write_analysis(m, "yolo-serial", True, 0.9, {"boxes": []})
+    store.write_analysis(n, "yolo-serial", False, 0.0, {"boxes": []})
+
+    deleted = store.clear_analysis("yolo-serial", motion_only=True)
+    assert deleted == 1  # only the motion frame's verdict
+    unanalyzed = {fid for fid, _ in store.iter_unanalyzed("yolo-serial")}
+    assert m in unanalyzed      # motion verdict cleared -> frame re-detects
+    assert n not in unanalyzed  # non-motion verdict spared
+
+
 # --- Store: cascade (eviction + clear drop analysis rows) ---------------------
 
 

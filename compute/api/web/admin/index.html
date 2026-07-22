@@ -1557,7 +1557,7 @@
                 <div class="control-group">
                     <label>&nbsp;</label>
                     <button type="button" id="activityAnalyzeBtn" class="btn-secondary"
-                        title="Re-run the yolo-serial detector over the events in this date range (reanalyze), so cat / person / bird subjects are (re)detected. This is the DETECT step; Identify then matches detected cats to the gallery. Progress shows on Sweeps.">Analyze</button>
+                        title="Re-detect just the LOADED events' motion frames with yolo-serial (tight + fast), so cat / person / bird subjects are (re)detected. This is the DETECT step; Identify then matches detected cats to the gallery. For whole-window / non-motion coverage use Sweeps. Progress shows on Sweeps.">Analyze</button>
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
@@ -5908,19 +5908,25 @@
             if (w) triggerIdentify(w.since_id, w.until_id);
         });
 
-        // The Activity "Analyze" button: re-DETECT the shown window with yolo-serial so the
-        // broadened detector rewrites its verdicts and the subjects (cat/person/bird) backfill.
+        // The Activity "Analyze" button: re-DETECT just the LOADED events with yolo-serial so
+        // the broadened detector rewrites their verdicts and the subjects (cat/person/bird)
+        // backfill. Deliberately TIGHT + FAST, not a breadth tool (that's Sweeps/buckets):
+        //   - scope = the id span the loaded events cover (their min start_id .. max end_id),
+        //     NOT the whole date window; the loaded events are the newest contiguous block, so
+        //     that span's motion frames are exactly those events' frames.
+        //   - motion_only=true so it skips the non-motion majority (~95% at continuous capture)
+        //     — the reanalyze clear is motion-scoped server-side, so it re-detects the visits'
+        //     motion frames WITHOUT wiping non-motion verdicts a breadth sweep produced.
         // Distinct from Identify, which only MATCHES already-detected cats to the gallery — this
-        // is the detect step. Enqueues onto the analysis (Sweeps) queue with reanalyze=true
-        // (reanalyze so frames already scored cat-only get re-detected, not skipped), then points
-        // the user to Sweeps for progress. The button reflects a running yolo-serial sweep.
+        // is the detect step. Enqueues onto the analysis (Sweeps) queue; the button reflects a
+        // running yolo-serial sweep and points the user to Sweeps for progress.
         function renderAnalyzeControl() {
             const runningSerial = !!analysisStatus.running && analysisStatus.analyzer === 'yolo-serial';
             activityAnalyzeBtn.disabled = analyzeSubmitting || runningSerial;
             activityAnalyzeBtn.textContent = analyzeSubmitting ? 'Enqueuing…'
                 : (runningSerial ? 'Analyzing…' : 'Analyze');
         }
-        async function triggerAnalyze(sinceId, untilId) {
+        async function triggerAnalyze(sinceId, untilId, nEvents) {
             try {
                 clearError();
                 activityAnalyzeNoteEl.classList.add('hidden');
@@ -5929,13 +5935,17 @@
                 const res = await fetch('/api/analysis/run', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ analyzer: 'yolo-serial', reanalyze: true, since_id: sinceId, until_id: untilId }),
+                    body: JSON.stringify({
+                        analyzer: 'yolo-serial', reanalyze: true, motion_only: true,
+                        since_id: sinceId, until_id: untilId,
+                    }),
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const data = await res.json();
+                const scope = `the ${nEvents} loaded event${nEvents === 1 ? '' : 's'} (motion frames)`;
                 activityAnalyzeNoteEl.textContent = (data.position > 0)
-                    ? `Re-detecting this window (yolo-serial) — queued at position ${data.position}. Track progress on Sweeps, then reload Activity.`
-                    : 'Re-detecting this window (yolo-serial). Track progress on Sweeps, then reload Activity to see the new subjects.';
+                    ? `Re-detecting ${scope} — queued at position ${data.position}. Track progress on Sweeps, then reload Activity.`
+                    : `Re-detecting ${scope}. Track progress on Sweeps, then reload Activity to see the new subjects.`;
                 activityAnalyzeNoteEl.classList.remove('hidden');
             } catch (err) {
                 showError(`Analyze failed: ${err.message}`);
@@ -5945,9 +5955,18 @@
                 pollAnalysisStatus();
             }
         }
-        activityAnalyzeBtn.addEventListener('click', async () => {
-            const w = await resolveActivityWindow();
-            if (w) triggerAnalyze(w.since_id, w.until_id);
+        activityAnalyzeBtn.addEventListener('click', () => {
+            if (!activityEvents.length) {
+                activityAnalyzeNoteEl.textContent = 'Load events first — Analyze re-detects the loaded events.';
+                activityAnalyzeNoteEl.classList.remove('hidden');
+                return;
+            }
+            // Bounding id-span of the loaded (newest-first) events. They form a contiguous
+            // newest block, so [min start_id, max end_id] holds exactly their frames; paired
+            // with motion_only the sweep touches only those events' motion frames.
+            const since = Math.min(...activityEvents.map(ev => ev.start_id));
+            const until = Math.max(...activityEvents.map(ev => ev.end_id));
+            triggerAnalyze(since, until, activityEvents.length);
         });
 
         // ================= init =================

@@ -92,6 +92,7 @@ def run_analysis(
     reanalyze: bool = False,
     since_id: "int | None" = None,
     until_id: "int | None" = None,
+    motion_only: bool = False,
 ) -> None:
     """Run ``analyzer`` over every applicable frame in ``store``, writing a verdict each.
 
@@ -185,7 +186,14 @@ def run_analysis(
     # window, so re-running an oracle over one group no longer discards every verdict
     # OUTSIDE it (the whole-store disagreement view and other windows keep their verdicts).
     if reanalyze:
-        store.clear_analysis(analyzer.name, since_id=since, until_id=until)
+        # motion_only scopes the clear to MOTION frames only (the tight Activity "Analyze"
+        # path), so it doesn't wipe non-motion verdicts a breadth sweep produced. It applies
+        # only to the stateless path: a WINDOWED oracle revisits + overwrites every frame
+        # regardless, so its clear is never motion-scoped.
+        store.clear_analysis(
+            analyzer.name, since_id=since, until_id=until,
+            motion_only=motion_only and not analyzer.windowed,
+        )
 
     if analyzer.windowed:
         # Windowed oracle: drive the scoped window in time order so its rolling
@@ -196,8 +204,8 @@ def run_analysis(
     else:
         # Stateless oracle: drive only the in-scope un-verdicted frames so a re-run is
         # cheap; the denominator is that outstanding TODO count within [since, until].
-        iterator = store.iter_unanalyzed(analyzer.name, since_id=since, until_id=until)
-        total = store.count_unanalyzed(analyzer.name, since_id=since, until_id=until)
+        iterator = store.iter_unanalyzed(analyzer.name, since_id=since, until_id=until, motion_only=motion_only)
+        total = store.count_unanalyzed(analyzer.name, since_id=since, until_id=until, motion_only=motion_only)
     manager.set_total(total)
 
     logger.info(
@@ -429,17 +437,19 @@ class _Job:
     until_id: "int | None"
     params: "tuple | None"
     label: str
+    motion_only: bool = False
 
     def dedup_key(self) -> tuple:
         """The full job identity used to drop a duplicate enqueue.
 
-        ``(kind, params, reanalyze, since_id, until_id)`` — the spec's dedup key. ``params``
-        distinguishes two MOG2 candidates over the same window (different params → different
-        jobs); ``reanalyze`` distinguishes a plain sweep from a re-verdict of the same
-        oracle+window (otherwise a re-run would dedup away against the earlier run and
-        silently never happen).
+        ``(kind, params, reanalyze, since_id, until_id, motion_only)`` — the dedup key.
+        ``params`` distinguishes two MOG2 candidates over the same window (different params
+        → different jobs); ``reanalyze`` distinguishes a plain sweep from a re-verdict of the
+        same oracle+window (otherwise a re-run would dedup away against the earlier run and
+        silently never happen); ``motion_only`` keeps a tight motion-scoped sweep distinct
+        from a full sweep of the same oracle+window, so one never dedups away the other.
         """
-        return (self.kind, self.params, self.reanalyze, self.since_id, self.until_id)
+        return (self.kind, self.params, self.reanalyze, self.since_id, self.until_id, self.motion_only)
 
 
 class AnalysisManager:
@@ -515,6 +525,7 @@ class AnalysisManager:
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
+        motion_only: bool = False,
     ) -> dict:
         """Resolve a registered oracle by ``name`` and enqueue a sweep of it.
 
@@ -544,6 +555,7 @@ class AnalysisManager:
             until_id=until_id,
             params=None,
             label=name,
+            motion_only=bool(motion_only),
         )
         return self._enqueue(store, job)
 
@@ -728,7 +740,7 @@ class AnalysisManager:
         """
         error: "str | None" = None
         try:
-            run_analysis(store, job.analyzer, self, job.reanalyze, job.since_id, job.until_id)
+            run_analysis(store, job.analyzer, self, job.reanalyze, job.since_id, job.until_id, job.motion_only)
         except Exception as exc:
             logger.exception("analysis sweep failed")
             error = str(exc)

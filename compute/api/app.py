@@ -101,12 +101,18 @@ class AnalysisRunRequest(BaseModel):
     ``since_id`` / ``until_id`` optionally scope the sweep to a group's inclusive id
     window (``None`` on either side = unbounded, so an absent scope sweeps the whole
     store exactly as before — see the frame-range-groups spec).
+
+    ``motion_only`` (opt-in, default off) restricts the sweep to ``frames.motion = 1``
+    — the tight/fast path the Activity "Analyze" button uses to re-detect just a visit
+    window's motion frames without paying for the non-motion majority. Off, every frame
+    in scope is a candidate exactly as before.
     """
 
     analyzer: str
     reanalyze: bool = False
     since_id: "int | None" = None
     until_id: "int | None" = None
+    motion_only: bool = False
 
 
 # The six motion-gate params, in the edge's own vocabulary — the exact keys the Pi
@@ -1033,6 +1039,7 @@ def create_app(
                 reanalyze=req.reanalyze,
                 since_id=req.since_id,
                 until_id=req.until_id,
+                motion_only=req.motion_only,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

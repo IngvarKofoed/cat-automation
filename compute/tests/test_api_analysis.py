@@ -168,12 +168,16 @@ class SpyAnalysisManager(AnalysisManager):
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
+        motion_only: bool = False,
     ) -> dict:
         self.enqueue_calls.append(
-            {"name": name, "reanalyze": reanalyze, "since_id": since_id, "until_id": until_id}
+            {
+                "name": name, "reanalyze": reanalyze, "since_id": since_id,
+                "until_id": until_id, "motion_only": motion_only,
+            }
         )
         return super().enqueue_named(
-            store, name, reanalyze=reanalyze, since_id=since_id, until_id=until_id
+            store, name, reanalyze=reanalyze, since_id=since_id, until_id=until_id, motion_only=motion_only
         )
 
 
@@ -705,7 +709,7 @@ def test_analysis_run_forwards_since_id_until_id_to_manager(tmp_path):
     )
     assert resp.status_code == 200
     assert manager.enqueue_calls == [
-        {"name": "yolo", "reanalyze": False, "since_id": ids[0], "until_id": ids[1]}
+        {"name": "yolo", "reanalyze": False, "since_id": ids[0], "until_id": ids[1], "motion_only": False}
     ]
     body = resp.json()
     assert body["since_id"] == ids[0]
@@ -730,11 +734,30 @@ def test_analysis_run_absent_scope_forwards_none(tmp_path):
     resp = client.post("/api/analysis/run", json={"analyzer": "yolo"})
     assert resp.status_code == 200
     assert manager.enqueue_calls == [
-        {"name": "yolo", "reanalyze": False, "since_id": None, "until_id": None}
+        {"name": "yolo", "reanalyze": False, "since_id": None, "until_id": None, "motion_only": False}
     ]
     body = resp.json()
     assert body["since_id"] is None
     assert body["until_id"] is None
+
+
+@_requires_cv
+def test_analysis_run_forwards_motion_only(tmp_path):
+    # The tight Activity "Analyze" path sends motion_only=true; it must forward through
+    # to the manager (and thus to run_analysis) unchanged.
+    fake = FakeAnalyzer(name="yolo")
+    manager = SpyAnalysisManager(_make_resolver({"yolo": fake}))
+    client, store = _make_app_with_manager(tmp_path, manager)
+    store.add(_frame(frame_id=1, motion=True, area=0.1, body=_jpeg_gray(0)), recv_ts_ms=1_700_000_000_000)
+
+    resp = client.post(
+        "/api/analysis/run",
+        json={"analyzer": "yolo", "reanalyze": True, "motion_only": True},
+    )
+    assert resp.status_code == 200
+    assert manager.enqueue_calls == [
+        {"name": "yolo", "reanalyze": True, "since_id": None, "until_id": None, "motion_only": True}
+    ]
 
     _poll_until_done(client)
     assert store.analysis_summary("yolo")["analyzed"] == 1

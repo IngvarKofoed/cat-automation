@@ -164,36 +164,19 @@
         .view-head { margin-bottom: 1.25rem; }
         .view-head h1 { margin: 0 0 .15rem; font-size: clamp(1.6rem, 5vw, 2.1rem); }
         .view-head .sub { margin: 0; color: var(--muted); font-size: .95rem; }
+        /* Activity head: the title and the "Hide our cats" toggle share one line, so
+           the feed starts higher and more visits fit on screen. */
+        .activity-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: .5rem 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+        .activity-head h1 { margin: 0; }
 
         /* ================= controls ================= */
-        .controls {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: flex-end;
-            gap: .75rem 1rem;
-            padding: .9rem 1rem;
-            margin-bottom: 1.25rem;
-            background: var(--surface);
-            border: 1px solid var(--hairline);
-            border-radius: var(--radius);
-            box-shadow: var(--shadow);
-        }
-        .field { display: flex; flex-direction: column; gap: .25rem; }
-        .field label {
-            font-size: .72rem;
-            font-weight: 700;
-            letter-spacing: .04em;
-            text-transform: uppercase;
-            color: var(--muted);
-        }
-        .field input[type="date"] {
-            padding: .45rem .6rem;
-            background: var(--surface-2);
-            border: 1px solid var(--hairline);
-            border-radius: var(--radius-sm);
-            font-variant-numeric: tabular-nums;
-            min-width: 9.5rem;
-        }
         .btn {
             padding: .5rem 1rem;
             font-weight: 700;
@@ -226,14 +209,6 @@
             margin-left: auto;
         }
         .toggle input { width: 1.05rem; height: 1.05rem; accent-color: var(--porch); cursor: pointer; }
-
-        .storerange {
-            font-family: var(--font-mono);
-            font-variant-numeric: tabular-nums;
-            font-size: .8rem;
-            color: var(--muted);
-            margin: 0 0 1rem;
-        }
 
         /* ================= notes / states ================= */
         .note {
@@ -339,16 +314,17 @@
         .event-row:active .event-card { transform: translateY(1px); }
         .event-row.selected .event-card { border-color: var(--porch); box-shadow: 0 0 0 2px var(--porch-soft), var(--shadow-lift); }
 
-        /* the "porthole" — soft rounded frame that leans into the top-down view */
+        /* the "porthole" — a round thumbnail holding the cat's avatar for a known cat,
+           or the door frame for an unknown/unidentified visit. A clean circle (matching
+           the Cats page) now that it usually shows a face, not the top-down scene. */
         .porthole {
             flex: none;
-            width: 92px;
+            width: 72px;
             aspect-ratio: 1 / 1;
-            border-radius: 40% / 40%;
+            border-radius: 50%;
             overflow: hidden;
             background: var(--surface-2);
-            box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--porch) 22%, transparent), inset 0 0 14px rgba(0,0,0,.18);
-            position: relative;
+            box-shadow: inset 0 0 0 1px var(--hairline);
         }
         .porthole img { width: 100%; height: 100%; object-fit: cover; }
         .event-meta { display: flex; flex-direction: column; gap: .28rem; min-width: 0; }
@@ -547,7 +523,7 @@
         .filmstrip .loading { padding: 1rem; color: var(--muted); font-size: .85rem; }
 
         @media (max-width: 480px) {
-            .porthole { width: 76px; }
+            .porthole { width: 60px; }
             .event-time { font-size: 1.05rem; }
         }
         @media (prefers-reduced-motion: reduce) {
@@ -576,20 +552,15 @@
     <main class="page">
         <!-- ============ ACTIVITY ============ -->
         <section id="view-activity" class="view">
-            <div class="view-head">
+            <div class="view-head activity-head">
                 <h1>At the door</h1>
-                <p class="sub">Every cat that crossed the threshold, newest first.</p>
-            </div>
-
-            <div class="controls">
                 <label class="toggle">
                     <input type="checkbox" id="strangersOnly">
-                    Non-residents &amp; unidentified only
+                    Hide our cats
                 </label>
             </div>
 
             <div class="note error hidden" id="activityError"></div>
-            <div class="note info hidden" id="activityTruncated"></div>
             <div class="empty hidden" id="activityEmpty"></div>
 
             <div id="activityRail"></div>
@@ -665,7 +636,8 @@
         // ================= state =================
         let route = 'activity';
 
-        let activityEvents = [], activityVisible = [], activityTruncated = false;
+        let activityEvents = [], activityVisible = [];
+        let catHasAvatar = {};   // cat_id -> has a photo (from /api/cats/overview); gates avatar requests
         let activitySeq = 0, activitySelectedIndex = -1;
         let strangersOnly = false;
 
@@ -680,7 +652,7 @@
         // ================= element refs =================
         const $ = (id) => document.getElementById(id);
         const strangersOnlyEl = $('strangersOnly');
-        const activityErrorEl = $('activityError'), activityTruncatedEl = $('activityTruncated');
+        const activityErrorEl = $('activityError');
         const activityEmptyEl = $('activityEmpty'), railEl = $('activityRail');
         const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
         const modalEl = $('playerModal'), dialogEl = $('playerDialog');
@@ -804,12 +776,24 @@
             closePlayer();
             try {
                 hideNote(activityErrorEl);
-                const eres = await fetch('/api/events');
+                // Events drive the feed; the cats overview (best-effort, in parallel) tells
+                // us which cats have a photo, so an identified event only requests an avatar
+                // that exists — a photoless cat shows its frame instead of firing a 404.
+                const [eres, cres] = await Promise.all([
+                    fetch('/api/events'),
+                    fetch('/api/cats/overview'),
+                ]);
                 if (!eres.ok) throw new Error(await errorFromResponse(eres));
                 const edata = await eres.json();
                 if (seq !== activitySeq) return;
+                if (cres.ok) {
+                    try {
+                        const cdata = await cres.json();
+                        catHasAvatar = {};
+                        for (const c of (cdata.cats || [])) catHasAvatar[c.id] = !!c.has_avatar;
+                    } catch (_) { /* keep the map as-is — worst case we show frames */ }
+                }
                 activityEvents = edata.events || [];
-                activityTruncated = !!edata.truncated;
                 renderActivity();
             } catch (err) {
                 if (seq === activitySeq) showNote(activityErrorEl, `Couldn't load activity: ${err.message}`);
@@ -822,13 +806,6 @@
             activityVisible = strangersOnly
                 ? activityEvents.filter(ev => !isResidentEvent(ev))
                 : activityEvents.slice();
-
-            if (activityTruncated) {
-                showNote(activityTruncatedEl,
-                    `Showing the ${activityEvents.length} most recent visits.`);
-            } else {
-                hideNote(activityTruncatedEl);
-            }
 
             const empty = activityVisible.length === 0;
             activityEmptyEl.classList.toggle('hidden', !empty);
@@ -888,9 +865,18 @@
             const port = document.createElement('div');
             port.className = 'porthole';
             const img = document.createElement('img');
-            img.src = `/media/${ev.rep_frame_id}`;
             img.loading = 'lazy';
             img.alt = '';
+            // A known cat shows its avatar (a recognizable face in the feed); an unknown
+            // or unidentified visit shows the actual door frame, where seeing the cat is
+            // the point. If a known cat has no photo yet, fall back to its frame.
+            if (ev.identity && ev.identity.cat_id != null && catHasAvatar[ev.identity.cat_id]) {
+                img.src = `/api/cats/${ev.identity.cat_id}/avatar`;
+                // Defensive: a crop file could vanish between the overview and this load.
+                img.addEventListener('error', () => { img.src = `/media/${ev.rep_frame_id}`; }, { once: true });
+            } else {
+                img.src = `/media/${ev.rep_frame_id}`;
+            }
             port.appendChild(img);
 
             const meta = document.createElement('div');

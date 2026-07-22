@@ -480,3 +480,16 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 82. Activity feed dropped its from/to date picker — it now just shows the recent visits, newest first
     (`/api/events` unbounded, capped server-side). The user view is a glance at recent door activity,
     not a searchable log (date-scoped browsing lives in `/admin`). The non-residents-only filter stays.
+
+83. Added a frontend dev proxy (`./frontend-dev.sh` → `compute/tools/frontend_dev_proxy.py`): serves the
+    LOCAL `web/{user,admin}/index.html` (no-store, so edit→refresh) and reverse-proxies every other
+    request to the real compute PC (`CAT_COMPUTE_URL`, default :8001). Iterate dashboard visuals on the
+    dev box against live data — no backend change, no CORS (the frontend uses same-origin absolute paths),
+    no data copy. Dev convenience only; reuses `.venv-compute` (fastapi+uvicorn+requests, already deps).
+
+84. Activity feed made denser: dropped the subtitle and the "showing N" note, and folded the filter
+    (relabelled "Hide our cats") onto the heading line — more visits fit on screen.
+    Event thumbnails are now round and show the identified cat's AVATAR (falling back to the door frame
+    if that cat has no photo); an unknown/unidentified visit still shows the frame, where seeing the cat
+    is the point. The feed fetches `/api/cats/overview` alongside events so a photoless cat shows its
+    frame rather than 404-ing on an avatar. Frontend-only.

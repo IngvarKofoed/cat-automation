@@ -638,6 +638,7 @@
 
         let activityEvents = [], activityVisible = [];
         let catHasAvatar = {};   // cat_id -> has a photo (from /api/cats/overview); gates avatar requests
+        let catAvatarVer = {};   // cat_id -> avatar_version (mtime); stamped on the URL so it caches yet busts on change
         let activitySeq = 0, activitySelectedIndex = -1;
         let strangersOnly = false;
 
@@ -646,8 +647,7 @@
         let playerFrames = [], playerImages = [], playerTiles = [], playerIndex = 0;
         let playerTimer = null, playerPlaying = false;
 
-        // cats
-        const avatarBust = {};   // per-cat cache-buster, bumped after an upload
+        // (cats avatars are version-stamped from the overview — no cache-buster var needed)
 
         // ================= element refs =================
         const $ = (id) => document.getElementById(id);
@@ -789,8 +789,11 @@
                 if (cres.ok) {
                     try {
                         const cdata = await cres.json();
-                        catHasAvatar = {};
-                        for (const c of (cdata.cats || [])) catHasAvatar[c.id] = !!c.has_avatar;
+                        catHasAvatar = {}; catAvatarVer = {};
+                        for (const c of (cdata.cats || [])) {
+                            catHasAvatar[c.id] = !!c.has_avatar;
+                            catAvatarVer[c.id] = c.avatar_version;
+                        }
                     } catch (_) { /* keep the map as-is — worst case we show frames */ }
                 }
                 activityEvents = edata.events || [];
@@ -871,7 +874,7 @@
             // or unidentified visit shows the actual door frame, where seeing the cat is
             // the point. If a known cat has no photo yet, fall back to its frame.
             if (ev.identity && ev.identity.cat_id != null && catHasAvatar[ev.identity.cat_id]) {
-                img.src = `/api/cats/${ev.identity.cat_id}/avatar`;
+                img.src = `/api/cats/${ev.identity.cat_id}/avatar?v=${catAvatarVer[ev.identity.cat_id]}`;
                 // Defensive: a crop file could vanish between the overview and this load.
                 img.addEventListener('error', () => { img.src = `/media/${ev.rep_frame_id}`; }, { once: true });
             } else {
@@ -1184,7 +1187,7 @@
             // crop) — otherwise show the initial straight away, so a photoless cat
             // never fires a 404 for its avatar.
             if (cat.has_avatar) {
-                img.src = `/api/cats/${cat.id}/avatar?v=${avatarBust[cat.id] || 0}`;
+                img.src = `/api/cats/${cat.id}/avatar?v=${cat.avatar_version}`;
             } else {
                 img.style.display = 'none';
                 fallback.style.display = 'flex';
@@ -1277,7 +1280,8 @@
                     body: blob,
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
-                avatarBust[catId] = Date.now();   // bust the cache so the new photo shows
+                // loadCats refetches the overview -> the new avatar_version stamps a fresh
+                // URL, so the new photo shows without a manual cache-buster.
                 await loadCats();                  // re-render (rebuilds this card)
             } catch (err) {
                 showNote(catsErrorEl, `Couldn't set the photo: ${err.message}`);

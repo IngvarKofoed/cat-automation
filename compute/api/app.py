@@ -1219,13 +1219,26 @@ def create_app(
     @app.get("/api/cats/overview")
     def api_cats_overview():
         # Roster + per-cat last-seen (derived from the same events() feed the Activity
-        # view renders) + has_crop. has_avatar = an uploaded file exists OR a labelled
-        # crop does (either yields a real photo). active_model() read ONCE: has_model =
-        # a gallery is promoted; uncalibrated = that model's threshold is None (so
-        # identification can't yet name residents — the UI notes it).
+        # view renders). Per cat, avatar_version = the mtime (ms) of the file GET
+        # .../avatar would serve (uploaded → labelled crop → none), and has_avatar = one
+        # exists. The client stamps the avatar URL with avatar_version, so an unchanged
+        # avatar keeps ONE cacheable URL while a replaced one gets a fresh URL that
+        # auto-busts — caching (avatars are big) without a stale photo. has_avatar is now
+        # derived from real file existence, so a crop row whose file is gone reads false
+        # (matching what GET .../avatar would actually 404 on). active_model() read ONCE:
+        # has_model = a gallery is promoted; uncalibrated = its threshold is None.
         rows = store.cats_overview()
         for row in rows:
-            row["has_avatar"] = os.path.isfile(store.avatar_path(row["id"])) or bool(row["has_crop"])
+            ver = None
+            uploaded = store.avatar_path(row["id"])
+            if os.path.isfile(uploaded):
+                ver = int(os.path.getmtime(uploaded) * 1000)
+            elif row["has_crop"]:
+                crop = store.cat_avatar_crop_path(row["id"])
+                if crop and os.path.isfile(crop):
+                    ver = int(os.path.getmtime(crop) * 1000)
+            row["avatar_version"] = ver
+            row["has_avatar"] = ver is not None
         model = store.active_model()
         return {
             "cats": rows,

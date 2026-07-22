@@ -230,9 +230,20 @@ def test_api_overview_has_avatar_from_crop_and_upload(api):
     assert client.post(f"/api/cats/{upload_cat['id']}/avatar", content=_real_jpeg(200)).status_code == 200
 
     cats = {c["id"]: c for c in client.get("/api/cats/overview").json()["cats"]}
-    assert cats[crop_cat["id"]]["has_avatar"] is True  # via has_crop
+    assert cats[crop_cat["id"]]["has_avatar"] is True  # via crop file
     assert cats[upload_cat["id"]]["has_avatar"] is True  # via uploaded file
     assert cats[bare_cat["id"]]["has_avatar"] is False
+
+    # avatar_version = mtime (ms) of the file GET .../avatar would serve; the client
+    # stamps it on the URL so a re-uploaded photo changes URL (busts cache) while an
+    # unchanged one stays cacheable. Present for crop + upload, None for the bare cat.
+    assert cats[crop_cat["id"]]["avatar_version"] == int(
+        os.path.getmtime(store.cat_avatar_crop_path(crop_cat["id"])) * 1000
+    )
+    assert cats[upload_cat["id"]]["avatar_version"] == int(
+        os.path.getmtime(store.avatar_path(upload_cat["id"])) * 1000
+    )
+    assert cats[bare_cat["id"]]["avatar_version"] is None
 
 
 # --- POST /api/cats/{id}/avatar ---------------------------------------------

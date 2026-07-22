@@ -500,3 +500,24 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     URL (big images stay cached); a re-uploaded one gets a fresh URL that auto-busts, so the new photo
     shows everywhere at once — no `Cache-Control` change needed. `has_avatar` now derives from real file
     existence (a crop row whose file is gone reads false); the per-session `avatarBust` hack is gone.
+
+86. User dashboard now refreshes its data on foreground, fixing the stale feed on a pinned/home-screen
+    iOS web app — iOS resumes the frozen WebView from memory rather than reloading, so the feed never
+    updated. `visibilitychange`→visible and `pageshow(persisted)` re-run the active view's loader (data
+    only, no shell reload — keeps scroll/route), plus a 60s visible-only poll of the Activity feed.
+    Guarded: never while playback is open (won't yank frames) or scrolled down (a rebuild jumps to top).
+
+87. Live push for the Activity feed over SSE (`GET /api/events/stream`): the server nudges connected
+    clients when the feed actually changes, so a foregrounded dashboard updates in near-real-time instead
+    of waiting for the poll. Signal is `Store.activity_signal()` — MAX motion-frame id (new door event),
+    MAX identifications rowid (a late naming), and the active model id (a promotion). Motion-SCOPED on
+    purpose: continuous frame capture would fire a whole-store "newest frame" signal every tick.
+    Client opens the stream while visible, tears it down when hidden; the 60s poll (86) stays as a
+    fallback for when SSE can't connect (unsupported client, buffering proxy).
+
+88. User dashboard is now an installable home-screen app: `apple-mobile-web-app-capable` (+ modern
+    `mobile-web-app-capable`), a real `/apple-touch-icon.png` (served at the root paths iOS probes; a
+    door-mark PNG generated once with cv2), an app title, and per-theme `theme-color`. Status bar is
+    `default`, not black-translucent — the latter forces white text, unreadable over the light interior.
+    Also: the SPA shells (`/`, `/admin`) now send `Cache-Control: no-cache`, so a redeployed single-file
+    shell is picked up on the next launch (revalidates against FileResponse's ETag; unchanged → 304).

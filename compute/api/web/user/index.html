@@ -6,6 +6,20 @@
     <title>The Cat Door</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%23cf801f'/%3E%3Crect%20x='11'%20y='8'%20width='10'%20height='17'%20rx='2'%20fill='%23fffcf6'/%3E%3Ccircle%20cx='18.4'%20cy='17'%20r='1.3'%20fill='%23cf801f'/%3E%3C/svg%3E">
     <!--
+      Home-screen web-app hints. When pinned to the iOS home screen the page runs
+      full-screen (no Safari chrome), which is why the auto-refresh + SSE below matter:
+      there's no pull-to-refresh to fall back on. Status bar is `default` (readable in
+      both themes, unlike black-translucent's forced-white text over a light interior);
+      theme-color tints the bar per theme to match the app-bar surface.
+    -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Cat Door">
+    <meta name="theme-color" content="#fffcf6" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#1f1810" media="(prefers-color-scheme: dark)">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <!--
       The household-facing app, served at `/`. A single self-contained, hash-routed
       SPA (own inline <style>/<script>): shares NO CSS with the admin workbench
       (/admin) — upholding the admin/user split spec. Only /api/* and /media/* are
@@ -1290,8 +1304,70 @@
             }
         }
 
+        // ================= live freshness =================
+        // A pinned / home-screen web app is usually RESUMED from memory, not reloaded,
+        // so iOS shows the frozen last-fetched feed (and there's no browser chrome to
+        // pull-to-refresh). Keep the DATA fresh — not by reloading the page (that flashes
+        // and loses scroll/route) but by re-running the active view's loader:
+        //   • on return to the foreground (the moment you reopen the app),
+        //   • when the server pushes a "feed changed" nudge over SSE (near-real-time),
+        //   • and on a slow fallback poll while visible, in case SSE can't connect.
+        const FOREGROUND_POLL_MS = 60000;
+        let pollTimer = null, es = null;
+
+        function playerOpen() { return !modalEl.classList.contains('hidden'); }
+
+        // Re-run the active view's loader. Never while playback is open (don't yank
+        // frames out from under the user) or while hidden (no point, saves battery).
+        function refreshActiveView() {
+            if (document.visibilityState !== 'visible' || playerOpen()) return;
+            onRouteEnter(route);
+        }
+        // Background-triggered refresh (poll tick / SSE nudge): additionally skip when
+        // scrolled down reading — a rebuild is newest-first and would jump to the top.
+        // Foreground-resume refreshes unconditionally: reopening at the top with fresh
+        // data is exactly what you want.
+        function gentleRefresh() {
+            if (window.scrollY > 200) return;
+            refreshActiveView();
+        }
+
+        function startPoll() {
+            stopPoll();
+            if (document.visibilityState === 'visible') pollTimer = setInterval(gentleRefresh, FOREGROUND_POLL_MS);
+        }
+        function stopPoll() {
+            if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+        }
+
+        // Live push: the server nudges us only when the feed actually changes (a new
+        // door event, a late identification, a promoted model), so we refetch on demand
+        // rather than on a fast timer. The browser auto-reconnects; we only drop the
+        // handle once it has truly given up (CLOSED) so a later foreground can remake it.
+        function connectLive() {
+            if (!('EventSource' in window) || es) return;
+            try { es = new EventSource('/api/events/stream'); }
+            catch { es = null; return; }
+            es.addEventListener('activity', gentleRefresh);
+            es.addEventListener('error', () => { if (es && es.readyState === EventSource.CLOSED) es = null; });
+        }
+        function disconnectLive() { if (es) { es.close(); es = null; } }
+
+        // Resume-from-background is the main case: visibilitychange fires when iOS brings
+        // the frozen WebView back on screen — pull fresh data immediately, then resume
+        // the live connection + fallback poll. Hidden: tear both down.
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') { refreshActiveView(); startPoll(); connectLive(); }
+            else { stopPoll(); disconnectLive(); }
+        });
+        // pageshow(persisted) covers a bfcache / standalone restore, where
+        // visibilitychange may not fire.
+        window.addEventListener('pageshow', (e) => { if (e.persisted) refreshActiveView(); });
+
         // ================= boot =================
         setRoute(location.hash.slice(1) || 'activity');
+        startPoll();
+        connectLive();
     })();
     </script>
 </body>

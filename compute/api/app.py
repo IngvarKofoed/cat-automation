@@ -35,12 +35,14 @@ import — ``compute.sh`` launches ``uvicorn --factory ...:create_app``.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from compute.analysis import ANALYZER_NAMES
 from compute.analysis.mog2 import MogAnalyzer
@@ -58,6 +60,13 @@ _WEB_DIR = Path(__file__).resolve().parent / "web"
 # docs/specs/2026-07-22-admin-user-area-split.md.
 _USER_HTML = _WEB_DIR / "user" / "index.html"
 _ADMIN_HTML = _WEB_DIR / "admin" / "index.html"
+# Home-screen icon for the pinned user app (served at the root paths iOS probes).
+_APPLE_TOUCH_ICON = _WEB_DIR / "user" / "apple-touch-icon.png"
+
+# /api/events/stream (SSE) cadence: how often the server samples the feed's change
+# signal, and how many quiet ticks between keepalive comments (~21 s at 3 s/tick).
+_SSE_POLL_SECONDS = 3.0
+_SSE_HEARTBEAT_TICKS = 7
 
 # Config via environment variables (the edge's style; the compute tier has no
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
@@ -615,13 +624,21 @@ def create_app(
         live_identify_manager.join(timeout=10.0)
         store.close()
 
+    # The SPA shells are single self-contained files (inline CSS+JS), so a stale
+    # cached shell means stale CODE after a redeploy — worst on a pinned home-screen
+    # app that rarely cold-loads. `no-cache` forces revalidation against the ETag /
+    # Last-Modified that FileResponse already sets: an unchanged shell still 304s
+    # (fast), a redeployed one is picked up on the next launch. (This is the shell;
+    # the running page keeps its data fresh via the foreground-refresh + SSE below.)
+    _SHELL_HEADERS = {"Cache-Control": "no-cache"}
+
     @app.get("/")
     def index():
         # The user-facing dashboard (the "Threshold" Activity + Cats SPA). 404 until
         # the file exists so a missing frontend is an obvious not-found, not a crash.
         if not _USER_HTML.is_file():
             raise HTTPException(status_code=404, detail="user UI not built")
-        return FileResponse(_USER_HTML, media_type="text/html")
+        return FileResponse(_USER_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
     @app.get("/admin")
     def admin():
@@ -629,7 +646,22 @@ def create_app(
         # Training). Its own document, own CSS; hash routing → /admin#activity.
         if not _ADMIN_HTML.is_file():
             raise HTTPException(status_code=404, detail="admin UI not built")
-        return FileResponse(_ADMIN_HTML, media_type="text/html")
+        return FileResponse(_ADMIN_HTML, media_type="text/html", headers=_SHELL_HEADERS)
+
+    @app.get("/apple-touch-icon.png")
+    @app.get("/apple-touch-icon-precomposed.png")
+    def apple_touch_icon():
+        # iOS auto-probes these root paths for a pinned app's home-screen icon (and the
+        # user page's <link rel="apple-touch-icon"> points here). One PNG backs both the
+        # plain and -precomposed names. Cache hard — it changes only on a rebuild, and
+        # iOS grabs it once at add-to-home-screen time.
+        if not _APPLE_TOUCH_ICON.is_file():
+            raise HTTPException(status_code=404, detail="icon not built")
+        return FileResponse(
+            _APPLE_TOUCH_ICON,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
 
     @app.get("/api/frames")
     def api_frames(
@@ -879,6 +911,52 @@ def create_app(
         # min_frames is clamped to >= 1 inside Store.events (the single source of
         # truth for the clamp), so the route passes it straight through.
         return store.events(since_id, until_id, min_frames=min_frames)
+
+    @app.get("/api/events/stream")
+    async def api_events_stream(request: Request):
+        # Server-Sent Events: push a lightweight "the feed changed" nudge so a pinned
+        # dashboard updates in near-real-time without every client polling. We send only
+        # a signal, not payloads — the client re-fetches /api/events on it, reusing its
+        # existing render path. The signal is Store.activity_signal() (motion-scoped, so
+        # continuous frame capture doesn't fire it every tick). Sampling and store reads
+        # run in the threadpool so the sync SQLite store never blocks the event loop;
+        # heartbeat comments keep the connection alive and a dropped client detectable
+        # through quiet periods.
+        async def gen():
+            # An initial comment flushes headers so EventSource fires `open` promptly.
+            yield ": connected\n\n"
+            last = None
+            ticks = 0
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    sig = await run_in_threadpool(store.activity_signal)
+                except Exception:
+                    # Store closing / transient read error — end the stream; the
+                    # browser's EventSource reconnects on its own.
+                    break
+                key = (sig["motion_id"], sig["ident_rev"], sig["model_id"])
+                if last is not None and key != last:
+                    # Only push on a CHANGE after connect — the client already fetched
+                    # on load, so the first sample just establishes the baseline.
+                    yield "event: activity\ndata: 1\n\n"
+                    ticks = 0
+                else:
+                    ticks += 1
+                    if ticks % _SSE_HEARTBEAT_TICKS == 0:
+                        yield ": ping\n\n"
+                last = key
+                await asyncio.sleep(_SSE_POLL_SECONDS)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # tell any reverse proxy not to buffer the stream
+            },
+        )
 
     @app.post("/api/collector/start")
     def api_collector_start():

@@ -1288,6 +1288,39 @@ class Store:
             (mx,) = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM frames").fetchone()
         return int(mx)
 
+    def activity_signal(self) -> dict:
+        """A cheap fingerprint of the user-facing feed, for the SSE change-push.
+
+        Returns ``{motion_id, ident_rev, model_id}`` — three counters that move
+        exactly when the Activity feed's CONTENT could change, so the events-stream
+        endpoint pushes a "refetch" nudge only on a real change instead of every tick:
+
+        - ``motion_id`` = ``MAX(frames.id)`` over motion frames → bumps when a NEW
+          motion frame is stored (a new door event, or a new frame of an ongoing one).
+          Scoped to the id, not ``recv_ts``/``COUNT``, so eviction of old motion frames
+          (the smallest ids) never lowers it — no spurious nudge on the eviction path.
+          The collector saves EVERY frame continuously, so a whole-store "newest frame"
+          signal would change every tick; motion-scoping is what makes the push
+          motion-driven, not capture-driven.
+        - ``ident_rev`` = ``MAX(rowid)`` over identifications → bumps when the live or
+          manual identify pass writes a new match, i.e. a recent event gets NAMED after
+          the fact (its frames already moved ``motion_id`` when they arrived).
+        - ``model_id`` = the active model version's id → bumps on a promotion/rollback,
+          which re-names every event.
+        """
+        with self._lock:
+            motion_id, ident_rev, model_id = self._conn.execute(
+                "SELECT"
+                " (SELECT COALESCE(MAX(id), 0) FROM frames WHERE motion = 1),"
+                " (SELECT COALESCE(MAX(rowid), 0) FROM identifications),"
+                " (SELECT COALESCE(MAX(id), 0) FROM model_versions WHERE status = 'active')"
+            ).fetchone()
+        return {
+            "motion_id": int(motion_id),
+            "ident_rev": int(ident_rev),
+            "model_id": int(model_id),
+        }
+
     def analysis_summary(self, analyzer: str) -> dict:
         """``{analyzed, present}`` verdict counts for ``analyzer`` — coverage/progress.
 

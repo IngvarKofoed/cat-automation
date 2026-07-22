@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 # bird, 15 cat, 16 dog, ... This is what we filter every detection against;
 # every other one of the model's 80 classes is noise for this oracle's purpose.
 _COCO_CAT_CLASS_ID = 15
+# The serial persona additionally detects 'person' (0) and 'bird' (14) so the
+# event-subject classifier can tell a human / bird apart from an unrecognized
+# blob. These NEVER affect the verdict/score (both stay cat-only — see
+# ``_result_from``); they only ride along in ``detail['boxes']``.
+_COCO_PERSON_CLASS_ID = 0
+_COCO_BIRD_CLASS_ID = 14
 
 # Env overrides, per the spec — each read once in __init__ and cached, so a
 # sweep's per-frame `analyze()` never touches the environment. Defaults favor
@@ -190,13 +196,24 @@ class YoloAnalyzer:
         paths can differ ONLY in call shape — a list vs a bare image — and never
         drift in imgsz / conf / class-filter / device / half. That invariant is what
         lets the ``yolo`` vs ``yolo-serial`` A/B attribute any verdict difference to
-        batching alone. Restricts detection to the COCO 'cat' class up front
+        batching alone. Restricts detection to a small COCO class set up front
         (``classes=``) so the model does the minimum work this oracle needs.
+
+        The class set is PER-PERSONA: the batched ``yolo`` oracle stays cat-only
+        (``[15]``) so its verdict/score are byte-identical to today (no scorecard
+        risk); the serial ``yolo-serial`` persona also detects person (0) and bird
+        (14) to feed the event-subject classifier. Verdict/score remain cat-only
+        for BOTH (see ``_result_from``) — the extra classes only populate
+        ``detail['boxes']``.
         """
+        if self._serial:
+            classes = [_COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID, _COCO_CAT_CLASS_ID]
+        else:
+            classes = [_COCO_CAT_CLASS_ID]
         return dict(
             imgsz=self._imgsz,
             conf=self._conf,
-            classes=[_COCO_CAT_CLASS_ID],
+            classes=classes,
             device=self._device,
             half=self._half,
             verbose=False,
@@ -227,17 +244,29 @@ class YoloAnalyzer:
         """Reduce one ultralytics ``Results`` to the uniform cat-present verdict.
 
         Keeps every surviving box (ultralytics already applied ``conf``
-        internally). Zero detections is the common, expected case (most frames
-        have no cat) — it falls straight through to an empty ``boxes`` list,
-        ``verdict=False``, ``score=0.0``, no special-casing.
+        internally), each recorded as ``[x1, y1, x2, y2, conf, cls]`` — the 6th
+        element is the COCO class id, so ``detail['boxes']`` now carries ALL
+        detected classes (cat, plus person/bird for the serial persona). Zero
+        detections is the common, expected case (most frames have no cat) — it
+        falls straight through to an empty ``boxes`` list, ``verdict=False``,
+        ``score=0.0``, no special-casing.
+
+        INVARIANT — ``verdict``/``score`` are computed from the CAT-class boxes
+        ALONE, so "verdict=1 ⇒ a cat is present" and "score = max cat confidence"
+        are UNCHANGED for both personas. For the batched ``yolo`` oracle every box
+        is class 15 already, so its verdict/score are identical to today by
+        construction; for ``yolo-serial`` a person/bird-only frame yields
+        ``verdict=False`` while still recording its box in ``detail`` for the
+        subject classifier.
         """
         boxes: "list[list[float]]" = []
         for box in result.boxes:
             x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-            boxes.append([x1, y1, x2, y2, float(box.conf[0])])
+            boxes.append([x1, y1, x2, y2, float(box.conf[0]), int(box.cls[0])])
 
-        verdict = bool(boxes)
-        score = max((b[4] for b in boxes), default=0.0)
+        cat_boxes = [b for b in boxes if b[5] == _COCO_CAT_CLASS_ID]
+        verdict = bool(cat_boxes)
+        score = max((b[4] for b in cat_boxes), default=0.0)
         detail = {"boxes": boxes, "model": self._weights, "device": self._device, "half": self._half}
         return AnalysisResult(verdict=verdict, score=score, detail=detail)
 

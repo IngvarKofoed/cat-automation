@@ -1083,7 +1083,8 @@
            same tone the false-trigger swatch uses elsewhere). No chip at all when the
            event carries no identification. flex-basis 100% drops it to its own line below
            the time/span row rather than being squeezed into the caption's space-between. */
-        .identity-chip {
+        .identity-chip,
+        .subject-chip {
             flex-basis: 100%;
             display: inline-block;
             width: fit-content;
@@ -1107,6 +1108,32 @@
             background: rgb(var(--v-false-rgb) / .18);
             color: var(--color-status-false);
             border: 1px solid rgb(var(--v-false-rgb) / .45);
+        }
+        /* Non-cat subject chips (event-subject-classification spec): rendered only when
+           ev.subject.kind !== 'cat' (cat falls through to .identity-chip above, unchanged).
+           Same one-line-below-the-caption layout as .identity-chip, but a deliberately
+           separate palette so these never read as a caught/missed verdict or a cat identity:
+           person/bird share the UI accent (blue) — a description, not a judgment — while
+           unrecognized/motion-only stay a quiet neutral gray (--v-neutral-rgb, already used
+           for non-verdict neutrals elsewhere), since both mean "nothing nameable here".
+           unrecognized (real motion above the learned floor, no matching class) is a shade
+           more legible than motion-only (below it) — it's the one worth a second look.
+           (Base layout is shared with .identity-chip above; only the palette differs.) */
+        .subject-chip.person,
+        .subject-chip.bird {
+            background: rgb(var(--accent-rgb) / .16);
+            color: var(--color-primary);
+            border: 1px solid rgb(var(--accent-rgb) / .45);
+        }
+        .subject-chip.unrecognized {
+            background: rgb(var(--v-neutral-rgb) / .16);
+            color: var(--color-text-muted);
+            border: 1px solid rgb(var(--v-neutral-rgb) / .4);
+        }
+        .subject-chip.motion-only {
+            background: transparent;
+            color: var(--color-text-muted);
+            border: 1px dashed rgb(var(--v-neutral-rgb) / .35);
         }
         /* Player stage: a fixed-height contained frame, mirroring #inboxRep so flipping
            events or scrubbing never resizes the box and reflows the strip below. */
@@ -1529,6 +1556,11 @@
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
+                    <button type="button" id="activityAnalyzeBtn" class="btn-secondary"
+                        title="Re-run the yolo-serial detector over the events in this date range (reanalyze), so cat / person / bird subjects are (re)detected. This is the DETECT step; Identify then matches detected cats to the gallery. Progress shows on Sweeps.">Analyze</button>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
                     <button type="button" id="activityIdentifyBtn" class="btn-secondary">Identify</button>
                 </div>
                 <div class="control-group">
@@ -1551,6 +1583,7 @@
                     </div>
                 </div>
             </div>
+            <div id="activityAnalyzeNote" class="hidden banner-warn"></div>
             <div id="activityIdentifyNote" class="hidden banner-warn"></div>
             <div id="activityTruncated" class="banner-warn hidden"></div>
             <div id="activityEmpty" class="empty hidden">No activity in this range.</div>
@@ -2125,6 +2158,8 @@
         const activityEmptyEl = document.getElementById('activityEmpty');
         const activityGridEl = document.getElementById('activityGrid');
         const activityStrangersOnlyEl = document.getElementById('activityStrangersOnly');
+        const activityAnalyzeBtn = document.getElementById('activityAnalyzeBtn');
+        const activityAnalyzeNoteEl = document.getElementById('activityAnalyzeNote');
         const activityIdentifyBtn = document.getElementById('activityIdentifyBtn');
         const activityIdentifyNoteEl = document.getElementById('activityIdentifyNote');
         const liveIdentifyToggleBtn = document.getElementById('liveIdentifyToggleBtn');
@@ -2334,6 +2369,7 @@
         // so each needs its own flag (a single shared one would mislabel the other's button).
         let buildSubmitting = false;
         let identifySubmitting = false;
+        let analyzeSubmitting = false;
         let trainRuns = [];             // feasibility_runs history, most-recent-first
         let trainLastResultRunId = null; // dedupes the runs-list refresh to one per completed run
         let trainLastGalleryResultSig = null; // dedupes the models-list refresh to one per completed build
@@ -2688,6 +2724,7 @@
                 const data = await res.json();
                 analysisStatus = data;
 
+                renderAnalyzeControl();   // Activity "Analyze" button reflects a running yolo-serial sweep
                 renderQueuePanel(data);
                 // Sweeps: refresh the coverage rows (scoped to the picked bucket) live
                 // during a sweep. Tuning: refresh the oracle chooser's coverage (no reset —
@@ -2914,7 +2951,11 @@
             // counts reading as a bug when they differ.
             right.textContent = `${formatSpan(ev.start_ts, ev.end_ts)} · ${ev.n_frames} motion frames`;
             cap.append(left, right);
-            const chip = identityChip(ev.identity);
+            // subject.kind === 'cat' (or no subject at all, pre-classification data) keeps
+            // the existing identity chip untouched; anything else is a non-cat/no-subject
+            // span and gets the new subject chip instead — the two are mutually exclusive.
+            const subj = ev.subject;
+            const chip = (!subj || subj.kind === 'cat') ? identityChip(ev.identity) : subjectChip(subj);
             if (chip) cap.append(chip);
             tile.append(img, cap);
             // Double-click / double-tap opens the playback modal (single click is a no-op,
@@ -2941,6 +2982,38 @@
                 chip.textContent = identity.cat_name || `cat #${identity.cat_id}`;
             }
             return chip;
+        }
+
+        // Non-cat subject chip (event-subject-classification spec): only called when
+        // subject.kind !== 'cat' — 'cat' spans keep using identityChip(). 'person'/'bird'
+        // are a factual description (a class YOLO saw), not a verdict, so they get their
+        // own accent rather than borrowing green/red/amber. 'unrecognized' is real motion
+        // above the learned floor with no nameable class (worth a look); 'motion_only' is
+        // below it (routine noise) — both render in the same quiet neutral, just a touch
+        // fainter for motion_only.
+        function subjectChip(subject) {
+            if (!subject) return null;
+            const chip = document.createElement('span');
+            switch (subject.kind) {
+                case 'person':
+                    chip.className = 'subject-chip person';
+                    chip.textContent = 'person';
+                    return chip;
+                case 'bird':
+                    chip.className = 'subject-chip bird';
+                    chip.textContent = 'bird';
+                    return chip;
+                case 'unrecognized':
+                    chip.className = 'subject-chip unrecognized';
+                    chip.textContent = 'unrecognized';
+                    return chip;
+                case 'motion_only':
+                    chip.className = 'subject-chip motion-only';
+                    chip.textContent = 'motion only';
+                    return chip;
+                default:
+                    return null;
+            }
         }
 
         function highlightSelectedCard() {
@@ -5804,8 +5877,8 @@
 
         // Resolves the Activity date pickers to id bounds — deliberately a separate,
         // small duplicate of loadActivityEvents's own resolution rather than a shared
-        // helper: the two call sites react differently to an inverted/empty window
-        // (Activity shows the empty grid; this just declines to enqueue Identify).
+        // helper: the call sites react differently to an inverted/empty window
+        // (Activity shows the empty grid; the Analyze / Identify buttons just decline to enqueue).
         async function resolveActivityWindow() {
             const fromTs = tsFromControls(activityFromDateEl.value, 0);
             const toTs = tsFromControls(activityToDateEl.value, 24);
@@ -5821,18 +5894,60 @@
                 // Identify, which the store would read as "whole store" and run an identify
                 // pass over every frame collected, far outside the selected window.
                 if (rdata.since_id == null || rdata.until_id == null || rdata.since_id > rdata.until_id) {
-                    showError('Identify: no frames in the selected date range.');
+                    showError('No frames in the selected date range.');
                     return null;
                 }
                 return { since_id: rdata.since_id, until_id: rdata.until_id };
             } catch (err) {
-                showError(`Identify failed: ${err.message}`);
+                showError(`Could not resolve the date range: ${err.message}`);
                 return null;
             }
         }
         activityIdentifyBtn.addEventListener('click', async () => {
             const w = await resolveActivityWindow();
             if (w) triggerIdentify(w.since_id, w.until_id);
+        });
+
+        // The Activity "Analyze" button: re-DETECT the shown window with yolo-serial so the
+        // broadened detector rewrites its verdicts and the subjects (cat/person/bird) backfill.
+        // Distinct from Identify, which only MATCHES already-detected cats to the gallery — this
+        // is the detect step. Enqueues onto the analysis (Sweeps) queue with reanalyze=true
+        // (reanalyze so frames already scored cat-only get re-detected, not skipped), then points
+        // the user to Sweeps for progress. The button reflects a running yolo-serial sweep.
+        function renderAnalyzeControl() {
+            const runningSerial = !!analysisStatus.running && analysisStatus.analyzer === 'yolo-serial';
+            activityAnalyzeBtn.disabled = analyzeSubmitting || runningSerial;
+            activityAnalyzeBtn.textContent = analyzeSubmitting ? 'Enqueuing…'
+                : (runningSerial ? 'Analyzing…' : 'Analyze');
+        }
+        async function triggerAnalyze(sinceId, untilId) {
+            try {
+                clearError();
+                activityAnalyzeNoteEl.classList.add('hidden');
+                analyzeSubmitting = true;
+                renderAnalyzeControl();
+                const res = await fetch('/api/analysis/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ analyzer: 'yolo-serial', reanalyze: true, since_id: sinceId, until_id: untilId }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                activityAnalyzeNoteEl.textContent = (data.position > 0)
+                    ? `Re-detecting this window (yolo-serial) — queued at position ${data.position}. Track progress on Sweeps, then reload Activity.`
+                    : 'Re-detecting this window (yolo-serial). Track progress on Sweeps, then reload Activity to see the new subjects.';
+                activityAnalyzeNoteEl.classList.remove('hidden');
+            } catch (err) {
+                showError(`Analyze failed: ${err.message}`);
+            } finally {
+                analyzeSubmitting = false;
+                renderAnalyzeControl();
+                pollAnalysisStatus();
+            }
+        }
+        activityAnalyzeBtn.addEventListener('click', async () => {
+            const w = await resolveActivityWindow();
+            if (w) triggerAnalyze(w.since_id, w.until_id);
         });
 
         // ================= init =================

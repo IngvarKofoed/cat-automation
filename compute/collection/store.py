@@ -32,6 +32,11 @@ import time
 from datetime import datetime
 
 from compute.analysis import ANALYZER_NAMES  # import-light registry (no ML); single source of oracle ids
+from compute.analysis.yolo import (  # import-light COCO class-id constants (yolo.py holds no ML at module scope)
+    _COCO_BIRD_CLASS_ID,
+    _COCO_CAT_CLASS_ID,
+    _COCO_PERSON_CLASS_ID,
+)
 
 # Oldest-first eviction batch size: eviction selects and deletes rows in chunks
 # rather than one round-trip per row, so freeing space after a burst stays cheap.
@@ -112,6 +117,38 @@ _QUALITIES = ("gallery", "ok", "poor")
 # Mirrors the gate scorecard's default oracle floor; fixed (not per-request) because
 # the queue's clean-crop purpose wants a stable, meaningful universe, not a knob.
 _ANNOTATE_MIN_CONF = 0.3
+
+# Pre-calibration default for the event-subject motion floor (see ``events()`` and
+# ``labeled_cat_motion_floor``). ``min_area`` is a FRACTION of the downscaled MOG2
+# ROI — the exact axis ``frames.area`` stores (largest-blob px / downscaled total,
+# in [0, 1], the same axis the tuning workbench shows); ``min_frames`` a per-event
+# motion-frame count. The floor only separates a NO-detection event into
+# ``unrecognized`` (>= floor: cat-scale motion YOLO couldn't name — worth a look)
+# vs ``motion_only`` (< floor: trivially small/brief — almost certainly noise). This
+# default is deliberately LOW — below the edge gate's own typical ``min_area`` (0.01),
+# so essentially every real motion cluster clears it — so that BEFORE any labelled
+# cat visits exist to learn a real floor (see ``labeled_cat_motion_floor``), an
+# un-nameable event ERRS TOWARD ``unrecognized`` (surface it for a human) rather than
+# ``motion_only`` (hide it as noise). Failing safe here means showing motion, not
+# swallowing it; the learned floor later sharpens the split from real cat data.
+_SUBJECT_FLOOR_DEFAULT = {"min_area": 0.005, "min_frames": 2}
+
+
+def _percentile(sorted_vals: "list[float]", pct: float) -> float:
+    """Linear-interpolated ``pct`` percentile of an ASCENDING-sorted non-empty list.
+
+    Plain Python (no numpy needed for a handful of per-visit values). ``pct`` is in
+    ``[0, 100]``; a length-1 list falls straight through the general path (k=0 →
+    ``sorted_vals[0]``). Used by ``labeled_cat_motion_floor`` to take a low percentile
+    across labelled cat visits.
+    """
+    n = len(sorted_vals)
+    k = (n - 1) * (pct / 100.0)
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return float(sorted_vals[int(k)])
+    return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo))
 
 
 def _parse_id_cursor(cursor: str) -> int:
@@ -2105,7 +2142,8 @@ class Store:
 
         Per surviving cluster the record is::
 
-            {start_id, end_id, start_ts, end_ts, n_frames, rep_frame_id}
+            {start_id, end_id, start_ts, end_ts, n_frames, rep_frame_id,
+             identity, subject}
 
         ``start_id``/``end_id`` = min/max frame id in the cluster (the id span the
         player fetches its frames over); ``start_ts``/``end_ts`` = first/last
@@ -2113,6 +2151,19 @@ class Store:
         highest-``area`` frame (tie-break by id), matching how ``visits`` picks a
         representative — the peak-area frame is likelier to show the cat prominently
         than a middle-by-time one.
+
+        ``identity`` answers *which cat* (the active-gallery join below; ``None``
+        without a promoted model). ``subject`` answers *what is it* — the read-time
+        classification (event-subject-classification spec) from the span's
+        ``yolo-serial`` boxes plus a motion floor::
+
+            {kind: 'cat' | 'person' | 'bird' | 'unrecognized' | 'motion_only', ...}
+
+        A positive cat detection always wins (``kind='cat'``; ``identity`` then
+        carries resident/neighbour/unknown-cat). Otherwise person/bird if YOLO named
+        one, else the motion floor splits substantial-but-unnamed motion
+        (``unrecognized``) from trivial noise (``motion_only``) — so no event is ever
+        a silent blank. See ``_classify_subject`` for the ladder.
 
         Events are sorted NEWEST-FIRST (``start_ts`` desc, tie-break ``start_id``
         desc) and capped at ``limit`` (clamped into ``[1, _MAX_EVENTS]``);
@@ -2135,17 +2186,24 @@ class Store:
         # Cluster + build records outside the lock (pure Python over the fetched
         # rows, already recv_ts-ordered by the query's ORDER BY).
         events: "list[dict]" = []
+        # start_id → the cluster's PEAK motion area, fed to the subject floor branch
+        # below. Kept out of the returned record (subject carries it when relevant);
+        # start_id is unique per event (clusters are disjoint id ranges).
+        peak_area_by_start: "dict[int, float]" = {}
         for cluster in self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[1]):
             n_frames = len(cluster)
             if n_frames < min_frames:
                 continue
             ids = [int(r[0]) for r in cluster]
             # area is NOT NULL; tie-break by id so the pick is deterministic,
-            # matching ``visits``'s ``(area, id)`` representative rule.
+            # matching ``visits``'s ``(area, id)`` representative rule. rep's area
+            # IS the cluster's peak area (max), reused for the subject motion floor.
             rep = max(cluster, key=lambda r: (r[2], r[0]))
+            start_id = min(ids)
+            peak_area_by_start[start_id] = float(rep[2])
             events.append(
                 {
-                    "start_id": min(ids),
+                    "start_id": start_id,
                     "end_id": max(ids),
                     "start_ts": int(cluster[0][1]),
                     "end_ts": int(cluster[-1][1]),
@@ -2160,25 +2218,71 @@ class Store:
         truncated = len(events) > limit
         events = events[:limit]
 
+        # Nothing survived the cluster/cap → nothing to annotate.
+        if not events:
+            return {"events": events, "truncated": truncated}
+
+        # The active model serves BOTH the identity join (below) and the subject
+        # motion floor (next): fetched once, lock free (clustering released it), and
+        # `active_model()` re-acquires the lock per the single-lock discipline.
+        model = self.active_model()
+        lo = min(e["start_id"] for e in events)
+        hi = max(e["end_id"] for e in events)
+
+        # --- Read-time subject classification (event-subject-classification spec).
+        # Annotate each RETURNED event with a `subject` — YOLO's "what is it" — from
+        # the span's `yolo-serial` analysis rows plus a motion floor. Read regardless
+        # of verdict: a person/bird box rides a verdict=0 row (verdict stays cat-only),
+        # so the classifier must see those rows the identify path ignores. The floor
+        # is resolved ONCE from the same active model's `metrics.subject_floor` (learned
+        # at gallery-build), falling back to a conservative hardcoded default so the
+        # feed still labels motion pre-calibration (no model, or a model with no floor).
+        # Resolve the floor from the active model's stamped subject_floor, MERGED over the
+        # conservative default so a missing/partial stamp always yields BOTH min_area and
+        # min_frames — no model, metrics None, no subject_floor key, a too-few-visits None,
+        # or even a floor dict lacking a key all fall back per-key. _classify_subject indexes
+        # both, so a partial floor must never KeyError the whole feed.
+        _metrics = (model or {}).get("metrics") or {}
+        _stamped_floor = _metrics.get("subject_floor")
+        floor = {**_SUBJECT_FLOOR_DEFAULT, **(_stamped_floor if isinstance(_stamped_floor, dict) else {})}
+        with self._lock:
+            # frame_id-ORDERED so each event's span is a contiguous slice found by
+            # bisect (like the identity join), and ALL verdicts (no verdict filter).
+            subj_rows = self._conn.execute(
+                "SELECT frame_id, detail FROM analysis"
+                " WHERE analyzer = 'yolo-serial' AND frame_id BETWEEN ? AND ?"
+                " ORDER BY frame_id ASC",
+                (int(lo), int(hi)),
+            ).fetchall()
+        subj_fids = [r[0] for r in subj_rows]
+        for event in events:
+            e_lo, e_hi = event["start_id"], event["end_id"]
+            lo_i = bisect.bisect_left(subj_fids, e_lo)
+            hi_i = bisect.bisect_right(subj_fids, e_hi)
+            # Merge each frame's per-class max confidence into a span-wide max.
+            class_conf: "dict[int, float]" = {}
+            for _fid, detail in subj_rows[lo_i:hi_i]:
+                for cls, conf in self._subject_classes(detail).items():
+                    if conf > class_conf.get(cls, 0.0):
+                        class_conf[cls] = conf
+            event["subject"] = self._classify_subject(
+                class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor
+            )
+
         # --- Active-model identity join (identification-gallery-activity spec).
         # Annotate each RETURNED event with the active gallery's aggregated identity
-        # (or None). Runs AFTER the cap so the join is bounded by `limit` events, and
-        # with the store lock free (clustering released it above) — `active_model()`
-        # and the reads below each re-acquire it per the single-lock discipline. With
-        # no active model, every event's `identity` is None, so the feed renders
-        # exactly like the oracle-free base feed did.
-        model = self.active_model()
-        if model is None or not events:
+        # (or None). Bounded by `limit` events (runs after the cap). With no active
+        # model, every event's `identity` is None, so the feed renders exactly like
+        # the oracle-free base feed did.
+        if model is None:
             for event in events:
                 event["identity"] = None
             return {"events": events, "truncated": truncated}
 
         # One indexed read of the active model's identifications across the returned
-        # events' overall id span, plus one cats lookup — then aggregate per event in
-        # pure Python (no numpy). Idents in the gaps between events match no event's
-        # [start_id, end_id] and are simply ignored.
-        lo = min(e["start_id"] for e in events)
-        hi = max(e["end_id"] for e in events)
+        # events' overall id span (`lo`/`hi` computed above), plus one cats lookup —
+        # then aggregate per event in pure Python (no numpy). Idents in the gaps
+        # between events match no event's [start_id, end_id] and are simply ignored.
         with self._lock:
             # frame_id-ORDERED so each event's span is a contiguous slice found by
             # bisect (below) — O(events·log N) instead of a full re-scan per event.
@@ -2208,6 +2312,20 @@ class Store:
             hi_i = bisect.bisect_right(ident_fids, e_hi)
             span = [(int(cid), float(dist)) for _fid, cid, dist in ident_rows[lo_i:hi_i]]
             event["identity"] = self._aggregate_identity(span, threshold, cat_names, cat_residents)
+            # A confident NAMED gallery match (resident/neighbour, cat_id set) is a
+            # stronger "is a cat" signal than the yolo-serial box confidence the subject
+            # ladder floors at _ANNOTATE_MIN_CONF, so it PROMOTES the subject to 'cat'
+            # even when the span's peak cat-box confidence sat in the recall-first
+            # [0.15, 0.3) band. Without this, a real (often night / hard-angle) resident
+            # whose only detections were low-confidence would carry a resident identity
+            # yet a 'motion only'/'unrecognized' subject — hiding the resident chip and
+            # diverging the two feeds' resident filters. Promotion upholds the spec's "a
+            # positive cat detection always wins". An UNKNOWN-cat identity (cat_id None, a
+            # far match) is NOT promoted: at low box confidence it may be an empty-scene
+            # phantom, so it stays phantom-safe (unrecognized/motion_only).
+            ident = event["identity"]
+            if ident is not None and ident.get("cat_id") is not None and event["subject"]["kind"] != "cat":
+                event["subject"] = {"kind": "cat"}
         return {"events": events, "truncated": truncated}
 
     @staticmethod
@@ -2290,6 +2408,51 @@ class Store:
             "n_frames_voted": count,
         }
 
+    @staticmethod
+    def _classify_subject(
+        class_conf: "dict[int, float]",
+        peak_area: float,
+        n_frames: int,
+        floor: dict,
+    ) -> dict:
+        """Classify one event's SUBJECT — "what is it" — per the ladder (spec).
+
+        ``class_conf`` maps a COCO class id → the span-wide max ``yolo-serial``
+        confidence for it (merged over the event's frames via ``_subject_classes``);
+        ``peak_area`` is the cluster's peak ``frames.area`` (downscaled-ROI fraction);
+        ``n_frames`` its motion-frame count; ``floor`` the resolved motion floor
+        (learned ``{min_area, min_frames, ...}`` or ``_SUBJECT_FLOOR_DEFAULT``). A
+        class counts as PRESENT only at conf ``>= _ANNOTATE_MIN_CONF`` — the same
+        floor the annotation queue uses to reject the recall-first oracle's low-conf
+        empty-scene phantoms, so a hallucinated box never earns a subject chip.
+
+        This is the BOX/motion ladder, in strict precedence::
+
+            1. cat         → {kind: 'cat'}                         # identity carries who
+            2. person      → {kind: 'person', conf}
+            3. bird        → {kind: 'bird', conf}
+            4. peak_area >= floor.min_area OR n_frames >= floor.min_frames
+                           → {kind: 'unrecognized', peak_area, n_frames}
+            5. else        → {kind: 'motion_only', peak_area, n_frames}
+
+        A positive cat box (step 1) always wins over the size floor, so a cat is never
+        second-guessed by geometry. One rung sits OUTSIDE this method: a confident
+        NAMED gallery match can promote a non-cat verdict to ``cat`` — that needs the
+        identity join, so ``events()`` applies it after calling this (see the promotion
+        note there). Steps 4–5 are the only reachable ones when the span has no
+        ``yolo-serial`` rows (no class info), so an un-swept or pre-model event still
+        gets an honest motion label rather than a blank card.
+        """
+        if class_conf.get(_COCO_CAT_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
+            return {"kind": "cat"}
+        if class_conf.get(_COCO_PERSON_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
+            return {"kind": "person", "conf": class_conf[_COCO_PERSON_CLASS_ID]}
+        if class_conf.get(_COCO_BIRD_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
+            return {"kind": "bird", "conf": class_conf[_COCO_BIRD_CLASS_ID]}
+        if peak_area >= floor["min_area"] or n_frames >= floor["min_frames"]:
+            return {"kind": "unrecognized", "peak_area": peak_area, "n_frames": n_frames}
+        return {"kind": "motion_only", "peak_area": peak_area, "n_frames": n_frames}
+
     # --- Cat-identity annotation tool: roster + dataset items --------------
     #
     # The label surface (see the cat-identity annotation-tool spec). It reuses the
@@ -2305,31 +2468,79 @@ class Store:
     # rest of the store.
 
     @staticmethod
-    def _best_box(detail_text: "str | None") -> "tuple[list[float], float] | None":
-        """The highest-confidence box in an ``analysis.detail`` JSON, or ``None``.
+    def _detail_boxes(detail_text: "str | None") -> list:
+        """The ``boxes`` list from an ``analysis.detail`` JSON, or ``[]``.
 
-        ``detail`` is a YOLO analyzer's ``{"boxes": [[x1,y1,x2,y2,conf], ...], ...}``
-        in the STORED JPEG's own pixel space (so a crop of that JPEG is
-        coordinate-consistent). Returns ``([x1,y1,x2,y2], conf)`` for the box with
-        the max ``conf``, or ``None`` when the detail is missing, malformed, or has
-        no usable box — so a present verdict whose detail can't yield a box is
-        skipped rather than crashing the queue (in practice ``yolo-serial`` always
-        writes a box when its verdict is present, so this is a defensive guard).
+        The shared, tolerant parse behind ``_best_box`` and ``_subject_classes`` —
+        factored so the two can never drift on how a stored detail is decoded.
+        Missing text, invalid JSON, a non-dict payload, or a non-list ``boxes`` all
+        collapse to ``[]``; the per-box shape/class is left to ``_box_class``.
         """
         if not detail_text:
-            return None
+            return []
         try:
             detail = json.loads(detail_text)
         except (ValueError, TypeError):
-            return None
+            return []
         boxes = detail.get("boxes") if isinstance(detail, dict) else None
-        if not boxes:
+        return boxes if isinstance(boxes, list) else []
+
+    @staticmethod
+    def _box_class(box) -> "int | None":
+        """The COCO class id of one detail box, or ``None`` when it is unusable.
+
+        The single home of the box-shape rule both readers share: a 6-element
+        ``[x1,y1,x2,y2,conf,cls]`` box (since the serial persona was broadened past
+        cat-only) yields ``int(cls)``; a legacy 5-element ``[x1,y1,x2,y2,conf]`` box
+        predates the class tag and was cat-only, so it counts as ``_COCO_CAT_CLASS_ID``;
+        a non-list or shorter entry is ``None``. Either usable shape carries the coords
+        (0–3) and ``conf`` (4) the callers read.
+        """
+        if not isinstance(box, (list, tuple)):
             return None
-        usable = [b for b in boxes if isinstance(b, (list, tuple)) and len(b) >= 5]
+        if len(box) >= 6:
+            return int(box[5])
+        if len(box) == 5:
+            return _COCO_CAT_CLASS_ID
+        return None
+
+    @staticmethod
+    def _best_box(detail_text: "str | None") -> "tuple[list[float], float] | None":
+        """The highest-confidence CAT box in an ``analysis.detail`` JSON, or ``None``.
+
+        ``detail`` is a YOLO analyzer's boxes in the STORED JPEG's own pixel space (so
+        a crop of that JPEG is coordinate-consistent). A box counts here only when
+        ``_box_class`` says it is a cat (a 6-element ``cls == 15`` box, or a legacy
+        5-element cat-only box). Returns ``([x1,y1,x2,y2], conf)`` for the cat box with
+        the max ``conf``, or ``None`` when the detail is missing, malformed, or holds
+        no cat box — so identify + annotation stay behaviour-preserving (they only ever
+        wanted the cat crop), and a person/bird-only frame yields ``None`` here.
+        """
+        usable = [b for b in Store._detail_boxes(detail_text) if Store._box_class(b) == _COCO_CAT_CLASS_ID]
         if not usable:
             return None
         best = max(usable, key=lambda b: b[4])
         return [float(best[0]), float(best[1]), float(best[2]), float(best[3])], float(best[4])
+
+    @staticmethod
+    def _subject_classes(detail_text: "str | None") -> "dict[int, float]":
+        """Map each detected COCO class → its max confidence in an ``analysis.detail``.
+
+        Over ALL classes (not just cat), sharing ``_detail_boxes`` + ``_box_class``
+        with ``_best_box`` so the parse and the legacy-5-element rule live in one place.
+        Each box contributes its class id → the running max ``conf`` for that class.
+        This is the signal the event-subject classification ladder reads to decide
+        whether a span holds a cat / person / bird when no cat was detected.
+        """
+        by_class: "dict[int, float]" = {}
+        for b in Store._detail_boxes(detail_text):
+            cls = Store._box_class(b)
+            if cls is None:
+                continue
+            conf = float(b[4])
+            if conf > by_class.get(cls, float("-inf")):
+                by_class[cls] = conf
+        return by_class
 
     @staticmethod
     def _bbox_area(bbox: "list[float]") -> float:
@@ -2797,6 +3008,64 @@ class Store:
             }
             for r in rows
         ]
+
+    def labeled_cat_motion_floor(self) -> "dict | None":
+        """Learn the event-subject motion floor from labelled CAT visits, or ``None``.
+
+        The gallery-build stamp behind ``events()``'s subject floor (see
+        ``build_gallery`` and ``_SUBJECT_FLOOR_DEFAULT``). Over every
+        ``dataset_items`` row a human labelled as a real cat — ``label_kind IN
+        ('identified', 'unknown_cat')`` — INNER-JOINed to ``frames`` on the
+        ``(src_frame_id, src_recv_ts)`` pair (the same ``clear``-safe linkage
+        ``labeled_visits`` uses, so a reused rowid can't cross-match), it reads each
+        frame's ``(recv_ts, area, motion)``. EVICTED frames simply drop out of the
+        join — the label survives eviction, but its motion profile only counts while
+        the frame is still in the rolling buffer.
+
+        Those frames are clustered into visits by the shared
+        ``_gap_split``/``_VISIT_GAP_MS`` primitive (the SAME clustering
+        ``events()``/``visits`` use, so "a visit" means one thing everywhere). Per
+        visit it takes the PEAK ``frames.area`` and the motion-frame count, then
+        returns a LOW percentile (~10th) of each across visits::
+
+            {min_area, min_frames, n_visits, source: 'labeled'}
+
+        The 10th percentile sits "below essentially every real cat visit", so a
+        no-detection event ABOVE it is cat-scale motion YOLO couldn't name (worth a
+        look → ``unrecognized``) and one BELOW it is less motion than any real cat
+        (noise → ``motion_only``). ``min_area`` is the interpolated percentile
+        (a fraction, same axis as the default); ``min_frames`` is the percentile
+        floored to an int (``>= 1``) since it counts frames. Returns ``None`` when
+        fewer than 3 visits survive the join, so a reader falls back to
+        ``_SUBJECT_FLOOR_DEFAULT`` rather than trusting a percentile of near-nothing.
+        Single connection + single lock, percentiles in plain Python.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.recv_ts, f.area, f.motion"
+                " FROM dataset_items d"
+                " JOIN frames f ON f.id = d.src_frame_id AND f.recv_ts = d.src_recv_ts"
+                " WHERE d.label_kind IN ('identified', 'unknown_cat')"
+                " ORDER BY f.recv_ts ASC",
+            ).fetchall()
+        # Cluster + reduce outside the lock (pure Python over fetched rows, already
+        # recv_ts-ordered by the query's ORDER BY).
+        peak_areas: "list[float]" = []
+        motion_counts: "list[int]" = []
+        for cluster in self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[0]):
+            peak_areas.append(max(float(r[1]) for r in cluster))
+            motion_counts.append(sum(1 for r in cluster if r[2]))
+        n_visits = len(peak_areas)
+        if n_visits < 3:
+            return None
+        peak_areas.sort()
+        motion_counts.sort()
+        return {
+            "min_area": _percentile(peak_areas, 10.0),
+            "min_frames": max(1, int(math.floor(_percentile(motion_counts, 10.0)))),
+            "n_visits": n_visits,
+            "source": "labeled",
+        }
 
     def count_identified_crops(
         self, qualities: "tuple[str, ...] | None"

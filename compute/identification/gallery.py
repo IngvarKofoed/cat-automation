@@ -59,7 +59,11 @@ def build_gallery(
     (``vectors`` RAW float32 ``(N,D)``, ``cat_ids`` int64 ``(N,)``, plus the resolved
     ``backbone``/``imgsz`` so identify rebuilds the SAME embedder). Returns a summary
     dict for the caller to persist as a ``model_versions`` row — this function does
-    **not** touch the DB.
+    **not** touch the DB. The summary's ``metrics`` dict carries the per-cat counts,
+    the resolved backbone/imgsz, the balanced-accuracy of the suggested threshold, and
+    ``subject_floor`` — the learned event-subject motion floor from
+    ``store.labeled_cat_motion_floor()`` (``None`` when too few labelled visits), which
+    ``Store.events()`` reads back off the active model to classify motion events.
 
     Cold-start / decode guards mirror ``run_feasibility_probe``: fewer than 2 crops
     OR fewer than 2 distinct cats (before embedding) returns
@@ -132,6 +136,13 @@ def build_gallery(
         "backbone": embedder.backbone,
         "imgsz": embedder.imgsz,
         "threshold_balanced_acc": bal_acc,
+        # Learned event-subject motion floor (event-subject-classification spec):
+        # the low-percentile motion profile of labelled cat visits, stamped on the
+        # model so ``Store.events()`` reads it from ``active_model()`` to split a
+        # no-detection event into ``unrecognized`` vs ``motion_only``. May be ``None``
+        # (too few labelled visits) — stored as-is; the reader then falls back to its
+        # conservative default. Recomputed on every build, so it sharpens with labels.
+        "subject_floor": store.labeled_cat_motion_floor(),
     }
 
     os.makedirs(out_dir, exist_ok=True)

@@ -59,6 +59,16 @@
             --unident:       #8c7d6e;   /* seen, but no model / no match */
             --unident-bg:    #efe6d7;
 
+            /* subject (non-cat / uncertain) — deliberately clear of the identity
+               palette above (green/coral/honey) and of the tuning workbench's
+               caught/missed verdict palette. */
+            --person:        #3a6fb0;   /* a person at the door — steel blue */
+            --person-bg:     #dde8f5;
+            --bird:          #1f8a7a;   /* a bird — teal */
+            --bird-bg:       #dcf0ec;
+            --unrec:         #7d5bc4;   /* substantial motion, nothing YOLO could name — violet */
+            --unrec-bg:      #ece4f8;
+
             --shadow:        0 1px 2px rgba(42,34,28,.06), 0 6px 20px rgba(42,34,28,.07);
             --shadow-lift:   0 2px 6px rgba(42,34,28,.10), 0 16px 40px rgba(42,34,28,.14);
             --radius:        16px;
@@ -88,6 +98,13 @@
                 --unknown-bg:   #33260f;
                 --unident:      #9a8a78;
                 --unident-bg:   #241c12;
+
+                --person:       #7fb0e8;
+                --person-bg:    #16283d;
+                --bird:         #4fd0bb;
+                --bird-bg:      #103029;
+                --unrec:        #b79ae8;
+                --unrec-bg:     #2a2038;
 
                 --shadow:       0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.5);
                 --shadow-lift:  0 2px 6px rgba(0,0,0,.5), 0 20px 48px rgba(0,0,0,.62);
@@ -266,6 +283,13 @@
         .chip.resident  { background: var(--resident-bg);  color: var(--resident); }
         .chip.neighbour { background: var(--neighbour-bg); color: var(--neighbour); }
         .chip.unknown   { background: var(--unknown-bg);   color: var(--unknown); }
+        /* non-cat / uncertain subjects — kept visually clear of the identity
+           palette above (green/coral/honey) and of the admin tuning workbench's
+           caught/missed verdict palette. */
+        .chip.person       { background: var(--person-bg); color: var(--person); }
+        .chip.bird         { background: var(--bird-bg);   color: var(--bird); }
+        .chip.unrecognized { background: var(--unrec-bg);  color: var(--unrec); }
+        .chip.motion       { background: var(--unident-bg); color: var(--unident); }
 
         /* ================= ACTIVITY: the threshold time-rail ================= */
         .day-group { margin-bottom: 1.5rem; }
@@ -312,6 +336,10 @@
         .event-row .dot.resident  { background: var(--resident); }
         .event-row .dot.neighbour { background: var(--neighbour); }
         .event-row .dot.unknown   { background: var(--unknown); }
+        .event-row .dot.person       { background: var(--person); }
+        .event-row .dot.bird         { background: var(--bird); }
+        .event-row .dot.unrecognized { background: var(--unrec); }
+        .event-row .dot.motion       { background: var(--unident); }
 
         .event-card {
             display: flex;
@@ -736,16 +764,37 @@
         function showNote(el, msg) { el.textContent = msg; el.classList.remove('hidden'); }
         function hideNote(el) { el.classList.add('hidden'); }
 
-        // ================= identity semantics =================
-        // resident   = confident, named, one of ours          -> green
-        // neighbour  = confident, named, NOT ours (foreign)    -> coral
-        // unknown    = a cat identified but too far to name    -> amber
-        // unidentified = no active model / nothing matched     -> no chip
+        // ================= identity / subject semantics =================
+        // Every event carries ev.subject = {kind: 'cat'|'person'|'bird'|'unrecognized'
+        // |'motion_only', ...} (see docs/specs/2026-07-22-event-subject-classification.md).
+        // 'cat' falls through to the existing identity-chip logic below, unchanged:
+        //   resident   = confident, named, one of ours          -> green
+        //   neighbour  = confident, named, NOT ours (foreign)    -> coral
+        //   unknown    = a cat identified but too far to name    -> amber
+        //   unidentified = no active model / nothing matched     -> no chip
+        // Non-cat subjects get their own chip, kept clear of the identity palette:
+        //   person        = a person was in frame                -> steel blue
+        //   bird          = a bird was in frame                   -> teal
+        //   unrecognized  = substantial motion, nothing nameable  -> violet
+        //   motion_only   = a little motion, likely noise         -> muted grey
         function identityKind(identity) {
             if (!identity) return 'unidentified';
             if (identity.cat_id == null) return 'unknown';
             return identity.is_resident ? 'resident' : 'neighbour';
         }
+        // The single chokepoint for "what is this event, chip-wise" — routes cat
+        // subjects to the existing identity logic, everything else to its own kind.
+        function subjectKind(ev) {
+            const subj = ev.subject;
+            if (!subj || subj.kind === 'cat') return identityKind(ev.identity);
+            return subj.kind;   // 'person' | 'bird' | 'unrecognized' | 'motion_only'
+        }
+        // Resident = a confident NAMED match to one of our cats (identity-derived, the
+        // same definition the admin feed uses) — not subject-derived, so the "hide our
+        // cats" filter still hides a low-confidence resident whose subject the ladder
+        // couldn't confirm as a cat. (Backend now promotes such an event's subject to
+        // 'cat' too, so chip and filter agree, but keeping the filter on identity is the
+        // single robust definition shared across both feeds.)
         function isResidentEvent(ev) { return identityKind(ev.identity) === 'resident'; }
         function identityChip(identity) {
             const kind = identityKind(identity);
@@ -756,6 +805,38 @@
                 ? 'unknown cat'
                 : (identity.cat_name || `cat #${identity.cat_id}`);
             return chip;
+        }
+        // The CSS-class token for a subject kind — the chip and the rail dot both use
+        // it, so they can't diverge: motion_only renders with the muted 'motion' styling
+        // (there is deliberately no `.motion_only` rule).
+        function subjectCssClass(kind) { return kind === 'motion_only' ? 'motion' : kind; }
+        // Builds the chip for ANY event — a cat keeps the exact identityChip()
+        // rendering above; every other subject kind gets its own chip.
+        function subjectChip(ev) {
+            const kind = subjectKind(ev);
+            if (kind === 'resident' || kind === 'neighbour' || kind === 'unknown') {
+                return identityChip(ev.identity);
+            }
+            if (kind === 'unidentified') return null;
+            const chip = document.createElement('span');
+            chip.className = 'chip ' + subjectCssClass(kind);
+            chip.textContent = kind === 'motion_only' ? 'motion only' : kind;
+            return chip;
+        }
+        // Screen-reader text describing the subject, for the row's aria-label.
+        function subjectAriaText(ev) {
+            const kind = subjectKind(ev);
+            switch (kind) {
+                case 'resident':
+                case 'neighbour':
+                    return ev.identity.cat_name || `cat #${ev.identity.cat_id}`;
+                case 'unknown': return 'an unknown cat';
+                case 'person': return 'a person';
+                case 'bird': return 'a bird';
+                case 'unrecognized': return 'unrecognized motion';
+                case 'motion_only': return 'motion only, likely noise';
+                default: return 'a cat';
+            }
         }
 
         // ================= router =================
@@ -862,19 +943,16 @@
         }
 
         function eventRow(ev, i) {
-            const kind = identityKind(ev.identity);
+            const kind = subjectKind(ev);
             const row = document.createElement('div');
             row.className = 'event-row';
             row.dataset.index = String(i);
             row.tabIndex = 0;
             row.setAttribute('role', 'button');
-            const chipText = kind === 'resident' || kind === 'neighbour'
-                ? (ev.identity.cat_name || `cat #${ev.identity.cat_id}`)
-                : (kind === 'unknown' ? 'an unknown cat' : 'a cat');
-            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${chipText}. Open playback.`);
+            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${subjectAriaText(ev)}. Open playback.`);
 
             const dot = document.createElement('div');
-            dot.className = 'dot ' + kind;
+            dot.className = 'dot ' + subjectCssClass(kind);
 
             const card = document.createElement('div');
             card.className = 'event-card';
@@ -905,7 +983,7 @@
             rel.className = 'event-rel';
             rel.textContent = relativeTime(ev.start_ts);
             meta.append(time, rel);
-            const chip = identityChip(ev.identity);
+            const chip = subjectChip(ev);
             if (chip) meta.appendChild(chip);
 
             card.append(port, meta);
@@ -958,7 +1036,7 @@
             // Header: when + identity chip.
             playerWhenEl.textContent = formatTime(ev.start_ts);
             playerChipSlotEl.innerHTML = '';
-            const chip = identityChip(ev.identity);
+            const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
 
             // Reset to a loading state so a slow fetch never shows the previous event.

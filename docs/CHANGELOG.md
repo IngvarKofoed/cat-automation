@@ -454,3 +454,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     hides events confidently identified as a resident, leaving foreign/unknown/unidentified visits —
     the events worth a look. The player + Prev/Next now step the filtered subset, so navigation can't
     land on a hidden resident.
+
+79. #tuning MOG2 fields now carry a per-knob description (`.param-hint`): what each param does and
+    which way to turn it to detect more (↓ var_threshold/learning_rate/min_area/persistence,
+    ↑ max_area_fraction/motion_downscale). persistence notes it's frames-not-seconds, so a higher
+    capture fps shortens the same value's time window. Presentation only.

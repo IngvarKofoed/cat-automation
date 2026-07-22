@@ -617,6 +617,21 @@
             color: var(--color-text);
             width: 110px;
         }
+        /* One-line-ish helper under a tuning field: what the knob does and which way
+           to turn it to "detect more". Muted + narrow so it wraps under the input
+           without widening the row; the leading directional cue is un-muted so the
+           actionable part reads at a glance. */
+        .param-hint {
+            font-size: 11px;
+            line-height: 1.35;
+            font-weight: 400;
+            color: var(--color-text-muted);
+            max-width: 172px;
+        }
+        .param-hint strong {
+            color: var(--color-text);
+            font-weight: 600;
+        }
         /* Saved-buckets / groups list rows. */
         .groups-list {
             display: flex;
@@ -1743,30 +1758,40 @@
         <!-- MOG2 tuning (relocated, window-scoped) + the multi-oracle comparison matrix. -->
         <div class="panel" id="tuningPanel">
             <h2>MOG2 Tuning</h2>
-            <div class="controls-row">
+            <!-- Top-align this row (not the default flex-end): each field now hangs a
+                 variable-height .param-hint below its input, so bottom-aligning would
+                 stagger the inputs. flex-start keeps the inputs on one line; the hints
+                 hang ragged beneath them. -->
+            <div class="controls-row" style="align-items: flex-start;">
                 <div class="control-group">
                     <label for="param_var_threshold">var_threshold</label>
                     <input type="number" id="param_var_threshold" step="0.5" class="param-input">
+                    <span class="param-hint"><strong>↓ lower = detect more.</strong> MOG2's foreground sensitivity — lower lets subtler pixel changes count (dark / low-contrast night cats).</span>
                 </div>
                 <div class="control-group">
                     <label for="param_learning_rate">learning_rate</label>
                     <input type="number" id="param_learning_rate" step="0.001" class="param-input">
+                    <span class="param-hint"><strong>↓ lower = detect more.</strong> How fast a still object fades into the background — lower keeps a paused / lingering cat foreground longer.</span>
                 </div>
                 <div class="control-group">
                     <label for="param_min_area">min_area</label>
                     <input type="number" id="param_min_area" step="0.0001" class="param-input">
+                    <span class="param-hint"><strong>↓ lower = detect more.</strong> Smallest blob that counts, as a fraction of the ROI — lower admits smaller / distant / partial-view cats.</span>
                 </div>
                 <div class="control-group">
                     <label for="param_max_area_fraction">max_area_fraction</label>
                     <input type="number" id="param_max_area_fraction" step="0.01" class="param-input">
+                    <span class="param-hint"><strong>↑ raise if close cats missed.</strong> Largest blob that counts — rejects whole-ROI light jumps. Raise only if a cat right under the camera fills the frame.</span>
                 </div>
                 <div class="control-group">
                     <label for="param_persistence">persistence</label>
                     <input type="number" id="param_persistence" step="1" class="param-input">
+                    <span class="param-hint"><strong>↓ lower = detect more.</strong> Consecutive motion frames before it fires; 1 catches fast / brief crossings. Counted in frames, not seconds — at higher fps the same value spans less time.</span>
                 </div>
                 <div class="control-group">
                     <label for="param_motion_downscale">motion_downscale</label>
                     <input type="number" id="param_motion_downscale" step="1" class="param-input">
+                    <span class="param-hint"><strong>↑ raise if tiny blobs vanish.</strong> ROI width (px) fed to MOG2 — higher preserves small / distant blobs, at more CPU cost.</span>
                 </div>
                 <div class="control-group push-end">
                     <span id="tuningParamSource" class="badge">Params: —</span>

@@ -551,3 +551,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     full sweep of the same window don't collide. The `reanalyze` clear is motion-scoped under `motion_only`,
     so the tight button re-detects the visits' motion frames WITHOUT wiping non-motion verdicts a breadth
     sweep produced. Default off everywhere → every existing sweep path is byte-identical.
+
+92. User Activity feed gained a "Show all" toggle beside "Hide our cats" (default off): off hides the two
+    low-signal subject kinds — `unrecognized` (cat-scale motion the detector couldn't name) and
+    `motion_only` (below-floor noise); on shows them. Any real subject (a cat named or not, person, bird)
+    always shows, so the default feed stays useful before a gallery is promoted (every cat is unidentified).
+    Client-only; the two toggles compose. Empty-state hint names whichever toggle would reveal something.

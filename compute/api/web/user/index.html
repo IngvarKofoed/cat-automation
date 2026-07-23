@@ -229,6 +229,15 @@
         }
         .btn.ghost:hover { background: var(--surface-2); filter: none; }
 
+        /* The activity toggles group at the right of the head; the group carries the
+           margin-left:auto so the two checkboxes sit together (not spread apart). */
+        .toggles {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-left: auto;
+        }
         .toggle {
             display: inline-flex;
             align-items: center;
@@ -237,7 +246,6 @@
             color: var(--muted);
             cursor: pointer;
             user-select: none;
-            margin-left: auto;
         }
         .toggle input { width: 1.05rem; height: 1.05rem; accent-color: var(--porch); cursor: pointer; }
 
@@ -596,10 +604,16 @@
         <section id="view-activity" class="view">
             <div class="view-head activity-head">
                 <h1>At the door</h1>
-                <label class="toggle">
-                    <input type="checkbox" id="strangersOnly">
-                    Hide our cats
-                </label>
+                <div class="toggles">
+                    <label class="toggle">
+                        <input type="checkbox" id="strangersOnly">
+                        Hide our cats
+                    </label>
+                    <label class="toggle">
+                        <input type="checkbox" id="showAll">
+                        Show all
+                    </label>
+                </div>
             </div>
 
             <div class="note error hidden" id="activityError"></div>
@@ -683,6 +697,9 @@
         let catAvatarVer = {};   // cat_id -> avatar_version (mtime); stamped on the URL so it caches yet busts on change
         let activitySeq = 0, activitySelectedIndex = -1;
         let strangersOnly = false;
+        // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
+        // motion and motion-only noise — leaving named cats, persons and birds.
+        let showAll = false;
 
         // player
         let playerSeq = 0;
@@ -694,6 +711,7 @@
         // ================= element refs =================
         const $ = (id) => document.getElementById(id);
         const strangersOnlyEl = $('strangersOnly');
+        const showAllEl = $('showAll');
         const activityErrorEl = $('activityError');
         const activityEmptyEl = $('activityEmpty'), railEl = $('activityRail');
         const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
@@ -796,6 +814,16 @@
         // 'cat' too, so chip and filter agree, but keeping the filter on identity is the
         // single robust definition shared across both feeds.)
         function isResidentEvent(ev) { return identityKind(ev.identity) === 'resident'; }
+        // Low-signal subject kinds hidden unless "Show all" is on: cat-scale motion the
+        // detector couldn't name, and below-floor motion-only noise. Any actual subject —
+        // a cat (named or not), a person, a bird — always shows.
+        const NOISE_KINDS = new Set(['unrecognized', 'motion_only']);
+        // Whether an event survives the two activity toggles.
+        function passesActivityFilters(ev) {
+            if (strangersOnly && isResidentEvent(ev)) return false;
+            if (!showAll && NOISE_KINDS.has(subjectKind(ev))) return false;
+            return true;
+        }
         function identityChip(identity) {
             const kind = identityKind(identity);
             if (kind === 'unidentified') return null;
@@ -901,17 +929,28 @@
         function renderActivity() {
             railEl.innerHTML = '';
             activitySelectedIndex = -1;
-            activityVisible = strangersOnly
-                ? activityEvents.filter(ev => !isResidentEvent(ev))
-                : activityEvents.slice();
+            activityVisible = activityEvents.filter(passesActivityFilters);
 
             const empty = activityVisible.length === 0;
             activityEmptyEl.classList.toggle('hidden', !empty);
             if (empty) {
                 let big = 'Quiet at the door', line = 'No cats have crossed recently.';
-                if (activityEvents.length && strangersOnly) {
-                    big = 'Only our own cats here';
-                    line = 'Every recent visit was one of our residents.';
+                // Events exist but are all filtered out — hint at whichever toggle,
+                // if loosened, would reveal something.
+                if (activityEvents.length) {
+                    const showAllWouldReveal = !showAll && activityEvents.some(ev =>
+                        !(strangersOnly && isResidentEvent(ev)) && NOISE_KINDS.has(subjectKind(ev)));
+                    const hideCatsWouldReveal = strangersOnly && activityEvents.some(isResidentEvent);
+                    if (hideCatsWouldReveal && !showAllWouldReveal) {
+                        big = 'Only our own cats here';
+                        line = 'Every recent visit was one of our residents — uncheck "Hide our cats".';
+                    } else if (showAllWouldReveal) {
+                        big = 'Nothing notable at the door';
+                        line = 'Recent activity was unrecognized or low-motion — check "Show all" to see it.';
+                    } else {
+                        big = 'Nothing to show';
+                        line = 'The current filters hide every recent visit.';
+                    }
                 }
                 activityEmptyEl.innerHTML = '';
                 const b = document.createElement('div'); b.className = 'big'; b.textContent = big;
@@ -1015,6 +1054,11 @@
         // (unfiltered) list can't dangle after the visible list shrinks.
         strangersOnlyEl.addEventListener('change', () => {
             strangersOnly = strangersOnlyEl.checked;
+            closePlayer();
+            renderActivity();
+        });
+        showAllEl.addEventListener('change', () => {
+            showAll = showAllEl.checked;
             closePlayer();
             renderActivity();
         });

@@ -37,6 +37,7 @@ from compute.analysis.yolo import (  # import-light COCO class-id constants (yol
     _COCO_CAT_CLASS_ID,
     _COCO_PERSON_CLASS_ID,
 )
+from shared.motion import corruption_thresholds  # import-light (cv2/numpy are lazy in shared.motion)
 
 # Oldest-first eviction batch size: eviction selects and deletes rows in chunks
 # rather than one round-trip per row, so freeing space after a burst stays cheap.
@@ -53,6 +54,25 @@ _ROW_COLUMNS_F = ", ".join("f." + c for c in _ROW_COLUMNS.split(", "))
 
 _ALLOWED_MOTION = ("all", "motion", "still")
 _ALLOWED_ORDER = ("time", "area_desc", "area_asc")
+
+# The corruption-review feed's filters (see the corruption-review-page spec):
+# "all" = every frame in the window; "corrupt" = only frames the guard flagged;
+# "corrupt-and-cat" = the fail-non-safe danger set (flagged corrupt AND a cat
+# oracle says a cat is present). Validated in ``corruption_feed`` so a typo is a
+# 400, mirroring ``query``'s motion/order handling.
+_ALLOWED_CORRUPT_FILTER = ("all", "corrupt", "corrupt-and-cat")
+
+# The analyzer name the corruption sweep persists under (a NON-registered analyzer
+# — deliberately absent from ANALYZER_NAMES so it never appears in the scorecard /
+# disagreement / oracle-coverage paths; see compute/analysis/corruption.py).
+_CORRUPTION_ANALYZER = "corruption"
+
+# The cat oracles the corruption page's "cat" flag / danger filter consults: a
+# frame reads cat-present if EITHER a batched-``yolo`` or a ``yolo-serial`` verdict
+# says so. A subset of ANALYZER_NAMES, named here so the corruption JOINs have one
+# source; the page shows "cat where a yolo sweep covered it", so an un-swept frame
+# reports cat = None (not covered), never a false negative.
+_CAT_ORACLES = ("yolo", "yolo-serial")
 # Disagreement modes for query_disagreements: which side of an oracle verdict vs.
 # the edge's MOG2 motion flag we want to eyeball. "missed" = MOG2 saw no motion
 # but the oracle says the subject is present (a genuine gate miss); "false" =
@@ -173,6 +193,17 @@ def _parse_area_cursor(cursor: str) -> "tuple[float, int]":
         return float(area_str), int(id_str)
     except (ValueError, AttributeError):
         raise ValueError(f"invalid area cursor: {cursor!r}")
+
+
+def _like_escape(s: str) -> str:
+    """Escape ``s`` for a SQLite ``LIKE ... ESCAPE '\\'`` exact-substring match.
+
+    ``%`` and ``_`` are LIKE wildcards; a serialized JSON fragment contains ``_``
+    (in keys like ``cast_chroma``), so without escaping ``_`` would match any char
+    and a stale-threshold count could over-match. Escaping ``\\`` first (it is the
+    escape char) then ``%``/``_`` makes the pattern a literal substring test.
+    """
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _range_bounds(col: str, since_id: "int | None", until_id: "int | None") -> "tuple[list, list]":
@@ -1522,6 +1553,175 @@ class Store:
         rows = [self._row_to_dict(r[:-1], score=r[-1]) for r in fetched]
         next_cursor = str(rows[-1]["id"]) if len(rows) == limit else None
         return rows, next_cursor
+
+    # --- Corruption-review feed --------------------------------------------
+    #
+    # The corruption-review page's read layer (see the corruption-review-page
+    # spec): a range-scoped, keyset-paged feed joining each frame to its persisted
+    # ``corruption`` verdict AND its cat-oracle (``yolo``/``yolo-serial``) verdict,
+    # plus a staleness count and a cat-coverage readout. Mirrors the analyzer-JOIN
+    # in ``query_disagreements``; corruption stays a NON-registered analyzer, so it
+    # is queried by the literal name and never enters the ANALYZER_NAMES paths.
+
+    # The cat presence per frame across the two cat oracles: MAX(verdict) over
+    # ``yolo``/``yolo-serial`` rows for a frame (1 iff either says present; 0 iff
+    # covered-but-none; NULL iff neither oracle has swept the frame). One place so
+    # the feed and the coverage readout can't drift. ``?, ?`` bind ``_CAT_ORACLES``.
+    _CAT_SUBQUERY = (
+        "SELECT frame_id, MAX(verdict) AS cat_verdict FROM analysis"
+        " WHERE analyzer IN (?, ?) GROUP BY frame_id"
+    )
+
+    def corruption_feed(
+        self,
+        filter: str,
+        cursor: "str | None",
+        limit: int,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+    ):
+        """Return ``(rows, next_cursor)`` for the corruption-review feed over a window.
+
+        Newest-first on ``frames.id`` (``id DESC``) with the SAME opaque keyset
+        contract as ``query`` / ``query_disagreements`` (token = last id; ``None``
+        once a page is short). Each frame LEFT JOINs its ``corruption`` verdict and
+        a MAX-over-cat-oracles presence, so an un-swept frame still appears (with
+        ``corrupt``/``cat`` = ``None``) under the ``all`` filter.
+
+        ``filter`` ∈ ``_ALLOWED_CORRUPT_FILTER``:
+
+        - ``all`` — every frame in the window.
+        - ``corrupt`` — only frames whose ``corruption`` verdict = 1.
+        - ``corrupt-and-cat`` — the fail-non-safe danger set: ``corruption`` = 1
+          AND a cat oracle verdict = 1. Operates over whatever cat verdicts exist,
+          so an empty danger set means "none found so far" — the caller pairs it
+          with ``cat_coverage`` to flag un-swept ranges (see the spec).
+
+        An unknown ``filter`` raises ``ValueError`` (→ 400, like ``query``'s bad
+        ``motion``/``order``). ``since_id``/``until_id`` are the usual optional
+        inclusive id scope. Each row is ``_row_to_dict``'s frame fields plus
+        ``corrupt`` (bool | None), ``reason`` (``"cast"``/``"line"``/None), and
+        ``cat`` (bool | None — None = no cat oracle covered the frame).
+        """
+        if filter not in _ALLOWED_CORRUPT_FILTER:
+            raise ValueError(
+                f"filter must be one of {_ALLOWED_CORRUPT_FILTER}, got {filter!r}"
+            )
+
+        where: list = []
+        if filter in ("corrupt", "corrupt-and-cat"):
+            where.append("c.verdict = 1")
+        if filter == "corrupt-and-cat":
+            where.append("cat.cat_verdict = 1")
+
+        # Param order follows the SQL TEXT order of the placeholders: the corruption
+        # LEFT JOIN's ``c.analyzer = ?`` comes first, then the cat subquery's
+        # ``IN (?, ?)``, then the optional cursor + range + limit.
+        params: list = [_CORRUPTION_ANALYZER, _CAT_ORACLES[0], _CAT_ORACLES[1]]
+        if cursor is not None:
+            where.append("f.id < ?")
+            params.append(_parse_id_cursor(cursor))
+        range_frags, range_params = _range_bounds("f.id", since_id, until_id)
+        where.extend(range_frags)
+        params.extend(range_params)
+        params.append(int(limit))
+
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._lock:
+            fetched = self._conn.execute(
+                f"SELECT {_ROW_COLUMNS_F}, c.verdict, c.detail, cat.cat_verdict FROM frames f"
+                " LEFT JOIN analysis c ON c.frame_id = f.id AND c.analyzer = ?"
+                f" LEFT JOIN ({self._CAT_SUBQUERY}) cat ON cat.frame_id = f.id"
+                f"{clause} ORDER BY f.id DESC LIMIT ?",
+                params,
+            ).fetchall()
+
+        rows = [self._corruption_row_to_dict(r) for r in fetched]
+        next_cursor = str(rows[-1]["id"]) if len(rows) == limit else None
+        return rows, next_cursor
+
+    @staticmethod
+    def _corruption_row_to_dict(row) -> dict:
+        """Map a corruption-feed row (frame cols + corrupt verdict/detail + cat verdict).
+
+        ``row`` is ``_ROW_COLUMNS`` (7 fields) then ``c.verdict``, ``c.detail``,
+        ``cat.cat_verdict``. ``corrupt``/``cat`` are ``None`` when the frame carries
+        no verdict for that analyzer (un-swept), so the UI can distinguish
+        "not corrupt" from "not yet checked". ``reason`` comes from the verdict's
+        stamped ``detail`` (``None`` for an un-swept or reasonless row).
+        """
+        base = Store._row_to_dict(row[:7])
+        corrupt_verdict, detail_text, cat_verdict = row[7], row[8], row[9]
+        base["corrupt"] = None if corrupt_verdict is None else bool(corrupt_verdict)
+        reason = None
+        if detail_text:
+            try:
+                reason = json.loads(detail_text).get("reason")
+            except (ValueError, AttributeError):
+                reason = None
+        base["reason"] = reason
+        base["cat"] = None if cat_verdict is None else bool(cat_verdict)
+        return base
+
+    def corruption_staleness(
+        self, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> dict:
+        """``{analyzed, stale}`` for the ``corruption`` verdicts in a window.
+
+        ``analyzed`` = corruption verdict rows whose frame is in ``[since_id,
+        until_id]``; ``stale`` = those whose stamped ``detail.thresholds`` differ
+        from the CURRENT ``corruption_thresholds()`` — i.e. verdicts computed under
+        an earlier set of the ``_CORRUPT_*`` constants, which the page warns should
+        be re-swept. "Current" is matched by an exact substring test of the
+        serialized thresholds fragment (``ESCAPE`` makes JSON key underscores
+        literal, not LIKE wildcards); every verdict from one sweep shares one
+        thresholds stamp, so the count is exact. A NULL/absent stamp counts stale.
+        """
+        # The exact serialized thresholds dict, as it appears inside a stored
+        # detail JSON (``write_analysis`` json.dumps the detail with default
+        # separators, and ``corruption_thresholds`` returns a fixed key order, so
+        # an unchanged stamp reproduces this fragment byte-for-byte).
+        fragment = json.dumps(corruption_thresholds())
+        like = "%" + _like_escape(fragment) + "%"
+        frags, range_params = _range_bounds("f.id", since_id, until_id)
+        range_sql = "".join(" AND " + frag for frag in frags)
+        with self._lock:
+            analyzed, current = self._conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(CASE WHEN a.detail LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END), 0)"
+                " FROM analysis a JOIN frames f ON f.id = a.frame_id"
+                " WHERE a.analyzer = ?" + range_sql,
+                [like, _CORRUPTION_ANALYZER] + range_params,
+            ).fetchone()
+        analyzed = int(analyzed)
+        return {"analyzed": analyzed, "stale": analyzed - int(current)}
+
+    def cat_coverage(
+        self, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> dict:
+        """``{total, analyzed, present}`` cat-oracle coverage over a window.
+
+        The corruption page's cat-coverage readout: ``total`` = frames in the
+        window, ``analyzed`` = those carrying a ``yolo`` OR ``yolo-serial`` verdict,
+        ``present`` = those a cat oracle says hold a cat. Lets the page flag
+        INCOMPLETE cat coverage so an empty ``corrupt-and-cat`` set reads as "none
+        found so far", never a false "safe" over an un-swept range (see the spec).
+        Mirrors ``analysis_coverage`` but folds the two cat oracles into one
+        presence via the shared cat subquery.
+        """
+        frags, range_params = _range_bounds("f.id", since_id, until_id)
+        where = (" WHERE " + " AND ".join(frags)) if frags else ""
+        with self._lock:
+            total, analyzed, present = self._conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(CASE WHEN cat.frame_id IS NOT NULL THEN 1 ELSE 0 END), 0),"
+                " COALESCE(SUM(CASE WHEN cat.cat_verdict = 1 THEN 1 ELSE 0 END), 0)"
+                " FROM frames f"
+                f" LEFT JOIN ({self._CAT_SUBQUERY}) cat ON cat.frame_id = f.id"
+                + where,
+                [_CAT_ORACLES[0], _CAT_ORACLES[1]] + range_params,
+            ).fetchone()
+        return {"total": int(total), "analyzed": int(analyzed), "present": int(present)}
 
     # --- Gate tuning scorecards --------------------------------------------
     #

@@ -566,6 +566,7 @@ class AnalysisManager:
         reanalyze: bool = False,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
+        motion_only: bool = False,
     ) -> dict:
         """Enqueue a sweep for an ALREADY-CONSTRUCTED analyzer instance (the MOG2 tuning path).
 
@@ -578,9 +579,15 @@ class AnalysisManager:
         tuple, so two candidates with *different* params over the same window are distinct
         jobs (the tune loop) while a same-params double-click is dropped.
 
-        ``reanalyze`` and the optional scope bounds ride along to the worker, where the
-        verdict clear happens only after a successful ``prepare`` (see ``run_analysis``), so
-        a deps-missing run can't wipe verdicts. Returns the same shape as ``enqueue_named``.
+        ``reanalyze``, the optional scope bounds, and ``motion_only`` ride along to the
+        worker, where the verdict clear happens only after a successful ``prepare`` (see
+        ``run_analysis``), so a deps-missing run can't wipe verdicts. ``motion_only`` is
+        meaningful only for a STATELESS instance (e.g. the corruption sweep) — a windowed
+        analyzer revisits every frame regardless, and ``run_analysis`` already ignores the
+        flag for the windowed path — so a ``MogAnalyzer`` caller simply leaves it at its
+        default. It is part of the dedup key (via ``_Job``), so a tight motion-only sweep
+        stays distinct from a full one of the same instance+window. Returns the same shape as
+        ``enqueue_named``.
         """
         analyzer.ensure_available()
         raw_params = getattr(analyzer, "_params", None)
@@ -594,6 +601,7 @@ class AnalysisManager:
             until_id=until_id,
             params=params,
             label=analyzer.name,
+            motion_only=bool(motion_only),
         )
         return self._enqueue(store, job)
 

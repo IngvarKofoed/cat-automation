@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from compute.analysis import ANALYZER_NAMES
+from compute.analysis.corruption import CorruptionAnalyzer
 from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.collection.collector import CollectorManager
@@ -185,6 +186,27 @@ class TuningRerunRequest(BaseModel):
     params: dict
     since_id: "int | None" = None
     until_id: "int | None" = None
+
+
+class CorruptionRunRequest(BaseModel):
+    """Body of ``POST /api/corruption/run``: enqueue a corruption sweep over a range.
+
+    Mirrors ``AnalysisRunRequest`` minus ``analyzer`` — corruption is a single
+    NON-registered analyzer built directly (never named through ``ANALYZER_NAMES``),
+    so the route hands ``CorruptionAnalyzer()`` to ``enqueue_analyzer`` exactly as
+    the Activity backfill / MOG2 tuning paths hand over their instances.
+
+    ``reanalyze`` clears the window's ``corruption`` verdicts first (the re-sweep
+    after a ``_CORRUPT_*`` constant change). ``since_id`` / ``until_id`` scope the
+    sweep to a range (``None`` = unbounded on that side). ``motion_only`` (opt-in)
+    restricts it to ``frames.motion = 1`` — corruption is stateless, so the flag
+    applies exactly as for the YOLO sweep.
+    """
+
+    reanalyze: bool = False
+    since_id: "int | None" = None
+    until_id: "int | None" = None
+    motion_only: bool = False
 
 
 class GroupCreateRequest(BaseModel):
@@ -1106,6 +1128,66 @@ def create_app(
         return {
             "total": total,
             "oracles": {name: {"analyzed": c["analyzed"], "present": c["present"]} for name, c in cov.items()},
+        }
+
+    # --- Corruption review (the corrupt-frame guard's calibration page) -------------
+    #
+    # A SIBLING surface to /api/analysis, NOT gated by ANALYZER_NAMES: corruption is a
+    # non-registered analyzer (it isn't gate ground-truth about cats/motion), so it must
+    # never be selectable in the scorecard/disagreement/oracle-coverage paths. Its own
+    # routes below own the sweep enqueue and the range feed. See the corruption-review
+    # spec and compute/analysis/corruption.py.
+
+    @app.post("/api/corruption/run")
+    def api_corruption_run(req: CorruptionRunRequest):
+        # Enqueue a corruption sweep over the resolved range, mirroring the Activity
+        # "Analyze" backfill (reanalyze + motion_only + scope) but on a directly-built
+        # CorruptionAnalyzer() instead of a registry name — so no ANALYZER_NAMES gate.
+        # enqueue_analyzer runs ensure_available() synchronously (a no-op here: numpy is
+        # a base dep), and reanalyze's verdict clear happens in the worker only after a
+        # successful prepare (see run_analysis). A second run ENQUEUES behind any active
+        # sweep on the shared queue (no busy-refusal); progress shows on the Sweeps page.
+        _validate_bounds(req.since_id, req.until_id)
+        try:
+            result = analysis_manager.enqueue_analyzer(
+                store,
+                CorruptionAnalyzer(),
+                reanalyze=req.reanalyze,
+                since_id=req.since_id,
+                until_id=req.until_id,
+                motion_only=req.motion_only,
+            )
+        except ImportError as exc:  # defensive: the guard needs no optional deps
+            raise HTTPException(status_code=503, detail=str(exc))
+        return result
+
+    @app.get("/api/corruption")
+    def api_corruption(
+        filter: str = Query(default="all"),
+        cursor: "str | None" = Query(default=None),
+        limit: int = Query(default=_DEFAULT_LIMIT),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The range feed + header readout. The feed is keyset-paged (opaque cursor, like
+        # /api/frames) and joins each frame to its corruption verdict + cat-oracle verdict,
+        # filtered by all / corrupt / corrupt-and-cat (a bad filter → 400 from the store).
+        # The readout carries: corruption coverage (total/analyzed/present in the window —
+        # the count + rate), the staleness count (verdicts whose stamped thresholds predate
+        # a constant change → "re-sweep"), and cat coverage so the UI can flag an un-swept
+        # range rather than read an empty danger set as "safe".
+        limit = max(1, min(limit, _MAX_LIMIT))
+        _validate_bounds(since_id, until_id)
+        try:
+            rows, next_cursor = store.corruption_feed(filter, cursor, limit, since_id, until_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "frames": rows,
+            "next_cursor": next_cursor,
+            "coverage": store.analysis_coverage("corruption", since_id, until_id),
+            "stale": store.corruption_staleness(since_id, until_id),
+            "cat_coverage": store.cat_coverage(since_id, until_id),
         }
 
     # --- Edge-config proxy + offline MOG2 tuning (motion-gate-diagnostic spec) ------

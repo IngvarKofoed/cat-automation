@@ -469,6 +469,43 @@
             justify-content: space-between;
             gap: 6px;
         }
+        /* Corruption-view per-frame FLAG BAR: one small cell per flag (motion,
+           corruption, cat), each lit in its own hue when set. Colour = verdict
+           (changelog 43): motion reuses caught-green (mirrors .tile.motion); corruption
+           and cat AVOID the red "missed" / green "caught" verdict pair — corruption
+           takes the (repurposed) rep-purple, cat the cool accent. Three visible states
+           per cell: on (lit fill), off (a definite negative — muted on surface), and
+           unchecked (null verdict, not yet swept — a dimmed dashed cell, distinct from
+           a plain "no"). */
+        .corr-tile { cursor: pointer; }
+        .flagbar {
+            display: flex;
+            border-top: 1px solid var(--color-border);
+        }
+        .flag {
+            flex: 1 1 0;
+            text-align: center;
+            padding: 4px 2px;
+            font: 700 9px/1.4 var(--font-data);
+            letter-spacing: .04em;
+            text-transform: uppercase;
+            border-left: 1px solid var(--color-border);
+            background: var(--color-surface);
+            color: var(--color-text-muted);   /* off: a readable negative */
+        }
+        .flag:first-child { border-left: none; }
+        .flag.unchecked {
+            /* null verdict — dimmed + dashed inset so "not checked" reads apart from a
+               definite "off". */
+            color: var(--color-text-muted);
+            opacity: .4;
+            box-shadow: inset 0 0 0 1px var(--color-border);
+            border-style: dashed;
+        }
+        .flag.on { color: var(--color-on-accent); }
+        .flag.motion.on     { background: var(--color-status-caught); }
+        .flag.corruption.on { background: var(--color-status-rep); }
+        .flag.cat.on        { background: var(--color-primary); }
         /* Bucket-viewer endpoint selection: selection is an affordance, not a verdict,
            so both endpoints use the cool accent (never green/red), told apart by an
            S/E corner tag + position rather than by hue. .in-range = faint accent wash. */
@@ -1476,6 +1513,7 @@
         <span class="nav-brand">Cat Door</span>
         <a href="#start" data-route="start" class="nav-link">Start</a>
         <a href="#activity" data-route="activity" class="nav-link">Activity</a>
+        <a href="#corruption" data-route="corruption" class="nav-link">Corruption</a>
         <a href="#buckets" data-route="buckets" class="nav-link">Buckets</a>
         <a href="#sweeps" data-route="sweeps" class="nav-link">Sweeps</a>
         <a href="#tuning" data-route="tuning" class="nav-link">Tuning</a>
@@ -1619,6 +1657,128 @@
                         <input type="range" id="playerScrub" min="0" max="0" value="0">
                     </div>
                     <div id="playerFilmstrip" class="filmstrip"></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ================= CORRUPTION VIEW ================= -->
+    <!-- Inspect the corrupt-frame guard over a time range: per-frame motion / corruption /
+         cat flags, a corruption rate, and the fail-non-safe danger case (corrupt AND cat).
+         Reuses the Buckets clock-picker (→ /api/frames/resolve → id range) and the browse
+         feed; corruption verdicts come from the non-registered `corruption` analyzer, swept
+         from here with progress on Sweeps. -->
+    <section id="view-corruption" class="view hidden">
+        <div class="panel">
+            <h2>Corruption review</h2>
+            <p class="caveat text-muted" style="margin: 0 0 12px;">
+                Pick a time range, then <strong>Compute corruption</strong> to sweep the
+                corrupt-frame guard over its frames (progress shows on Sweeps). Each frame's
+                flag bar lights <span style="color: var(--color-status-caught);">motion</span>,
+                <span style="color: var(--color-status-rep);">corruption</span>, and
+                <span style="color: var(--color-primary);">cat</span>; a dashed cell means that
+                flag was not checked yet. Click a frame to open it full-res — a thin corrupt
+                line can be invisible at thumbnail size.
+            </p>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label for="corrStartDate">Start date</label>
+                    <input type="date" id="corrStartDate">
+                </div>
+                <div class="control-group">
+                    <label for="corrStartTime">Start time</label>
+                    <select id="corrStartTime"></select>
+                </div>
+                <div class="control-group">
+                    <label for="corrEndDate">End date</label>
+                    <input type="date" id="corrEndDate">
+                </div>
+                <div class="control-group">
+                    <label for="corrEndTime">End time</label>
+                    <select id="corrEndTime"></select>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="corrLoadBtn" class="btn-primary">Load range</button>
+                </div>
+                <div class="control-group push-end">
+                    <div class="metrics"><div id="corrStoreRange" class="metric"><span class="metric__cap">Store</span><span class="metric__val">—</span></div></div>
+                </div>
+            </div>
+            <div class="controls-row" style="margin-top: 12px;">
+                <div class="control-group">
+                    <label for="corrFilter">Filter</label>
+                    <select id="corrFilter">
+                        <option value="all">All frames</option>
+                        <option value="corrupt">Corrupt only</option>
+                        <option value="corrupt-and-cat">Corrupt &amp; cat (danger)</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <button type="button" id="corrComputeBtn" class="btn-secondary"
+                        title="Sweep the corrupt-frame guard over the loaded range and store each verdict. Progress shows on Sweeps. Tick Recompute to clear + re-sweep after a constant change (or when the header warns of stale verdicts).">Compute corruption for this range</button>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label" style="align-self: center;"
+                        title="Clear + recompute the range's corruption verdicts. Use after a threshold-constant change, or when the header warns that stored verdicts are stale.">
+                        <input type="checkbox" id="corrReanalyze">
+                        Recompute
+                    </label>
+                </div>
+                <div class="control-group">
+                    <label>&nbsp;</label>
+                    <label class="checkbox-label" style="align-self: center;"
+                        title="Restrict the sweep to motion frames only (tight + fast). Leave off to also check the non-motion majority. WARNING: the guard forces every corrupt frame to motion=0, so a motion-only sweep of frames captured AFTER the guard went live can never find corruption (it reports ~0%) — motion-only is only meaningful over pre-guard calibration buckets.">
+                        <input type="checkbox" id="corrMotionOnly">
+                        Motion only
+                    </label>
+                </div>
+                <div class="control-group push-end">
+                    <div class="metrics">
+                        <div id="corrSelectedRange" class="metric"><span class="metric__cap">Range</span><span class="metric__val">—</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="controls-row" style="margin-top: 12px;">
+                <div class="metrics">
+                    <div id="corrSweptMetric" class="metric"><span class="metric__cap">Swept</span><span class="metric__val">—</span></div>
+                    <div id="corrCorruptMetric" class="metric"><span class="metric__cap">Corrupt</span><span class="metric__val">—</span></div>
+                    <div id="corrRateMetric" class="metric"><span class="metric__cap">Rate</span><span class="metric__val">—</span></div>
+                    <div id="corrDangerMetric" class="metric"><span class="metric__cap">Corrupt &amp; cat</span><span class="metric__val">—</span></div>
+                </div>
+            </div>
+
+            <div id="corrComputeNote" class="hidden banner-warn"></div>
+            <div id="corrStaleNote" class="hidden banner-warn"></div>
+            <div id="corrCatCovNote" class="hidden banner-warn"></div>
+            <div id="corrEmpty" class="empty">Load a range to see frames.</div>
+            <div id="corrGrid" class="grid"></div>
+            <div id="corrPager" class="pager hidden">
+                <button type="button" id="corrPrevBtn" class="btn-secondary">← Prev</button>
+                <span id="corrPageLabel" class="badge">Page 1</span>
+                <button type="button" id="corrNextBtn" class="btn-secondary">Next →</button>
+            </div>
+        </div>
+
+        <!-- Full-res lightbox: clicking a frame opens the stored JPEG (full ROI) so a thin
+             corrupt line invisible at thumbnail size can be confirmed. Closable via Esc, the
+             × button, or a backdrop click. Self-contained (own ids); does not touch the
+             Activity playback modal. -->
+        <div id="corrLightbox" class="modal-overlay hidden" role="dialog" aria-modal="true"
+             aria-labelledby="corrLightboxTitle">
+            <div class="modal-dialog" id="corrLightboxDialog" tabindex="-1">
+                <div class="modal-head">
+                    <h2 id="corrLightboxTitle">Frame</h2>
+                    <button type="button" id="corrLightboxClose" class="modal-close"
+                            aria-label="Close (Esc)" title="Close (Esc)">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="corrLightboxStage" style="flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto;">
+                        <img id="corrLightboxImg" alt="Full-resolution frame" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+                    </div>
                 </div>
             </div>
         </div>
@@ -2312,7 +2472,7 @@
         const trainIdentifyNoteEl = document.getElementById('trainIdentifyNote');
 
         // ================= shared constants + state =================
-        const ROUTES = ['start', 'activity', 'buckets', 'sweeps', 'tuning', 'annotate', 'train'];
+        const ROUTES = ['start', 'activity', 'corruption', 'buckets', 'sweeps', 'tuning', 'annotate', 'train'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
         const ANALYZERS = [
@@ -2494,24 +2654,26 @@
             }
         }
 
-        function buildTimeOptions() {
+        // Populate a Start/End time-of-day pair. Defaults to the Buckets pickers; the
+        // Corruption view passes its own pair (same 3 h-slot convention).
+        function buildTimeOptions(startEl = startTimeEl, endEl = endTimeEl) {
             // A window brackets whole 3 h slots: [start of the start slot, END of the end
             // slot]. So Start lists slot STARTS (00:00 … 21:00) and End lists slot ENDS
             // (03:00 … 24:00) — the End dropdown shows the actual end of the chosen slot,
             // not its start, and its value is the real end hour (so no hidden +step at load).
-            startTimeEl.innerHTML = '';
-            endTimeEl.innerHTML = '';
+            startEl.innerHTML = '';
+            endEl.innerHTML = '';
             for (let h = 0; h < 24; h += CLOCK_STEP_HOURS) {
                 const startOpt = document.createElement('option');
                 startOpt.value = String(h);
                 startOpt.textContent = pad2(h) + ':00';
-                startTimeEl.appendChild(startOpt);
+                startEl.appendChild(startOpt);
 
                 const endH = h + CLOCK_STEP_HOURS;  // 03:00 … 24:00 (24:00 = end of day)
                 const endOpt = document.createElement('option');
                 endOpt.value = String(endH);
                 endOpt.textContent = pad2(endH) + ':00';
-                endTimeEl.appendChild(endOpt);
+                endEl.appendChild(endOpt);
             }
         }
 
@@ -2631,6 +2793,8 @@
             // releases the body scroll-lock), so it can't tick in the background or pop back
             // open when the route is re-entered.
             if (r !== 'activity') closePlayer();
+            // Leaving Corruption: close its full-res lightbox (releases the scroll-lock).
+            if (r !== 'corruption') closeCorrLightbox();
             if (r === 'activity') {
                 populateActivityDefaults();
                 loadModels();   // the Identify gate (active model) + button state
@@ -2640,6 +2804,8 @@
                     activityAutoLoaded = true;
                     loadActivityEvents();
                 }
+            } else if (r === 'corruption') {
+                populateCorrClockDefaults();
             } else if (r === 'buckets') {
                 loadGroups();
                 populateClockDefaults();
@@ -2702,6 +2868,8 @@
                 // Keep the Buckets clock badge/limits live without clobbering edits
                 // (populateClockDefaults only fills empty fields).
                 populateClockDefaults();
+                // Same for the Corruption clock badge/limits + Load-range enablement.
+                populateCorrClockDefaults();
                 // Same for the Activity date range + store badge; and if the user is on
                 // Activity but stats hadn't landed on first load (dates were empty), do the
                 // one deferred initial fetch now that a default range exists.
@@ -2725,6 +2893,7 @@
                 analysisStatus = data;
 
                 renderAnalyzeControl();   // Activity "Analyze" button reflects a running yolo-serial sweep
+                renderCorrComputeControl();  // Corruption "Compute" button reflects a running corruption sweep
                 renderQueuePanel(data);
                 // Sweeps: refresh the coverage rows (scoped to the picked bucket) live
                 // during a sweep. Tuning: refresh the oracle chooser's coverage (no reset —
@@ -5969,9 +6138,360 @@
             triggerAnalyze(since, until, activityEvents.length);
         });
 
+        // ================= CORRUPTION view =================
+        // Inspect the corrupt-frame guard over a time range: reuse the Buckets clock-picker
+        // (→ /api/frames/resolve → id range) and a keyset-paged feed joining each frame to
+        // its corruption + cat verdicts. The sweep is enqueued from here (progress on
+        // Sweeps), like the Activity "Analyze" backfill.
+        const corrStartDateEl = document.getElementById('corrStartDate');
+        const corrStartTimeEl = document.getElementById('corrStartTime');
+        const corrEndDateEl = document.getElementById('corrEndDate');
+        const corrEndTimeEl = document.getElementById('corrEndTime');
+        const corrLoadBtn = document.getElementById('corrLoadBtn');
+        const corrStoreRangeEl = document.getElementById('corrStoreRange');
+        const corrSelectedRangeEl = document.getElementById('corrSelectedRange');
+        const corrFilterEl = document.getElementById('corrFilter');
+        const corrComputeBtn = document.getElementById('corrComputeBtn');
+        const corrReanalyzeEl = document.getElementById('corrReanalyze');
+        const corrMotionOnlyEl = document.getElementById('corrMotionOnly');
+        const corrComputeNoteEl = document.getElementById('corrComputeNote');
+        const corrStaleNoteEl = document.getElementById('corrStaleNote');
+        const corrCatCovNoteEl = document.getElementById('corrCatCovNote');
+        const corrSweptMetricEl = document.getElementById('corrSweptMetric');
+        const corrCorruptMetricEl = document.getElementById('corrCorruptMetric');
+        const corrRateMetricEl = document.getElementById('corrRateMetric');
+        const corrDangerMetricEl = document.getElementById('corrDangerMetric');
+        const corrEmptyEl = document.getElementById('corrEmpty');
+        const corrGridEl = document.getElementById('corrGrid');
+        const corrPagerEl = document.getElementById('corrPager');
+        const corrPrevBtn = document.getElementById('corrPrevBtn');
+        const corrPageLabelEl = document.getElementById('corrPageLabel');
+        const corrNextBtn = document.getElementById('corrNextBtn');
+        const corrLightboxEl = document.getElementById('corrLightbox');
+        const corrLightboxDialogEl = document.getElementById('corrLightboxDialog');
+        const corrLightboxImgEl = document.getElementById('corrLightboxImg');
+        const corrLightboxTitleEl = document.getElementById('corrLightboxTitle');
+        const corrLightboxCloseBtn = document.getElementById('corrLightboxClose');
+
+        const CORR_PAGE_SIZE = 200;      // matches the backend default; capped at 1000
+        const CORR_DANGER_CAP = 1000;    // one count fetch of the danger set, capped
+
+        let corrScope = null;            // { since_id, until_id, since_ts, until_ts }
+        let corrCursors = [null];        // corrCursors[i] = keyset cursor to fetch page i
+        let corrPageIndex = 0;
+        let corrLoading = false;
+        let corrSeq = 0;                 // guards out-of-order feed responses
+        let corrSubmitting = false;      // Compute click → enqueue POST resolves
+        let corrCatCovIncomplete = false; // last header: cat coverage < total (danger set may be under-swept)
+
+        function populateCorrClockDefaults() {
+            const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
+            corrStoreRangeEl.querySelector('.metric__val').textContent = hasRange
+                ? `${formatTime(storeOldestTs)} → ${formatTime(storeNewestTs)}`
+                : 'empty';
+            corrLoadBtn.disabled = !hasRange;
+            if (!hasRange) return;
+            const minD = dateInputValue(storeOldestTs);
+            const maxD = dateInputValue(storeNewestTs);
+            corrStartDateEl.min = minD; corrStartDateEl.max = maxD;
+            corrEndDateEl.min = minD; corrEndDateEl.max = maxD;
+            if (!corrStartDateEl.value) {
+                corrStartDateEl.value = minD;
+                corrStartTimeEl.value = String(Math.floor(new Date(storeOldestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS);
+            }
+            if (!corrEndDateEl.value) {
+                corrEndDateEl.value = maxD;
+                const slotStart = Math.floor(new Date(storeNewestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS;
+                corrEndTimeEl.value = String(slotStart + CLOCK_STEP_HOURS);
+            }
+        }
+
+        corrLoadBtn.addEventListener('click', async () => {
+            const s = tsFromControls(corrStartDateEl.value, Number(corrStartTimeEl.value));
+            const e = tsFromControls(corrEndDateEl.value, Number(corrEndTimeEl.value));
+            if (s == null || e == null) { showError('Pick a start and end date.'); return; }
+            const lo = Math.min(s, e), hi = Math.max(s, e);
+            try {
+                clearError();
+                const params = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi) });
+                const res = await fetch('/api/frames/resolve?' + params.toString());
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (data.since_id == null || data.until_id == null) {
+                    showError('No frames in that time window — widen the clock range.');
+                    return;
+                }
+                corrScope = {
+                    since_id: data.since_id, until_id: data.until_id,
+                    since_ts: data.since_ts, until_ts: data.until_ts,
+                };
+                corrSelectedRangeEl.querySelector('.metric__val').textContent =
+                    formatRange(data.since_ts, data.until_ts);
+                loadCorrFeed(true);
+            } catch (err) {
+                showError(`Resolve window failed: ${err.message}`);
+            }
+        });
+
+        corrFilterEl.addEventListener('change', () => { if (corrScope) loadCorrFeed(true); });
+
+        function loadCorrFeed(reset) {
+            if (!corrScope) {
+                corrEmptyEl.classList.remove('hidden');
+                corrEmptyEl.textContent = 'Load a range to see frames.';
+                corrGridEl.innerHTML = '';
+                corrPagerEl.classList.add('hidden');
+                return;
+            }
+            if (reset) { corrCursors = [null]; corrPageIndex = 0; }
+            loadCorrPage(corrPageIndex, reset);
+        }
+
+        async function loadCorrPage(targetIndex, reset) {
+            const seq = ++corrSeq;
+            const scope = corrScope;
+            corrLoading = true;
+            updateCorrPager();
+            try {
+                clearError();
+                const params = new URLSearchParams({
+                    filter: corrFilterEl.value,
+                    limit: String(CORR_PAGE_SIZE),
+                });
+                addBounds(params, scope.since_id, scope.until_id);
+                const cursor = corrCursors[targetIndex];
+                if (cursor != null) params.set('cursor', String(cursor));
+                const res = await fetch('/api/corruption?' + params.toString());
+                if (seq !== corrSeq) return;
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (seq !== corrSeq) return;
+                const frames = data.frames || [];
+                // Header first: it sets corrCatCovIncomplete, which renderCorrFrames' empty
+                // message reads to distinguish "none found so far" from a clean/empty page.
+                renderCorrHeader(data.coverage || {}, data.stale || {}, data.cat_coverage || {});
+                renderCorrFrames(frames);
+                corrPageIndex = targetIndex;
+                corrCursors[corrPageIndex + 1] = data.next_cursor != null ? data.next_cursor : null;
+                // Hide the pager on an empty result — a disabled "Page 1" beside the
+                // empty-state message reads as a broken page.
+                corrPagerEl.classList.toggle('hidden', frames.length === 0);
+                window.scrollTo(0, 0);
+                // The danger headline (corrupt∧cat) is filter-independent, so refresh it on a
+                // reset (range load / filter change / after Compute) — not on every page hop.
+                if (reset) refreshCorrDanger(scope);
+            } catch (err) {
+                if (seq === corrSeq) showError(`Load corruption feed failed: ${err.message}`);
+            } finally {
+                if (seq === corrSeq) { corrLoading = false; updateCorrPager(); }
+            }
+        }
+
+        function updateCorrPager() {
+            corrPageLabelEl.textContent = `Page ${corrPageIndex + 1}`;
+            corrPrevBtn.disabled = corrLoading || corrPageIndex === 0;
+            corrNextBtn.disabled = corrLoading || corrCursors[corrPageIndex + 1] == null;
+        }
+        corrPrevBtn.addEventListener('click', () => {
+            if (corrLoading || corrPageIndex === 0) return;
+            loadCorrPage(corrPageIndex - 1, false);
+        });
+        corrNextBtn.addEventListener('click', () => {
+            if (corrLoading || corrCursors[corrPageIndex + 1] == null) return;
+            loadCorrPage(corrPageIndex + 1, false);
+        });
+
+        function renderCorrFrames(frames) {
+            corrGridEl.innerHTML = '';
+            corrEmptyEl.classList.toggle('hidden', frames.length > 0);
+            if (frames.length === 0) {
+                // Distinguish an empty danger set over an un-swept range ("none found so
+                // far") from a genuinely clean/empty page — never let empty read as "safe".
+                corrEmptyEl.textContent = (corrFilterEl.value === 'corrupt-and-cat' && corrCatCovIncomplete)
+                    ? 'No corrupt-and-cat frames found so far — this range is not fully cat-swept, so this is not a clean bill.'
+                    : 'No frames match this filter in the loaded range.';
+            }
+            for (const f of frames) corrGridEl.appendChild(corrThumb(f));
+        }
+
+        // A single flag cell. value === null/undefined → "not checked" (dashed, dimmed),
+        // distinct from a definite false. Truthy → lit in the flag's own hue.
+        function corrFlagCell(kind, label, value) {
+            const cell = document.createElement('span');
+            cell.className = 'flag ' + kind;
+            cell.textContent = label;
+            if (value === null || value === undefined) { cell.classList.add('unchecked'); cell.title = label + ': not checked'; }
+            else if (value) { cell.classList.add('on'); cell.title = label + ': yes'; }
+            else { cell.title = label + ': no'; }
+            return cell;
+        }
+
+        function corrThumb(frame) {
+            const tile = document.createElement('div');
+            tile.className = 'tile corr-tile' + (frame.motion ? ' motion' : '');
+            tile.dataset.id = String(frame.id);
+
+            const img = document.createElement('img');
+            img.src = frame.url;
+            img.loading = 'lazy';
+            img.alt = 'Frame';
+            tile.appendChild(img);
+
+            const bar = document.createElement('div');
+            bar.className = 'flagbar';
+            bar.append(
+                corrFlagCell('motion', 'motion', frame.motion),
+                corrFlagCell('corruption', 'corrupt', frame.corrupt),
+                corrFlagCell('cat', 'cat', frame.cat),
+            );
+            tile.appendChild(bar);
+
+            const cap = document.createElement('div');
+            cap.className = 'caption';
+            const t = document.createElement('span');
+            t.textContent = formatTime(frame.recv_ts);
+            cap.appendChild(t);
+            if (frame.corrupt && frame.reason) {
+                const r = document.createElement('span');
+                r.textContent = frame.reason;
+                r.style.color = 'var(--color-status-rep)';
+                cap.appendChild(r);
+            }
+            tile.appendChild(cap);
+
+            tile.addEventListener('click', () => openCorrLightbox(frame));
+            return tile;
+        }
+
+        function renderCorrHeader(coverage, stale, catCov) {
+            const total = coverage.total, analyzed = coverage.analyzed, present = coverage.present;
+            corrSweptMetricEl.querySelector('.metric__val').textContent =
+                (typeof analyzed === 'number' && typeof total === 'number')
+                    ? `${analyzed.toLocaleString()} / ${total.toLocaleString()}` : '—';
+            corrCorruptMetricEl.querySelector('.metric__val').textContent =
+                typeof present === 'number' ? present.toLocaleString() : '—';
+            corrRateMetricEl.querySelector('.metric__val').textContent =
+                (typeof present === 'number' && typeof analyzed === 'number' && analyzed > 0)
+                    ? `${(100 * present / analyzed).toFixed(1)}%` : '—';
+
+            // Staleness: stored verdicts whose stamped thresholds != the current constants —
+            // recommend a Recompute re-sweep rather than trusting stale flags.
+            const staleN = typeof stale.stale === 'number' ? stale.stale : 0;
+            corrStaleNoteEl.classList.toggle('hidden', staleN <= 0);
+            if (staleN > 0) {
+                corrStaleNoteEl.textContent =
+                    `${staleN.toLocaleString()} corruption verdict${staleN === 1 ? '' : 's'} predate a threshold-constant change — tick Recompute and re-sweep for current flags.`;
+            }
+
+            // Incomplete cat coverage: the corrupt∧cat danger set is only as trustworthy as
+            // the cat sweep behind it — flag an un-swept range so an empty danger set reads
+            // as "none found so far," not a false "safe."
+            const catTotal = catCov.total, catAnalyzed = catCov.analyzed;
+            corrCatCovIncomplete = (typeof catAnalyzed === 'number' && typeof catTotal === 'number' && catAnalyzed < catTotal);
+            corrCatCovNoteEl.classList.toggle('hidden', !corrCatCovIncomplete);
+            if (corrCatCovIncomplete) {
+                corrCatCovNoteEl.textContent =
+                    `Cat coverage is incomplete over this range (${catAnalyzed.toLocaleString()} / ${catTotal.toLocaleString()} frames have a cat verdict). An empty danger set means "none found so far," not "safe" — run a YOLO sweep on Sweeps for full cat coverage.`;
+            }
+        }
+
+        // The load-bearing headline: how many frames are BOTH corrupt AND cat-present (the
+        // fail-non-safe case). Filter-independent, so fetched separately from the browse
+        // feed; capped at one page (danger frames should be rare — that is the point).
+        async function refreshCorrDanger(scope) {
+            corrDangerMetricEl.querySelector('.metric__val').textContent = '…';
+            try {
+                const params = new URLSearchParams({ filter: 'corrupt-and-cat', limit: String(CORR_DANGER_CAP) });
+                addBounds(params, scope.since_id, scope.until_id);
+                const res = await fetch('/api/corruption?' + params.toString());
+                if (corrScope !== scope) return;   // range changed while in flight
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                if (corrScope !== scope) return;
+                const n = (data.frames || []).length;
+                const capped = data.next_cursor != null;
+                let text = capped ? `${CORR_DANGER_CAP.toLocaleString()}+` : n.toLocaleString();
+                if (n === 0 && corrCatCovIncomplete) text = '0 so far';
+                corrDangerMetricEl.querySelector('.metric__val').textContent = text;
+                // Danger present ⇒ colour the metric like the corruption hue to draw the eye.
+                corrDangerMetricEl.classList.toggle('warn', n > 0);
+            } catch (err) {
+                corrDangerMetricEl.querySelector('.metric__val').textContent = '—';
+                corrDangerMetricEl.classList.remove('warn');
+            }
+        }
+
+        // "Compute corruption for this range" — enqueue a corruption sweep over the loaded
+        // range on the shared job queue (progress on Sweeps), mirroring Activity's Analyze.
+        function renderCorrComputeControl() {
+            const running = !!analysisStatus.running && analysisStatus.analyzer === 'corruption';
+            corrComputeBtn.disabled = corrSubmitting || running || !corrScope;
+            corrComputeBtn.textContent = corrSubmitting ? 'Enqueuing…'
+                : (running ? 'Computing…' : 'Compute corruption for this range');
+        }
+        corrComputeBtn.addEventListener('click', async () => {
+            if (!corrScope) {
+                corrComputeNoteEl.textContent = 'Load a range first — Compute sweeps the loaded range.';
+                corrComputeNoteEl.classList.remove('hidden');
+                return;
+            }
+            const scope = corrScope;
+            try {
+                clearError();
+                corrComputeNoteEl.classList.add('hidden');
+                corrSubmitting = true;
+                renderCorrComputeControl();
+                const res = await fetch('/api/corruption/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        reanalyze: corrReanalyzeEl.checked,
+                        motion_only: corrMotionOnlyEl.checked,
+                        since_id: scope.since_id, until_id: scope.until_id,
+                    }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                corrComputeNoteEl.textContent = (data.position > 0)
+                    ? `Corruption sweep queued at position ${data.position}. Track progress on Sweeps, then reload this range.`
+                    : 'Computing corruption over this range. Track progress on Sweeps, then reload this range to see the flags.';
+                corrComputeNoteEl.classList.remove('hidden');
+            } catch (err) {
+                showError(`Compute corruption failed: ${err.message}`);
+            } finally {
+                corrSubmitting = false;
+                renderCorrComputeControl();
+                pollAnalysisStatus();
+            }
+        });
+
+        // ---- full-res lightbox ----
+        let corrLightboxKeyHandler = null;
+        function openCorrLightbox(frame) {
+            corrLightboxImgEl.src = frame.url;
+            const parts = [`#${frame.id}`, formatTime(frame.recv_ts)];
+            if (frame.corrupt && frame.reason) parts.push(`corrupt (${frame.reason})`);
+            corrLightboxTitleEl.textContent = parts.join(' · ');
+            corrLightboxEl.classList.remove('hidden');
+            document.body.classList.add('modal-open');
+            corrLightboxDialogEl.focus();
+            corrLightboxKeyHandler = (e) => { if (e.key === 'Escape') { closeCorrLightbox(); e.preventDefault(); } };
+            document.addEventListener('keydown', corrLightboxKeyHandler);
+        }
+        function closeCorrLightbox() {
+            if (corrLightboxEl.classList.contains('hidden')) return;
+            corrLightboxEl.classList.add('hidden');
+            document.body.classList.remove('modal-open');
+            corrLightboxImgEl.removeAttribute('src');   // stop holding the full-res bytes
+            if (corrLightboxKeyHandler) { document.removeEventListener('keydown', corrLightboxKeyHandler); corrLightboxKeyHandler = null; }
+        }
+        corrLightboxCloseBtn.addEventListener('click', closeCorrLightbox);
+        corrLightboxEl.addEventListener('click', (e) => { if (e.target === corrLightboxEl) closeCorrLightbox(); });
+
         // ================= init =================
         window.addEventListener('load', () => {
             buildTimeOptions();
+            buildTimeOptions(corrStartTimeEl, corrEndTimeEl);
             buildCoverageRows();
             buildOracleChooser();
             setInboxMode('missed');

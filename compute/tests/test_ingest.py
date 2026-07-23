@@ -256,6 +256,7 @@ def edge_server(tmp_path, monkeypatch):
     app = create_app(
         source_factory=lambda device: FakeCaptureSource(device),
         start_grabber=True,
+        start_watchdog=False,  # real grabber, but don't arm os._exit inside pytest
     )
     server = make_server("127.0.0.1", 0, app, threaded=True)
     host, port = server.server_address

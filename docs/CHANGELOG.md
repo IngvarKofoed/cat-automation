@@ -557,3 +557,22 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `motion_only` (below-floor noise); on shows them. Any real subject (a cat named or not, person, bird)
     always shows, so the default feed stays useful before a gallery is promoted (every cat is unidentified).
     Client-only; the two toggles compose. Empty-state hint names whichever toggle would reveal something.
+
+93. Root CLAUDE.md review mandate reframed to match reality: the per-edit pass is the agent's OWN self-run
+    review (single read for small edits; Agent-tool subagent fan-out with verified findings for big ones),
+    NOT an invocation of the `/code-review` skill — that skill is user-invoke-only (`disable-model-invocation`),
+    so the old "invoke code-review --fix" mandate silently failed every edit. Grouped-severity reporting and
+    the user-run `/code-review medium` nudge are unchanged. Also: the ultracode section now notes a returning
+    workflow's aggregate diff triggers that same self-review (no single subagent saw the whole change).
+
+94. Edge now survives a camera-grab stall instead of leaking itself to death. A wedged CSI read froze
+    `frame_id`, and each compute `/stream` reconnect then leaked a Werkzeug handler+FD until the process died.
+    Now `/stream` sheds its handler after `CAT_EDGE_STREAM_STALL_S` (15s) idle, and a new watchdog `os._exit`s
+    a frozen grabber (70=wedge, 71=never-got-a-frame) for systemd to respawn (new `deploy/cat-edge.service`,
+    `Restart=always`); fires only while `Grabber.is_running()`. Spec: docs/specs/2026-07-23-edge-grab-stall-recovery.md.
+
+95. Edge grab failures + liveness are now visible in journald (were only in the invisible `last_error`): the
+    grabber logs the first failure + throttled repeats + recovery, the watchdog logs a 30s heartbeat, and
+    routine `GET /stream` 200 access lines are filtered so a reconnect storm can't bury them. New `README.md`
+    documents running the edge (bare + systemd), the reliability env knobs, and reading the crash cause from
+    the journal / exit code.

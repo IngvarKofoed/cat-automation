@@ -22,6 +22,7 @@ docs/specs/2026-07-08-edge-motion-detection.md.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import TYPE_CHECKING, Callable, NamedTuple
@@ -39,6 +40,13 @@ if TYPE_CHECKING:  # only for annotations — keep runtime imports light
 # spinning or dividing by zero. It is NOT the config default (that lives in
 # settings.py) — it never overrides a valid configured fps.
 _DEFAULT_FPS = 5.0
+
+# Grab failures are logged (not just stashed in last_error) so a stall is visible
+# in journald. The first failure after a run of successes logs immediately; while
+# it keeps failing, log at most once per this interval so an error-thrash can't
+# flood. The watchdog (edge/server/watchdog.py) restarts the process on a stall.
+_log = logging.getLogger("edge.grabber")
+_FAILURE_LOG_INTERVAL_S = 10.0
 
 # The motion params (var_threshold/learning_rate/min_area/max_area_fraction/
 # persistence/downscale) now live in shared.motion, imported by both tiers so
@@ -137,6 +145,14 @@ class Grabber:
         # Pacing fallback; owned by the grab path.
         self._fps_fallback = _DEFAULT_FPS
 
+        # Grab-failure logging state (consecutive-failure count + last throttled-log
+        # time). Guarded by self._cond: a device-swap POST calls grab_once() on the
+        # request thread while the background loop runs, so two callers can touch
+        # these concurrently. The log EMIT itself stays outside the lock (no I/O in
+        # the slot critical section).
+        self._consecutive_failures = 0
+        self._last_failure_log_mono = 0.0
+
         # Thread lifecycle.
         self._stop = threading.Event()
         self._thread: "threading.Thread | None" = None
@@ -166,6 +182,19 @@ class Grabber:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
+
+    def is_running(self) -> bool:
+        """True while the grab loop is started and not stopping.
+
+        The watchdog reads this to avoid treating a *stopped* grabber's frozen
+        slot as a stall — ``stop()`` (shutdown, or a test teardown) freezes
+        ``frame_id``/``mono`` by design, which is not a fault. ``grab_once()``-only
+        use (no thread) reads False, so a test that drives grabs by hand never arms
+        the watchdog.
+        """
+        with self._lifecycle_lock:
+            thread = self._thread
+        return thread is not None and thread.is_alive() and not self._stop.is_set()
 
     # -- grabbing ----------------------------------------------------------
 
@@ -202,9 +231,25 @@ class Grabber:
                 self._fps_fallback = fps
             img = cfg.source.read()
         except Exception as exc:  # noqa: BLE001 - a failed grab must never kill the loop
+            msg = str(exc) or repr(exc)
             with self._cond:
-                self._last_error = str(exc) or repr(exc)
+                self._last_error = msg
+                self._consecutive_failures += 1
+                count = self._consecutive_failures
+                now = time.monotonic()
+                due = count == 1 or (
+                    now - self._last_failure_log_mono >= _FAILURE_LOG_INTERVAL_S
+                )
+                if due:
+                    self._last_failure_log_mono = now
                 self._cond.notify_all()
+            # Emit OUTSIDE the lock. First failure after successes logs at once (the
+            # transition is the signal); consecutive failures throttle so an
+            # error-thrash can't flood journald. Recovery is logged on next success.
+            if due and count == 1:
+                _log.warning("camera grab failed: %s", msg)
+            elif due:
+                _log.warning("camera grab still failing (%d consecutive): %s", count, msg)
             return fps
 
         # The read succeeded, so the frame WILL be published regardless of motion.
@@ -220,6 +265,10 @@ class Grabber:
         except Exception:  # noqa: BLE001 - motion must never gate delivery or kill the loop
             motion, bbox, area = False, None, 0.0
         with self._cond:
+            # Reset the failure streak under the same lock that owns it, then log
+            # recovery outside the lock. recovered == 0 on a normal success.
+            recovered = self._consecutive_failures
+            self._consecutive_failures = 0
             self._frame = img
             self._ts = ts
             self._mono = mono
@@ -229,6 +278,8 @@ class Grabber:
             self._area = area
             self._frame_id += 1  # monotonic; advances only on a successful read
             self._cond.notify_all()
+        if recovered:
+            _log.info("camera recovered after %d failed grab(s)", recovered)
         return fps
 
     def _run(self) -> None:

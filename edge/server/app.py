@@ -11,9 +11,12 @@ docs/specs/2026-07-08-edge-motion-detection.md.
 """
 from __future__ import annotations
 
+import atexit
 import glob
+import logging
 import os
 import platform
+import re
 import threading
 import time
 from pathlib import Path
@@ -28,6 +31,7 @@ from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 from edge.server.grabber import GrabConfig, Grabber, MotionConfig
 from edge.server.metrics import SystemMetrics
+from edge.server.watchdog import Watchdog, env_positive_float
 from shared import wire
 from shared.wire import StreamFrameMeta
 
@@ -44,6 +48,12 @@ _VERSION = os.environ.get("CAT_EDGE_VERSION", "unknown")
 # camera warmup) and how long a /stream generator waits between frame checks.
 _FIRST_FRAME_WAIT_S = 5.0
 _STREAM_WAIT_S = 5.0
+
+# How long a /stream generator keeps looping with nothing sent before it returns
+# and sheds its handler. During a camera freeze the generator never writes, so it
+# would otherwise never detect the client disconnected — leaking a Werkzeug handler
+# thread + FD per compute reconnect until the process dies. Env-overridable.
+_STREAM_STALL_EXIT_S = env_positive_float("CAT_EDGE_STREAM_STALL_S", 15.0)
 
 
 def _coerce_device(device: "int | str") -> "int | str":
@@ -199,7 +209,9 @@ def _enumerate_cameras() -> "list[dict]":
 
 
 def create_app(
-    source_factory: "SourceFactory | None" = None, start_grabber: bool = True
+    source_factory: "SourceFactory | None" = None,
+    start_grabber: bool = True,
+    start_watchdog: bool = True,
 ) -> Flask:
     """Build the Flask app.
 
@@ -212,6 +224,12 @@ def create_app(
     ``start_grabber`` controls the background grab loop: it starts by default,
     but tests pass ``False`` and drive ``app.grabber.grab_once()`` to populate
     the slot deterministically without a free-spinning thread.
+
+    ``start_watchdog`` (default True) starts the grab-stall watchdog alongside the
+    grabber; its default action is ``os._exit`` on a frozen slot, so an integration
+    test that runs the real app with a *live* grabber passes ``False`` to avoid
+    arming a process-killer inside the test runner. No-op when ``start_grabber`` is
+    False (the watchdog is meaningless without a running loop).
     """
     factory: SourceFactory = source_factory or create_source
 
@@ -296,8 +314,20 @@ def create_app(
 
     grabber = Grabber(read_config)
     app.grabber = grabber
+    # The watchdog runs only alongside a live grab loop (never under the
+    # start_grabber=False test drivers). It reads grabber.is_running(), so stopping
+    # the grabber disarms it — no caller is surprised by a stray os._exit. atexit
+    # stops both cleanly on a normal exit (Ctrl-C); a watchdog-forced os._exit
+    # intentionally skips atexit (immediate teardown of a wedged process).
+    watchdog: "Watchdog | None" = None
     if start_grabber:
         grabber.start()
+    if start_grabber and start_watchdog:
+        watchdog = Watchdog(grabber)
+        watchdog.start()
+        atexit.register(grabber.stop)
+        atexit.register(watchdog.stop)
+    app.watchdog = watchdog
 
     # One instance closed over by /status: it owns the CPU window/delta state, so
     # a per-request instance would reset that state and never yield a CPU reading.
@@ -395,20 +425,34 @@ def create_app(
 
         def gen():
             last_sent_id = 0
+            last_sent_mono = time.monotonic()
             try:
                 snap = grabber.snapshot()
                 if snap.frame_id > 0:
                     part = _build_part(snap, overlay=overlay)
                     if part is not None:
                         last_sent_id = snap.frame_id
+                        last_sent_mono = time.monotonic()
                         yield part
                 while True:
                     snap = grabber.wait_next(last_sent_id, timeout=_STREAM_WAIT_S)
                     if snap.frame_id > last_sent_id and snap.frame is not None:
                         part = _build_part(snap, overlay=overlay)
+                        # Advance last_sent_id even when encoding fails, so a frame
+                        # that repeatedly fails to encode makes us wait for the NEXT
+                        # frame rather than busy-spin re-processing this one. Only a
+                        # real send moves last_sent_mono (the stall clock).
+                        last_sent_id = snap.frame_id
                         if part is not None:
-                            last_sent_id = snap.frame_id
+                            last_sent_mono = time.monotonic()
                             yield part
+                    # Unconditional (not elif): shed this handler after
+                    # _STREAM_STALL_EXIT_S with nothing sent — a frozen grabber, or
+                    # a frame that keeps failing to encode. Nothing is written
+                    # during a freeze, so without this the generator loops forever
+                    # and never notices the client left (a thread + FD leak).
+                    if time.monotonic() - last_sent_mono > _STREAM_STALL_EXIT_S:
+                        return
             except (GeneratorExit, OSError):
                 # Client disconnected (Live toggled off, or the PC dropped the
                 # stream): end quietly rather than surfacing a broken-pipe
@@ -642,6 +686,35 @@ def create_app(
     return app
 
 
+# Matches a werkzeug access line for a /stream request that returned a 2xx: the
+# quoted request line (any method, path /stream, optional query), then the status
+# token in its own position (`" 2xx `). Anchoring on the closing quote + status
+# position avoids the bare-`" 200 "`-substring pitfalls: a `" 200 "` inside a query
+# string, a size field, or a non-status spot can't match, and a real error line
+# (`" 500 `) is always kept.
+_STREAM_2XX_ACCESS_RE = re.compile(r'"[A-Z]+ /stream\b[^"]*" 2\d\d ')
+
+
+class _StreamAccessLogFilter(logging.Filter):
+    """Drop routine successful ``GET /stream`` access-log lines.
+
+    During a camera wedge the compute client reconnects every few seconds; without
+    this, that storm of ``"GET /stream" 2xx`` lines would bury the grabber/watchdog
+    logs. Attached to the ``werkzeug`` logger — a logger-level filter also blocks
+    propagation, so the line never reaches the root handler. Non-2xx /stream (a
+    genuinely failing stream) and every other route still log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - Filter API
+        return _STREAM_2XX_ACCESS_RE.search(record.getMessage()) is None
+
+
 if __name__ == "__main__":
+    # INFO to stdout so the grabber/watchdog logs reach journald under systemd; the
+    # filter silences the routine /stream access-log storm during a reconnect loop.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+    logging.getLogger("werkzeug").addFilter(_StreamAccessLogFilter())
     port = int(os.environ.get("CAT_EDGE_PORT", "8000"))
     create_app().run(host="0.0.0.0", port=port, threaded=True)

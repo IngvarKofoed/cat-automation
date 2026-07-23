@@ -42,7 +42,7 @@ Each subtree has its own `CLAUDE.md` with scoped tool/skill rules:
 
 ## After making changes
 
-After a non-trivial edit, invoke the **`code-review`** skill with the `medium --fix` arguments to review the touched code for correctness, reuse, clarity, and efficiency, then apply every finding to the working tree automatically. Bump to `high --fix` for large or high-risk changes — broad diffs, or security- / data-integrity-sensitive code. It does not auto-trigger — you must invoke it explicitly.
+After a non-trivial edit, **review the touched code yourself, automatically** — a code-review-grade pass over correctness, security & data-integrity, edge cases & tests, reuse, clarity, performance, and conformance to this repo's conventions — then apply every finding to the working tree. Scale the pass to the change: a careful single read of the diff for a small edit; for a substantial or high-risk change (a broad diff, or security- / data-integrity-sensitive code) **fan out across subagents with the Agent tool — one per at-risk dimension (~2–4) — and verify each finding before acting on it**. Do **not** try to invoke the `/code-review` skill for this routine pass: it is user-invoke-only (`disable-model-invocation`), so you can't call it — this per-edit pass is your own self-run review. (The `/code-review` skill stays the user's to run; see the significant-change nudge below.)
 
 Once the fixes are applied, report what changed:
 
@@ -50,7 +50,7 @@ Once the fixes are applied, report what changed:
 2. **Summarize each bucket in one line** so the user can see what was fixed without expanding every finding.
 3. Do not stop to ask which to fix — all findings are fixed by default. The user can review the diff and revert anything they disagree with.
 
-For a **significant** change — a broad or high-risk diff, or a large batch of auto-applied fixes — end the turn by suggesting the user run a deliberate `/code-review medium` pass themselves. The single auto-`--fix` pass above is never re-reviewed, so a large diff still warrants a human-in-the-loop second look; the nudge is the checkpoint.
+For a **significant** change — a broad or high-risk diff, or a large batch of auto-applied fixes — end the turn by suggesting the user run a deliberate `/code-review medium` pass themselves. The single self-review pass above is never independently re-reviewed, so a large diff still warrants a human-in-the-loop second look; the nudge is the checkpoint.
 
 ## Multi-agent workflows
 
@@ -63,6 +63,8 @@ When you fan a task out across subagents — the Workflow tool ("ultracode") —
 The guardrail: the stage that *catches* problems (adversarial review) stays strong; the stages that merely *check* an already-caught finding (per-finding verification) drop a tier — unless the finding is subtle or security-/data-integrity-critical, where verification stays strong. Set this per `agent()` call (`model` / `effort`); an agent that omits `model` inherits the session model, which is why an untiered fan-out silently runs everything on the most expensive tier.
 
 **Invoking a named workflow is not authoring one.** The tiers above are yours to set only when *you* write the `agent()` calls. A built-in or named workflow — e.g. `Workflow({ name: 'code-review' })` — runs its own stages on the session model; nothing tiers them for you, so a wide fan-out (the review's per-`(file,line)` verifiers most of all) silently bills every agent at the top tier. Before launching one at `high`+ effort or over a broad diff, check the `scriptPath` the run reports: if a large *checking* stage isn't tiered, edit that script to drop those agents to the mid model (leaving the finders and final synthesis strong) and re-invoke with `{ scriptPath }` instead. Keep them strong only when the diff is security-/data-integrity-critical. For `code-review` specifically: its verifier agents default to the mid model.
+
+**When a workflow returns, the after-edits self-review applies to its aggregate diff.** No single subagent saw the whole combined change, so treat the workflow's landed edits as one change and run the *After making changes* self-review over the aggregate diff. Because it's a multi-agent, no-single-author change, it's a prime case for the end-of-turn `/code-review medium` nudge.
 
 This section is inert unless you actually run a multi-agent workflow.
 

@@ -1,0 +1,24 @@
+[Unit]
+Description=Cat Automation edge (camera node)
+# StartLimit* are [Unit] directives (systemd >= 230; Pi OS ships 247+) — under
+# [Service] they are silently ignored. This caps a FAST startup crash-loop: an
+# import/config error that dies before the first frame (~3-4 s/cycle with
+# RestartSec=2) trips 5-in-60 s and the unit stops as `failed` (visible via
+# `systemctl status`). A camera *wedge* restarts on the ~20-65 s watchdog cycle —
+# far outside this window — so a genuinely dead camera keeps slow-retrying and
+# self-heals when it returns, the intended behaviour for an unattended door node.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ingvar
+WorkingDirectory=/home/ingvar/cat-automation
+ExecStart=/home/ingvar/cat-automation/edge.sh
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

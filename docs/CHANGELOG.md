@@ -707,3 +707,13 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      (apt/system-site-packages, absent off a Pi), so `available:false` there and `set()` refuses
      (503) rather than faking actuation; the UI disables the switches with a note. Distinct from the
      deferred intent-based Control API (lock/unlock/sound/light) — this is a hardware bring-up tool.
+
+115. GPIO outputs changed to match the actual door wiring: three relay channels on BCM 26/20/21
+     — `channel1` (26), `channel2` (20), `channel3` (21) — replacing the earlier `light` (27) /
+     `aux` (17). Backend/API/UI unchanged (all data-driven off `GPIO_OUTPUTS`); a Pi picks up the
+     new pins on the next edge restart, releasing 17/27. Still raw HIGH/LOW level control.
+
+116. GPIO channels now boot HIGH, not LOW (new `_INITIAL_HIGH` — the one source both the tracked
+     state and the backend's `OutputDevice(initial_value=)` read, so they can't drift). The door's
+     relay board is active-low, so HIGH = released/off: idling HIGH keeps relays de-energized at
+     startup instead of switching them on. `/api/gpio` and the UI report HIGH from first load.

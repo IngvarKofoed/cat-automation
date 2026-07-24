@@ -1,16 +1,17 @@
 """Manual GPIO output control for the edge tier.
 
-The door Pi has relays wired to a couple of BCM pins (a light on GPIO 27, a
-spare channel on GPIO 17). This driver exposes them as named outputs the config
-UI can drive HIGH or LOW by hand — a hardware bring-up / testing tool, distinct
-from (and simpler than) the deferred intent-based Control API
-(lock/unlock/sound/light) in docs/ARCHITECTURE.md.
+The door Pi has a relay board wired to three BCM pins (channels on GPIO 26, 20,
+21). This driver exposes them as named outputs the config UI can drive HIGH or
+LOW by hand — a hardware bring-up / testing tool, distinct from (and simpler
+than) the deferred intent-based Control API (lock/unlock/sound/light) in
+docs/ARCHITECTURE.md.
 
-Raw pin *level*, not "light on/off": relay boards differ on active-high vs
-active-low, so the switch drives the pin HIGH or LOW and the operator maps level
-→ relay behavior at the wiring. State is NOT persisted — pins initialize LOW on
-boot, the safe/neutral default (nothing driven until the operator asks), matching
-the fail-safe principle.
+Raw pin *level*, not "on/off": relay boards differ on active-high vs active-low,
+so the switch drives the pin HIGH or LOW and the operator maps level → relay
+behavior at the wiring. State is NOT persisted — pins initialize HIGH on boot
+(see ``_INITIAL_HIGH``), because the door's relay board is active-low (HIGH =
+released/off), so idling HIGH keeps relays off at startup rather than energizing
+them. The UI reflects that HIGH-at-boot state.
 
 Backend is pluggable behind ``PinBackend`` exactly as the camera sits behind
 ``CaptureSource``: the real backend (``GpioZeroBackend``) lazily imports
@@ -26,14 +27,20 @@ from typing import Callable, Protocol
 
 log = logging.getLogger(__name__)
 
-# BCM pin assignments for the relays wired at the door, presented in the config
-# UI as manual HIGH/LOW switches. GPIO 27 switches the light relay; GPIO 17 is a
-# spare relay channel, currently unused. `name` is the API/state key, `label`
-# the human-facing name.
+# BCM pin assignments for the relay channels wired at the door, presented in the
+# config UI as manual HIGH/LOW switches. Three channels on GPIO 26 / 20 / 21.
+# `name` is the API/state key, `label` the human-facing name.
 GPIO_OUTPUTS: "tuple[dict, ...]" = (
-    {"name": "light", "pin": 27, "label": "Light"},
-    {"name": "aux", "pin": 17, "label": "Aux"},
+    {"name": "channel1", "pin": 26, "label": "Channel 1"},
+    {"name": "channel2", "pin": 20, "label": "Channel 2"},
+    {"name": "channel3", "pin": 21, "label": "Channel 3"},
 )
+
+# Level each channel comes up at on boot (state is not persisted). HIGH, because
+# the door's relay board is active-low: HIGH = relay released/off, so the pins
+# idle HIGH and nothing is energized at startup. Both the tracked state and the
+# real backend's OutputDevice initial_value read this, so they can't drift.
+_INITIAL_HIGH = True
 
 
 class GpioUnavailable(RuntimeError):
@@ -51,19 +58,20 @@ class PinBackend(Protocol):
 
 
 class GpioZeroBackend:
-    """Real backend: one ``gpiozero.OutputDevice`` per pin, initialized LOW.
+    """Real backend: one ``gpiozero.OutputDevice`` per pin, initialized HIGH.
 
     ``gpiozero`` is imported lazily so importing this module never fails off a
     Pi; construction raises (import error, no ``/dev/gpiochip``, permissions)
     and ``GpioOutputs`` catches that to report unavailability. ``active_high``
-    with ``initial_value=False`` gives on()→HIGH, off()→LOW starting LOW.
+    with ``initial_value=_INITIAL_HIGH`` brings each pin up HIGH (relays idle
+    off on an active-low board); value=1→HIGH, value=0→LOW thereafter.
     """
 
     def __init__(self, pins: "list[int]") -> None:
         from gpiozero import OutputDevice  # lazy: absent/unusable off a Pi
 
         self._devices = {
-            pin: OutputDevice(pin, active_high=True, initial_value=False)
+            pin: OutputDevice(pin, active_high=True, initial_value=_INITIAL_HIGH)
             for pin in pins
         }
 
@@ -94,8 +102,9 @@ class GpioOutputs:
     ) -> None:
         self._outputs = [dict(o) for o in outputs]
         self._pin_by_name = {o["name"]: o["pin"] for o in self._outputs}
-        # name -> is_high; LOW at boot (safe default, state is not persisted).
-        self._state = {o["name"]: False for o in self._outputs}
+        # name -> is_high; HIGH at boot (see _INITIAL_HIGH), matching the level
+        # the backend brings the pins up at. State is not persisted across restarts.
+        self._state = {o["name"]: _INITIAL_HIGH for o in self._outputs}
         self._lock = threading.Lock()
         self._backend: "PinBackend | None" = None
         self._error: "str | None" = None

@@ -36,29 +36,31 @@ def _raising_factory(pins):
 # --- GpioOutputs unit ---
 
 
-def test_defaults_low_and_available_with_backend():
+def test_defaults_high_and_available_with_backend():
     backend = FakeBackend([o["pin"] for o in GPIO_OUTPUTS])
     gpio = GpioOutputs(backend_factory=lambda pins: backend)
     assert gpio.available is True
-    assert gpio.names() == ["light", "aux"]
+    assert gpio.names() == ["channel1", "channel2", "channel3"]
     outputs = gpio.outputs()
-    assert [o["high"] for o in outputs] == [False, False]
-    assert outputs[0] == {"name": "light", "pin": 27, "label": "Light", "high": False}
+    # HIGH at boot (active-low relay board idles HIGH = off).
+    assert [o["high"] for o in outputs] == [True, True, True]
+    assert outputs[0] == {"name": "channel1", "pin": 26, "label": "Channel 1", "high": True}
 
 
-def test_set_high_then_low_drives_pin_and_tracks_state():
+def test_set_low_then_high_drives_pin_and_tracks_state():
     backend = FakeBackend([o["pin"] for o in GPIO_OUTPUTS])
     gpio = GpioOutputs(backend_factory=lambda pins: backend)
 
-    gpio.set("light", True)
-    assert backend.writes[-1] == (27, True)
-    assert {o["name"]: o["high"] for o in gpio.outputs()}["light"] is True
+    gpio.set("channel1", False)
+    assert backend.writes[-1] == (26, False)
+    assert {o["name"]: o["high"] for o in gpio.outputs()}["channel1"] is False
 
-    gpio.set("light", False)
-    assert backend.writes[-1] == (27, False)
-    assert {o["name"]: o["high"] for o in gpio.outputs()}["light"] is False
-    # The spare channel is independent and untouched.
-    assert {o["name"]: o["high"] for o in gpio.outputs()}["aux"] is False
+    gpio.set("channel1", True)
+    assert backend.writes[-1] == (26, True)
+    assert {o["name"]: o["high"] for o in gpio.outputs()}["channel1"] is True
+    # The other channels are independent and untouched (still at the HIGH default).
+    states = {o["name"]: o["high"] for o in gpio.outputs()}
+    assert states["channel2"] is True and states["channel3"] is True
 
 
 def test_set_unknown_name_raises_keyerror():
@@ -70,10 +72,11 @@ def test_set_unknown_name_raises_keyerror():
 def test_unavailable_when_backend_fails_to_build():
     gpio = GpioOutputs(backend_factory=_raising_factory)
     assert gpio.available is False
-    # State still readable (all LOW), but a drive is refused, not silently dropped.
-    assert [o["high"] for o in gpio.outputs()] == [False, False]
+    # State still readable (the HIGH boot default), but a drive is refused, not
+    # silently dropped.
+    assert [o["high"] for o in gpio.outputs()] == [True, True, True]
     with pytest.raises(GpioUnavailable):
-        gpio.set("light", True)
+        gpio.set("channel1", True)
 
 
 def test_close_releases_backend_and_is_idempotent():
@@ -84,7 +87,7 @@ def test_close_releases_backend_and_is_idempotent():
     gpio.close()  # no raise on second close
     # After close there is no backend to drive.
     with pytest.raises(GpioUnavailable):
-        gpio.set("light", True)
+        gpio.set("channel1", True)
 
 
 # --- /api/gpio endpoints ---
@@ -106,18 +109,20 @@ def test_get_gpio_lists_outputs(gpio_client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["available"] is True
-    assert [o["name"] for o in data["outputs"]] == ["light", "aux"]
-    assert all(o["high"] is False for o in data["outputs"])
+    assert [o["name"] for o in data["outputs"]] == ["channel1", "channel2", "channel3"]
+    # HIGH at boot (active-low relay board idles HIGH = off).
+    assert all(o["high"] is True for o in data["outputs"])
 
 
-def test_post_gpio_sets_high_and_returns_state(gpio_client):
+def test_post_gpio_sets_level_and_returns_state(gpio_client):
     client, backend = gpio_client
-    resp = client.post("/api/gpio/light", json={"high": True})
+    # Drive LOW — an actual change from the HIGH boot default.
+    resp = client.post("/api/gpio/channel1", json={"high": False})
     assert resp.status_code == 200
     data = resp.get_json()
-    light = {o["name"]: o for o in data["outputs"]}["light"]
-    assert light["high"] is True
-    assert backend.writes[-1] == (27, True)
+    channel1 = {o["name"]: o for o in data["outputs"]}["channel1"]
+    assert channel1["high"] is False
+    assert backend.writes[-1] == (26, False)
 
 
 def test_post_gpio_unknown_name_404(gpio_client):
@@ -130,9 +135,9 @@ def test_post_gpio_unknown_name_404(gpio_client):
 def test_post_gpio_bad_body_400(gpio_client, body):
     client, _ = gpio_client
     if isinstance(body, str):
-        resp = client.post("/api/gpio/light", data=body, content_type="application/json")
+        resp = client.post("/api/gpio/channel1", data=body, content_type="application/json")
     else:
-        resp = client.post("/api/gpio/light", json=body)
+        resp = client.post("/api/gpio/channel1", json=body)
     assert resp.status_code == 400
 
 
@@ -142,5 +147,5 @@ def test_post_gpio_unavailable_backend_503(tmp_path, monkeypatch):
     app = create_app(source_factory=FakeCaptureSource, start_grabber=False, gpio=gpio)
     client = app.test_client()
     assert client.get("/api/gpio").get_json()["available"] is False
-    resp = client.post("/api/gpio/light", json={"high": True})
+    resp = client.post("/api/gpio/channel1", json={"high": True})
     assert resp.status_code == 503

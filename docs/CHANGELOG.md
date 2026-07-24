@@ -674,3 +674,19 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      of the visit's three detection aggregates (one strong peak frame shouldn't mask a poor visit). Thresholds
      (%): rate red<30/green≥60, peak red<40/green≥65, mean red<30/green≥55. No dot when unmeasured (`ratio`
      null). Provisional — raw uncalibrated scores, depressed by the top-down view; re-tune vs known-good visits.
+
+111. `GET /api/frames/sample` gains an optional `detections=<analyzer>` param (400 if not in ANALYZER_NAMES,
+     count branch only) that attaches each sampled frame's stored per-frame detection for playback overlays:
+     `{analyzed, score, box, cls}` — the highest-confidence {cat, person, bird} box (new cv2-free
+     `Store._best_detection_box`, distinct from cat-only `_best_box`), or None keys when the swept frame holds
+     no such box; `analyzed=false` distinguishes an UN-swept frame from a swept miss. Without the param the
+     response is byte-identical `{id, recv_ts, url}` (no extra read), so the density/buckets viewers are
+     untouched. Per-frame truth (not the visit `subject` chip) so a `person` box can show during a `cat` visit.
+     The API/data layer; the user+admin rendering that consumes it is entry 112. Spec: docs/specs/2026-07-24-playback-yolo-boxes.md.
+
+112. Activity playback (user + admin) now renders per-frame YOLO detections: each filmstrip tile carries
+     a bottom confidence bar (red<40/amber/green≥65, reusing visit-health thresholds), and the played stage
+     frame draws the detected box (highest-conf cat/person/bird) with caption. Fed by `detections=yolo-serial`
+     param on `/api/frames/sample` (read-time; zero overhead without it). Box is per-frame truth, not
+     per-visit subject chip — a person box can appear mid-cat visit. Admin/user dashboards each own a
+     `bandOf` copy so they drift independently if re-tuned. Presentation only; all payload in entry 111.

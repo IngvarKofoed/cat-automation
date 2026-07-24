@@ -1092,7 +1092,8 @@ class Store:
         return int(row[0]) if row is not None else None
 
     def sample_frames(
-        self, since_id: "int | None", until_id: "int | None", count: int
+        self, since_id: "int | None", until_id: "int | None", count: int,
+        detections: "str | None" = None,
     ) -> "list[dict]":
         """~``count`` frames evenly spread across ``[since_id, until_id]`` by INDEX, id ASC.
 
@@ -1108,6 +1109,14 @@ class Store:
         minute / per hour" uses ``sample_frames_by_interval`` instead, which is a
         true time rate. Each row is ``{"id", "recv_ts", "url"}`` with
         ``url = f"/media/{id}"``. Empty list when the window matches no frame.
+
+        ``detections`` (an analyzer name, e.g. ``"yolo-serial"``) OPTIONALLY joins
+        that analyzer's stored per-frame detection over just the sampled ids and
+        adds four keys per frame — ``analyzed`` (a verdict row exists, i.e. the
+        frame was swept), ``score``/``box``/``cls`` (the highest-confidence
+        {cat, person, bird} box, or ``None`` when the row holds no such box). When
+        ``detections is None`` the shape is EXACTLY ``{"id", "recv_ts", "url"}`` and
+        no extra read runs, so the density/buckets viewers are byte-identical.
         """
         count = max(1, min(int(count), _MAX_SAMPLE))
         frags, params = _range_bounds("id", since_id, until_id)
@@ -1126,7 +1135,43 @@ class Store:
                 ") WHERE (rn - 1) % ? = 0 ORDER BY id ASC",
                 params + [stride],
             ).fetchall()
-        return [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
+            out = [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
+            if detections is None:
+                return out
+            # One extra indexed read over ONLY the sampled ids (bounded by
+            # `count` <= _MAX_SAMPLE) joins the analyzer's stored detail so each
+            # tile can be colored / boxed by what YOLO detected — no re-detection.
+            ids = [f["id"] for f in out]
+            placeholders = ",".join("?" for _ in ids)
+            detail_by_id = {
+                int(fid): detail
+                for fid, detail in self._conn.execute(
+                    "SELECT frame_id, detail FROM analysis"
+                    " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
+                    [detections] + ids,
+                ).fetchall()
+            }
+        for f in out:
+            if f["id"] not in detail_by_id:
+                # No verdict row → not swept ("not measured"), distinct from a
+                # swept miss (below), so the caller can render the two differently.
+                f["analyzed"] = False
+                f["score"] = None
+                f["box"] = None
+                f["cls"] = None
+                continue
+            f["analyzed"] = True
+            best = self._best_detection_box(detail_by_id[f["id"]])
+            if best is None:
+                f["score"] = None
+                f["box"] = None
+                f["cls"] = None
+            else:
+                box, conf, cls = best
+                f["box"] = box
+                f["score"] = conf
+                f["cls"] = cls
+        return out
 
     def sample_frames_by_interval(
         self, since_id: "int | None", until_id: "int | None", interval_ms: int
@@ -2921,6 +2966,33 @@ class Store:
             return None
         best = max(usable, key=lambda b: b[4])
         return [float(best[0]), float(best[1]), float(best[2]), float(best[3])], float(best[4])
+
+    @staticmethod
+    def _best_detection_box(detail_text: "str | None") -> "tuple[list[float], float, int] | None":
+        """Highest-confidence {cat, person, bird} box in a ``detail`` JSON, or ``None``.
+
+        Unlike cat-only ``_best_box``, this shows what the (broadened) serial YOLO
+        persona actually detected in the frame — over the same class set the event
+        detection aggregates use — so the played-back box is honest about the frame
+        even when it differs from the visit's summary chip. Returns
+        ``([x1,y1,x2,y2], conf, cls)`` for the max-``conf`` box over that class set,
+        sharing ``_detail_boxes`` + ``_box_class`` so the parse and the legacy
+        5-element rule stay single-sourced. ``None`` when the detail is missing,
+        malformed, or holds no such box.
+        """
+        allowed = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID)
+        usable = [
+            (b, Store._box_class(b)) for b in Store._detail_boxes(detail_text)
+        ]
+        usable = [(b, cls) for b, cls in usable if cls in allowed]
+        if not usable:
+            return None
+        best, cls = max(usable, key=lambda bc: bc[0][4])
+        return (
+            [float(best[0]), float(best[1]), float(best[2]), float(best[3])],
+            float(best[4]),
+            int(cls),
+        )
 
     @staticmethod
     def _subject_classes(detail_text: "str | None") -> "dict[int, float]":

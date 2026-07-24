@@ -566,7 +566,43 @@
             display: grid;
             place-items: center;
         }
-        .stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        /* The image is wrapped in an aspect-locked positioned frame so a YOLO box can
+           be overlaid as a percentage of the image's natural dimensions. The frame is
+           constrained max-width/height:100% INSIDE the fixed 4/3 stage, so it occupies
+           exactly the contained-image rectangle without ever resizing the stage — the
+           fixed stage still prevents reflow on open / Prev / Next. aspect-ratio is a 4/3
+           fallback until JS learns the real natural dims (constant: one camera feeds all
+           events) and pins it, so the box maps 1:1 onto the drawn image at any size. */
+        .player-frame {
+            position: relative;
+            max-width: 100%;
+            max-height: 100%;
+            aspect-ratio: 4 / 3;
+        }
+        .player-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .player-bbox {
+            position: absolute;
+            border: 2px solid var(--tl-green);
+            border-radius: 3px;
+            pointer-events: none;
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+        }
+        .player-bbox.hidden { display: none; }
+        /* Class + confidence caption in the box's top-left corner. Dark chip so the
+           band-coloured text (matching the border) stays legible on any frame. */
+        .player-bbox-cap {
+            position: absolute;
+            left: -1px; top: -1px;
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            font-size: .66rem;
+            font-weight: 700;
+            line-height: 1.35;
+            padding: 0 .28rem;
+            border-radius: 3px 0 3px 0;
+            background: rgba(0, 0, 0, .72);
+            white-space: nowrap;
+        }
         .player-controls {
             display: flex;
             align-items: center;
@@ -587,6 +623,7 @@
             scrollbar-width: thin;
         }
         .film-tile {
+            position: relative;
             flex: none;
             width: 60px;
             aspect-ratio: 4 / 3;
@@ -598,6 +635,16 @@
             background: var(--surface-2);
         }
         .film-tile img { width: 100%; height: 100%; object-fit: cover; }
+        /* A thin YOLO-detection-confidence bar along the tile's bottom edge — a per-frame
+           signal distinct from the border/inset, which stay reserved for the film-current
+           (accent) and film-rep (purple) markers. Absent when the frame has no detection
+           (or wasn't measured): score == null → no bar. */
+        .film-conf {
+            position: absolute;
+            left: 0; right: 0; bottom: 0;
+            height: 4px;
+            z-index: 1;
+        }
         .film-tile:hover { opacity: 1; }
         .film-tile.film-current { border-color: var(--porch); opacity: 1; }
         .film-tile.film-rep { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--porch) 45%, transparent); }
@@ -721,7 +768,12 @@
                 <span id="playerChipSlot"></span>
                 <button class="x" id="playerClose" aria-label="Close playback">&times;</button>
             </div>
-            <div class="stage"><img id="playerImg" alt="Event frame"></div>
+            <div class="stage">
+                <div class="player-frame" id="playerFrame">
+                    <img id="playerImg" alt="Event frame">
+                    <div class="player-bbox hidden" id="playerBbox"><span class="player-bbox-cap" id="playerBboxCap"></span></div>
+                </div>
+            </div>
             <div class="player-controls">
                 <button class="btn" id="playerPlay" disabled>Play</button>
                 <button class="btn ghost" id="playerPrev" disabled>Prev</button>
@@ -760,6 +812,10 @@
         let playerSeq = 0;
         let playerFrames = [], playerImages = [], playerTiles = [], playerIndex = 0;
         let playerTimer = null, playerPlaying = false;
+        // The stored-JPEG natural dimensions of the played frames — one camera feeds
+        // every event, so these are constant once learned and pin the box overlay's
+        // %-of-natural-dims math. Set from the first frame that finishes loading.
+        let playerNatW = null, playerNatH = null;
 
         // (cats avatars are version-stamped from the overview — no cache-buster var needed)
 
@@ -776,6 +832,7 @@
         const playerScrubEl = $('playerScrub'), playerCountEl = $('playerCount');
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
+        const playerFrameEl = $('playerFrame'), playerBboxEl = $('playerBbox'), playerBboxCapEl = $('playerBboxCap');
 
         // ================= helpers =================
         function pad2(n) { return String(n).padStart(2, '0'); }
@@ -1172,6 +1229,56 @@
         });
 
         // ================= playback modal =================
+        // Per-frame YOLO detection overlay (playback-yolo-boxes spec): each played frame
+        // may carry {analyzed, score, box, cls} from /api/frames/sample?detections=yolo-serial.
+        // A frame's confidence colours its filmstrip bar and box border via the SAME
+        // bandOf(score, 0.40, 0.65) thresholds the visit-health conf_max band uses, so a
+        // per-frame colour matches the card's health signal. score == null (no detection
+        // or not measured) → no bar, no box.
+        const BAND_COLOR = ['var(--tl-red)', 'var(--tl-amber)', 'var(--tl-green)'];
+        function confColor(score) {
+            return score == null ? null : BAND_COLOR[bandOf(score, 0.40, 0.65)];
+        }
+        // Map a returned COCO class id to a label for the box caption (cat / person / bird).
+        function clsLabel(cls) {
+            if (cls === 15) return 'cat';
+            if (cls === 0) return 'person';
+            if (cls === 14) return 'bird';
+            return 'object';
+        }
+        // Draw (or hide) the detection box for a frame, positioned as a percentage of the
+        // image's natural dimensions — so it tracks the drawn image at any stage size with
+        // no resize math. Hidden when the frame has no box, or before natural dims are known.
+        function positionBbox(f) {
+            const box = f && f.box;
+            if (!box || box.length !== 4 || !playerNatW || !playerNatH) {
+                playerBboxEl.classList.add('hidden');
+                return;
+            }
+            const [x1, y1, x2, y2] = box;
+            playerBboxEl.style.left = (x1 / playerNatW * 100) + '%';
+            playerBboxEl.style.top = (y1 / playerNatH * 100) + '%';
+            playerBboxEl.style.width = ((x2 - x1) / playerNatW * 100) + '%';
+            playerBboxEl.style.height = ((y2 - y1) / playerNatH * 100) + '%';
+            const color = confColor(f.score) || 'var(--tl-green)';
+            playerBboxEl.style.borderColor = color;
+            playerBboxCapEl.style.color = color;
+            playerBboxCapEl.textContent = f.score == null
+                ? clsLabel(f.cls)
+                : `${clsLabel(f.cls)} ${Math.round(f.score * 100)}%`;
+            playerBboxEl.classList.remove('hidden');
+        }
+        // Learn the constant natural dims from the first loaded frame and pin the frame
+        // wrapper's aspect-ratio, then (re)draw the current box now that dims are known.
+        playerImgEl.addEventListener('load', () => {
+            if (playerNatW == null && playerImgEl.naturalWidth) {
+                playerNatW = playerImgEl.naturalWidth;
+                playerNatH = playerImgEl.naturalHeight;
+                playerFrameEl.style.aspectRatio = `${playerNatW} / ${playerNatH}`;
+            }
+            positionBbox(playerFrames[playerIndex]);
+        });
+
         // Per-visit YOLO detection aggregates (ev.detection = {ratio, conf_max,
         // conf_mean}; visit-detection-aggregates spec) under the filmstrip, one stat
         // per line. Each value distinguishes "not measured" (null → '—', the visit's
@@ -1219,6 +1326,7 @@
             playerFrames = []; playerImages = []; playerTiles = [];
             playerIndex = 0;
             playerImgEl.removeAttribute('src');
+            playerBboxEl.classList.add('hidden');
             playerCountEl.textContent = '—';
             playerFilmstripEl.innerHTML = '<div class="loading">Loading frames…</div>';
             playerPlayBtn.disabled = true;
@@ -1229,7 +1337,7 @@
                 // Sample the WHOLE span evenly (id ASC) so a long visit plays from its
                 // beginning; sample_frames returns every frame when short, an even spread
                 // when long — already chronological.
-                const sp = new URLSearchParams({ count: String(MAX_PLAY_FRAMES) });
+                const sp = new URLSearchParams({ count: String(MAX_PLAY_FRAMES), detections: 'yolo-serial' });
                 addBounds(sp, ev.start_id, ev.end_id);
                 const sres = await fetch('/api/frames/sample?' + sp.toString());
                 if (!sres.ok) throw new Error(await errorFromResponse(sres));
@@ -1261,6 +1369,14 @@
                 const im = document.createElement('img');
                 im.src = f.url; im.loading = 'lazy'; im.alt = '';
                 tile.appendChild(im);
+                // Thin confidence bar on the bottom edge; only when YOLO detected here.
+                const color = confColor(f.score);
+                if (color) {
+                    const bar = document.createElement('span');
+                    bar.className = 'film-conf';
+                    bar.style.background = color;
+                    tile.appendChild(bar);
+                }
                 tile.addEventListener('click', () => { pausePlayback(); showPlayerFrame(idx); });
                 return tile;
             });
@@ -1285,6 +1401,9 @@
             preloadAround(idx);
             const f = playerFrames[idx];
             playerImgEl.src = f.url;
+            // Position the box now for an already-loaded (cached) frame; the img 'load'
+            // listener re-runs positionBbox once natural dims / a fresh decode are ready.
+            positionBbox(f);
             playerCountEl.textContent = `${idx + 1} / ${playerFrames.length}`;
             if (playerScrubEl.value !== String(idx)) playerScrubEl.value = String(idx);
             playerTiles.forEach((t, j) => t.classList.toggle('film-current', j === idx));

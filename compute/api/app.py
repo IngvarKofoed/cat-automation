@@ -863,6 +863,7 @@ def create_app(
         per_ms: "int | None" = Query(default=None),
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
+        detections: "str | None" = Query(default=None),
     ):
         # The density viewer's decimated preview, so a wide bucket is never dumped as tens
         # of thousands of thumbs. Two strategies:
@@ -871,10 +872,20 @@ def create_app(
         #  - else → ~count frames evenly spread by frame INDEX.
         # Both clamp their density server-side (interval raised / count capped) so the
         # result can't exceed _MAX_SAMPLE thumbnails.
+        #
+        # `detections` (the count branch only) attaches each sampled frame's stored
+        # per-frame detection for that analyzer (the playback filmstrip/box overlay);
+        # gated against ANALYZER_NAMES like /api/frames. Not applicable to the per_ms
+        # density path, so it's ignored there.
         if per_ms is not None:
             frames = store.sample_frames_by_interval(since_id, until_id, per_ms)
         else:
-            frames = store.sample_frames(since_id, until_id, count)
+            if detections is not None and detections not in ANALYZER_NAMES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown analyzer {detections!r}; known: {ANALYZER_NAMES}",
+                )
+            frames = store.sample_frames(since_id, until_id, count, detections=detections)
         return {"frames": frames}
 
     @app.get("/api/timeline")

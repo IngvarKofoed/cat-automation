@@ -128,8 +128,10 @@ def _valid_focus(focus) -> bool:
 
 # Bounds shared by the night-light offset fields (load-time defaulting AND the POST
 # validator): integer minutes, generously capped so a fat-finger can't push a
-# transition wildly off, but wide enough for any real dawn/dusk lead/lag.
-_NL_OFFSET_MIN = 0
+# transition wildly off. NEGATIVE is allowed and shifts the transition the OTHER
+# way (lamp on after sunset / off before sunrise — a narrower on-window), so the
+# range is symmetric around 0.
+_NL_OFFSET_MIN = -240
 _NL_OFFSET_MAX = 240
 
 

@@ -103,6 +103,16 @@ def test_should_be_on_evening_boundary_is_inclusive():
     assert NightLight.should_be_on(_SUNRISE, _SUNSET, 30, 30, just_before) is False
 
 
+def test_should_be_on_negative_offsets_narrow_the_window():
+    # Negative offsets shift transitions the OTHER way: on 30 min AFTER sunset
+    # (on_start = 16:30), off 30 min BEFORE sunrise (on_end = 06:30) — a narrower
+    # on-window. Between sunset (16:00) and 16:30 the lamp is now OFF, not on.
+    still_off = datetime(2026, 1, 15, 16, 15, tzinfo=timezone.utc)
+    assert NightLight.should_be_on(_SUNRISE, _SUNSET, -30, -30, still_off) is False
+    now_on = datetime(2026, 1, 15, 16, 45, tzinfo=timezone.utc)  # past sunset+30
+    assert NightLight.should_be_on(_SUNRISE, _SUNSET, -30, -30, now_on) is True
+
+
 # --- tick: write-on-change only + LOW-on-configured-channel -------------
 
 
@@ -325,8 +335,8 @@ def test_get_night_light_returns_config_available_and_status(nl_client):
         {"channel": ""},  # empty
         {"on_before_sunset_min": 30.5},  # non-integer minutes
         {"off_after_sunrise_min": True},  # bool rejected (int subclass)
-        {"on_before_sunset_min": 241},  # out of [0, 240]
-        {"on_before_sunset_min": -1},  # out of [0, 240]
+        {"on_before_sunset_min": 241},  # above the 240 cap
+        {"on_before_sunset_min": -241},  # below the -240 floor
         {"latitude": 91},  # out of [-90, 90]
         {"latitude": "north"},  # not a number
         {"longitude": 181},  # out of [-180, 180]
@@ -382,6 +392,20 @@ def test_post_night_light_persists_and_round_trips(nl_client):
     assert saved["enabled"] is True
     assert saved["channel"] == "channel2"
     assert saved["on_before_sunset_min"] == 45
+
+
+def test_post_night_light_accepts_negative_offsets(nl_client):
+    # Negative offsets are valid (they shift the transition the other way); the
+    # symmetric [-240, 240] range accepts them and they round-trip.
+    client, _ = nl_client
+    resp = client.post(
+        "/api/night-light",
+        json={"on_before_sunset_min": -15, "off_after_sunrise_min": -20},
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["on_before_sunset_min"] == -15
+    assert data["off_after_sunrise_min"] == -20
 
 
 def test_camera_config_post_does_not_wipe_night_light(nl_client):

@@ -732,3 +732,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      button that round-trips through `GET`/`POST /api/night-light`. Status line (on/off, next change,
      sunrise/sunset) renders server UTC instants in the browser's local time. Disables + notes when
      `available:false` (no GPIO backend), mirroring the existing GPIO-switches note.
+
+120. Night-light offsets now accept NEGATIVE minutes (range widened to −240..240): a negative value
+     shifts the transition the other way — lamp on AFTER sunset / off BEFORE sunrise, a narrower
+     on-window — vs the prior 0..240 which only ever widened coverage (on before dark / off after light).
+     Validation + UI min-bound only; the schedule math already handled negative timedeltas.

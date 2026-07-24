@@ -34,6 +34,7 @@
             --v-false-rgb:   245 165 36;
             --v-caught-rgb:  63 185 80;
             --v-neutral-rgb: 139 152 166;
+            --v-rep-rgb:     163 113 247;
             --accent-rgb:    74 179 255;
 
             /* ---- semantics ---- */
@@ -94,6 +95,7 @@
             --v-false-rgb:   191 135 0;
             --v-caught-rgb:  26 127 55;
             --v-neutral-rgb: 107 114 128;
+            --v-rep-rgb:     130 80 223;
             --accent-rgb:    31 111 235;
 
             /* softened for a light canvas — the dark .35 halo is too heavy on white */
@@ -1172,6 +1174,35 @@
             color: var(--color-text-muted);
             border: 1px dashed rgb(var(--v-neutral-rgb) / .35);
         }
+        /* `corrupted` (visit-detection-aggregates spec): YOLO saw nothing AND a frame in
+           the visit is corruption-flagged — a glitch-explained span, deprioritised but
+           still reachable. Takes the corruption purple (--v-rep) used across the
+           corruption view, so it never reads as a caught/missed verdict or a real
+           subject; it's a distinct "this was probably a sensor glitch" tone. */
+        .subject-chip.corrupted {
+            background: rgb(var(--v-rep-rgb) / .16);
+            color: var(--color-status-rep);
+            border: 1px solid rgb(var(--v-rep-rgb) / .45);
+        }
+        /* Per-visit YOLO detection aggregates (visit-detection-aggregates spec): a quiet
+           mono instrument line under the caption on each event card — the visit's detection
+           RATE (fraction of its motion frames carrying a cat/person/bird box, a recall
+           proxy) plus PEAK and MEAN detection confidence. Deliberately understated (muted,
+           11px) so it never competes with the identity/subject chip; the value itself gets
+           the readable ink. '—' marks a null: det '—' = the visit's motion frames were not
+           swept ("not measured"), distinct from det 0% = swept but YOLO detected nothing. */
+        .det-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px var(--space-3);
+            padding: 0 var(--space-2) 6px;
+            font-family: var(--font-data);
+            font-variant-numeric: tabular-nums;
+            font-size: 11px;
+            color: var(--color-text-muted);
+        }
+        .det-stats .det-stat { white-space: nowrap; }
+        .det-stats .det-stat b { font-weight: 600; color: var(--color-text); }
         /* Player stage: a fixed-height contained frame, mirroring #inboxRep so flipping
            events or scrubbing never resizes the box and reflows the strip below. */
         #playerStage {
@@ -3137,6 +3168,10 @@
             const chip = (!subj || subj.kind === 'cat') ? identityChip(ev.identity) : subjectChip(subj);
             if (chip) cap.append(chip);
             tile.append(img, cap);
+            // Per-visit YOLO detection aggregates (visit-detection-aggregates spec) as a
+            // quiet line under the caption. Absent on legacy pre-aggregate events.
+            const stats = detectionStats(ev.detection);
+            if (stats) tile.append(stats);
             // Double-click / double-tap opens the playback modal (single click is a no-op,
             // so a stray tap while scanning the grid doesn't launch the player).
             tile.addEventListener('dblclick', () => openEvent(i));
@@ -3163,10 +3198,12 @@
             return chip;
         }
 
-        // Non-cat subject chip (event-subject-classification spec): only called when
-        // subject.kind !== 'cat' — 'cat' spans keep using identityChip(). 'person'/'bird'
-        // are a factual description (a class YOLO saw), not a verdict, so they get their
-        // own accent rather than borrowing green/red/amber. 'unrecognized' is real motion
+        // Non-cat subject chip (event-subject-classification + visit-detection-aggregates
+        // specs): only called when subject.kind !== 'cat' — 'cat' spans keep using
+        // identityChip(). 'person'/'bird' are a factual description (a class YOLO saw), not a
+        // verdict, so they get their own accent rather than borrowing green/red/amber.
+        // 'corrupted' (YOLO saw nothing AND a frame is corruption-flagged) is a
+        // glitch-explained span, in the corruption purple. 'unrecognized' is real motion
         // above the learned floor with no nameable class (worth a look); 'motion_only' is
         // below it (routine noise) — both render in the same quiet neutral, just a touch
         // fainter for motion_only.
@@ -3182,6 +3219,10 @@
                     chip.className = 'subject-chip bird';
                     chip.textContent = 'bird';
                     return chip;
+                case 'corrupted':
+                    chip.className = 'subject-chip corrupted';
+                    chip.textContent = 'corrupted';
+                    return chip;
                 case 'unrecognized':
                     chip.className = 'subject-chip unrecognized';
                     chip.textContent = 'unrecognized';
@@ -3193,6 +3234,39 @@
                 default:
                     return null;
             }
+        }
+
+        // Per-visit YOLO detection aggregates (visit-detection-aggregates spec):
+        // det = detection RATE over the visit's motion frames (fraction carrying a
+        // cat/person/bird box, a recall proxy); peak / mean = detection confidence.
+        // Every value distinguishes "not measured" (null → '—', no yolo-serial sweep
+        // over the visit's motion frames) from a measured 0 (det 0% = swept, YOLO saw
+        // nothing). Returns null for legacy events with no `detection` field so those
+        // cards render exactly as before. All three combine cat+person+bird, RAW (no
+        // confidence floor) — matching what the backend records.
+        function detectionStats(det) {
+            if (!det) return null;
+            const row = document.createElement('div');
+            row.className = 'det-stats';
+            row.title = "YOLO detection over this visit's motion frames — "
+                + 'det: fraction with a detection (a recall proxy); '
+                + 'peak / mean: detection confidence. '
+                + "'—' means not measured (frames not swept), distinct from det 0% "
+                + '(swept, nothing detected).';
+            const stat = (label, val) => {
+                const s = document.createElement('span');
+                s.className = 'det-stat';
+                s.append(document.createTextNode(label + ' '));
+                const b = document.createElement('b');
+                b.textContent = val;
+                s.append(b);
+                return s;
+            };
+            const pct = det.ratio == null ? '—' : Math.round(det.ratio * 100) + '%';
+            const peak = det.conf_max == null ? '—' : det.conf_max.toFixed(2);
+            const mean = det.conf_mean == null ? '—' : det.conf_mean.toFixed(2);
+            row.append(stat('det', pct), stat('peak', peak), stat('mean', mean));
+            return row;
         }
 
         function highlightSelectedCard() {

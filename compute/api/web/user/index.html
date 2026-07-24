@@ -69,6 +69,14 @@
             --unrec:         #7d5bc4;   /* substantial motion, nothing YOLO could name — violet */
             --unrec-bg:      #ece4f8;
 
+            /* visit detection "health" — a weakest-of-three traffic light on each
+               Activity card. Canonical signal colours, kept a touch brighter/cooler
+               than the identity hues so a health dot reads as a status LED, not as
+               another identity chip. */
+            --tl-green:      #2fa35f;
+            --tl-amber:      #e0a81e;
+            --tl-red:        #db3f2a;
+
             --shadow:        0 1px 2px rgba(42,34,28,.06), 0 6px 20px rgba(42,34,28,.07);
             --shadow-lift:   0 2px 6px rgba(42,34,28,.10), 0 16px 40px rgba(42,34,28,.14);
             --radius:        16px;
@@ -105,6 +113,10 @@
                 --bird-bg:      #103029;
                 --unrec:        #b79ae8;
                 --unrec-bg:     #2a2038;
+
+                --tl-green:     #57c98a;
+                --tl-amber:     #f0be55;
+                --tl-red:       #f2694f;
 
                 --shadow:       0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.5);
                 --shadow-lift:  0 2px 6px rgba(0,0,0,.5), 0 20px 48px rgba(0,0,0,.62);
@@ -298,6 +310,22 @@
         .chip.bird         { background: var(--bird-bg);   color: var(--bird); }
         .chip.unrecognized { background: var(--unrec-bg);  color: var(--unrec); }
         .chip.motion       { background: var(--unident-bg); color: var(--unident); }
+
+        /* ================= visit-health traffic light ================= */
+        /* One circle beside the pill on each Activity card: the WEAKEST band of the
+           visit's three detection aggregates (rate / peak / mean). Absent when the
+           visit was never analysed (no reading to show). */
+        .chip-row { display: flex; align-items: center; gap: .4rem; align-self: flex-start; }
+        .health-dot {
+            flex: none;
+            width: .62rem; height: .62rem;
+            border-radius: 50%;
+            /* a faint ring lifts the dot off any card / chip colour behind it */
+            box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 14%, transparent);
+        }
+        .health-dot.tl-green  { background: var(--tl-green); }
+        .health-dot.tl-yellow { background: var(--tl-amber); }
+        .health-dot.tl-red    { background: var(--tl-red); }
 
         /* ================= ACTIVITY: the threshold time-rail ================= */
         .day-group { margin-bottom: 1.5rem; }
@@ -545,8 +573,11 @@
             gap: .6rem;
             padding: .65rem 1rem;
         }
-        .player-controls .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: .82rem; color: var(--muted); min-width: 5.5rem; }
-        .player-controls input[type="range"] { flex: 1; accent-color: var(--porch); cursor: pointer; }
+        .player-controls .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: .82rem; color: var(--muted); flex: none; white-space: nowrap; text-align: right; min-width: 5.5rem; }
+        /* min-width:0 lets the range shrink below its UA intrinsic width; without it the
+           flex:1 slider stays wide on a narrow phone and shoves the frame count off the
+           dialog edge. */
+        .player-controls input[type="range"] { flex: 1; min-width: 0; accent-color: var(--porch); cursor: pointer; }
         .player-controls .btn { padding: .4rem .8rem; }
         .filmstrip {
             display: flex;
@@ -571,6 +602,29 @@
         .film-tile.film-current { border-color: var(--porch); opacity: 1; }
         .film-tile.film-rep { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--porch) 45%, transparent); }
         .filmstrip .loading { padding: 1rem; color: var(--muted); font-size: .85rem; }
+
+        /* Per-visit YOLO detection aggregates (visit-detection-aggregates spec), shown
+           under the filmstrip: one stat per line in a two-column grid so every label
+           shares a left edge and every value shares a right edge (numbers aligned).
+           '—' means not measured (the visit's motion frames weren't swept), distinct
+           from a measured 0% / low confidence. */
+        .player-stats {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: .3rem 1rem;
+            align-items: baseline;
+            padding: .3rem 1rem 1rem;
+            border-top: 1px solid var(--hairline);
+        }
+        .player-stats.hidden { display: none; }
+        .player-stats .k { color: var(--muted); font-size: .85rem; }
+        .player-stats .v {
+            justify-self: end;
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+            font-size: .85rem;
+        }
 
         @media (max-width: 480px) {
             .porthole { width: 60px; }
@@ -676,6 +730,7 @@
                 <span class="count mono" id="playerCount">—</span>
             </div>
             <div class="filmstrip" id="playerFilmstrip"></div>
+            <div class="player-stats hidden" id="playerStats"></div>
         </div>
     </div>
 
@@ -720,9 +775,13 @@
         const playerPlayBtn = $('playerPlay'), playerPrevBtn = $('playerPrev'), playerNextBtn = $('playerNext');
         const playerScrubEl = $('playerScrub'), playerCountEl = $('playerCount');
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
+        const playerStatsEl = $('playerStats');
 
         // ================= helpers =================
         function pad2(n) { return String(n).padStart(2, '0'); }
+        // A 0–1 detection value as a percent; null → '—' (not measured). Shared by the
+        // Activity health dot and the playback-modal detection stats so they can't drift.
+        function detPct(x) { return x == null ? '—' : Math.round(x * 100) + '%'; }
 
         async function errorFromResponse(res) {
             try {
@@ -867,6 +926,43 @@
             }
         }
 
+        // ================= visit-health traffic light =================
+        // A single glanceable circle per Activity card, driven by the WEAKEST of the
+        // visit's three YOLO detection aggregates (ev.detection = {ratio, conf_max,
+        // conf_mean}) — because one strong peak frame shouldn't mask an otherwise-poor
+        // visit. Thresholds (percent) match the playback-modal stats; they're raw,
+        // uncalibrated detector scores and depressed by the top-down view, so treat
+        // them as a relative signal and re-tune against known-good visits.
+        //   green = clearly saw a subject throughout · amber = borderline
+        //   red   = weak (hard view, fleeting edge crossing, or likely false trigger)
+        // Returns null when the visit was never analysed (ratio null) or a legacy event
+        // carries no `detection` — no reading, so no dot.
+        const TL_WORD = { green: 'good', yellow: 'fair', red: 'weak' };
+        function bandOf(frac, redBelow, yellowBelow) {
+            if (frac < redBelow) return 0;      // red
+            if (frac < yellowBelow) return 1;   // yellow
+            return 2;                           // green
+        }
+        function visitHealth(det) {
+            if (!det || det.ratio == null) return null;
+            // ratio is always present here; conf_* are null only when nothing was
+            // detected (rate 0 already forces red), so skipping them is safe.
+            const bands = [bandOf(det.ratio, 0.30, 0.60)];
+            if (det.conf_max != null) bands.push(bandOf(det.conf_max, 0.40, 0.65));
+            if (det.conf_mean != null) bands.push(bandOf(det.conf_mean, 0.30, 0.55));
+            return ['red', 'yellow', 'green'][Math.min(...bands)];
+        }
+        function healthDot(ev) {
+            const level = visitHealth(ev.detection);
+            if (!level) return null;
+            const d = ev.detection;
+            const dot = document.createElement('span');
+            dot.className = 'health-dot tl-' + level;
+            dot.title = `Detection ${TL_WORD[level]} — weakest of `
+                + `rate ${detPct(d.ratio)}, peak ${detPct(d.conf_max)}, mean ${detPct(d.conf_mean)}`;
+            return dot;
+        }
+
         // ================= router =================
         function setRoute(r) {
             route = ROUTES.includes(r) ? r : 'activity';
@@ -988,7 +1084,11 @@
             row.dataset.index = String(i);
             row.tabIndex = 0;
             row.setAttribute('role', 'button');
-            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${subjectAriaText(ev)}. Open playback.`);
+            // Fold the visit-health verdict into the label so assistive tech gets the
+            // signal the colour dot gives everyone else (omitted when unmeasured).
+            const health = visitHealth(ev.detection);
+            const healthText = health ? ` Detection ${TL_WORD[health]}.` : '';
+            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${subjectAriaText(ev)}.${healthText} Open playback.`);
 
             const dot = document.createElement('div');
             dot.className = 'dot ' + subjectCssClass(kind);
@@ -1022,8 +1122,16 @@
             rel.className = 'event-rel';
             rel.textContent = relativeTime(ev.start_ts);
             meta.append(time, rel);
+            // The identity/subject pill and the visit-health dot share one line.
             const chip = subjectChip(ev);
-            if (chip) meta.appendChild(chip);
+            const healthEl = healthDot(ev);
+            if (chip || healthEl) {
+                const chipRow = document.createElement('div');
+                chipRow.className = 'chip-row';
+                if (chip) chipRow.appendChild(chip);
+                if (healthEl) chipRow.appendChild(healthEl);
+                meta.appendChild(chipRow);
+            }
 
             card.append(port, meta);
             row.append(dot, card);
@@ -1064,6 +1172,29 @@
         });
 
         // ================= playback modal =================
+        // Per-visit YOLO detection aggregates (ev.detection = {ratio, conf_max,
+        // conf_mean}; visit-detection-aggregates spec) under the filmstrip, one stat
+        // per line. Each value distinguishes "not measured" (null → '—', the visit's
+        // motion frames weren't swept) from a measured value (rate 0% = swept, nothing
+        // detected). Hidden entirely for a legacy event with no `detection` field.
+        function renderPlayerStats(det) {
+            playerStatsEl.innerHTML = '';
+            if (!det) { playerStatsEl.classList.add('hidden'); return; }
+            // All three shown as a percentage via the shared detPct (confidences 0–1 → ×100).
+            const row = (label, val, title) => {
+                const k = document.createElement('div'); k.className = 'k'; k.textContent = label; k.title = title;
+                const v = document.createElement('div'); v.className = 'v'; v.textContent = val; v.title = title;
+                playerStatsEl.append(k, v);
+            };
+            row('Detection rate', detPct(det.ratio),
+                "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
+            row('Peak confidence', detPct(det.conf_max),
+                'Highest detector confidence across the visit (0–100%). “—” means not measured.');
+            row('Mean confidence', detPct(det.conf_mean),
+                'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
+            playerStatsEl.classList.remove('hidden');
+        }
+
         async function openEvent(i) {
             if (i < 0 || i >= activityVisible.length) return;
             const ev = activityVisible[i];
@@ -1082,6 +1213,7 @@
             playerChipSlotEl.innerHTML = '';
             const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
+            renderPlayerStats(ev.detection);
 
             // Reset to a loading state so a slow fetch never shows the previous event.
             playerFrames = []; playerImages = []; playerTiles = [];

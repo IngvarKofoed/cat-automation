@@ -12,3 +12,8 @@ opencv-python-headless
 # httptools/websockets extras so the served page and media perform well.
 fastapi
 uvicorn[standard]
+# Async HTTP client for the frontend dev proxy (compute/tools/frontend_dev_proxy.py):
+# it streams responses (incl. the long-lived SSE feed) without blocking the event loop,
+# where a blocking client would freeze the proxy. Dev-only; usually already present as
+# a transitive dep, but declared so a fresh .venv-compute has it.
+httpx

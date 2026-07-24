@@ -657,3 +657,20 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      so one visit whose subject looks wrong is re-detected without re-sweeping the whole loaded block.
      Shares the yolo-serial queue + running state with the whole-events Analyze button (both disable
      while a serial sweep runs); feedback lands in the modal, progress on Sweeps.
+
+108. User dashboard playback modal shows the per-visit YOLO detection aggregates below the filmstrip
+     — rate / peak / mean, one per line, values right-aligned, all as % (same `event["detection"]` and
+     `—`=not-measured distinction as the admin cards, entry 106), refreshed on open + Prev/Next hop.
+     Also fixed the scrub slider overflowing on a narrow phone (`flex:1` lacked `min-width:0`, so it stayed
+     wide and shoved the frame count off the dialog edge). Presentation only.
+
+109. Frontend dev proxy no longer wedges or ignores Ctrl-C: a BLOCKING `requests` call in an async handler,
+     buffering the dashboard's endless SSE stream (`/api/events/stream`), parked the event loop (stuck in a
+     C-level read, so the interrupt never fired); no pooling also churned a TCP handshake per `/media` image.
+     Now a pooled `httpx.AsyncClient` that STREAMS responses, plus uvicorn `timeout_graceful_shutdown=5` so
+     one Ctrl-C stops it mid-stream. `httpx` added to compute/requirements.txt (was only transitive).
+
+110. User Activity cards gained a single "visit-health" traffic-light dot beside the pill: the WEAKEST band
+     of the visit's three detection aggregates (one strong peak frame shouldn't mask a poor visit). Thresholds
+     (%): rate red<30/green≥60, peak red<40/green≥65, mean red<30/green≥55. No dot when unmeasured (`ratio`
+     null). Provisional — raw uncalibrated scores, depressed by the top-down view; re-tune vs known-good visits.

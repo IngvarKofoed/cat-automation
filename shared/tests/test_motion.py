@@ -15,10 +15,9 @@ frames (no camera):
 - A live ``var_threshold`` change is applied via ``setVarThreshold`` WITHOUT
   dropping the learned background — the property that lets the UI tune without
   bursting false motion.
-- The corrupt-frame guard: a whole-frame colour cast and a thin coloured line
-  are recognized and skipped BEFORE MOG2 (motion False, corrupt True, no model
-  built, streak untouched), while a neutral frame and a compact coloured "cat"
-  are NOT flagged, and a mono/2D ROI bypasses the guard.
+- ``classify_corruption`` (the compute-side, review-only corruption detector that
+  also lives in this module) names the check that fired (cast/line/None). It is
+  NOT used by the gate — a corrupt frame can still contain a real cat.
 
 MOG2 is stateful, so a fresh gate must first learn the flat synthetic
 background (``_warm``) before a blob means anything — the same convergence the
@@ -137,10 +136,9 @@ def test_motion_on_sustained_blob_with_roughly_correct_bbox():
 
     motion = False
     for _ in range(params.persistence):
-        motion, bbox, area, corrupt = gate.process(_with_blob(), params)
+        motion, bbox, area = gate.process(_with_blob(), params)
 
     assert motion is True
-    assert corrupt is False
     assert bbox is not None
     assert params.min_area <= area <= params.max_area_fraction
     bx, by, bw, bh = bbox
@@ -164,7 +162,7 @@ def test_locality_gate_rejects_blob_below_min_area():
     motion = False
     area = 0.0
     for _ in range(params.persistence + 2):
-        motion, _bbox, area, _c = gate.process(_with_blob(rect=(70, 50, 10, 10)), params)
+        motion, _bbox, area = gate.process(_with_blob(rect=(70, 50, 10, 10)), params)
 
     assert 0.0 < area < params.min_area
     assert motion is False
@@ -180,7 +178,7 @@ def test_locality_gate_rejects_whole_roi_illumination():
     motion = True
     area = 0.0
     for _ in range(params.persistence + 2):
-        motion, _bbox, area, _c = gate.process(_bright(), params)
+        motion, _bbox, area = gate.process(_bright(), params)
 
     assert area > params.max_area_fraction
     assert motion is False
@@ -195,12 +193,12 @@ def test_persistence_debounce_requires_consecutive_frames():
     _warm(gate, params)
 
     # Frames 1 and 2 build the streak but stay below persistence=3.
-    m1, _b1, _a1, _c1 = gate.process(_with_blob(), params)
+    m1, _b1, _a1 = gate.process(_with_blob(), params)
     assert m1 is False
-    m2, _b2, _a2, _c2 = gate.process(_with_blob(), params)
+    m2, _b2, _a2 = gate.process(_with_blob(), params)
     assert m2 is False
     # Frame 3 reaches the streak and flips motion on.
-    m3, _b3, _a3, _c3 = gate.process(_with_blob(), params)
+    m3, _b3, _a3 = gate.process(_with_blob(), params)
     assert m3 is True
 
 
@@ -268,90 +266,12 @@ def test_var_threshold_change_is_live_and_keeps_the_background():
     assert gate._mog2.getVarThreshold() == pytest.approx(40.0)
 
 
-# --- corrupt-frame guard ----------------------------------------------------
-
-
-def test_magenta_cast_is_skipped_without_touching_gate_state():
-    # A whole-frame colour cast reports corrupt+no-motion and is skipped BEFORE
-    # MOG2: the model is never created and the streak is never advanced.
-    gate = MotionGate()
-    params = _params()
-
-    result = gate.process(_magenta_cast(), params)
-    assert result.corrupt is True
-    assert result.motion is False
-    assert result.bbox is None
-    assert result.area == 0.0
-    assert gate._mog2 is None  # _ensure_mog2 never ran (no background poisoning)
-    assert gate._streak == 0  # debounce untouched
-
-
-def test_corrupt_frame_neither_advances_nor_resets_the_streak():
-    # A single glitch frame mid-crossing must not cost a real crossing its
-    # accumulated streak, nor advance it, nor update the learned model.
-    gate = MotionGate()
-    params = _params()  # persistence=2
-    _warm(gate, params)
-
-    assert gate.process(_with_blob(), params).motion is False  # streak -> 1
-    assert gate._streak == 1
-    model = gate._mog2
-
-    result = gate.process(_magenta_cast(), params)
-    assert result.corrupt is True
-    assert gate._streak == 1  # neither advanced nor reset
-    assert gate._mog2 is model  # existing model instance untouched
-
-
-def test_thin_colored_line_is_flagged_corrupt():
-    gate = MotionGate()
-    params = _params()
-    result = gate.process(_colored_line(), params)
-    assert result.corrupt is True
-    assert result.motion is False
-
-
-def test_neutral_frame_is_not_corrupt():
-    gate = MotionGate()
-    params = _params()
-    result = gate.process(_background(), params)
-    assert result.corrupt is False
-
-
-def test_compact_colored_blob_is_not_corrupt():
-    # A real coloured object (a ginger "cat") is a large in-band region, not a
-    # thin line or a global cast — it must never be suppressed as corruption.
-    gate = MotionGate()
-    params = _params()
-    result = gate.process(_colored_blob(), params)
-    assert result.corrupt is False
-
-
-def test_vivid_but_channel_balanced_frame_is_not_corrupt():
-    # The cast check is high global chroma AND a collapsed channel. A uniformly
-    # vivid scene clears the chroma bar but keeps all three channels alive, so it
-    # must NOT be flagged — locks in the AND (weakening it to OR would suppress
-    # this healthy frame).
-    gate = MotionGate()
-    params = _params()
-    result = gate.process(_vivid_balanced(), params)
-    assert result.corrupt is False
-
-
-def test_mono_roi_bypasses_the_guard():
-    # A single-channel ROI has no chroma; the guard bypasses it (no crash, not
-    # corrupt) and the frame flows through the normal mono MOG2 path.
-    gate = MotionGate()
-    params = _params()
-    result = gate.process(_mono(), params)
-    assert result.corrupt is False
-
-
-# --- classify_corruption seam + thresholds stamp ----------------------------
+# --- classify_corruption: the compute-side corruption detector --------------
 #
-# The public detector the offline CorruptionAnalyzer shares with the live guard:
-# it returns WHICH check fired ("cast"/"line"/None), and _is_corrupt is now just
-# ``classify_corruption(...) is not None`` — so the two can never disagree.
+# ``classify_corruption`` (and ``corruption_thresholds``) live in shared.motion
+# but are used ONLY by the compute-side corruption review (the CorruptionAnalyzer
+# sweep + the corruption page) — the motion gate does NOT use them (a corrupt
+# frame can contain a real cat). It names which check fired ("cast"/"line"/None).
 
 
 def test_classify_corruption_names_the_check_that_fired():
@@ -363,16 +283,6 @@ def test_classify_corruption_names_the_check_that_fired():
     assert classify_corruption(_colored_blob()) is None
     assert classify_corruption(_vivid_balanced()) is None
     assert classify_corruption(_mono()) is None  # 2D ROI bypasses (None, not crash)
-
-
-def test_is_corrupt_is_the_boolean_of_classify_corruption():
-    # The single-detector guarantee: _is_corrupt agrees with classify_corruption on
-    # every frame kind, since it is defined as its is-not-None.
-    from shared.motion import _is_corrupt, classify_corruption
-
-    for frame in (_magenta_cast(), _colored_line(), _background(), _colored_blob(),
-                  _vivid_balanced(), _mono()):
-        assert _is_corrupt(frame) == (classify_corruption(frame) is not None)
 
 
 def test_corruption_thresholds_exposes_the_constants():

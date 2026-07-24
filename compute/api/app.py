@@ -616,13 +616,21 @@ def create_app(
         )
     app.state.live_identify_manager = live_identify_manager
 
-    # Restore the persisted live-naming intent — but ONLY on a live app. ``restore``
-    # start()s a GPU worker thread when the intent was on (the compute PC is the
-    # dedicated always-on box), which a test app (start_collector=False) must never do;
-    # so, unlike the collector's in-memory ``restore_motion_only``, this is gated on
-    # start_collector. Persisted under the "live_identify" settings key by start/stop.
+    # Restore live-naming at launch — but ONLY on a live app. ``restore`` start()s a GPU
+    # worker thread (the compute PC is the dedicated always-on box), which a test app
+    # (start_collector=False) must never do; so, unlike the collector's in-memory
+    # ``restore_motion_only``, this is gated on start_collector. It starts when EITHER the
+    # operator left it on (persisted "live_identify" intent) OR a model has been promoted:
+    # with an active gallery, new visits should be named automatically without a manual
+    # toggle. (Without an active model the worker just idles each tick, so this is a no-op
+    # then.) First-ever enable still seeds the watermark to the frame horizon, so it names
+    # only NEW visits — back-identifying history stays the manual Identify pass's job.
     if start_collector:
-        live_identify_manager.restore(store.get_setting("live_identify") == "1")
+        want_live = (
+            store.get_setting("live_identify") == "1"
+            or store.active_model() is not None
+        )
+        live_identify_manager.restore(want_live)
 
     @app.on_event("shutdown")
     def _shutdown() -> None:

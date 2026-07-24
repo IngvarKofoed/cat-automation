@@ -7,13 +7,14 @@ param that improves the re-run improves the Pi, and there is no "second MOG2
 that drifts." See docs/specs/2026-07-10-motion-gate-diagnostic.md ("Shared
 motion core" and the "One shared motion core" key decision).
 
-A per-frame CORRUPT-FRAME GUARD runs at the very top of ``process`` (before
-MOG2): the Pi's CSI camera intermittently emits thin coloured lines and a
-whole-frame magenta cast that would falsely trip MOG2, so a cheap chroma test
-recognizes and skips them — reported as ``corrupt`` on the ``MotionResult``,
-with no background update and no debounce change. Living in this shared core
-means the edge live gate and the compute offline re-run skip them identically.
-See docs/specs/2026-07-23-corrupt-frame-motion-guard.md.
+This module also exposes a corruption DETECTOR (``classify_corruption`` /
+``corruption_thresholds``): a chroma test for the Pi CSI camera's thin
+coloured-line and magenta-cast glitches. It is NOT used by the motion gate — a
+corrupt frame can still contain a real cat, so filtering corrupt frames out of
+motion would be fail-non-safe. It is a COMPUTE-side, review-only helper (the
+``compute.analysis.corruption.CorruptionAnalyzer`` sweep and the corruption
+page), living here only because ``shared.motion`` is the import-light module its
+compute callers already depend on. See docs/specs/2026-07-23-corruption-review-page.md.
 
 Kept dependency-light per shared/'s discipline: ``cv2``/``numpy`` are imported
 LAZILY inside the methods, so ``import shared.motion`` stays cheap and never
@@ -39,25 +40,6 @@ _CORRUPT_BASELINE_HALFWIN = 15  # rows each side of a row for its baseline media
 _CORRUPT_LINE_MAX_ROWS = 20  # a flagged band this tall or thinner is a line (taller => real)
 
 
-class MotionResult(NamedTuple):
-    """The gate's per-frame decision: the motion verdict plus a corruption flag.
-
-    ``motion``/``bbox``/``area`` are the debounced decision as before (``area``
-    the largest foreground blob as a fraction of the ROI, always reported for
-    tuning; ``bbox`` that blob normalized to 0..1 when motion is active, else
-    ``None``). ``corrupt`` is True when the frame was recognized as CSI
-    corruption (a thin coloured line or a whole-frame colour cast) and skipped
-    BEFORE MOG2 — in that case ``motion`` is False, ``bbox`` None, ``area`` 0.0.
-    A named result (not a bare tuple) so a future per-frame classification field
-    is one line, not another contract change.
-    """
-
-    motion: bool
-    bbox: "tuple | None"
-    area: float
-    corrupt: bool
-
-
 def corruption_thresholds() -> dict:
     """The ``_CORRUPT_*`` constants as a plain dict, for stamping into a verdict.
 
@@ -81,11 +63,11 @@ def corruption_thresholds() -> dict:
 def classify_corruption(roi_bgr) -> "str | None":
     """Which CSI-corruption check fires on ``roi_bgr`` — ``"cast"`` / ``"line"`` / ``None``.
 
-    The single detector for the corrupt-frame guard: the live gate calls it via
-    the thin ``_is_corrupt`` wrapper, and the offline ``CorruptionAnalyzer`` calls
-    it directly to record WHICH check fired (the ``reason``). ``None`` means the
-    frame is not corruption. There is exactly ONE implementation of the logic, so
-    an offline swept verdict equals the live verdict for the same frame.
+    The corruption detector, called by the offline ``CorruptionAnalyzer`` to
+    record WHICH check fired (the ``reason``); ``None`` means the frame is not
+    corruption. Review-only — the motion gate does NOT use it, because a corrupt
+    frame can still contain a real cat (filtering corrupt frames out of motion
+    would be fail-non-safe).
 
     Runs on the FULL, un-downscaled ROI (downscaling would blur a 1-few-row
     line away) BEFORE any resize. The signal is ABSOLUTE BGR chroma, not HSV
@@ -155,16 +137,6 @@ def classify_corruption(roi_bgr) -> "str | None":
     return None
 
 
-def _is_corrupt(roi_bgr) -> bool:
-    """True if ``roi_bgr`` is a CSI-corruption frame (thin colour line OR colour cast).
-
-    The gate's boolean guard, kept as a one-line wrapper over
-    ``classify_corruption`` so there is a SINGLE detector: the guard and the
-    offline analyzer can never disagree about whether a frame is corrupt.
-    """
-    return classify_corruption(roi_bgr) is not None
-
-
 class MotionParams(NamedTuple):
     """The six motion-detection parameters (the exact set the edge persists).
 
@@ -221,29 +193,18 @@ class MotionGate:
         self._mog2_var_threshold: "float | None" = None
         self._streak = 0
 
-    def process(self, roi_bgr, params: MotionParams) -> MotionResult:
+    def process(self, roi_bgr, params: MotionParams):
         """Compute the debounced motion decision for one ALREADY rotated+cropped ROI.
 
         ``roi_bgr`` is the door-region frame the caller has already transformed
         (rotate+crop stays in the caller); this method is the motion core from
-        the downscale step onward. Returns a ``MotionResult`` where ``area`` is
-        the largest foreground blob as a fraction of the ROI (always reported,
-        for tuning), ``bbox`` is that blob normalized to the ROI (0..1) when
-        motion is active (else ``None``), and ``corrupt`` flags a skipped CSI
-        corruption frame.
-
-        A corruption frame (thin coloured line or whole-frame colour cast) is
-        recognized FIRST, on the full un-downscaled ROI, and skipped entirely:
-        it returns ``MotionResult(False, None, 0.0, True)`` WITHOUT running MOG2
-        and WITHOUT touching the debounce streak — the background is never
-        poisoned and a single glitch mid-crossing neither advances nor resets the
-        streak (transparent to gate state). See the module's ``_is_corrupt``.
+        the downscale step onward. Returns ``(motion, bbox, area)`` where
+        ``area`` is the largest foreground blob as a fraction of the ROI (always
+        reported, for tuning) and ``bbox`` is that blob normalized to the ROI
+        (0..1) when motion is active, else ``None``.
 
         Not internally locked — see the class docstring.
         """
-        if _is_corrupt(roi_bgr):
-            return MotionResult(False, None, 0.0, True)
-
         import cv2
 
         height, width = roi_bgr.shape[:2]
@@ -301,7 +262,7 @@ class MotionGate:
         else:
             bbox = None
 
-        return MotionResult(motion, bbox, area, False)
+        return motion, bbox, area
 
     def _ensure_mog2(self, params: MotionParams):
         """Return the MOG2 instance, creating it lazily and applying live tuning.

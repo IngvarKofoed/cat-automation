@@ -213,10 +213,10 @@ def test_feed_keyset_paging(tmp_path):
     store = _store(tmp_path)
     ids = _seed_feed(store)
     page1, cur = store.corruption_feed("all", None, 2, None, None)
-    assert [r["id"] for r in page1] == [ids[3], ids[2]]  # newest-first
+    assert [r["id"] for r in page1] == [ids[0], ids[1]]  # oldest-first
     assert cur is not None
     page2, cur2 = store.corruption_feed("all", cur, 2, None, None)
-    assert [r["id"] for r in page2] == [ids[1], ids[0]]
+    assert [r["id"] for r in page2] == [ids[2], ids[3]]
     # A FULL page always hands back a cursor (same keyset contract as
     # query_disagreements); the emptiness is discovered on the next fetch.
     assert cur2 is not None

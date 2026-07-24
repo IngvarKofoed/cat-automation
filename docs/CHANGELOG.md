@@ -590,3 +590,26 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     predating a `_CORRUPT_*` change) and cat-coverage warnings so an empty danger set never reads as "safe".
     Caveat: the guard forces corrupt→motion=0, so a motion-only sweep can't find corruption in post-guard
     frames. Spec: docs/specs/2026-07-23-corruption-review-page.md.
+
+98. Corruption page picker + paging reworked: a `datetime-local` START (to the minute) + a preset TIMESPAN
+    (15 min … 24 h) set the window; the grid then pages by MINUTES (a 1/2/5 min-per-page selector between
+    Prev/Next), each page a resolved time sub-window so the header counts stay range-wide while you scan
+    chronologically. Feed is OLDEST-first (`corruption_feed` ORDER BY `id ASC` + forward keyset). Buckets
+    picker unchanged.
+
+99. Removed the edge motion-gate corruption guard (entry 96): a corrupt frame can still contain a real cat, so
+    filtering corrupt frames out of motion is FAIL-NON-SAFE. `MotionGate.process` reverts to `(motion, bbox,
+    area)` — no `MotionResult`/skip, `_is_corrupt` gone. Corruption is now a review-ONLY flag: the
+    `classify_corruption`/`corruption_thresholds` detector stays in `shared.motion`, used solely by the
+    `CorruptionAnalyzer` sweep + the `#corruption` page. Filtering belongs later at the GALLERY/ID, not the gate.
+
+100. Compute auto-starts live naming at launch when a model has been promoted (an active gallery exists),
+     not only when the operator left the intent on — a promoted model means new visits should be named
+     without a manual toggle. First-ever enable still seeds the watermark to the frame horizon (names only
+     NEW visits; back-identifying history stays the manual Identify pass). No active model → worker idles (no-op).
+
+101. `events()` derives a `corrupted` subject + attaches per-visit detection aggregates — read-time, no
+     schema/sweep. `corrupted` (between bird/unrecognized) fires only when YOLO saw NOTHING and any frame in
+     the visit's id span is `corruption`-flagged, so a cat in a corrupt frame stays `cat`. `event["detection"]`
+     = {ratio, conf_max, conf_mean} over the visit's motion frames, RAW; ratio is null when unswept ("not
+     measured") vs 0.0 for a swept miss. Spec: docs/specs/2026-07-23-visit-detection-aggregates.md.

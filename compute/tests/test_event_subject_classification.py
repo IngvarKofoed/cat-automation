@@ -25,7 +25,13 @@ import os
 
 import pytest
 
-from compute.collection.store import Store, _VISIT_GAP_MS, _SUBJECT_FLOOR_DEFAULT, _ANNOTATE_MIN_CONF
+from compute.collection.store import (
+    Store,
+    _VISIT_GAP_MS,
+    _SUBJECT_FLOOR_DEFAULT,
+    _ANNOTATE_MIN_CONF,
+    _CORRUPTION_ANALYZER,
+)
 from compute.ingest import StreamFrame
 from shared.wire import StreamFrameMeta
 
@@ -233,6 +239,118 @@ def test_subject_merges_max_confidence_across_span_frames(tmp_path):
     store.write_analysis(ids[1], "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 4, 4, 0.77, _PERSON]]))
     ev = store.events(None, None)["events"][0]
     assert ev["subject"] == {"kind": "person", "conf": pytest.approx(0.77)}
+
+
+# --- `corrupted` rung + per-visit detection aggregates ----------------------
+# (visit-detection-aggregates spec, docs/specs/2026-07-23-visit-detection-aggregates.md)
+
+
+def test_subject_corrupted_when_no_detection_and_corruption_present(tmp_path):
+    # A visit that would be 'unrecognized' (area above floor) with NO YOLO detection but
+    # a corruption verdict on one of its frames files as 'corrupted' — the new rung
+    # between bird and unrecognized.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    store.write_analysis(ids[0], _CORRUPTION_ANALYZER, True, None, {"reason": "cast"})
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"] == {"kind": "corrupted"}
+
+
+def test_subject_cat_in_corrupt_frame_stays_cat(tmp_path):
+    # corrupted fires only when YOLO detected NOTHING, so a cat box (>= floor) sharing a
+    # frame with a corruption verdict still wins — the corruption fail-safe is preserved.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    (f1,) = _one_event_ids(store, base, 1)
+    store.write_analysis(f1, "yolo-serial", True, 0.9, _boxes_detail([[0, 0, 4, 4, 0.9, _CAT]]))
+    store.write_analysis(f1, _CORRUPTION_ANALYZER, True, None, {"reason": "line"})
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"] == {"kind": "cat"}
+
+
+def test_subject_no_detection_no_corruption_falls_back_to_unrecognized(tmp_path):
+    # Coverage fallback: no YOLO detection AND no corruption verdict over the span → the
+    # ladder falls through the (un-fired) corrupted rung to unrecognized. Never crashes.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unrecognized"
+
+
+def test_subject_corruption_verdict_zero_does_not_trigger_corrupted(tmp_path):
+    # A corruption row that says NOT corrupt (verdict=0) must not fire the rung — the
+    # lookup filters verdict=1.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    store.write_analysis(ids[0], _CORRUPTION_ANALYZER, False, None, {"reason": None})
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unrecognized"
+
+
+def test_subject_corruption_anywhere_in_visit_span_triggers_corrupted(tmp_path):
+    # A corruption verdict on ANY frame in the visit's id span [start_id, end_id] — even a
+    # NON-motion frame between the motion frames — files a no-detection visit as `corrupted`.
+    # Deliberately span-based (not motion-filtered): a glitch anywhere in the visit's window
+    # is enough; a corruption-adjacent missed cat landing here is an accepted loss.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    above = _SUBJECT_FLOOR_DEFAULT["min_area"] * 10
+    a = _add(store, base + 0, motion=True, area=above)
+    d = _add(store, base + 50, motion=False, area=0.0)  # in span [a, c], NON-motion
+    _c = _add(store, base + 100, motion=True, area=above)
+    store.write_analysis(d, _CORRUPTION_ANALYZER, True, None, {"reason": "cast"})
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"] == {"kind": "corrupted"}
+
+
+def test_detection_aggregates_over_motion_frames_raw_no_floor(tmp_path):
+    # Three motion frames (A sub-0.3 cat, B person 0.8, C nothing) + one NON-motion frame
+    # D (strong cat box) whose id falls inside the span. The aggregates: count only motion
+    # frames with a detection (A, B), over the visit's motion-frame count (3), and record
+    # RAW confidences (A's 0.2 counts despite being below _ANNOTATE_MIN_CONF). D's 0.95
+    # must be excluded from the ratio (non-motion).
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    a = _add(store, base + 0, motion=True, area=0.1)
+    b = _add(store, base + 100, motion=True, area=0.1)
+    d = _add(store, base + 150, motion=False, area=0.1)  # in span, must NOT count
+    c = _add(store, base + 200, motion=True, area=0.1)
+    low = _ANNOTATE_MIN_CONF - 0.1
+    store.write_analysis(a, "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 4, 4, low, _CAT]]))
+    store.write_analysis(b, "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 4, 4, 0.8, _PERSON]]))
+    store.write_analysis(d, "yolo-serial", True, 0.95, _boxes_detail([[0, 0, 4, 4, 0.95, _CAT]]))
+    # C: no yolo-serial row at all -> no detection.
+    ev = store.events(None, None)["events"][0]
+    assert ev["n_frames"] == 3  # A, B, C clustered; D (non-motion) not a member
+    det = ev["detection"]
+    assert det["ratio"] == pytest.approx(2 / 3)          # A + B detected, C none; over 3 motion frames
+    assert det["conf_max"] == pytest.approx(0.8)          # max(0.2, 0.8)
+    assert det["conf_mean"] == pytest.approx((low + 0.8) / 2)
+
+
+def test_detection_aggregates_unmeasured_visit_is_null(tmp_path):
+    # An UN-SWEPT visit (no yolo-serial rows on its motion frames) → "not measured":
+    # ratio is null (not 0.0), so a consumer can't mistake it for a measured miss.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    _one_event_ids(store, base, 2, area=0.1)
+    ev = store.events(None, None)["events"][0]
+    assert ev["detection"] == {"ratio": None, "conf_max": None, "conf_mean": None}
+
+
+def test_detection_aggregates_measured_miss_is_zero(tmp_path):
+    # A visit whose motion frames WERE swept but YOLO detected nothing (empty boxes) →
+    # a real miss: ratio 0.0 (distinct from the unmeasured null above), confs null.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2, area=0.1)
+    for fid in ids:
+        store.write_analysis(fid, "yolo-serial", False, 0.0, _boxes_detail([]))
+    ev = store.events(None, None)["events"][0]
+    assert ev["detection"] == {"ratio": 0.0, "conf_max": None, "conf_mean": None}
 
 
 # --- Preserved box-reading contract (scorecard / identify path) -------------

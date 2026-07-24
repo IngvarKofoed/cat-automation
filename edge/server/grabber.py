@@ -28,7 +28,7 @@ import time
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from edge.clip.transform import crop, rotate
-from shared.motion import MotionGate, MotionParams, MotionResult
+from shared.motion import MotionGate, MotionParams
 
 if TYPE_CHECKING:  # only for annotations — keep runtime imports light
     import numpy as np
@@ -153,14 +153,6 @@ class Grabber:
         self._consecutive_failures = 0
         self._last_failure_log_mono = 0.0
 
-        # Corrupt-frame suppression logging, guarded by self._cond, throttled with
-        # the SAME pattern as grab failures. Dedicated fields (not the grab-failure
-        # counter): a corrupt frame is a SUCCESSFUL grab, and the success path zeroes
-        # _consecutive_failures every iteration — reusing it would defeat both this
-        # throttle and the grab-recovery accounting.
-        self._consecutive_corrupt = 0
-        self._last_corrupt_log_mono = 0.0
-
         # Thread lifecycle.
         self._stop = threading.Event()
         self._thread: "threading.Thread | None" = None
@@ -267,49 +259,27 @@ class Grabber:
         ts = int(time.time() * 1000)
         mono = time.monotonic()
         try:
-            result = self._compute_motion(
+            motion, bbox, area = self._compute_motion(
                 img, cfg.rotation, cfg.clip, cfg.motion
             )
         except Exception:  # noqa: BLE001 - motion must never gate delivery or kill the loop
-            result = MotionResult(False, None, 0.0, False)
+            motion, bbox, area = False, None, 0.0
         with self._cond:
             # Reset the failure streak under the same lock that owns it, then log
             # recovery outside the lock. recovered == 0 on a normal success.
             recovered = self._consecutive_failures
             self._consecutive_failures = 0
-            # Corrupt-frame suppression: the frame is still published (motion is a
-            # pull signal, never a delivery gate) but its motion is forced False by
-            # the gate. Throttle the log so a degrading cable can't flood journald.
-            corrupt_due = False
-            corrupt_count = 0
-            if result.corrupt:
-                self._consecutive_corrupt += 1
-                corrupt_count = self._consecutive_corrupt
-                corrupt_due = corrupt_count == 1 or (
-                    mono - self._last_corrupt_log_mono >= _FAILURE_LOG_INTERVAL_S
-                )
-                if corrupt_due:
-                    self._last_corrupt_log_mono = mono
-            else:
-                self._consecutive_corrupt = 0
             self._frame = img
             self._ts = ts
             self._mono = mono
             self._last_error = None
-            # corrupt is NOT stored in the slot / FrameSnapshot — no wire change.
-            self._motion = result.motion
-            self._bbox = result.bbox
-            self._area = result.area
+            self._motion = motion
+            self._bbox = bbox
+            self._area = area
             self._frame_id += 1  # monotonic; advances only on a successful read
             self._cond.notify_all()
         if recovered:
             _log.info("camera recovered after %d failed grab(s)", recovered)
-        # Emit OUTSIDE the lock. First corrupt after clean frames logs at once; while
-        # it persists, throttle so a reconnect/corruption storm can't bury journald.
-        if corrupt_due:
-            _log.warning(
-                "motion gate suppressed corrupt frame (%d consecutive)", corrupt_count
-            )
         return fps
 
     def _run(self) -> None:
@@ -328,18 +298,17 @@ class Grabber:
 
     def _compute_motion(
         self, frame, rotation, clip, cfg: MotionConfig
-    ) -> MotionResult:
+    ) -> "tuple[bool, tuple | None, float]":
         """Compute the debounced motion decision for one raw frame.
 
         Applies this edge's rotate+crop (so motion tracks exactly the door
         region the serving routes show), then hands the ROI to the shared
-        ``MotionGate`` — the corrupt-frame guard, then the downscale → gray →
-        MOG2 → threshold → morph → largest-blob → locality/persistence core lives
-        there, identical to the compute tier's offline re-run. Returns the
-        ``MotionResult``: ``area`` is the largest foreground blob as a fraction of
-        the ROI (always reported, for tuning), ``bbox`` is that blob normalized to
-        the ROI (0..1) when motion is active (else None), and ``corrupt`` flags a
-        skipped CSI corruption frame.
+        ``MotionGate`` — the downscale → gray → MOG2 → threshold → morph →
+        largest-blob → locality/persistence core lives there, identical to the
+        compute tier's offline re-run. Returns ``(motion, bbox, area)`` where
+        ``area`` is the largest foreground blob as a fraction of the ROI (always
+        reported, for tuning) and ``bbox`` is that blob normalized to the ROI
+        (0..1) when motion is active, else None.
 
         The gate is not internally locked, so ``process`` runs under
         ``self._motion_lock`` — a concurrent ``reset_motion()`` can't swap the

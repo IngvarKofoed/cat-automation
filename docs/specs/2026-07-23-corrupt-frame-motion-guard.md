@@ -1,5 +1,12 @@
 # Corrupt-frame motion guard
 
+> **SUPERSEDED (2026-07-23, changelog 99).** The motion-gate guard described here
+> was removed: a corrupt frame can still contain a real cat, so suppressing corrupt
+> frames at the gate is fail-non-safe. The chroma *detector* (`classify_corruption`)
+> survives as a review-only flag for the corruption page (spec
+> `2026-07-23-corruption-review-page.md`); it is no longer used to filter motion.
+> The design below is kept for historical context only.
+
 The Pi's CSI camera (IMX708 / Module 3) intermittently emits corrupt frames that
 falsely trip the MOG2 motion gate: **thin coloured horizontal lines** (1–few
 rows, full- or partial-width, any hue incl. dark navy, solid or dashed) and a

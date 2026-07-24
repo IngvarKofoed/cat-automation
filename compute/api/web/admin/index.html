@@ -1682,20 +1682,21 @@
             </p>
             <div class="controls-row">
                 <div class="control-group">
-                    <label for="corrStartDate">Start date</label>
-                    <input type="date" id="corrStartDate">
+                    <label for="corrStart">Start</label>
+                    <input type="datetime-local" id="corrStart">
                 </div>
                 <div class="control-group">
-                    <label for="corrStartTime">Start time</label>
-                    <select id="corrStartTime"></select>
-                </div>
-                <div class="control-group">
-                    <label for="corrEndDate">End date</label>
-                    <input type="date" id="corrEndDate">
-                </div>
-                <div class="control-group">
-                    <label for="corrEndTime">End time</label>
-                    <select id="corrEndTime"></select>
+                    <label for="corrSpan">Timespan</label>
+                    <select id="corrSpan">
+                        <option value="15">15 min</option>
+                        <option value="30">30 min</option>
+                        <option value="60" selected>1 hour</option>
+                        <option value="120">2 hours</option>
+                        <option value="180">3 hours</option>
+                        <option value="360">6 hours</option>
+                        <option value="720">12 hours</option>
+                        <option value="1440">24 hours</option>
+                    </select>
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
@@ -1730,7 +1731,7 @@
                 <div class="control-group">
                     <label>&nbsp;</label>
                     <label class="checkbox-label" style="align-self: center;"
-                        title="Restrict the sweep to motion frames only (tight + fast). Leave off to also check the non-motion majority. WARNING: the guard forces every corrupt frame to motion=0, so a motion-only sweep of frames captured AFTER the guard went live can never find corruption (it reports ~0%) — motion-only is only meaningful over pre-guard calibration buckets.">
+                        title="Restrict the sweep to motion frames only (tight + fast). Leave off to also check the non-motion majority. The motion-gate corrupt guard was removed (changelog 99): corrupt frames are no longer forced to motion=0, so a motion-only corruption sweep is meaningful on post-guard-removal buckets.">
                         <input type="checkbox" id="corrMotionOnly">
                         Motion only
                     </label>
@@ -1758,7 +1759,16 @@
             <div id="corrGrid" class="grid"></div>
             <div id="corrPager" class="pager hidden">
                 <button type="button" id="corrPrevBtn" class="btn-secondary">← Prev</button>
-                <span id="corrPageLabel" class="badge">Page 1</span>
+                <label class="checkbox-label" style="align-self: center;"
+                    title="How many minutes of frames each page shows. At ~5 fps a minute is ~300 frames; 5 min exceeds the page cap and shows only the first 1000.">
+                    min/page
+                    <select id="corrMinsPerPage">
+                        <option value="1" selected>1</option>
+                        <option value="2">2</option>
+                        <option value="5">5</option>
+                    </select>
+                </label>
+                <span id="corrPageLabel" class="badge">—</span>
                 <button type="button" id="corrNextBtn" class="btn-secondary">Next →</button>
             </div>
         </div>
@@ -2482,7 +2492,7 @@
         ];
         const ANALYZER_LABELS = Object.fromEntries(ANALYZERS.map(a => [a.id, a.label]));
         const TUNING_PARAM_KEYS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
-        const CLOCK_STEP_HOURS = 3;            // clock-picker time-of-day granularity
+        const CLOCK_STEP_HOURS = 3;            // clock-picker time-of-day granularity (Buckets)
         const VIEWER_PAGE_SIZE = 500;          // "All" density paged feed
         const CONTEXT_FRAMES = 8;              // preceding frames shown in the inbox filmstrip
         const STATS_POLL_MS = 4000;
@@ -6143,10 +6153,8 @@
         // (→ /api/frames/resolve → id range) and a keyset-paged feed joining each frame to
         // its corruption + cat verdicts. The sweep is enqueued from here (progress on
         // Sweeps), like the Activity "Analyze" backfill.
-        const corrStartDateEl = document.getElementById('corrStartDate');
-        const corrStartTimeEl = document.getElementById('corrStartTime');
-        const corrEndDateEl = document.getElementById('corrEndDate');
-        const corrEndTimeEl = document.getElementById('corrEndTime');
+        const corrStartEl = document.getElementById('corrStart');
+        const corrSpanEl = document.getElementById('corrSpan');
         const corrLoadBtn = document.getElementById('corrLoadBtn');
         const corrStoreRangeEl = document.getElementById('corrStoreRange');
         const corrSelectedRangeEl = document.getElementById('corrSelectedRange');
@@ -6167,22 +6175,33 @@
         const corrPrevBtn = document.getElementById('corrPrevBtn');
         const corrPageLabelEl = document.getElementById('corrPageLabel');
         const corrNextBtn = document.getElementById('corrNextBtn');
+        const corrMinsPerPageEl = document.getElementById('corrMinsPerPage');
         const corrLightboxEl = document.getElementById('corrLightbox');
         const corrLightboxDialogEl = document.getElementById('corrLightboxDialog');
         const corrLightboxImgEl = document.getElementById('corrLightboxImg');
         const corrLightboxTitleEl = document.getElementById('corrLightboxTitle');
         const corrLightboxCloseBtn = document.getElementById('corrLightboxClose');
 
-        const CORR_PAGE_SIZE = 200;      // matches the backend default; capped at 1000
+        const CORR_PAGE_FETCH = 1000;    // a minute-window's frames in one fetch (backend cap); coarser min/page truncates
         const CORR_DANGER_CAP = 1000;    // one count fetch of the danger set, capped
 
-        let corrScope = null;            // { since_id, until_id, since_ts, until_ts }
-        let corrCursors = [null];        // corrCursors[i] = keyset cursor to fetch page i
-        let corrPageIndex = 0;
+        let corrScope = null;            // whole-window { since_id, until_id, since_ts, until_ts } — header + danger counts
+        let corrWindowStart = 0;         // paging window start (ms) — the picked, minute-aligned start
+        let corrWindowEnd = 0;           // paging window end (ms) — clamped to the last real frame
+        let corrPageIndex = 0;           // current minute-page (0-based; page 0 = oldest)
+        let corrTruncated = false;       // current page hit the fetch cap (min/page too coarse)
         let corrLoading = false;
         let corrSeq = 0;                 // guards out-of-order feed responses
         let corrSubmitting = false;      // Compute click → enqueue POST resolves
         let corrCatCovIncomplete = false; // last header: cat coverage < total (danger set may be under-swept)
+
+        // datetime-local wants a local "YYYY-MM-DDTHH:MM" string (no timezone); build it
+        // from local date parts so the picker shows the operator's wall clock.
+        function datetimeLocalValue(ts) {
+            const d = new Date(ts);
+            return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+                + `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+        }
 
         function populateCorrClockDefaults() {
             const hasRange = typeof storeOldestTs === 'number' && typeof storeNewestTs === 'number';
@@ -6191,26 +6210,18 @@
                 : 'empty';
             corrLoadBtn.disabled = !hasRange;
             if (!hasRange) return;
-            const minD = dateInputValue(storeOldestTs);
-            const maxD = dateInputValue(storeNewestTs);
-            corrStartDateEl.min = minD; corrStartDateEl.max = maxD;
-            corrEndDateEl.min = minD; corrEndDateEl.max = maxD;
-            if (!corrStartDateEl.value) {
-                corrStartDateEl.value = minD;
-                corrStartTimeEl.value = String(Math.floor(new Date(storeOldestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS);
-            }
-            if (!corrEndDateEl.value) {
-                corrEndDateEl.value = maxD;
-                const slotStart = Math.floor(new Date(storeNewestTs).getHours() / CLOCK_STEP_HOURS) * CLOCK_STEP_HOURS;
-                corrEndTimeEl.value = String(slotStart + CLOCK_STEP_HOURS);
-            }
+            // Constrain the start picker to the store's span; default to the oldest frame
+            // (a natural chronological start — the operator then picks a timespan).
+            corrStartEl.min = datetimeLocalValue(storeOldestTs);
+            corrStartEl.max = datetimeLocalValue(storeNewestTs);
+            if (!corrStartEl.value) corrStartEl.value = datetimeLocalValue(storeOldestTs);
         }
 
         corrLoadBtn.addEventListener('click', async () => {
-            const s = tsFromControls(corrStartDateEl.value, Number(corrStartTimeEl.value));
-            const e = tsFromControls(corrEndDateEl.value, Number(corrEndTimeEl.value));
-            if (s == null || e == null) { showError('Pick a start and end date.'); return; }
-            const lo = Math.min(s, e), hi = Math.max(s, e);
+            if (!corrStartEl.value) { showError('Pick a start time.'); return; }
+            const lo = new Date(corrStartEl.value).getTime();
+            if (Number.isNaN(lo)) { showError('Pick a valid start time.'); return; }
+            const hi = lo + Number(corrSpanEl.value) * 60000;  // timespan is in minutes
             try {
                 clearError();
                 const params = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi) });
@@ -6225,6 +6236,10 @@
                     since_id: data.since_id, until_id: data.until_id,
                     since_ts: data.since_ts, until_ts: data.until_ts,
                 };
+                // Page across the PICKED window from its minute-aligned start; clamp the end to
+                // the last real frame so Next never walks into empty future minutes.
+                corrWindowStart = lo;
+                corrWindowEnd = data.until_ts + 1;
                 corrSelectedRangeEl.querySelector('.metric__val').textContent =
                     formatRange(data.since_ts, data.until_ts);
                 loadCorrFeed(true);
@@ -6235,7 +6250,7 @@
 
         corrFilterEl.addEventListener('change', () => { if (corrScope) loadCorrFeed(true); });
 
-        function loadCorrFeed(reset) {
+        async function loadCorrFeed(reset) {
             if (!corrScope) {
                 corrEmptyEl.classList.remove('hidden');
                 corrEmptyEl.textContent = 'Load a range to see frames.';
@@ -6243,43 +6258,81 @@
                 corrPagerEl.classList.add('hidden');
                 return;
             }
-            if (reset) { corrCursors = [null]; corrPageIndex = 0; }
-            loadCorrPage(corrPageIndex, reset);
+            if (reset) {
+                corrPageIndex = 0;
+                // AWAIT the header first: it sets corrCatCovIncomplete, which an empty danger
+                // page's message reads to say "not a clean bill" vs a plain empty. The danger
+                // headline can lag (it only paints a metric), so it stays concurrent.
+                await loadCorrHeader(corrScope);
+                refreshCorrDanger(corrScope);
+            }
+            loadCorrPage(corrPageIndex);
         }
 
-        async function loadCorrPage(targetIndex, reset) {
+        // Whole-window header (coverage / stale / cat-coverage) over the loaded range — NOT per
+        // page, so the corruption rate + danger overview stay range-wide as you page by minute.
+        // limit=1 because only the aggregate count fields are used, not the frame.
+        async function loadCorrHeader(scope) {
+            try {
+                const params = new URLSearchParams({ filter: 'all', limit: '1' });
+                addBounds(params, scope.since_id, scope.until_id);
+                const res = await fetch('/api/corruption?' + params.toString());
+                if (corrScope !== scope || !res.ok) return;
+                const data = await res.json();
+                if (corrScope !== scope) return;
+                renderCorrHeader(data.coverage || {}, data.stale || {}, data.cat_coverage || {});
+            } catch (err) { /* header is best-effort; the grid still loads */ }
+        }
+
+        // Resolve a [lo, hi) ms sub-window to an inclusive id range, or null if it holds no frames.
+        async function resolveCorrIds(lo, hi) {
+            const params = new URLSearchParams({ start_ts: String(lo), end_ts: String(hi - 1) });
+            const res = await fetch('/api/frames/resolve?' + params.toString());
+            if (!res.ok) throw new Error(await errorFromResponse(res));
+            const d = await res.json();
+            return (d.since_id == null || d.until_id == null) ? null : { since_id: d.since_id, until_id: d.until_id };
+        }
+
+        function corrPageSpanMs() { return Number(corrMinsPerPageEl.value) * 60000; }
+        function corrTotalPages() {
+            return Math.max(1, Math.ceil((corrWindowEnd - corrWindowStart) / corrPageSpanMs()));
+        }
+        function corrPageBounds(p) {
+            const span = corrPageSpanMs();
+            const lo = corrWindowStart + p * span;
+            return { lo, hi: Math.min(lo + span, corrWindowEnd) };
+        }
+
+        // Each minute-page is a bounded time sub-window fetched whole (no keyset cursor): resolve
+        // its ms bounds to an id range, then pull all its frames (capped at CORR_PAGE_FETCH).
+        async function loadCorrPage(targetIndex) {
             const seq = ++corrSeq;
-            const scope = corrScope;
             corrLoading = true;
+            corrPageIndex = targetIndex;
+            corrTruncated = false;
             updateCorrPager();
             try {
                 clearError();
-                const params = new URLSearchParams({
-                    filter: corrFilterEl.value,
-                    limit: String(CORR_PAGE_SIZE),
-                });
-                addBounds(params, scope.since_id, scope.until_id);
-                const cursor = corrCursors[targetIndex];
-                if (cursor != null) params.set('cursor', String(cursor));
-                const res = await fetch('/api/corruption?' + params.toString());
+                const { lo, hi } = corrPageBounds(targetIndex);
+                const sub = await resolveCorrIds(lo, hi);
                 if (seq !== corrSeq) return;
-                if (!res.ok) throw new Error(await errorFromResponse(res));
-                const data = await res.json();
-                if (seq !== corrSeq) return;
-                const frames = data.frames || [];
-                // Header first: it sets corrCatCovIncomplete, which renderCorrFrames' empty
-                // message reads to distinguish "none found so far" from a clean/empty page.
-                renderCorrHeader(data.coverage || {}, data.stale || {}, data.cat_coverage || {});
+                let frames = [];
+                if (sub) {
+                    const params = new URLSearchParams({ filter: corrFilterEl.value, limit: String(CORR_PAGE_FETCH) });
+                    addBounds(params, sub.since_id, sub.until_id);
+                    const res = await fetch('/api/corruption?' + params.toString());
+                    if (seq !== corrSeq) return;
+                    if (!res.ok) throw new Error(await errorFromResponse(res));
+                    const data = await res.json();
+                    if (seq !== corrSeq) return;
+                    // Oldest-first on the page, regardless of the backend feed's order (so it's
+                    // correct even before the ORDER BY id ASC backend change is deployed).
+                    frames = (data.frames || []).sort((a, b) => a.id - b.id);
+                    corrTruncated = frames.length >= CORR_PAGE_FETCH;
+                }
                 renderCorrFrames(frames);
-                corrPageIndex = targetIndex;
-                corrCursors[corrPageIndex + 1] = data.next_cursor != null ? data.next_cursor : null;
-                // Hide the pager on an empty result — a disabled "Page 1" beside the
-                // empty-state message reads as a broken page.
-                corrPagerEl.classList.toggle('hidden', frames.length === 0);
+                corrPagerEl.classList.remove('hidden');
                 window.scrollTo(0, 0);
-                // The danger headline (corrupt∧cat) is filter-independent, so refresh it on a
-                // reset (range load / filter change / after Compute) — not on every page hop.
-                if (reset) refreshCorrDanger(scope);
             } catch (err) {
                 if (seq === corrSeq) showError(`Load corruption feed failed: ${err.message}`);
             } finally {
@@ -6287,18 +6340,26 @@
             }
         }
 
+        function corrHM(ts) { const d = new Date(ts); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
         function updateCorrPager() {
-            corrPageLabelEl.textContent = `Page ${corrPageIndex + 1}`;
-            corrPrevBtn.disabled = corrLoading || corrPageIndex === 0;
-            corrNextBtn.disabled = corrLoading || corrCursors[corrPageIndex + 1] == null;
+            const total = corrTotalPages();
+            const { lo, hi } = corrPageBounds(corrPageIndex);
+            let label = `${corrHM(lo)}–${corrHM(hi)} · page ${corrPageIndex + 1}/${total}`;
+            if (corrTruncated) label += ` · first ${CORR_PAGE_FETCH.toLocaleString()} — lower min/page`;
+            corrPageLabelEl.textContent = label;
+            corrPrevBtn.disabled = corrLoading || corrPageIndex <= 0;
+            corrNextBtn.disabled = corrLoading || corrPageIndex >= total - 1;
         }
         corrPrevBtn.addEventListener('click', () => {
-            if (corrLoading || corrPageIndex === 0) return;
-            loadCorrPage(corrPageIndex - 1, false);
+            if (corrLoading || corrPageIndex <= 0) return;
+            loadCorrPage(corrPageIndex - 1);
         });
         corrNextBtn.addEventListener('click', () => {
-            if (corrLoading || corrCursors[corrPageIndex + 1] == null) return;
-            loadCorrPage(corrPageIndex + 1, false);
+            if (corrLoading || corrPageIndex >= corrTotalPages() - 1) return;
+            loadCorrPage(corrPageIndex + 1);
+        });
+        corrMinsPerPageEl.addEventListener('change', () => {
+            if (corrScope) loadCorrPage(0);   // re-chunk from the window start
         });
 
         function renderCorrFrames(frames) {
@@ -6308,8 +6369,8 @@
                 // Distinguish an empty danger set over an un-swept range ("none found so
                 // far") from a genuinely clean/empty page — never let empty read as "safe".
                 corrEmptyEl.textContent = (corrFilterEl.value === 'corrupt-and-cat' && corrCatCovIncomplete)
-                    ? 'No corrupt-and-cat frames found so far — this range is not fully cat-swept, so this is not a clean bill.'
-                    : 'No frames match this filter in the loaded range.';
+                    ? 'No corrupt-and-cat frames in this window — this range is not fully cat-swept, so this is not a clean bill.'
+                    : 'No matching frames in this minute-window (a capture gap, or nothing matches the filter here) — use Prev/Next.';
             }
             for (const f of frames) corrGridEl.appendChild(corrThumb(f));
         }
@@ -6491,7 +6552,6 @@
         // ================= init =================
         window.addEventListener('load', () => {
             buildTimeOptions();
-            buildTimeOptions(corrStartTimeEl, corrEndTimeEl);
             buildCoverageRows();
             buildOracleChooser();
             setInboxMode('missed');

@@ -179,10 +179,7 @@ class MogAnalyzer:
         The verdict is the gate's debounced ``motion`` and the score is the largest
         blob's ``area`` fraction (always reported, so a stored re-run can be re-bucketed
         against thresholds later without re-running); ``detail`` echoes the normalized
-        ``bbox``, the exact six params that produced this verdict, and ``corrupt`` —
-        the shared gate's flag that this frame was skipped as CSI corruption (a thin
-        coloured line or a colour cast), so an offline sweep can count/inspect
-        corruption without re-running detection.
+        ``bbox`` and the exact six params that produced this verdict.
 
         Stored frames are ALREADY rotated+cropped (the Pi streams the ROI), so unlike
         the edge grabber this passes ``image`` straight to the gate with no transform.
@@ -190,10 +187,6 @@ class MogAnalyzer:
         if self._gate is None:
             raise RuntimeError("MogAnalyzer.analyze() called before prepare()")
 
-        result = self._gate.process(image, self._params)
-        detail = {
-            "bbox": result.bbox,
-            "params": self._params._asdict(),
-            "corrupt": result.corrupt,
-        }
-        return AnalysisResult(verdict=result.motion, score=result.area, detail=detail)
+        motion, bbox, area = self._gate.process(image, self._params)
+        detail = {"bbox": bbox, "params": self._params._asdict()}
+        return AnalysisResult(verdict=motion, score=area, detail=detail)

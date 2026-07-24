@@ -1582,7 +1582,7 @@ class Store:
     ):
         """Return ``(rows, next_cursor)`` for the corruption-review feed over a window.
 
-        Newest-first on ``frames.id`` (``id DESC``) with the SAME opaque keyset
+        Oldest-first on ``frames.id`` (``id ASC``) with the SAME opaque keyset
         contract as ``query`` / ``query_disagreements`` (token = last id; ``None``
         once a page is short). Each frame LEFT JOINs its ``corruption`` verdict and
         a MAX-over-cat-oracles presence, so an un-swept frame still appears (with
@@ -1619,7 +1619,7 @@ class Store:
         # ``IN (?, ?)``, then the optional cursor + range + limit.
         params: list = [_CORRUPTION_ANALYZER, _CAT_ORACLES[0], _CAT_ORACLES[1]]
         if cursor is not None:
-            where.append("f.id < ?")
+            where.append("f.id > ?")  # oldest-first: page forward past the last id seen
             params.append(_parse_id_cursor(cursor))
         range_frags, range_params = _range_bounds("f.id", since_id, until_id)
         where.extend(range_frags)
@@ -1632,7 +1632,7 @@ class Store:
                 f"SELECT {_ROW_COLUMNS_F}, c.verdict, c.detail, cat.cat_verdict FROM frames f"
                 " LEFT JOIN analysis c ON c.frame_id = f.id AND c.analyzer = ?"
                 f" LEFT JOIN ({self._CAT_SUBQUERY}) cat ON cat.frame_id = f.id"
-                f"{clause} ORDER BY f.id DESC LIMIT ?",
+                f"{clause} ORDER BY f.id ASC LIMIT ?",
                 params,
             ).fetchall()
 
@@ -2377,7 +2377,7 @@ class Store:
         Per surviving cluster the record is::
 
             {start_id, end_id, start_ts, end_ts, n_frames, rep_frame_id,
-             identity, subject}
+             identity, subject, detection}
 
         ``start_id``/``end_id`` = min/max frame id in the cluster (the id span the
         player fetches its frames over); ``start_ts``/``end_ts`` = first/last
@@ -2391,13 +2391,26 @@ class Store:
         classification (event-subject-classification spec) from the span's
         ``yolo-serial`` boxes plus a motion floor::
 
-            {kind: 'cat' | 'person' | 'bird' | 'unrecognized' | 'motion_only', ...}
+            {kind: 'cat'|'person'|'bird'|'corrupted'|'unrecognized'|'motion_only', ...}
 
         A positive cat detection always wins (``kind='cat'``; ``identity`` then
         carries resident/neighbour/unknown-cat). Otherwise person/bird if YOLO named
-        one, else the motion floor splits substantial-but-unnamed motion
-        (``unrecognized``) from trivial noise (``motion_only``) — so no event is ever
-        a silent blank. See ``_classify_subject`` for the ladder.
+        one; else ``corrupted`` when YOLO saw NOTHING and any frame in the visit carries
+        a ``corruption`` verdict (glitch-explained, deprioritised-not-hidden); else the
+        motion floor splits substantial-but-unnamed motion (``unrecognized``) from
+        trivial noise (``motion_only``) — so no event is ever a silent blank. See
+        ``_classify_subject`` for the ladder.
+
+        ``detection`` records per-visit ``yolo-serial`` detection aggregates over the
+        visit's MOTION frames — ``{ratio, conf_max, conf_mean}`` — combining the
+        cat/person/bird classes into one detection-density signal, RAW (no
+        ``_ANNOTATE_MIN_CONF`` floor, unlike the subject ladder). ``ratio`` = (motion
+        frames with >=1 such box) / ``n_frames``; ``conf_max``/``conf_mean`` are over
+        those per-frame max confidences, ``null`` when the visit has none. ``ratio`` is
+        ``null`` (not 0.0) when NONE of the visit's motion frames were swept — "not
+        measured", distinct from a swept-but-zero-detection ``ratio`` of 0.0 (a real
+        miss) — so a not-measured visit → ``{ratio: null, conf_max: null, conf_mean: null}``.
+        Read-time (not persisted); the data layer for a future YOLO-recall evaluation feature.
 
         Events are sorted NEWEST-FIRST (``start_ts`` desc, tie-break ``start_id``
         desc) and capped at ``limit`` (clamped into ``[1, _MAX_EVENTS]``);
@@ -2482,25 +2495,77 @@ class Store:
         with self._lock:
             # frame_id-ORDERED so each event's span is a contiguous slice found by
             # bisect (like the identity join), and ALL verdicts (no verdict filter).
+            # JOIN frames.motion so the per-visit detection aggregates can count only
+            # the visit's MOTION frames (a yolo-serial row can ride a non-motion frame
+            # whose id falls inside the span under continuous capture — that must NOT
+            # count toward the ratio; the subject ladder's class_conf still merges over
+            # all rows, unchanged).
             subj_rows = self._conn.execute(
-                "SELECT frame_id, detail FROM analysis"
-                " WHERE analyzer = 'yolo-serial' AND frame_id BETWEEN ? AND ?"
-                " ORDER BY frame_id ASC",
+                "SELECT a.frame_id, a.detail, f.motion FROM analysis a"
+                " JOIN frames f ON f.id = a.frame_id"
+                " WHERE a.analyzer = 'yolo-serial' AND a.frame_id BETWEEN ? AND ?"
+                " ORDER BY a.frame_id ASC",
                 (int(lo), int(hi)),
             ).fetchall()
+            # Corruption presence: ANY frame in the visit's id span [start_id, end_id] with a
+            # corruption verdict=1 — motion or not; a glitch anywhere in the visit's window is
+            # enough — sliced per event by bisect like subj_rows. No-detection + this →
+            # `corrupted`. Deliberately NOT motion-filtered: a corruption-adjacent missed cat
+            # landing in `corrupted` is an accepted loss — YOLO misses on corruption-FREE
+            # visits (plain `unrecognized`) are plentiful and cleaner to learn from, a miss
+            # co-occurring with corruption is confounded anyway, and `corrupted` stays
+            # reachable. Read-time — no such frames → can't fire, stays `unrecognized`.
+            corrupt_rows = self._conn.execute(
+                "SELECT frame_id FROM analysis"
+                " WHERE analyzer = ? AND verdict = 1 AND frame_id BETWEEN ? AND ?"
+                " ORDER BY frame_id ASC",
+                (_CORRUPTION_ANALYZER, int(lo), int(hi)),
+            ).fetchall()
         subj_fids = [r[0] for r in subj_rows]
+        corrupt_fids = [r[0] for r in corrupt_rows]
+        # The three detection classes the aggregates combine into one density signal.
+        _det_classes = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID)
         for event in events:
             e_lo, e_hi = event["start_id"], event["end_id"]
             lo_i = bisect.bisect_left(subj_fids, e_lo)
             hi_i = bisect.bisect_right(subj_fids, e_hi)
-            # Merge each frame's per-class max confidence into a span-wide max.
+            # Merge each frame's per-class max confidence into a span-wide max (subject
+            # ladder), AND collect the per-MOTION-frame max detection confidence over
+            # {cat, person, bird} — RAW, no _ANNOTATE_MIN_CONF floor (record the full
+            # distribution for the future eval feature; the ladder keeps its own floor).
             class_conf: "dict[int, float]" = {}
-            for _fid, detail in subj_rows[lo_i:hi_i]:
-                for cls, conf in self._subject_classes(detail).items():
+            det_frame_confs: "list[float]" = []  # per motion frame with >=1 detection
+            n_swept_motion = 0  # the visit's motion frames that carry a yolo-serial row
+            for _fid, detail, motion in subj_rows[lo_i:hi_i]:
+                classes = self._subject_classes(detail)
+                for cls, conf in classes.items():
                     if conf > class_conf.get(cls, 0.0):
                         class_conf[cls] = conf
+                if motion:
+                    n_swept_motion += 1
+                    frame_confs = [classes[c] for c in _det_classes if c in classes]
+                    if frame_confs:
+                        det_frame_confs.append(max(frame_confs))
+            # ratio DISTINGUISHES "not measured" from "measured miss": null (UI '-') when
+            # NONE of the visit's motion frames were swept (coverage unknown), vs 0.0 (a
+            # real YOLO miss) when swept but nothing detected — so a future recall stat can
+            # tell the two apart. Denominator is the visit's motion-frame count (n_frames);
+            # a PARTIALLY-swept visit therefore deflates ratio (accepted edge case — the
+            # live-identify worker sweeps whole visits). conf_max/conf_mean are over the
+            # per-motion-frame max detection confidences, null when there are none.
+            n_motion = event["n_frames"]
+            event["detection"] = {
+                "ratio": None if n_swept_motion == 0 else (len(det_frame_confs) / n_motion),
+                "conf_max": max(det_frame_confs) if det_frame_confs else None,
+                "conf_mean": (sum(det_frame_confs) / len(det_frame_confs)) if det_frame_confs else None,
+            }
+            # Corruption present iff any corruption verdict=1 frame falls in this span.
+            c_lo = bisect.bisect_left(corrupt_fids, e_lo)
+            c_hi = bisect.bisect_right(corrupt_fids, e_hi)
+            corruption_present = c_hi > c_lo
             event["subject"] = self._classify_subject(
-                class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor
+                class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor,
+                corruption_present,
             )
 
         # --- Active-model identity join (identification-gallery-activity spec).
@@ -2648,6 +2713,7 @@ class Store:
         peak_area: float,
         n_frames: int,
         floor: dict,
+        corruption_present: bool = False,
     ) -> dict:
         """Classify one event's SUBJECT — "what is it" — per the ladder (spec).
 
@@ -2655,27 +2721,36 @@ class Store:
         confidence for it (merged over the event's frames via ``_subject_classes``);
         ``peak_area`` is the cluster's peak ``frames.area`` (downscaled-ROI fraction);
         ``n_frames`` its motion-frame count; ``floor`` the resolved motion floor
-        (learned ``{min_area, min_frames, ...}`` or ``_SUBJECT_FLOOR_DEFAULT``). A
-        class counts as PRESENT only at conf ``>= _ANNOTATE_MIN_CONF`` — the same
-        floor the annotation queue uses to reject the recall-first oracle's low-conf
-        empty-scene phantoms, so a hallucinated box never earns a subject chip.
+        (learned ``{min_area, min_frames, ...}`` or ``_SUBJECT_FLOOR_DEFAULT``);
+        ``corruption_present`` is True when ANY frame in the visit carries a
+        ``corruption`` verdict (see ``events()``). A class counts as PRESENT only at
+        conf ``>= _ANNOTATE_MIN_CONF`` — the same floor the annotation queue uses to
+        reject the recall-first oracle's low-conf empty-scene phantoms, so a
+        hallucinated box never earns a subject chip.
 
         This is the BOX/motion ladder, in strict precedence::
 
             1. cat         → {kind: 'cat'}                         # identity carries who
             2. person      → {kind: 'person', conf}
             3. bird        → {kind: 'bird', conf}
-            4. peak_area >= floor.min_area OR n_frames >= floor.min_frames
+            4. corrupted   → {kind: 'corrupted'}                   # NO cat/person/bird box AND corruption_present
+            5. peak_area >= floor.min_area OR n_frames >= floor.min_frames
                            → {kind: 'unrecognized', peak_area, n_frames}
-            5. else        → {kind: 'motion_only', peak_area, n_frames}
+            6. else        → {kind: 'motion_only', peak_area, n_frames}
 
         A positive cat box (step 1) always wins over the size floor, so a cat is never
-        second-guessed by geometry. One rung sits OUTSIDE this method: a confident
-        NAMED gallery match can promote a non-cat verdict to ``cat`` — that needs the
-        identity join, so ``events()`` applies it after calling this (see the promotion
-        note there). Steps 4–5 are the only reachable ones when the span has no
-        ``yolo-serial`` rows (no class info), so an un-swept or pre-model event still
-        gets an honest motion label rather than a blank card.
+        second-guessed by geometry — and because ``corrupted`` (step 4) fires only when
+        YOLO detected NOTHING, a cat that shares a frame with a glitch still resolves to
+        ``cat`` (the corruption fail-safe). ``corrupted`` is deprioritised-not-hidden:
+        it marks glitch-explained motion as low-interest so ``unrecognized`` sharpens to
+        "cat-scale motion YOLO couldn't name and that isn't a glitch", but a corruption
+        that masks a real cat stays reachable in the feed. One rung sits OUTSIDE this
+        method: a confident NAMED gallery match can promote a non-cat verdict (including
+        ``corrupted``) to ``cat`` — that needs the identity join, so ``events()`` applies
+        it after calling this (see the promotion note there). Steps 4–6 are the only
+        reachable ones when the span has no ``yolo-serial`` rows (no class info), so an
+        un-swept or pre-model event still gets an honest label rather than a blank card;
+        with no ``corruption`` verdicts either, step 4 simply can't fire.
         """
         if class_conf.get(_COCO_CAT_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
             return {"kind": "cat"}
@@ -2683,6 +2758,8 @@ class Store:
             return {"kind": "person", "conf": class_conf[_COCO_PERSON_CLASS_ID]}
         if class_conf.get(_COCO_BIRD_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
             return {"kind": "bird", "conf": class_conf[_COCO_BIRD_CLASS_ID]}
+        if corruption_present:
+            return {"kind": "corrupted"}
         if peak_area >= floor["min_area"] or n_frames >= floor["min_frames"]:
             return {"kind": "unrecognized", "peak_area": peak_area, "n_frames": n_frames}
         return {"kind": "motion_only", "peak_area": peak_area, "n_frames": n_frames}

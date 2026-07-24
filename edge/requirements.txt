@@ -1,6 +1,9 @@
 flask
 opencv-python-headless
 psutil  # host CPU%/memory for /status — one portable path for Pi OS + macOS
+astral  # offline sunrise/sunset math for the night-light scheduler — pure-Python
+        # and pip-installable (unlike gpiozero/picamera2), so the Pi computes sun
+        # times locally and still never dials out.
 # Pi CSI camera (Picamera2) is NOT pip-installed: `sudo apt install python3-picamera2`
 # and build the venv with --system-site-packages (see edge.sh). USB cameras need
 # nothing beyond the two deps above.

@@ -720,3 +720,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 
 117. Swapped the pins behind `channel2`/`channel3` to match the wiring: now `channel2`→GPIO 21,
      `channel3`→GPIO 20 (`channel1`→26 unchanged).
+
+118. Night-light scheduler (edge-side): drives GPIO channel LOW from sunset−30min to sunrise+30min to power
+     a lamp; sun times computed offline via `astral` (no network). Survives compute-PC outages and
+     preserves manual switch flips (write-on-change). Configured in the config UI (channel, offsets,
+     location); no-ops off a Pi. Edge-side because fixed camera illumination must survive an outage,
+     diverging from the deferred intent-based Control API (lock/sound/deterrent-light).
+
+119. Config UI gained the Night light panel promised by entry 118: enable checkbox, channel dropdown
+     (sourced from `/api/gpio`'s output names), on/off minute offsets, latitude/longitude, and a Save
+     button that round-trips through `GET`/`POST /api/night-light`. Status line (on/off, next change,
+     sunrise/sunset) renders server UTC instants in the browser's local time. Disables + notes when
+     `available:false` (no GPIO backend), mirroring the existing GPIO-switches note.

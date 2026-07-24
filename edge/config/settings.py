@@ -27,6 +27,19 @@ DEFAULTS = {
     # cat-sized blob and drops it below min_area within seconds — 320 keeps the
     # blob robust. Still cheap on a Pi 3 (~4x the motion pixels of 160, low ms).
     "motion_downscale": 320,
+    # Autonomous night-light scheduler (see edge/server/night_light.py). Drives one
+    # relay channel LOW (= on, active-low board) from sunset − on_before_sunset_min
+    # to sunrise + off_after_sunrise_min, sun times computed offline from lat/lon
+    # (default Copenhagen). Off by default; edited via GET/POST /api/night-light and
+    # carried through the whole-config assembly so a camera POST never wipes it.
+    "night_light": {
+        "enabled": False,
+        "channel": "channel1",
+        "on_before_sunset_min": 30,
+        "off_after_sunrise_min": 30,
+        "latitude": 55.676,
+        "longitude": 12.568,
+    },
 }
 
 

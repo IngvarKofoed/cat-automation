@@ -652,6 +652,7 @@ cat-automation/
 4. Storage: confirm **SQLite** start (vs. Postgres from day one).
 5. Push-notification provider.
 6. The **light**'s role: visual deterrent, camera illumination, or both.
+   *(Partial answer: Channel 1 provides fixed camera illumination via an autonomous astronomical schedule on the Pi edge, distinct from the deferred deterrent-light intent.)*
 7. Dashboard frontend: **lightweight SPA (Svelte/React) vs. HTMX + server-rendered
    Jinja** — the annotation UI (keyboard-driven image labelling) leans SPA;
    simplicity leans HTMX.

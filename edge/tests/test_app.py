@@ -597,6 +597,16 @@ def test_save_settings_then_load_settings_roundtrips(config_path):
         "max_area_fraction": 0.5,
         "persistence": 3,
         "motion_downscale": 200,
+        # Non-default night_light too, for the same reason — a roundtrip bug can't
+        # hide behind the default block.
+        "night_light": {
+            "enabled": True,
+            "channel": "channel2",
+            "on_before_sunset_min": 20,
+            "off_after_sunrise_min": 45,
+            "latitude": 40.0,
+            "longitude": -3.0,
+        },
     }
     settings.save_settings(full)
     assert settings.load_settings() == full

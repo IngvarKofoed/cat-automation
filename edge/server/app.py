@@ -19,6 +19,7 @@ import platform
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +33,7 @@ from edge.clip.transform import crop, rotate
 from edge.config.settings import DEFAULTS, load_settings, save_settings
 from edge.server.grabber import GrabConfig, Grabber, MotionConfig
 from edge.server.metrics import SystemMetrics
+from edge.server.night_light import NightLight
 from edge.server.watchdog import Watchdog, env_positive_float
 from shared import wire
 from shared.wire import StreamFrameMeta
@@ -124,6 +126,48 @@ def _valid_focus(focus) -> bool:
     return _is_number(focus) and 0 <= focus <= 100
 
 
+# Bounds shared by the night-light offset fields (load-time defaulting AND the POST
+# validator): integer minutes, generously capped so a fat-finger can't push a
+# transition wildly off, but wide enough for any real dawn/dusk lead/lag.
+_NL_OFFSET_MIN = 0
+_NL_OFFSET_MAX = 240
+
+
+def _valid_night_light(nl) -> bool:
+    """True if `nl` is a well-formed ``night_light`` config block.
+
+    Structural check for load-time defaulting (same fail-safe posture as
+    fps/focus): a hand-edited or partial block falls back to the default block
+    wholesale rather than crash boot or feed the scheduler junk. ``channel`` is
+    only checked to be a non-empty string here — the POST path additionally
+    validates it against the live GPIO output names (unknown here at load time).
+    """
+    if not isinstance(nl, dict):
+        return False
+    try:
+        enabled = nl["enabled"]
+        channel = nl["channel"]
+        before = nl["on_before_sunset_min"]
+        after = nl["off_after_sunrise_min"]
+        lat = nl["latitude"]
+        lon = nl["longitude"]
+    except (KeyError, TypeError):
+        return False
+    return (
+        isinstance(enabled, bool)
+        and isinstance(channel, str)
+        and bool(channel)
+        and _is_int(before)
+        and _NL_OFFSET_MIN <= before <= _NL_OFFSET_MAX
+        and _is_int(after)
+        and _NL_OFFSET_MIN <= after <= _NL_OFFSET_MAX
+        and _is_number(lat)
+        and -90 <= lat <= 90
+        and _is_number(lon)
+        and -180 <= lon <= 180
+    )
+
+
 # Motion-config keys: (validator, 400 message). One table drives load-time
 # defaulting, the POST presence check, per-key validation, and the state
 # snapshot, so the six motion keys are handled uniformly with fps/rotation/clip.
@@ -213,6 +257,7 @@ def create_app(
     source_factory: "SourceFactory | None" = None,
     start_grabber: bool = True,
     start_watchdog: bool = True,
+    start_scheduler: bool = True,
     gpio: "GpioOutputs | None" = None,
 ) -> Flask:
     """Build the Flask app.
@@ -233,10 +278,17 @@ def create_app(
     arming a process-killer inside the test runner. No-op when ``start_grabber`` is
     False (the watchdog is meaningless without a running loop).
 
+    ``start_scheduler`` (default True) starts the autonomous night-light scheduler
+    (``edge/server/night_light.py``) alongside the app — a daemon thread that drives
+    a GPIO channel on an astronomical clock. Tests pass ``False`` to avoid a
+    free-spinning thread; the scheduler self-gates per tick (disabled config, or no
+    GPIO backend → no-op), so it is safe to run everywhere. Always app-owned.
+
     ``gpio`` is the manual GPIO-output driver for the config UI's HIGH/LOW
     switches; it defaults to a real ``GpioOutputs`` (which reports unavailable
     off a Pi). Tests inject one wired to a fake backend. An app-owned default is
-    closed at exit; an injected one is the caller's to manage.
+    closed at exit; an injected one is the caller's to manage. The night-light
+    scheduler drives the same ``gpio`` instance.
     """
     factory: SourceFactory = source_factory or create_source
 
@@ -275,6 +327,15 @@ def create_app(
     # fail-safe transform, so an invalid stored value falls back to the default.
     for key, (validator, _msg) in _MOTION_VALIDATORS.items():
         state[key] = settings[key] if validator(settings[key]) else DEFAULTS[key]
+    # night_light feeds the scheduler thread (which drives GPIO), so a malformed
+    # stored block falls back to the default block wholesale — same fail-safe
+    # posture as fps/focus/motion. Copied so the persisted default can't be
+    # mutated through the live state.
+    state["night_light"] = (
+        dict(settings["night_light"])
+        if _valid_night_light(settings["night_light"])
+        else dict(DEFAULTS["night_light"])
+    )
     # Push the persisted focus onto the source. A no-op on non-focus backends;
     # on the CSI backend it's applied when the camera opens (see set_focus).
     state["source"].set_focus(focus)
@@ -297,6 +358,11 @@ def create_app(
         }
         for key in _MOTION_VALIDATORS:
             cfg[key] = state[key]
+        # Nested block; copied so the returned/persisted dict can't alias (and be
+        # mutated through) the live state. Carried here so every whole-config write
+        # (save_settings overwrites wholesale) preserves it — a camera-only POST can
+        # never wipe the schedule. Edited only via POST /api/night-light.
+        cfg["night_light"] = dict(state["night_light"])
         return cfg
 
     def read_config() -> GrabConfig:
@@ -344,6 +410,32 @@ def create_app(
     app.gpio = gpio
     if gpio_owned:
         atexit.register(gpio.close)
+
+    def read_night_light() -> dict:
+        # The live night_light config, snapshotted under the lock, handed to the
+        # scheduler each tick (like Grabber(read_config)) so a UI enable/offset
+        # change takes effect on the next poll with no thread restart.
+        with lock:
+            return dict(state["night_light"])
+
+    # The autonomous night-light scheduler drives the SAME gpio instance as the
+    # manual switches. The thread starts regardless of `enabled` — it self-gates per
+    # tick — so a UI toggle needs no restart. Always app-owned; stopped at exit.
+    night_light = NightLight(gpio, read_night_light)
+    app.night_light = night_light
+    if start_scheduler:
+        night_light.start()
+        atexit.register(night_light.stop)
+
+    def _night_light_payload() -> dict:
+        # Shared GET/POST response shape: the live config block + hardware
+        # availability + a schedule snapshot (or null status when disabled /
+        # uncomputable). One builder so the two endpoints can't diverge.
+        with lock:
+            cfg = dict(state["night_light"])
+        cfg["available"] = gpio.available
+        cfg["status"] = night_light.status(datetime.now(timezone.utc))
+        return cfg
 
     # One instance closed over by /status: it owns the CPU window/delta state, so
     # a per-request instance would reset that state and never yield a CPU reading.
@@ -640,6 +732,10 @@ def create_app(
             "clip": body["clip"] if "clip" in body else cur_clip,
             "fps": body["fps"] if "fps" in body else cur_fps,
             "focus": body["focus"] if "focus" in body else cur_focus,
+            # Carried from live state (this endpoint never edits it) so a camera POST
+            # preserves the schedule through the wholesale file rewrite. Edited only
+            # via POST /api/night-light. Copied to avoid aliasing the live state.
+            "night_light": dict(state["night_light"]),
         }
         for key in _MOTION_VALIDATORS:
             next_config[key] = body[key] if key in body else state[key]
@@ -723,6 +819,69 @@ def create_app(
             # No backend to drive the pin (not a Pi, or gpiozero missing/blocked).
             return jsonify(error=str(e)), 503
         return jsonify(available=gpio.available, outputs=gpio.outputs())
+
+    @app.get("/api/night-light")
+    def night_light_get():
+        # The night-light schedule config + hardware availability + a live schedule
+        # snapshot (status is null when disabled / uncomputable).
+        return jsonify(_night_light_payload())
+
+    @app.post("/api/night-light")
+    def night_light_set():
+        # Edit the schedule. Accepts a subset of the config keys, merged over the
+        # current block; 400 on the first bad field (matching set_config's style).
+        # Persisted through the whole-config assembly point so it lands in the same
+        # file the camera config lives in. The scheduler picks the change up next
+        # tick (it reads read_night_light() live) — no restart.
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="body must be a JSON object"), 400
+        if "enabled" in body and not isinstance(body["enabled"], bool):
+            return jsonify(error="enabled must be a boolean"), 400
+        if "channel" in body and body["channel"] not in gpio.names():
+            return jsonify(
+                error="channel must be one of " + ", ".join(gpio.names())
+            ), 400
+        for key in ("on_before_sunset_min", "off_after_sunrise_min"):
+            if key in body and not (
+                _is_int(body[key]) and _NL_OFFSET_MIN <= body[key] <= _NL_OFFSET_MAX
+            ):
+                return jsonify(
+                    error=f"{key} must be an integer between "
+                    f"{_NL_OFFSET_MIN} and {_NL_OFFSET_MAX} minutes"
+                ), 400
+        if "latitude" in body and not (
+            _is_number(body["latitude"]) and -90 <= body["latitude"] <= 90
+        ):
+            return jsonify(error="latitude must be a number between -90 and 90"), 400
+        if "longitude" in body and not (
+            _is_number(body["longitude"]) and -180 <= body["longitude"] <= 180
+        ):
+            return jsonify(error="longitude must be a number between -180 and 180"), 400
+
+        # Merge the present fields over the live block and persist the COMPLETE
+        # config (save_settings overwrites wholesale) via the one assembly point.
+        with lock:
+            merged = dict(state["night_light"])
+            for key in (
+                "enabled",
+                "channel",
+                "on_before_sunset_min",
+                "off_after_sunrise_min",
+                "latitude",
+                "longitude",
+            ):
+                if key in body:
+                    merged[key] = body[key]
+            next_config = _config_snapshot_locked()
+            next_config["night_light"] = merged
+        try:
+            save_settings(next_config)
+        except OSError as e:
+            return jsonify(error=f"failed to persist night-light config: {e}"), 500
+        with lock:
+            state["night_light"] = merged
+        return jsonify(_night_light_payload())
 
     return app
 

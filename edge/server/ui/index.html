@@ -385,6 +385,48 @@
         </div>
     </div>
 
+    <div class="controls">
+        <h2>Night light</h2>
+        <p id="nlNote" class="gpio-note hidden"></p>
+
+        <div class="control-group">
+            <label><input type="checkbox" id="nlEnabled"> Enabled</label>
+        </div>
+
+        <div class="control-group">
+            <label for="nlChannel">Channel</label>
+            <select id="nlChannel"></select>
+        </div>
+
+        <div class="tuning-grid">
+            <div class="control-group">
+                <label for="nlOnBefore">Minutes before sunset (on)</label>
+                <input type="number" id="nlOnBefore" step="1" min="0" max="240">
+            </div>
+            <div class="control-group">
+                <label for="nlOffAfter">Minutes after sunrise (off)</label>
+                <input type="number" id="nlOffAfter" step="1" min="0" max="240">
+            </div>
+            <div class="control-group">
+                <label for="nlLat">Latitude</label>
+                <input type="number" id="nlLat" step="0.001" min="-90" max="90">
+            </div>
+            <div class="control-group">
+                <label for="nlLon">Longitude</label>
+                <input type="number" id="nlLon" step="0.001" min="-180" max="180">
+            </div>
+        </div>
+
+        <div class="control-group">
+            <div class="btn-row">
+                <button type="button" id="nlSaveBtn">Save</button>
+            </div>
+        </div>
+
+        <p id="nlStatus" class="gpio-note"></p>
+        <p class="gpio-note">A manual GPIO switch flip holds until the next scheduled transition.</p>
+    </div>
+
     <div class="preview-section">
         <div id="previewWrap">
             <img id="still" alt="Camera preview">
@@ -424,6 +466,15 @@
         const relearnBtn = document.getElementById('relearnBtn');
         const gpioList = document.getElementById('gpioList');
         const gpioNote = document.getElementById('gpioNote');
+        const nlNote = document.getElementById('nlNote');
+        const nlEnabled = document.getElementById('nlEnabled');
+        const nlChannel = document.getElementById('nlChannel');
+        const nlOnBefore = document.getElementById('nlOnBefore');
+        const nlOffAfter = document.getElementById('nlOffAfter');
+        const nlLat = document.getElementById('nlLat');
+        const nlLon = document.getElementById('nlLon');
+        const nlSaveBtn = document.getElementById('nlSaveBtn');
+        const nlStatusEl = document.getElementById('nlStatus');
         const focusGroup = document.getElementById('focusGroup');
         const focusSlider = document.getElementById('focusSlider');
         const focusValueEl = document.getElementById('focusValue');
@@ -1187,6 +1238,9 @@
                 btn.addEventListener('click', () => setGpio(o.name, !o.high));
                 gpioList.appendChild(btn);
             });
+            // The night-light channel dropdown draws its options from the same
+            // output list — channel names live on GPIO, not on the scheduler.
+            populateNightLightChannels(data.outputs || []);
         }
 
         async function loadGpio() {
@@ -1200,6 +1254,129 @@
                 gpioNote.classList.remove('hidden');
             }
         }
+
+        // ---- Night light scheduler ----
+
+        // Fill the channel <select> from /api/gpio's output names, preserving
+        // whatever is currently selected (or falling back to "channel1", the
+        // server-side default) so a later loadNightLight() can set it.
+        function populateNightLightChannels(outputs) {
+            const prev = nlChannel.value;
+            nlChannel.innerHTML = '';
+            outputs.forEach(o => {
+                const opt = document.createElement('option');
+                opt.value = o.name;
+                opt.textContent = o.label || o.name;
+                nlChannel.appendChild(opt);
+            });
+            const known = [...nlChannel.options].some(o => o.value === prev);
+            nlChannel.value = known ? prev : 'channel1';
+        }
+
+        // Format an ISO UTC instant in the browser's local time, 24h clock.
+        function formatLocalTime(iso) {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return '—';
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+
+        // Render the one-line status readout from GET/POST /api/night-light's
+        // `status` block ({on_now, next_change, sunrise, sunset} or null).
+        function renderNightLightStatus(status) {
+            if (!status) {
+                nlStatusEl.textContent = 'Schedule status unavailable.';
+                return;
+            }
+            const state = status.on_now ? 'ON now' : 'OFF now';
+            const next = status.on_now ? 'next OFF' : 'next ON';
+            nlStatusEl.textContent =
+                `Lamp ${state} — ${next} ≈ ${formatLocalTime(status.next_change)} ` +
+                `(sunrise ${formatLocalTime(status.sunrise)}, sunset ${formatLocalTime(status.sunset)})`;
+        }
+
+        // Populate the form + status readout from a GET/POST /api/night-light
+        // response. Disables the inputs and shows a note when the host has no
+        // GPIO backend — mirrors renderGpio's available:false handling.
+        function applyNightLightData(data) {
+            // Flat response: the night_light config block plus `available` and
+            // `status` (see GET/POST /api/night-light's shared _night_light_payload).
+            nlEnabled.checked = !!data.enabled;
+            if (data.channel) nlChannel.value = data.channel;
+            setIfPresent(nlOnBefore, data.on_before_sunset_min);
+            setIfPresent(nlOffAfter, data.off_after_sunrise_min);
+            setIfPresent(nlLat, data.latitude);
+            setIfPresent(nlLon, data.longitude);
+
+            const available = data.available !== false;
+            [nlEnabled, nlChannel, nlOnBefore, nlOffAfter, nlLat, nlLon, nlSaveBtn].forEach(el => {
+                el.disabled = !available;
+            });
+            if (available) {
+                nlNote.classList.add('hidden');
+            } else {
+                nlNote.textContent = 'No GPIO backend on this host — the schedule can\'t drive the pin here (run on the Pi).';
+                nlNote.classList.remove('hidden');
+            }
+
+            renderNightLightStatus(data.status);
+        }
+
+        async function loadNightLight() {
+            try {
+                const res = await fetch('/api/night-light');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                applyNightLightData(await res.json());
+            } catch (err) {
+                nlNote.textContent = `Night light unavailable: ${err.message}`;
+                nlNote.classList.remove('hidden');
+            }
+        }
+
+        nlSaveBtn.addEventListener('click', async () => {
+            // Reject blank fields explicitly: Number('') is 0 (not NaN), so a
+            // cleared latitude/longitude/offset would otherwise pass the isNaN
+            // guard and silently save 0 (e.g. relocating the sun calc to 0,0).
+            if ([nlOnBefore, nlOffAfter, nlLat, nlLon].some(el => el.value.trim() === '')) {
+                showError('Night light: all number fields are required.');
+                return;
+            }
+            const onBefore = Number(nlOnBefore.value);
+            const offAfter = Number(nlOffAfter.value);
+            const lat = Number(nlLat.value);
+            const lon = Number(nlLon.value);
+            if ([onBefore, offAfter, lat, lon].some(Number.isNaN)) {
+                showError('Night light: invalid number in one of the fields.');
+                return;
+            }
+            const body = {
+                enabled: nlEnabled.checked,
+                channel: nlChannel.value,
+                on_before_sunset_min: onBefore,
+                off_after_sunrise_min: offAfter,
+                latitude: lat,
+                longitude: lon,
+            };
+            try {
+                clearError();
+                nlSaveBtn.disabled = true;
+                const res = await fetch('/api/night-light', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (!res.ok) {
+                    showError(`Night light error: ${await errorFromResponse(res)}`);
+                    await loadNightLight();  // re-sync to the persisted values
+                    return;
+                }
+                applyNightLightData(await res.json());
+                clearError();
+            } catch (err) {
+                showError(`Night light error: ${err.message}`);
+                nlSaveBtn.disabled = false;
+            }
+        });
 
         // Toggle one output; the response carries the full authoritative state,
         // so re-render from it rather than assuming the flip succeeded.
@@ -1304,7 +1481,9 @@
         window.addEventListener('load', () => {
             // Capabilities after cameras+config, so applyFocusUi sees currentFocus.
             loadCameras().then(loadCapabilities);
-            loadGpio();
+            // Night light after GPIO so its channel <select> has options to
+            // populate/select from (see populateNightLightChannels).
+            loadGpio().then(loadNightLight);
             startStatusPolling();
         });
     </script>

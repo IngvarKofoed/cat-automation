@@ -129,6 +129,32 @@
         .hidden {
             display: none !important;
         }
+        /* GPIO manual switches: neutral when LOW, green when driven HIGH
+           (matches the motion "active" green); disabled/greyed when the host
+           has no GPIO backend. */
+        .gpio-btn {
+            background: #e0e0e0;
+            color: #333;
+        }
+        .gpio-btn:hover {
+            background: #d0d0d0;
+        }
+        .gpio-btn.active {
+            background: #2e7d32;
+            color: white;
+        }
+        .gpio-btn.active:hover {
+            background: #256428;
+        }
+        .gpio-btn:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .gpio-note {
+            font-size: 13px;
+            color: #888;
+            margin: 0 0 12px;
+        }
         h2 {
             font-size: 18px;
             margin: 0 0 12px;
@@ -351,6 +377,14 @@
         </div>
     </div>
 
+    <div class="controls">
+        <h2>GPIO outputs</h2>
+        <p id="gpioNote" class="gpio-note hidden"></p>
+        <div class="control-group">
+            <div id="gpioList" class="btn-row"></div>
+        </div>
+    </div>
+
     <div class="preview-section">
         <div id="previewWrap">
             <img id="still" alt="Camera preview">
@@ -388,6 +422,8 @@
         const cpuLoadEl = document.getElementById('cpuLoad');
         const memLoadEl = document.getElementById('memLoad');
         const relearnBtn = document.getElementById('relearnBtn');
+        const gpioList = document.getElementById('gpioList');
+        const gpioNote = document.getElementById('gpioNote');
         const focusGroup = document.getElementById('focusGroup');
         const focusSlider = document.getElementById('focusSlider');
         const focusValueEl = document.getElementById('focusValue');
@@ -1128,6 +1164,65 @@
             }
         });
 
+        // ---- GPIO manual switches ----
+
+        // Render the outputs returned by /api/gpio as HIGH/LOW toggle buttons.
+        // Rebuilds the list each time (after load and after every set) so a
+        // button always shows the server's authoritative level. When the host
+        // has no GPIO backend, the buttons are disabled and a note explains why.
+        function renderGpio(data) {
+            gpioList.innerHTML = '';
+            if (data.available) {
+                gpioNote.classList.add('hidden');
+            } else {
+                gpioNote.textContent = 'No GPIO backend on this host — switches are inactive (run on the Pi to drive the relays).';
+                gpioNote.classList.remove('hidden');
+            }
+            (data.outputs || []).forEach(o => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'gpio-btn' + (o.high ? ' active' : '');
+                btn.textContent = `${o.label} (GPIO ${o.pin}): ${o.high ? 'HIGH' : 'LOW'}`;
+                btn.disabled = !data.available;
+                btn.addEventListener('click', () => setGpio(o.name, !o.high));
+                gpioList.appendChild(btn);
+            });
+        }
+
+        async function loadGpio() {
+            try {
+                const res = await fetch('/api/gpio');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                renderGpio(await res.json());
+            } catch (err) {
+                gpioList.innerHTML = '';
+                gpioNote.textContent = `GPIO unavailable: ${err.message}`;
+                gpioNote.classList.remove('hidden');
+            }
+        }
+
+        // Toggle one output; the response carries the full authoritative state,
+        // so re-render from it rather than assuming the flip succeeded.
+        async function setGpio(name, high) {
+            try {
+                clearError();
+                const res = await fetch('/api/gpio/' + encodeURIComponent(name), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ high })
+                });
+                if (!res.ok) {
+                    showError(`GPIO error: ${await errorFromResponse(res)}`);
+                    await loadGpio();  // re-sync buttons to the real level
+                    return;
+                }
+                clearError();
+                renderGpio(await res.json());
+            } catch (err) {
+                showError(`GPIO error: ${err.message}`);
+            }
+        }
+
         // ---- Motion status polling ----
 
         // Poll GET /status a few times a second for the motion indicator,
@@ -1209,6 +1304,7 @@
         window.addEventListener('load', () => {
             // Capabilities after cameras+config, so applyFocusUi sees currentFocus.
             loadCameras().then(loadCapabilities);
+            loadGpio();
             startStatusPolling();
         });
     </script>

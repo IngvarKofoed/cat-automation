@@ -4,3 +4,7 @@ psutil  # host CPU%/memory for /status — one portable path for Pi OS + macOS
 # Pi CSI camera (Picamera2) is NOT pip-installed: `sudo apt install python3-picamera2`
 # and build the venv with --system-site-packages (see edge.sh). USB cameras need
 # nothing beyond the two deps above.
+# GPIO output control (manual light/relay switches) uses gpiozero, also NOT
+# pip-installed here: `sudo apt install python3-gpiozero python3-lgpio` (usually
+# preinstalled on Pi OS) and picked up via the same --system-site-packages venv.
+# Imported lazily — absent off a Pi, so GET /api/gpio just reports available:false.

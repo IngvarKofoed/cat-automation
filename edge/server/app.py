@@ -25,6 +25,7 @@ from typing import Callable
 import cv2
 from flask import Flask, Response, jsonify, request, send_from_directory
 
+from edge.actuators.gpio import GpioOutputs, GpioUnavailable
 from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.factory import create_source
 from edge.clip.transform import crop, rotate
@@ -212,6 +213,7 @@ def create_app(
     source_factory: "SourceFactory | None" = None,
     start_grabber: bool = True,
     start_watchdog: bool = True,
+    gpio: "GpioOutputs | None" = None,
 ) -> Flask:
     """Build the Flask app.
 
@@ -230,6 +232,11 @@ def create_app(
     test that runs the real app with a *live* grabber passes ``False`` to avoid
     arming a process-killer inside the test runner. No-op when ``start_grabber`` is
     False (the watchdog is meaningless without a running loop).
+
+    ``gpio`` is the manual GPIO-output driver for the config UI's HIGH/LOW
+    switches; it defaults to a real ``GpioOutputs`` (which reports unavailable
+    off a Pi). Tests inject one wired to a fake backend. An app-owned default is
+    closed at exit; an injected one is the caller's to manage.
     """
     factory: SourceFactory = source_factory or create_source
 
@@ -328,6 +335,15 @@ def create_app(
         atexit.register(grabber.stop)
         atexit.register(watchdog.stop)
     app.watchdog = watchdog
+
+    # Manual GPIO outputs (light + spare relay). An app-owned default is closed
+    # on exit; an injected one (tests) is left to the caller. atexit runs before
+    # interpreter teardown so the pins release cleanly on Ctrl-C / systemd stop.
+    gpio_owned = gpio is None
+    gpio = gpio if gpio is not None else GpioOutputs()
+    app.gpio = gpio
+    if gpio_owned:
+        atexit.register(gpio.close)
 
     # One instance closed over by /status: it owns the CPU window/delta state, so
     # a per-request instance would reset that state and never yield a CPU reading.
@@ -682,6 +698,31 @@ def create_app(
     @app.get("/api/cameras")
     def cameras():
         return jsonify(cameras=_enumerate_cameras())
+
+    @app.get("/api/gpio")
+    def gpio_state():
+        # The manual GPIO switches for the config UI. `available` is false off a
+        # Pi (no gpiozero) — the UI disables the switches rather than lie.
+        return jsonify(available=gpio.available, outputs=gpio.outputs())
+
+    @app.post("/api/gpio/<name>")
+    def gpio_set(name):
+        # Drive one named output HIGH/LOW. Body: {"high": bool}. Raw pin level —
+        # the caller maps level→relay behavior at the wiring (see actuators/gpio).
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or "high" not in body:
+            return jsonify(error="body must be an object with a boolean 'high'"), 400
+        high = body["high"]
+        if not isinstance(high, bool):
+            return jsonify(error="'high' must be a boolean"), 400
+        try:
+            gpio.set(name, high)
+        except KeyError:
+            return jsonify(error=f"unknown gpio output: {name}"), 404
+        except GpioUnavailable as e:
+            # No backend to drive the pin (not a Pi, or gpiozero missing/blocked).
+            return jsonify(error=str(e)), 503
+        return jsonify(available=gpio.available, outputs=gpio.outputs())
 
     return app
 

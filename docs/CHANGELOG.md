@@ -690,3 +690,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      param on `/api/frames/sample` (read-time; zero overhead without it). Box is per-frame truth, not
      per-visit subject chip — a person box can appear mid-cat visit. Admin/user dashboards each own a
      `bandOf` copy so they drift independently if re-tuned. Presentation only; all payload in entry 111.
+
+113. Playback filmstrip now separates YOLO "ran but found nothing" from "never swept": a grey bar
+     (`band-none`, `analyzed=true` + no box) marks a real detection MISS, while an unswept frame
+     (`analyzed=false`) still shows NO bar. A bar now means "YOLO ran here" — colour = confidence,
+     grey = ran-but-empty. Previously both cases were blank, hiding a genuine miss among the (majority)
+     not-measured non-motion frames. Frontend-only (entry 111's payload already carried `analyzed`);
+     user + admin. Bars gained a confidence / "no detection" title tooltip.

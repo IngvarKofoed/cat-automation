@@ -637,8 +637,9 @@
         .film-tile img { width: 100%; height: 100%; object-fit: cover; }
         /* A thin YOLO-detection-confidence bar along the tile's bottom edge — a per-frame
            signal distinct from the border/inset, which stay reserved for the film-current
-           (accent) and film-rep (purple) markers. Absent when the frame has no detection
-           (or wasn't measured): score == null → no bar. */
+           (accent) and film-rep (purple) markers. A bar means YOLO ran on the frame:
+           coloured (red/amber/green) = detection confidence; grey = ran but detected
+           nothing (a real miss). No bar at all = never swept ("not measured"). */
         .film-conf {
             position: absolute;
             left: 0; right: 0; bottom: 0;
@@ -1369,12 +1370,21 @@
                 const im = document.createElement('img');
                 im.src = f.url; im.loading = 'lazy'; im.alt = '';
                 tile.appendChild(im);
-                // Thin confidence bar on the bottom edge; only when YOLO detected here.
+                // Thin bar on the bottom edge. A bar means YOLO ran: coloured by
+                // confidence when it detected something, grey when it ran but found
+                // nothing (a real miss). No bar when the frame was never swept.
                 const color = confColor(f.score);
                 if (color) {
                     const bar = document.createElement('span');
                     bar.className = 'film-conf';
                     bar.style.background = color;
+                    bar.title = `YOLO confidence ${Math.round(f.score * 100)}%`;
+                    tile.appendChild(bar);
+                } else if (f.analyzed) {
+                    const bar = document.createElement('span');
+                    bar.className = 'film-conf';
+                    bar.style.background = 'var(--muted)';
+                    bar.title = 'YOLO ran — no detection';
                     tile.appendChild(bar);
                 }
                 tile.addEventListener('click', () => { pausePlayback(); showPlayerFrame(idx); });

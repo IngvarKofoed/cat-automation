@@ -1042,8 +1042,9 @@
            NEW signal, separate from the motion caught/miss border the player turns
            off, and from the film-current outline / film-rep ring that own the tile's
            border/inset (so the three cues layer without fighting). Appended last, so
-           it sits under the caption at the bottom. No bar when score is null (nothing
-           detected, or the frame was never swept) — neutral. */
+           it sits under the caption at the bottom. A bar means YOLO RAN on this frame:
+           red/amber/green = detection confidence; grey (band-none) = ran but detected
+           nothing (a real miss). No bar at all = never swept ("not measured"). */
         .film-tile .film-conf {
             display: block;
             height: 3px;
@@ -1052,6 +1053,7 @@
         .film-conf.band-red   { background: var(--color-status-missed); }
         .film-conf.band-amber { background: var(--color-status-false); }
         .film-conf.band-green { background: var(--color-status-caught); }
+        .film-conf.band-none  { background: var(--color-text-muted); }
 
         /* Annotate view: per-crop quality badge under each filmstrip tile. Not a gate
            verdict, so it uses its own affordance (click to cycle) but borrows the
@@ -3431,11 +3433,19 @@
             playerFilmstripEl.innerHTML = '';
             playerTiles = playerFrames.map((f, idx) => {
                 const tile = filmTile(f, false, repId, { verdict: false });   // neutral strip — no motion/miss coloring
-                // Detection-confidence bar (a NEW signal; motion verdicts stay off). No
-                // bar when score is null (nothing detected, or frame not swept) → neutral.
+                // Detection-confidence bar (a NEW signal; motion verdicts stay off).
+                // A bar means YOLO ran: coloured by confidence when it detected something,
+                // grey (band-none) when it ran but found nothing (a real miss). No bar at
+                // all when the frame was never swept (analyzed false → "not measured").
                 if (f.score != null) {
                     const bar = document.createElement('span');
                     bar.className = 'film-conf band-' + bandOf(f.score, 0.40, 0.65);
+                    bar.title = 'YOLO confidence ' + Math.round(f.score * 100) + '%';
+                    tile.appendChild(bar);
+                } else if (f.analyzed) {
+                    const bar = document.createElement('span');
+                    bar.className = 'film-conf band-none';
+                    bar.title = 'YOLO ran — no detection';
                     tile.appendChild(bar);
                 }
                 tile.addEventListener('click', () => { pausePlayback(); showPlayerFrame(idx); });

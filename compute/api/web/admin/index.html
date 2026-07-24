@@ -1668,8 +1668,12 @@
             <div class="modal-dialog" id="playerDialog" tabindex="-1">
                 <div class="modal-head">
                     <h2 id="playerTitle">Playback</h2>
-                    <button type="button" id="playerCloseBtn" class="modal-close"
-                            aria-label="Close playback (Esc)" title="Close (Esc)">&times;</button>
+                    <div class="btn-row" style="align-items: center;">
+                        <button type="button" id="playerAnalyzeBtn" class="btn-secondary"
+                                title="Re-run yolo-serial detection over THIS event's motion frames only (reanalyze), so its cat / person / bird subject is (re)detected. Progress shows on Sweeps; reload Activity to see the new subject.">Re-analyze frames</button>
+                        <button type="button" id="playerCloseBtn" class="modal-close"
+                                aria-label="Close playback (Esc)" title="Close (Esc)">&times;</button>
+                    </div>
                 </div>
                 <div class="modal-body">
                     <div class="controls-row" style="align-items: center;">
@@ -1683,6 +1687,7 @@
                             <button type="button" id="playerNextBtn" class="btn-secondary">Next event →</button>
                         </div>
                     </div>
+                    <div id="playerAnalyzeNote" class="hidden banner-warn"></div>
                     <div id="playerStage"><img id="playerImg" alt="Event frame"></div>
                     <div class="controls-row" style="margin-top: 10px;">
                         <input type="range" id="playerScrub" min="0" max="0" value="0">
@@ -2368,6 +2373,8 @@
         const activityModalEl = document.getElementById('activityModal');
         const playerDialogEl = document.getElementById('playerDialog');
         const playerCloseBtn = document.getElementById('playerCloseBtn');
+        const playerAnalyzeBtn = document.getElementById('playerAnalyzeBtn');
+        const playerAnalyzeNoteEl = document.getElementById('playerAnalyzeNote');
         const playerPlayBtn = document.getElementById('playerPlayBtn');
         const playerTsEl = document.getElementById('playerTs');
         const playerFrameNoEl = document.getElementById('playerFrameNo');
@@ -2571,6 +2578,7 @@
         let buildSubmitting = false;
         let identifySubmitting = false;
         let analyzeSubmitting = false;
+        let playerAnalyzeSubmitting = false;  // per-event "Re-analyze frames" enqueue in flight (modal)
         let trainRuns = [];             // feasibility_runs history, most-recent-first
         let trainLastResultRunId = null; // dedupes the runs-list refresh to one per completed run
         let trainLastGalleryResultSig = null; // dedupes the models-list refresh to one per completed build
@@ -3291,6 +3299,7 @@
             // Esc / Space / arrows land on the player and screen readers announce it.
             if (wasHidden) playerDialogEl.focus();
             // Reset to a loading state so a slow fetch never shows the previous event.
+            playerAnalyzeNoteEl.classList.add('hidden');   // drop any note from the previous event
             playerFrames = []; playerImages = []; playerTiles = [];
             playerIndex = 0;
             playerImgEl.removeAttribute('src');
@@ -6178,6 +6187,11 @@
             activityAnalyzeBtn.disabled = analyzeSubmitting || runningSerial;
             activityAnalyzeBtn.textContent = analyzeSubmitting ? 'Enqueuing…'
                 : (runningSerial ? 'Analyzing…' : 'Analyze');
+            // Per-event button in the playback modal — same shared yolo-serial queue, so it
+            // reflects the same running state (a sweep from either button blocks both).
+            playerAnalyzeBtn.disabled = playerAnalyzeSubmitting || runningSerial;
+            playerAnalyzeBtn.textContent = playerAnalyzeSubmitting ? 'Enqueuing…'
+                : (runningSerial ? 'Analyzing…' : 'Re-analyze frames');
         }
         async function triggerAnalyze(sinceId, untilId, nEvents) {
             try {
@@ -6220,6 +6234,42 @@
             const since = Math.min(...activityEvents.map(ev => ev.start_id));
             const until = Math.max(...activityEvents.map(ev => ev.end_id));
             triggerAnalyze(since, until, activityEvents.length);
+        });
+
+        // Per-event "Re-analyze frames" (playback modal): re-DETECT just the OPEN event's
+        // motion frames with yolo-serial. Same semantics as the whole-events Analyze button
+        // (reanalyze + motion_only) but scoped to this one event's [start_id, end_id] span,
+        // so a single visit whose subject looks wrong can be re-detected without re-sweeping
+        // the whole loaded block. Feedback lands in the modal; progress shows on Sweeps.
+        playerAnalyzeBtn.addEventListener('click', async () => {
+            const ev = activityVisible[activitySelectedIndex];
+            if (!ev) return;
+            try {
+                playerAnalyzeNoteEl.classList.add('hidden');
+                playerAnalyzeSubmitting = true;
+                renderAnalyzeControl();
+                const res = await fetch('/api/analysis/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        analyzer: 'yolo-serial', reanalyze: true, motion_only: true,
+                        since_id: ev.start_id, until_id: ev.end_id,
+                    }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                playerAnalyzeNoteEl.textContent = (data.position > 0)
+                    ? `Re-detecting this event — queued at position ${data.position}. Track progress on Sweeps, then reload Activity.`
+                    : 'Re-detecting this event. Track progress on Sweeps, then reload Activity to see the new subject.';
+                playerAnalyzeNoteEl.classList.remove('hidden');
+            } catch (err) {
+                playerAnalyzeNoteEl.textContent = `Re-analyze failed: ${err.message}`;
+                playerAnalyzeNoteEl.classList.remove('hidden');
+            } finally {
+                playerAnalyzeSubmitting = false;
+                renderAnalyzeControl();
+                pollAnalysisStatus();
+            }
         });
 
         // ================= CORRUPTION view =================

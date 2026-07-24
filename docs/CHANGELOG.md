@@ -717,3 +717,6 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      state and the backend's `OutputDevice(initial_value=)` read, so they can't drift). The door's
      relay board is active-low, so HIGH = released/off: idling HIGH keeps relays de-energized at
      startup instead of switching them on. `/api/gpio` and the UI report HIGH from first load.
+
+117. Swapped the pins behind `channel2`/`channel3` to match the wiring: now `channel2`→GPIO 21,
+     `channel3`→GPIO 20 (`channel1`→26 unchanged).

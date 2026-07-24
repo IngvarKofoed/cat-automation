@@ -28,12 +28,12 @@ from typing import Callable, Protocol
 log = logging.getLogger(__name__)
 
 # BCM pin assignments for the relay channels wired at the door, presented in the
-# config UI as manual HIGH/LOW switches. Three channels on GPIO 26 / 20 / 21.
+# config UI as manual HIGH/LOW switches. Channels 1/2/3 → GPIO 26 / 21 / 20.
 # `name` is the API/state key, `label` the human-facing name.
 GPIO_OUTPUTS: "tuple[dict, ...]" = (
     {"name": "channel1", "pin": 26, "label": "Channel 1"},
-    {"name": "channel2", "pin": 20, "label": "Channel 2"},
-    {"name": "channel3", "pin": 21, "label": "Channel 3"},
+    {"name": "channel2", "pin": 21, "label": "Channel 2"},
+    {"name": "channel3", "pin": 20, "label": "Channel 3"},
 )
 
 # Level each channel comes up at on boot (state is not persisted). HIGH, because

@@ -107,12 +107,22 @@ _VISIT_WINDOW_MS = 3000
 # ``count = X × span-minutes`` and this clamps it into ``[1, _MAX_SAMPLE]``.
 _MAX_SAMPLE = 4000
 
-# Server-side cap on how many activity events ``events`` returns. Clustering is
-# cheap (it runs over the sparse motion frames only), so this bounds the response
-# and the client's DOM/JSON size, NOT compute: a busy multi-day store could yield
+# Server-side cap on how many activity events ``events`` returns. This bounds the
+# response and the client's DOM/JSON size: a busy multi-day store could yield
 # thousands of clusters, and the activity grid renders one card each. When the cap
 # bites, ``events`` flags ``truncated`` so the UI can prompt for a narrower date.
 _MAX_EVENTS = 500
+
+# Cap on how many motion frames ``events`` scans to build the newest-first feed.
+# The returned events are always the newest ``_MAX_EVENTS``, which live in the TAIL
+# of recv_ts order — so ``events`` reads only the newest ``_EVENT_SCAN_FRAMES``
+# motion frames (idx_frames_motion_recv, DESC + LIMIT, no sort) instead of the whole
+# motion history. Without this the scan was O(all motion frames), growing without
+# bound under continuous capture — the activity feed slowed as the store grew. Sized
+# to comfortably hold ``_MAX_EVENTS`` complete clusters with headroom for long
+# lingering visits; a window with more motion frames than this returns the newest
+# events with ``truncated`` set (older ones need a narrower date range).
+_EVENT_SCAN_FRAMES = 200_000
 
 # The visit-inbox error modes ``visits`` clusters and ranks (see the
 # motion-detection-workflow spec). "missed"/"false" judge the LIVE edge gate
@@ -268,10 +278,20 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
         self._init_schema()
-        # Recompute the running byte total once from the DB rather than tracking
-        # it across restarts — it must survive a process restart and stay exact.
-        row = self._conn.execute("SELECT COALESCE(SUM(bytes), 0) FROM frames").fetchone()
+        # Recompute the running byte total AND frame/motion counts once from the DB
+        # rather than tracking them across restarts — they must survive a process
+        # restart and stay exact. Kept in memory and maintained in lockstep by add /
+        # _evict_locked / clear (like _total_bytes), so stats() never re-scans the
+        # whole table: COUNT(*)/SUM(motion) over a growing store is an O(store) scan,
+        # and stats() is polled every few seconds by the dashboard — that recurring
+        # full scan held the shared lock and dragged down every concurrent reader/
+        # writer (the collector, sweeps). This one-time seed pays that scan once.
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(bytes), 0), COUNT(*), COALESCE(SUM(motion), 0) FROM frames"
+        ).fetchone()
         self._total_bytes = int(row[0])
+        self._count = int(row[1])
+        self._motion_count = int(row[2])
 
     def _init_schema(self) -> None:
         # Schema is fixed by the spec; the (motion, area) index is what makes the
@@ -375,6 +395,10 @@ class Store:
               bytes    INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_frames_motion_area ON frames(motion, area);
+            -- Serves the activity feed's newest-first scan: WHERE motion=1 ORDER BY
+            -- recv_ts (id=rowid is the implicit tiebreak), so a DESC + LIMIT tail read
+            -- streams in exact order with no temp b-tree sort (see events()/_EVENT_SCAN_FRAMES).
+            CREATE INDEX IF NOT EXISTS idx_frames_motion_recv ON frames(motion, recv_ts);
             CREATE TABLE IF NOT EXISTS analysis (
               frame_id INTEGER NOT NULL,
               analyzer TEXT    NOT NULL,
@@ -510,6 +534,9 @@ class Store:
                 )
                 new_id = cur.lastrowid
                 self._total_bytes += n_bytes
+                self._count += 1
+                if meta.motion:
+                    self._motion_count += 1
                 self._evict_locked()
                 self._conn.commit()
                 return int(new_id)
@@ -524,8 +551,12 @@ class Store:
                 # the total from the committed rows. Then re-raise for the caller.
                 self._conn.rollback()
                 self._unlink(rel_path)
-                row = self._conn.execute("SELECT COALESCE(SUM(bytes), 0) FROM frames").fetchone()
+                row = self._conn.execute(
+                    "SELECT COALESCE(SUM(bytes), 0), COUNT(*), COALESCE(SUM(motion), 0) FROM frames"
+                ).fetchone()
                 self._total_bytes = int(row[0])
+                self._count = int(row[1])
+                self._motion_count = int(row[2])
                 raise
 
     def _evict_locked(self) -> None:
@@ -538,7 +569,7 @@ class Store:
         """
         while self._total_bytes > self._max_bytes:
             rows = self._conn.execute(
-                "SELECT id, path, bytes FROM frames ORDER BY id ASC LIMIT ?",
+                "SELECT id, path, bytes, motion FROM frames ORDER BY id ASC LIMIT ?",
                 (_EVICT_BATCH,),
             ).fetchall()
             if not rows:
@@ -546,8 +577,10 @@ class Store:
                 # total is authoritative-from-DB, so this can't happen; guard
                 # anyway so a bad cap (< one frame) can't spin forever.
                 self._total_bytes = 0
+                self._count = 0
+                self._motion_count = 0
                 return
-            for row_id, rel_path, n_bytes in rows:
+            for row_id, rel_path, n_bytes, motion in rows:
                 self._unlink(rel_path)
                 self._conn.execute("DELETE FROM frames WHERE id = ?", (row_id,))
                 # Cascade: drop any oracle verdicts about this frame in the same
@@ -559,6 +592,12 @@ class Store:
                 # cheap to recompute from the durable gallery, so never precious.
                 self._conn.execute("DELETE FROM identifications WHERE frame_id = ?", (row_id,))
                 self._total_bytes -= int(n_bytes)
+                # Keep the in-memory counts in lockstep with the byte total (stats()
+                # reads them instead of re-scanning): every evicted frame drops the
+                # frame count, and a motion frame also drops the motion count.
+                self._count -= 1
+                if motion:
+                    self._motion_count -= 1
                 if self._total_bytes <= self._max_bytes:
                     break
 
@@ -710,11 +749,20 @@ class Store:
 
         ``oldest_ts`` / ``newest_ts`` are ``recv_ts`` (the reliable compute axis)
         and are ``None`` when the store is empty.
+
+        Frame/motion counts come from the in-memory ``_count`` / ``_motion_count``
+        (maintained in lockstep by add/evict/clear), NOT a ``COUNT(*)/SUM(motion)``
+        scan — this method is polled every few seconds by the dashboard, and a
+        full-store scan each time held the shared lock and starved the collector and
+        tuning sweeps. The time span is two O(1) index-endpoint seeks
+        (``idx_frames_recv_ts``), so nothing here scans the table.
         """
         with self._lock:
-            count, motion_count, oldest_ts, newest_ts = self._conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(motion), 0), MIN(recv_ts), MAX(recv_ts) FROM frames"
+            oldest_ts, newest_ts = self._conn.execute(
+                "SELECT (SELECT MIN(recv_ts) FROM frames), (SELECT MAX(recv_ts) FROM frames)"
             ).fetchone()
+            count = self._count
+            motion_count = self._motion_count
             total_bytes = self._total_bytes
         return {
             "count": count,
@@ -771,6 +819,8 @@ class Store:
             self._conn.execute("DELETE FROM mode_changes")
             self._conn.commit()
             self._total_bytes = 0
+            self._count = 0
+            self._motion_count = 0
             return len(rows)
 
     # --- Settings + collector-mode persistence ------------------------------
@@ -988,24 +1038,38 @@ class Store:
         """Resolve a wall-clock window to inclusive frame-id bounds.
 
         Maps the clock-picker range to the id axis every scoped read shares:
-        ``since_id`` = ``MIN(id) WHERE recv_ts >= start_ts`` (the nearest frame
-        at-or-after the start), ``until_id`` = ``MAX(id) WHERE recv_ts <= end_ts``
-        (nearest at-or-before the end). A ``None`` bound stays ``None`` (unbounded
-        on that side); a bound that matches no frame also resolves to ``None`` on
-        that side. Served off ``idx_frames_recv_ts`` so it is an indexed lookup,
-        not a full-table walk. Returns ``(since_id, until_id)``.
+        ``since_id`` = the nearest frame at-or-after the start, ``until_id`` = the
+        nearest at-or-before the end. A ``None`` bound stays ``None`` (unbounded on
+        that side); a bound that matches no frame also resolves to ``None`` on that
+        side. Returns ``(since_id, until_id)``.
+
+        The "nearest" frame is the first/last by ``recv_ts``, written as an indexed
+        ``ORDER BY recv_ts … LIMIT 1`` off ``idx_frames_recv_ts`` — an O(log n) seek.
+        (The earlier ``MIN(id) WHERE recv_ts >= ?`` form could NOT use the recv_ts
+        index for the MIN — SQLite fell back to a rowid scan from ``id = 1`` until the
+        first match, so a recent "from" bound walked almost the whole table, growing
+        with the store.) The two agree exactly because ``recv_ts`` is non-decreasing
+        with ``id`` — frames are added in receive order under the write lock — so the
+        first frame by ``recv_ts`` is also the min ``id`` in range; this form also
+        matches the stated intent ("nearest at-or-after/before") more directly.
         """
         since_id: "int | None" = None
         until_id: "int | None" = None
         with self._lock:
             if start_ts is not None:
-                (since_id,) = self._conn.execute(
-                    "SELECT MIN(id) FROM frames WHERE recv_ts >= ?", (int(start_ts),)
+                row = self._conn.execute(
+                    "SELECT id FROM frames WHERE recv_ts >= ?"
+                    " ORDER BY recv_ts ASC, id ASC LIMIT 1",
+                    (int(start_ts),),
                 ).fetchone()
+                since_id = row[0] if row else None
             if end_ts is not None:
-                (until_id,) = self._conn.execute(
-                    "SELECT MAX(id) FROM frames WHERE recv_ts <= ?", (int(end_ts),)
+                row = self._conn.execute(
+                    "SELECT id FROM frames WHERE recv_ts <= ?"
+                    " ORDER BY recv_ts DESC, id DESC LIMIT 1",
+                    (int(end_ts),),
                 ).fetchone()
+                until_id = row[0] if row else None
         return (
             int(since_id) if since_id is not None else None,
             int(until_id) if until_id is not None else None,
@@ -2374,6 +2438,13 @@ class Store:
         ``resolve_ts_range``. Clusters with fewer than ``min_frames`` motion frames
         are dropped (a per-event noise floor; default 1 keeps every cluster).
 
+        Only the newest ``_EVENT_SCAN_FRAMES`` motion frames in scope are read (the
+        feed's events are the newest ``limit``, which live in the recv_ts TAIL), so
+        the scan is bounded no matter how large the store grows — reading the whole
+        motion history is what made this feed degrade as frames accumulated. If more
+        motion frames than the cap fall in scope, the oldest event in the read window
+        may be partial, so it is dropped and ``truncated`` is set (see below).
+
         Per surviving cluster the record is::
 
             {start_id, end_id, start_ts, end_ts, n_frames, rep_frame_id,
@@ -2413,25 +2484,35 @@ class Store:
         Read-time (not persisted); the data layer for a future YOLO-recall evaluation feature.
 
         Events are sorted NEWEST-FIRST (``start_ts`` desc, tie-break ``start_id``
-        desc) and capped at ``limit`` (clamped into ``[1, _MAX_EVENTS]``);
-        ``truncated`` is True iff the cap dropped events. The cap bounds the
-        response and the client's DOM, not compute — clustering over the sparse
-        motion frames is cheap regardless.
+        desc) and capped at ``limit`` (clamped into ``[1, _MAX_EVENTS]``).
+        ``truncated`` is True when the ``limit`` cap dropped events OR the frame-scan
+        cap was hit (older events exist beyond the read window) — either way the UI
+        prompts for a narrower date range.
         """
         limit = max(1, min(int(limit), _MAX_EVENTS))
         min_frames = max(1, int(min_frames))
 
         frags, params = _range_bounds("id", since_id, until_id)
         where = " AND ".join(["motion = 1"] + frags)
+        # Read only the newest _EVENT_SCAN_FRAMES motion frames, not the whole motion
+        # history: the feed returns the newest _MAX_EVENTS events, which are the most
+        # recent in time and therefore live in the TAIL of recv_ts order. Fetching DESC
+        # + LIMIT is served in exact order by idx_frames_motion_recv (no temp b-tree),
+        # so the scan is bounded regardless of how large the store grows — the whole-
+        # history scan is what made this feed slow more and more as frames accumulated.
+        # Fetch one extra row to detect whether older motion frames exist beyond the cap.
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, recv_ts, area FROM frames WHERE " + where +
-                " ORDER BY recv_ts ASC, id ASC",
-                params,
+                " ORDER BY recv_ts DESC, id DESC LIMIT ?",
+                params + [_EVENT_SCAN_FRAMES + 1],
             ).fetchall()
+        scan_capped = len(rows) > _EVENT_SCAN_FRAMES
+        rows = rows[:_EVENT_SCAN_FRAMES]
+        rows.reverse()  # back to recv_ts ASC, id ASC for gap-clustering
 
         # Cluster + build records outside the lock (pure Python over the fetched
-        # rows, already recv_ts-ordered by the query's ORDER BY).
+        # rows, restored to recv_ts-ascending order above).
         events: "list[dict]" = []
         # start_id → the cluster's PEAK motion area, fed to the subject floor branch
         # below. Kept out of the returned record (subject carries it when relevant);
@@ -2462,7 +2543,15 @@ class Store:
         # Newest-first: most recent event on top, ties broken by id so ordering is
         # stable across calls.
         events.sort(key=lambda e: (e["start_ts"], e["start_id"]), reverse=True)
-        truncated = len(events) > limit
+        # When the scan hit its cap, older motion frames exist beyond the read window,
+        # so (a) more events exist than we can show → truncated, and (b) the OLDEST
+        # cluster in the window may be missing its head (earlier frames fell just past
+        # the tail), so drop it as potentially-partial. It's the last element after the
+        # newest-first sort; if there were already > limit clusters it sits beyond the
+        # cap and the pop is a no-op on the returned slice, so the pop is always safe.
+        truncated = len(events) > limit or scan_capped
+        if scan_capped and events:
+            events.pop()
         events = events[:limit]
 
         # Nothing survived the cluster/cap → nothing to annotate.

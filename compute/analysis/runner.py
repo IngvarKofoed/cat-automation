@@ -54,6 +54,17 @@ logger = logging.getLogger(__name__)
 # flood the log at frame rate. Mirrors the collector's ``_LOG_EVERY``.
 _LOG_EVERY = 500
 
+# How many windowed-sweep verdicts to accumulate before one batched flush (one lock
+# hold + one commit via ``write_analysis_batch``). A windowed oracle (MOG2/BSUV) must
+# analyze frames strictly in order, so it can't use the stateless path's prefetch+batch
+# producer — but its verdict WRITES don't need to be per-frame. Per-frame ``commit`` made
+# the sweep acquire the store's shared write lock once per frame, each contending with the
+# collector's continuous inserts, which starved the sweep under load. Flushing every
+# _WRITE_BATCH cuts that contention ~two orders of magnitude. Safe because a windowed sweep
+# revisits every frame each run, so verdicts lost to a cancel before their flush are simply
+# recomputed on the next run.
+_WRITE_BATCH = 256
+
 # How many finished jobs ``status()`` reports back, most-recent-first. Bounded because the
 # history is in-memory diagnostics for a returning operator, not a durable audit log — a
 # restart drops it (the verdicts it summarizes persist, and a re-enqueue resumes cheaply).
@@ -219,10 +230,24 @@ def run_analysis(
     errors = 0
 
     if analyzer.windowed:
-        # Windowed oracle: the strict-time-order per-frame loop, unchanged. Its rolling
-        # background depends on seeing every frame in order, so it can be neither batched nor
-        # prefetched-with-reordering — decode → analyze → write, one at a time, with a cancel
-        # check and throttled log-and-skip between frames.
+        # Windowed oracle: strict-time-order decode → analyze (its rolling background
+        # depends on seeing every frame in order, so inference can be neither batched nor
+        # prefetched-with-reordering), but with verdict WRITES BATCHED — accumulate onto
+        # ``pending`` and flush every _WRITE_BATCH in one lock hold + one commit, instead of
+        # a per-frame commit that contends with the collector on every frame.
+        pending: "list[tuple]" = []
+
+        def _flush_windowed() -> None:
+            # One lock hold + one commit for the whole pending batch; write_analysis_batch
+            # shares write_analysis's idempotency (INSERT OR REPLACE) and eviction guard
+            # (WHERE EXISTS on the frames row). A write failure is intentionally NOT caught
+            # (matching the stateless path): a real one (disk full / I/O error) is persistent,
+            # so failing the job fast surfaces it — and the batch's frames stay un-verdicted,
+            # recomputed when the windowed sweep is re-run.
+            if pending:
+                store.write_analysis_batch(pending)
+                pending.clear()
+
         for frame_id, abs_path in iterator:
             if manager.stop_event.is_set():
                 logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
@@ -230,7 +255,6 @@ def run_analysis(
             try:
                 image = _read_decode(abs_path)
                 result = analyzer.analyze(image)
-                store.write_analysis(frame_id, analyzer.name, result.verdict, result.score, result.detail)
             except Exception:
                 # One bad frame — evicted between listing and read, corrupt bytes, a transient
                 # inference error — must not abort the sweep. Log throttled (first, then every
@@ -239,10 +263,16 @@ def run_analysis(
                 if errors == 1 or errors % _LOG_EVERY == 0:
                     logger.exception("analysis: frame %s failed (%d skipped this run)", frame_id, errors)
                 continue
+            pending.append((frame_id, analyzer.name, result.verdict, result.score, result.detail))
             manager.record(bool(result.verdict))
             done += 1
+            if len(pending) >= _WRITE_BATCH:
+                _flush_windowed()
             if done % _LOG_EVERY == 0:
                 logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+        # Flush the final partial batch — also the path a cancel/break takes, so verdicts
+        # computed before the stop are persisted rather than discarded.
+        _flush_windowed()
     else:
         # Stateless oracle: decode-ahead producer + batched GPU consumer (see the
         # yolo-sweep-throughput spec). One daemon thread reads+decodes frames onto a bounded

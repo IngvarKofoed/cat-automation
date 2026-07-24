@@ -132,6 +132,31 @@ def test_retention_running_total_survives_restart(tmp_path):
     assert reopened.stats()["count"] == 3
 
 
+def test_stats_counts_track_motion_through_eviction_and_restart(tmp_path):
+    # stats() reads the in-memory frame/motion counts (not a COUNT/SUM scan); this
+    # asserts they stay exact through add + eviction (which must decrement the motion
+    # count only for evicted MOTION frames) and are re-seeded on restart.
+    body_len = len(_JPEG_BODY)
+    db_path = str(tmp_path / "index.db")
+    media_root = str(tmp_path / "media")
+    store = Store(db_path=db_path, media_root=media_root, max_bytes=int(body_len * 3.5))
+
+    # Alternate motion / non-motion so eviction drops a mix of both kinds.
+    for i in range(10):
+        store.add(_frame(frame_id=i, motion=(i % 2 == 0)), recv_ts_ms=1_700_000_000_000 + i)
+
+    stats = store.stats()
+    rows, _ = store.query(cursor=None, limit=100, motion="all", order="time")
+    # In-memory counts match a ground-truth walk of the surviving rows.
+    assert stats["count"] == len(rows)
+    assert stats["motion_count"] == sum(1 for r in rows if r["motion"])
+
+    # A fresh Store re-seeds both counts from the DB, matching the live store.
+    reopened = Store(db_path=db_path, media_root=media_root, max_bytes=int(body_len * 3.5))
+    assert reopened.stats()["count"] == stats["count"]
+    assert reopened.stats()["motion_count"] == stats["motion_count"]
+
+
 def test_eviction_survives_an_undeletable_media_file(tmp_path, monkeypatch):
     # If a media file can't be removed during eviction (a transient OSError, not
     # just FileNotFoundError), eviction must NOT roll back and resurrect the row —

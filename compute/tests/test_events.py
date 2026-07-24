@@ -162,6 +162,52 @@ def test_events_truncated_when_over_limit(tmp_path):
     assert len(result_full["events"]) == 3
 
 
+def test_events_scan_cap_returns_newest_and_truncates(tmp_path, monkeypatch):
+    """When more motion frames than the scan cap fall in scope, the feed still
+    returns the NEWEST events (they live in the recv_ts tail) and flags truncated."""
+    import compute.collection.store as store_mod
+
+    # Cap the tail scan at 3 frames so a handful of frames exercises the bound.
+    monkeypatch.setattr(store_mod, "_EVENT_SCAN_FRAMES", 3)
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    # Six well-separated single-frame events, chronological.
+    ids = [
+        store.add(_frame(frame_id=i, motion=True, area=0.1), recv_ts_ms=base + i * 10 * _VISIT_GAP_MS)
+        for i in range(6)
+    ]
+
+    result = store.events(None, None)
+    events = result["events"]
+    # Scan read the newest 3 frames (cap hit), then dropped the oldest as
+    # potentially-partial -> the two newest events, newest-first.
+    assert result["truncated"] is True
+    assert [ev["start_id"] for ev in events] == [ids[5], ids[4]]
+
+
+def test_events_scan_cap_drops_partial_oldest_cluster(tmp_path, monkeypatch):
+    """A cluster split by the scan-cap boundary is dropped, not returned as a
+    bogus short event with an understated frame count."""
+    import compute.collection.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_EVENT_SCAN_FRAMES", 2)
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    # One 3-frame event (f1..f3), then a separate newer 1-frame event (f4).
+    store.add(_frame(frame_id=1, motion=True, area=0.1), recv_ts_ms=base)
+    store.add(_frame(frame_id=2, motion=True, area=0.1), recv_ts_ms=base + 100)
+    store.add(_frame(frame_id=3, motion=True, area=0.1), recv_ts_ms=base + 200)
+    f4 = store.add(_frame(frame_id=4, motion=True, area=0.1), recv_ts_ms=base + 20 * _VISIT_GAP_MS)
+
+    result = store.events(None, None)
+    events = result["events"]
+    # The newest-2 frames are f4 and f3; f3 alone is the truncated tail of the
+    # real 3-frame event, so it is dropped rather than reported as a 1-frame event.
+    assert result["truncated"] is True
+    assert len(events) == 1
+    assert events[0]["start_id"] == f4 and events[0]["n_frames"] == 1
+
+
 # --- GET /api/events --------------------------------------------------------
 
 

@@ -613,3 +613,33 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      the visit's id span is `corruption`-flagged, so a cat in a corrupt frame stays `cat`. `event["detection"]`
      = {ratio, conf_max, conf_mean} over the visit's motion frames, RAW; ratio is null when unswept ("not
      measured") vs 0.0 for a swept miss. Spec: docs/specs/2026-07-23-visit-detection-aggregates.md.
+
+102. Activity feed (`events()`) no longer slows as the store grows: it read EVERY motion frame in history
+     and temp-b-tree-sorted them on every call (twice per page load — the feed AND `cats_overview`), so the
+     scan cost climbed with the store and inflated further under lock contention with the collector/live
+     worker (the 13 s `/api/events`, 49 s `/api/cats/overview`). Now it scans only the newest
+     `_EVENT_SCAN_FRAMES` (200k) motion frames — the feed's newest events live in the recv_ts tail — via a
+     DESC+LIMIT read served in-order by new index `idx_frames_motion_recv (motion, recv_ts)`, no sort,
+     bounded regardless of store size. A scan-capped window drops its oldest (possibly-partial) cluster and
+     sets `truncated`. Existing stores build the index on next open.
+
+103. `resolve_ts_range` (clock→id, run before every windowed read incl. the admin Activity page) no longer
+     scans the whole store. `MIN(id) WHERE recv_ts >= ?` could NOT use the recv_ts index — SQLite walked the
+     rowid from id=1 to the first match, so a recent "from" bound scanned almost every frame and grew with
+     the store (~285 ms at 1.5M frames). Rewritten as an indexed `ORDER BY recv_ts … LIMIT 1` seek
+     (idx_frames_recv_ts), O(log n) (~0.06 ms). Exactly equivalent because recv_ts is non-decreasing with id
+     (frames added in receive order), so the first frame by recv_ts is the min id in range.
+
+104. `stats()` no longer scans the whole store. It read `COUNT(*), SUM(motion) FROM frames` — an O(store)
+     full scan — and the dashboard polls it every ~4 s, so that recurring scan held the shared lock and
+     starved the collector and tuning sweeps as the store grew. Frame/motion counts are now kept in memory
+     (`_count`/`_motion_count`), seeded once at open and maintained in lockstep by add/evict/clear exactly
+     like `_total_bytes`; the recv_ts span is two O(1) index-endpoint seeks. stats() is now O(1), no scan.
+
+105. Windowed analysis sweeps (MOG2/BSUV tuning) batch their verdict writes instead of committing per frame.
+     Per-frame `commit` made the sweep grab the store's shared write lock once per frame, each contending
+     with the collector's continuous inserts — the dominant cost behind a tuning sweep crawling at ~0.4 fps
+     (decode+MOG2 alone run ~100 fps; the gap was lock contention, not compute). Now verdicts accumulate and
+     flush every `_WRITE_BATCH` (256) in one lock hold + commit, plus a final/cancel flush. Safe because a
+     windowed sweep revisits every frame each run, so verdicts lost to a cancel before their flush are
+     recomputed next run. Inference stays strictly in-order (MOG2/BSUV are stateful).

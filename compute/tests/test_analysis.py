@@ -488,6 +488,28 @@ def test_run_analysis_windowed_visits_every_frame_in_time_order(tmp_path):
     assert manager.status()["done"] == len(levels)
 
 
+@_requires_cv
+def test_run_analysis_windowed_batched_writes_persist_across_flushes(tmp_path):
+    # The windowed loop batches verdict writes (flush every _WRITE_BATCH, plus a final
+    # partial flush). Over more than one batch, EVERY frame's verdict must still persist
+    # — proof the mid-sweep flush and the final partial flush together lose nothing.
+    from compute.analysis.runner import _WRITE_BATCH
+
+    store = _store(tmp_path)
+    n = _WRITE_BATCH + 37  # crosses one batch boundary, leaves a partial final batch
+    for i in range(n):
+        store.add(_frame(frame_id=i, ts=i, body=_jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i)
+
+    fake = FakeAnalyzer(name="fakewin", windowed=True)
+    manager = AnalysisManager()
+    run_analysis(store, fake, manager)
+
+    # All n frames analyzed and persisted (bright ⇒ present), none left un-verdicted.
+    assert store.analysis_summary("fakewin") == {"analyzed": n, "present": n}
+    assert store.count_unanalyzed("fakewin") == 0
+    assert manager.status()["done"] == n
+
+
 # --- Runner: since_id/until_id scoping (frame-range groups) --------------------
 #
 # A group expands to an inclusive [since_id, until_id] id range that a Run/re-run

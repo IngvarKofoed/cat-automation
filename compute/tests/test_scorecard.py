@@ -344,6 +344,87 @@ def test_gate_fidelity_agreement_over_slot_frames(tmp_path):
     assert fidelity["rate"] == pytest.approx(2 / 3)
 
 
+# --- gate_scorecard: optional day/night split (admin-next P2) ----------------
+#
+# The split is per-VISIT — visit recall is the metric (changelog 46) — so each
+# visit is bucketed by ``is_night`` of its FIRST present frame's recv_ts, and a
+# dusk/dawn-straddling visit counts once. Absent ``is_night`` no ``"split"`` key
+# is added (byte-identical). The bucketing math is pinned here with a synthetic
+# ``is_night`` (no astral); the real sun-time path lives in test_suntimes.py.
+
+
+def test_scorecard_split_absent_is_night_adds_no_split_key(tmp_path):
+    store = _store(tmp_path)
+    _seed(store, 10_000, motion=True, area=0.05, yolo=(1, 0.9))
+    card = store.gate_scorecard("live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3)
+    assert "split" not in card
+
+
+def test_scorecard_split_buckets_visits_by_first_present_frame(tmp_path):
+    store = _store(tmp_path)
+    # Visit A (caught): present+motion then a missed present, close in time.
+    _seed(store, 10_000, motion=True, area=0.05, yolo=(1, 0.9))
+    _seed(store, 10_500, motion=False, area=0.05, yolo=(1, 0.9))
+    # Visit B (wholly missed): two present frames, no motion frame within ±window.
+    _seed(store, 30_000, motion=False, area=0.005, yolo=(1, 0.9))
+    _seed(store, 30_500, motion=False, area=0.2, yolo=(1, 0.9))
+    # Visit C (caught): a missed present then a present+motion, close in time.
+    _seed(store, 50_000, motion=False, area=0.05, yolo=(1, 0.9))
+    _seed(store, 50_500, motion=True, area=0.05, yolo=(1, 0.9))
+
+    # night iff first present recv_ts >= 40_000 -> A,B are day, C is night.
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        is_night=lambda ts: ts >= 40_000,
+    )
+    assert card["visits"] == {"total": 3, "caught": 2, "wholly_missed": 1}
+    assert card["split"]["day"] == {"total": 2, "caught": 1, "wholly_missed": 1}
+    assert card["split"]["night"] == {"total": 1, "caught": 1, "wholly_missed": 0}
+    # The split partitions the combined visit counts EXACTLY.
+    assert card["split"]["day"]["total"] + card["split"]["night"]["total"] == card["visits"]["total"]
+    assert card["split"]["day"]["caught"] + card["split"]["night"]["caught"] == card["visits"]["caught"]
+
+
+def test_scorecard_split_straddling_visit_counts_once_in_first_frame_bucket(tmp_path):
+    # A single visit whose first present frame sits on the DAY side of the boundary
+    # but whose later frame (same cluster) sits on the NIGHT side must count ONCE,
+    # in the day bucket — never split into two half-visits.
+    store = _store(tmp_path)
+    _seed(store, 39_000, motion=True, area=0.05, yolo=(1, 0.9))   # first present -> day
+    _seed(store, 39_500, motion=False, area=0.05, yolo=(1, 0.9))  # +500ms -> night side, same visit
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        is_night=lambda ts: ts >= 39_250,
+    )
+    assert card["visits"] == {"total": 1, "caught": 1, "wholly_missed": 0}
+    assert card["split"]["day"] == {"total": 1, "caught": 1, "wholly_missed": 0}
+    assert card["split"]["night"] == {"total": 0, "caught": 0, "wholly_missed": 0}
+
+
+def test_scorecard_split_empty_present_is_all_zero(tmp_path):
+    store = _store(tmp_path)
+    _seed(store, 1_000, motion=True, area=0.02, yolo=(0, 0.1))  # nothing present anywhere
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        is_night=lambda ts: True,
+    )
+    assert card["visits"] == {"total": 0, "caught": 0, "wholly_missed": 0}
+    assert card["split"]["day"] == {"total": 0, "caught": 0, "wholly_missed": 0}
+    assert card["split"]["night"] == {"total": 0, "caught": 0, "wholly_missed": 0}
+
+
+def test_scorecard_split_needs_rerun_slot_carries_no_split(tmp_path):
+    # A slot with zero rows short-circuits to needs_rerun even with is_night set —
+    # nothing to score, so no split.
+    store = _store(tmp_path)
+    _seed(store, 1_000, motion=True, area=0.05, yolo=(1, 0.9))
+    card = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        is_night=lambda ts: False,
+    )
+    assert card == {"source": "mog2:candidate", "oracle": "yolo", "needs_rerun": True}
+
+
 def test_gate_fidelity_empty_slot_is_zero(tmp_path):
     store = _store(tmp_path)
     _seed(store, 1_000, motion=True, area=0.05, yolo=(1, 0.9))

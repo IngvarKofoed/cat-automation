@@ -111,8 +111,9 @@ The domain the system reasons about:
 The heart of the system. From the camera feed it detects that a cat is present
 and determines which cat — one of the named residents, or a stranger. It must
 cope with the hard parts of the real world: four or more cats that may look
-alike, varied poses and angles, day and night, weather, and partial views as a
-cat approaches the flap.
+alike, varied poses and angles, day and night — including the **colour-by-day
+vs. infra-red-monochrome-by-night** shift that makes the same cat look quite
+different — weather, and partial views as a cat approaches the flap.
 
 Because reliable individual recognition across many similar cats is genuinely
 hard, the system is explicit about **confidence**, and its decisions degrade
@@ -149,16 +150,23 @@ The owner is kept informed of the events that matter — a stranger detected, a
 deterrent triggered, a resident coming home or going out — through push
 notifications, without needing to watch a live video feed.
 
-### 6. At-a-glance dashboard
+### 6. At-a-glance dashboard and the admin workbench
 
-The main user-facing app. At a glance: which resident cats are home and which are
-out, and when each last crossed ("is Mittens still out?"); a timeline of
-enter/leave events; and a log of foreign-cat sightings and any deterrents. It is
-also where the household is managed — reviewing and correcting identifications,
-annotating images, and teaching the system (see *How the system learns*). It runs
-on the compute PC, reached from a browser on the home network, and is separate
-from the door device's small camera-setup page. It shows status, events, and
-stored snapshots — not a live video feed.
+The compute PC serves **two** browser surfaces, split by audience:
+
+- **The at-a-glance dashboard** — the main user-facing app. At a glance: which
+  resident cats are home and which are out, and when each last crossed ("is
+  Mittens still out?"); a timeline of enter/leave events; and a log of
+  foreign-cat sightings and any deterrents. It shows status, events, and stored
+  snapshots — not a live video feed.
+- **The admin workbench** — a separate management console where the household is
+  taught and the system is tuned: reviewing and correcting identifications,
+  annotating images, building and promoting models (see *How the system learns*),
+  and tuning the motion gate. It is deliberately kept apart from the everyday
+  glance so the user-facing app stays simple.
+
+Both run on the compute PC, reached from a browser on the home network, and are
+separate from the door device's small camera-setup page.
 
 ## How it works (at a glance)
 
@@ -253,7 +261,10 @@ collection with the door in its safe default until a first model is trained.
   door device must handle the safety basics if the GPU host or network drops.
 - **Real-world door conditions.** Outdoor lighting, night operation, weather,
   and cats approaching at speed and odd angles are the normal case, not edge
-  cases.
+  cases. In particular the camera sees **two distinct visual regimes**: colour by
+  day and **infra-red monochrome** at night (a filterless/NoIR camera lit by IR
+  LEDs — *planned*). The same cat looks materially different across the two, which
+  identification must handle (see *Individual cat identification*).
 - **Multi-cat difficulty.** Distinguishing 4+ possibly similar cats individually
   is the central technical risk; the design must tolerate uncertainty rather
   than assume perfect recognition.
@@ -269,6 +280,11 @@ collection with the door in its safe default until a first model is trained.
 - **Re-teaching cadence.** The learning loop (see *How the system learns*) covers
   enrollment and retraining; still open is how often re-teaching is needed as cats
   age or coats change, and how much labelled data a reliable model needs.
+- **Day vs. night appearance.** A resident looks very different in colour by day
+  and in IR-monochrome at night, so what the system learns of a cat in one regime
+  may not recognise it in the other. The plan is to teach from **both** regimes;
+  how much night (IR) data each cat needs, and whether the two regimes must be
+  learned separately, is open.
 - **Directionality.** How do we robustly tell "entering" from "leaving"? We stay
   open to auxiliary non-vision inputs here — a motion sensor, or a flap/beam
   sensor — since *direction* need not be vision-based even though

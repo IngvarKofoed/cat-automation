@@ -117,13 +117,13 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 
 | Component | Responsibility |
 |---|---|
-| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped frames off the open response as they arrive (delivered continuously; motion is a separate signal, read from `X-Motion` part headers or `GET /status`). Always-on frame collection stores every frame (motion + non-motion) with motion flag + area to a bounded local store for motion-gate tuning via a browse UI. **Opt-in:** motion-only capture mode (default off) drops non-motion frames to save disk; caveat — misses become unmeasurable in that store. |
+| **Stream client / ingest** | Connect to the Pi's `GET /stream` and read the clipped frames off the open response as they arrive (delivered continuously; motion is a separate signal, read from `X-Motion` part headers or `GET /status`). Always-on frame collection stores every frame (motion + non-motion) with motion flag + area to a bounded local store for motion-gate tuning via a browse UI. **Opt-in:** motion-only capture mode (default off) drops non-motion frames to save disk; caveat — misses become unmeasurable in that store. **When to use which:** keep *all* frames while tuning the motion gate — a gate *miss* is a non-motion frame that in fact held a cat, visible only if non-motion frames are stored — then switch to motion-only for the long collection/annotation haul once the gate is trusted. |
 | **Detection + inference** | Detect that a cat is present, track it, crop, embed, and match against the resident gallery → identity + confidence. GPU-accelerated. |
 | **Tracker / direction resolver** | Associate detections across frames into tracks; resolve a track's path across the door zone into *enter* vs *leave*. |
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |
 | **Event store & state** | Durable record of cats, sightings, identifications, transitions, actions; derives current occupancy ("who's home"). |
 | **Notifier** | Turns notify intents into push notifications to the owner. |
-| **Dashboard + API (main UI)** | The user-facing web app on the compute PC: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log; plus the management surfaces — review/correct identifications, work the annotation queue, switch operating mode, start training, and configure policy. Distinct from the Pi's camera-setup page. |
+| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
 | **Dataset / annotation / training** | Store collected crops and their labels, serve the annotation queue, and run training jobs that (re)build the gallery/model and promote a new version. Enrollment of a new cat is a focused case of this. |
 | **Model store** | Versioned detection, embedding, and gallery artifacts served to the inference service. |
 
@@ -154,6 +154,15 @@ focus is controllable, IR/low-light — and the Config UI adapts to them (e.g. t
 focus control appears only when the active source supports it). This keeps "which
 camera" a config/backend decision rather than a fork in the design, and lets the
 edge run on whatever hardware is at the door.
+
+**Day/night visual regime (planned).** The camera being fitted is a
+filterless/NoIR CSI module (Camera Module 3-class, so autofocus still applies):
+**colour by day, monochrome under infra-red by night**, lit by IR LEDs. This
+gives the pipeline two distinct visual regimes rather than one — a fact the
+identification approach and motion-gate tuning must both account for (see
+*Identification approach* and *Cross-cutting concerns → Observability*). Night IR
+illumination runs on the edge's autonomous astronomical night-light schedule (see
+*Deployment*), so the night regime persists even if the compute PC is down.
 
 **Selection lives in the Config UI.** The frontend is where you pick the active
 source — from the detected CSI/USB devices, or by entering an IP/RTSP camera's
@@ -287,6 +296,16 @@ gallery, not a fixed N-way classifier.**
 
 This is the single highest-risk part of the system (distinguishing 4+ possibly
 similar cats), so it is designed to degrade to "unknown" rather than guess.
+
+**Day/night regimes and the gallery (decision).** Because the camera shows a
+resident in two very different regimes — colour by day, IR-monochrome by night
+(see *Camera source*) — an embedding learned in one regime will not reliably match
+the other. **Decision:** build **one gallery per cat holding crops from *both*
+regimes**, so a resident is representable day or night; escalate to **separate
+day/night galleries selected by time of day** only if cross-regime matching proves
+too weak in validation. Either way, collection/annotation must deliberately gather
+**night (IR) crops** of every resident, or the night side of recognition starts
+empty. *Planned* — the IR camera is not yet fitted.
 
 ### Direction and occupancy
 
@@ -635,7 +654,13 @@ cat-automation/
   on the LAN; no cloud storage of video. Revisit auth only if the system is ever
   exposed beyond the home network.
 - **Observability.** Structured logs and saved clips for every uncertain or
-  wrong decision — these double as debugging aid and as retraining data.
+  wrong decision — these double as debugging aid and as retraining data. The
+  motion gate itself is **validated offline** on the compute tier: a cat detector
+  (YOLO) run over stored frames acts as an *oracle*, and visit-recall scorecards
+  (plus a corruption-frame review) quantify where the edge gate misses or
+  false-triggers, so its parameters can be tuned against real data before the gate
+  is trusted (a Phase-1 activity). Day and night are scored **separately** — the
+  IR-night regime behaves differently from colour day.
 - **Config.** The Pi owns camera/motion config (clip, focus, fps, background);
   the compute tier owns door-zone geometry, thresholds, which actuators exist,
   and notification policy. No hardcoded assumptions about installed hardware.
@@ -648,6 +673,9 @@ cat-automation/
 2. Camera: which capture-source backend to build first (**CSI / USB / IP-RTSP**)
    and the hardware — the interface makes cameras swappable, but night/IR + focus
    support still guide the hardware pick.
+   *(Direction: a filterless/NoIR **CSI** Camera-Module-3-class sensor — colour by
+   day, IR-monochrome by night — so the CSI/Picamera2 backend and its autofocus
+   stay, and the IMX708 corruption handling still applies. Not yet fitted.)*
 3. Identification model family and the specific re-ID/embedding architecture.
 4. Storage: confirm **SQLite** start (vs. Postgres from day one).
 5. Push-notification provider.
@@ -672,5 +700,9 @@ cat-automation/
 - Active-learning thresholds: what confidence routes a sample to the annotation
   queue, and what validation gates a model version before it is promoted to Run.
 - Retraining cadence and how much labelled data a reliable model needs.
+- Day/night identification: a resident looks very different in colour by day and
+  IR-monochrome at night. Plan is one gallery spanning both regimes, splitting to
+  separate day/night galleries only if cross-regime matching proves too weak; how
+  much night (IR) data each cat needs is open. *(See Identification approach.)*
 - Multiple cameras/doors (out of scope for now; keep the model from precluding
   it).

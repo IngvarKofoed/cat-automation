@@ -737,3 +737,54 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      shifts the transition the other way — lamp on AFTER sunset / off BEFORE sunrise, a narrower
      on-window — vs the prior 0..240 which only ever widened coverage (on before dark / off after light).
      Validation + UI min-bound only; the schedule math already handled negative timedeltas.
+
+121. admin-next scaffold (Wave 0 / P0 of the admin redesign): new `GET /admin-next` route + a
+     self-contained dark shell (own CSS/JS, entry-80 convention) hash-routing six stub pages
+     (Start · Motion tuning · Frame review · Annotation · Model building · Activity). Built in
+     PARALLEL to `/admin`, which stays untouched until a final flip swaps the two FileResponse paths —
+     so the old workbench keeps working through the whole rebuild. Pages are filled in per phase.
+     Plan: docs/NEW_ADMIN_PLAN.md; spec: docs/specs/2026-07-25-admin-next-redesign.md.
+
+122. Compute-side location (lat/lon) setting gating the day/night split (admin-next P1): `Store.get_location`
+     /`set_location` persist to the settings KV; `GET`/`POST /api/location`. Seeds ONCE from the edge's
+     night-light config when unset — any failure / unreachable / out-of-range leaves it unset, never a
+     silent (0,0). POST validates range and rejects booleans (pydantic's bool-is-int coercion) and
+     NaN/Infinity; a new app-wide 422 handler sanitizes non-finite floats that would otherwise 500 the
+     response encoder. Non-finite stored values also degrade to "unset".
+
+123. Day/night tuning-scorecard split (admin-next P2): new `compute/analysis/suntimes.py` computes
+     sunrise/sunset offline via `astral` (new compute dep, lazy-imported). `Store.gate_scorecard` gains an
+     optional per-VISIT day/night split (bucketed by each visit's FIRST present frame; warm-up applied
+     once); `GET /api/tuning/compare?split=1` splits when a location is set, else reports it unavailable
+     (never guesses a boundary). The classifier keys day/night off the nearest sun EVENT, robust at any
+     longitude — a single UTC date's (sunrise,sunset) pair mis-classifies far-from-Copenhagen longitudes.
+
+124. Identity read API (admin-next P3): `GET /api/frames/sample?identify=1` attaches each frame's
+     nearest-gallery match {cat_id, name, is_resident, distance, resolved} for Frame-review overlays,
+     reusing the active model's read-time threshold and uncalibrated fail-safe (an uncalibrated model
+     resolves every frame to "unknown"). Additive — byte-identical without the flag.
+
+125. Annotation backend (admin-next P4): the queue is now bounded/paginated (no whole-store scan); an
+     `ignored` `dataset_items` label (no crop) drops an event from the queue reversibly via the existing
+     relabel/delete (no new table); per-cat day/night crop coverage; and, with an active model, the queue
+     sorts below-threshold matches worst-first by distance (never-identified events after).
+
+126. Cleanup purges (admin-next P7): `CleanupManager` runs two batched, cancelable background jobs that
+     release the store lock between batches — drop non-motion frames (through the eviction accounting path,
+     never a raw DELETE; a mid-batch error rolls back and resyncs counters so `_count`/`_motion_count`/
+     `_total_bytes` can't drift) and sweep orphaned JPEGs (frames media dir only). Never touches
+     `dataset_items`/crops/`model_versions`. A non-motion purge records a `purge_spans` marker so later
+     scorecards/coverage over that window warn "misses unmeasurable". `/api/cleanup/*`; the reclaim estimate
+     counts exactly and approximates bytes (avoids an O(store) SUM scan under the lock).
+
+127. admin-next Start page (Wave 2 P1 frontend) — the first real page in the shell: capture-mode toggle
+     (Tuning=keep-all vs Collecting=motion-only), collection controls (start/stop/resume, live-naming,
+     clear-all), active-model+threshold readout, store stats, the lat/lon location setting, and the two
+     cleanup purges (non-motion + orphan) with estimate/run/progress/cancel — wiring the Wave-1 backend.
+     Shell pages are now a mount(view)→teardown model, so a live page polls (3s) and stops its timers on nav.
+
+128. admin-next Motion tuning page (Wave 2 P2 frontend): day scope (resolved to an id window) → YOLO-serial
+     coverage + sweep with a live job readout → six MOG2 params seeded from the edge baseline → baseline/
+     candidate re-runs → visit-recall scorecards (Live / Baseline / Candidate) with the Day/Night split and a
+     copy-to-edge param line. Wires the P2 backend (`/api/tuning/compare?split`, `/api/tuning/rerun`,
+     `/api/analysis/*`, `/api/frames/resolve`, `/api/edge/config`).

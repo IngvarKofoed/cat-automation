@@ -36,20 +36,25 @@ import — ``compute.sh`` launches ``uvicorn --factory ...:create_app``.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from compute.analysis import ANALYZER_NAMES
 from compute.analysis.corruption import CorruptionAnalyzer
 from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
+from compute.analysis.suntimes import astral_available, night_classifier
+from compute.collection.cleanup import CleanupManager
 from compute.collection.collector import CollectorManager
-from compute.collection.store import _QUALITIES, Store
+from compute.collection.store import _ANNOTATE_PAGE_DEFAULT, _QUALITIES, Store
 from compute.dataset import crops
 from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams
@@ -61,6 +66,10 @@ _WEB_DIR = Path(__file__).resolve().parent / "web"
 # docs/specs/2026-07-22-admin-user-area-split.md.
 _USER_HTML = _WEB_DIR / "user" / "index.html"
 _ADMIN_HTML = _WEB_DIR / "admin" / "index.html"
+# admin-next: the streamlined rebuild of /admin, served at its own route so /admin
+# stays untouched until the final flip (see docs/NEW_ADMIN_PLAN.md and
+# docs/specs/2026-07-25-admin-next-redesign.md).
+_ADMIN_NEXT_HTML = _WEB_DIR / "admin-next" / "index.html"
 # Home-screen icon for the pinned user app (served at the root paths iOS probes).
 _APPLE_TOUCH_ICON = _WEB_DIR / "user" / "apple-touch-icon.png"
 
@@ -209,6 +218,35 @@ class CorruptionRunRequest(BaseModel):
     motion_only: bool = False
 
 
+class LocationRequest(BaseModel):
+    """Body of ``POST /api/location``: manually set the compute-side lat/lon.
+
+    Gates the P2 day/night split (admin-next). ``Field`` bounds mean an
+    out-of-range or non-numeric value is rejected by pydantic BEFORE the route
+    body runs, surfacing as FastAPI's standard 422 — the range-validation status
+    the location API contract calls for, with no hand-rolled check needed.
+
+    Two corner cases the bare ``Field`` bounds miss: ``allow_inf_nan=False``
+    rejects NaN/Infinity (which Python's JSON parser accepts) as a clean 422 —
+    otherwise NaN slips past the bounds (every NaN comparison is False) and then
+    crashes the error encoder as a 500. The ``bool`` guard mirrors the edge-seed
+    path: pydantic treats ``bool`` as an int subtype, so without it ``true``/
+    ``false`` would coerce to 1.0/0.0 instead of being rejected.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+
+    @field_validator("latitude", "longitude", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a number, not a boolean")
+        return v
+
+
 class GroupCreateRequest(BaseModel):
     """Body of ``POST /api/groups``: name a contiguous frame window ``[start_id, end_id]``.
 
@@ -220,6 +258,20 @@ class GroupCreateRequest(BaseModel):
     name: str
     start_id: int
     end_id: int
+
+
+class CleanupRunRequest(BaseModel):
+    """Body of ``POST /api/cleanup/run``: which purge to start (admin-next P7).
+
+    ``kind`` is ``"nonmotion"`` (drop motion=0 frames) or ``"orphan"`` (sweep JPEGs
+    with no frames row). ``before_ts`` (ms epoch, non-motion only) scopes the purge to
+    frames at-or-before that instant — the endpoint resolves it to an ``until_id`` and
+    snapshots the store's id bounds so a whole-store purge (``before_ts`` omitted) can't
+    chase the live collector. Ignored for the orphan sweep.
+    """
+
+    kind: str
+    before_ts: "int | None" = None
 
 
 class CollectorMotionOnlyRequest(BaseModel):
@@ -308,6 +360,19 @@ class DeleteRequest(BaseModel):
 
     ``frame_ids`` are source frame ids whose ``dataset_items`` rows (and materialised
     crop files) are removed, so the frames re-enter the annotation queue (undecided).
+    """
+
+    frame_ids: "list[int]" = []
+
+
+class IgnoreRequest(BaseModel):
+    """Body of ``POST /api/label/ignore``: mark a visit's frames as ``ignored`` (admin-next P4).
+
+    ``frame_ids`` are source frame ids that each get a crop-less ``ignored``
+    ``dataset_items`` row — "reviewed, skip" — so the queue's "already decided" test
+    drops the event. No crop, cat, quality, or box is stored. Reversible via the
+    existing ``POST /api/label/delete`` (requeue) or ``/api/label/relabel`` (relabel),
+    like any other label — never a permanent one-keystroke loss.
     """
 
     frame_ids: "list[int]" = []
@@ -413,6 +478,47 @@ def _edge_config_params(client) -> "tuple[str, dict]":
             # the defaults rather than 500. The user still gets a usable, labelled seed.
             pass
     return "defaults", dict(_EDGE_MOTION_DEFAULTS)
+
+
+def _location_from_edge_night_light(client) -> "tuple[float, float] | None":
+    """Best-effort read of the Pi's configured lat/lon, for the one-time seed.
+
+    Reuses the exact same client + ``GET /api/config`` fetch as
+    ``_edge_config_params`` — the Pi's whole-config snapshot (see
+    ``edge/server/app.py``'s ``_config_snapshot_locked``) already nests
+    ``night_light.{latitude,longitude}``, so no separate ``/api/night-light``
+    call or new ``EdgeClient`` method is needed.
+
+    Returns ``None`` on ANY failure — unreachable edge, a client with no
+    ``get_config``, a malformed body, or a non-numeric/out-of-range value —
+    never a guess. This is what keeps ``GET /api/location`` honest: an
+    unreachable/unset edge leaves the compute-side location UNSET rather than
+    silently seeding ``(0, 0)`` or the edge's own Copenhagen default as if it
+    were a deliberate choice.
+    """
+    if client is None:
+        return None
+    try:
+        cfg = client.get_config()
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    night_light = cfg.get("night_light")
+    if not isinstance(night_light, dict):
+        return None
+    lat = night_light.get("latitude")
+    lon = night_light.get("longitude")
+    # bool is an int subclass; exclude it explicitly so True/False can't pass an
+    # isinstance(..., (int, float)) check as 1.0/0.0.
+    if isinstance(lat, bool) or isinstance(lon, bool):
+        return None
+    if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+        return None
+    lat, lon = float(lat), float(lon)
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
 
 
 def _read_slot_params(store: Store, slot: str) -> "dict | None":
@@ -525,6 +631,7 @@ def create_app(
     analysis_manager=None,
     training_manager=None,
     live_identify_manager=None,
+    cleanup_manager=None,
 ) -> FastAPI:
     """Build the FastAPI app.
 
@@ -565,6 +672,23 @@ def create_app(
     app = FastAPI()
     app.state.store = store
 
+    @app.exception_handler(RequestValidationError)
+    def _validation_error_handler(request: Request, exc: RequestValidationError):
+        # Default FastAPI 422, but sanitize non-finite floats (NaN/Infinity) that the
+        # JSON body parser accepts: left raw in the error detail they crash Starlette's
+        # allow_nan=False response encoder as a 500. Rendering them as strings turns a
+        # bad value into a clean 422 on ANY float endpoint (e.g. POST /api/location).
+        def _san(o):
+            if isinstance(o, float):
+                return o if math.isfinite(o) else str(o)
+            if isinstance(o, dict):
+                return {k: _san(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [_san(x) for x in o]
+            return o
+
+        return JSONResponse(status_code=422, content=_san(jsonable_encoder(exc.errors())))
+
     # Build the EdgeClient only for a live collector: importing it lazily keeps the
     # module (and tests) loadable without the ingest client's transitive deps
     # (requests) when the collector is off. A test app (start_collector=False,
@@ -600,6 +724,13 @@ def create_app(
 
     training_manager = training_manager if training_manager is not None else TrainingManager()
     app.state.training_manager = training_manager
+
+    # The cleanup-purge manager (admin-next P7). A fresh instance by default — it drives
+    # pure Store methods (no torch/ML deps), so no lazy import is needed and a test can
+    # inject its own or use the default against a temp store. SEPARATE from the analysis/
+    # training queues: a purge is unrelated maintenance work and must not share a slot.
+    cleanup_manager = cleanup_manager if cleanup_manager is not None else CleanupManager()
+    app.state.cleanup_manager = cleanup_manager
 
     # The always-on live-identify worker. Built AFTER the analysis + training managers
     # because it must yield the shared GPU/DB-connection to either while a manual job
@@ -658,6 +789,11 @@ def create_app(
         # before close() — same load-bearing ordering as the three above.
         live_identify_manager.stop()
         live_identify_manager.join(timeout=10.0)
+        # The cleanup purge is a FIFTH writer of the shared connection (its batched
+        # deletes commit through the store), so it too is canceled AND joined before
+        # close() — same load-bearing ordering as the workers above.
+        cleanup_manager.stop_all()
+        cleanup_manager.join(timeout=10.0)
         store.close()
 
     # The SPA shells are single self-contained files (inline CSS+JS), so a stale
@@ -683,6 +819,15 @@ def create_app(
         if not _ADMIN_HTML.is_file():
             raise HTTPException(status_code=404, detail="admin UI not built")
         return FileResponse(_ADMIN_HTML, media_type="text/html", headers=_SHELL_HEADERS)
+
+    @app.get("/admin-next")
+    def admin_next():
+        # The streamlined admin rebuild (WIP), at its own route so /admin keeps
+        # working byte-for-byte until the final flip. Own document, own CSS; hash
+        # routing → /admin-next#start. 404 until the file exists (same as /admin).
+        if not _ADMIN_NEXT_HTML.is_file():
+            raise HTTPException(status_code=404, detail="admin-next UI not built")
+        return FileResponse(_ADMIN_NEXT_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
     @app.get("/apple-touch-icon.png")
     @app.get("/apple-touch-icon-precomposed.png")
@@ -788,6 +933,76 @@ def create_app(
             store.record_mode_change(collector_manager.current_motion_only)
         return JSONResponse({"ok": True, "deleted": deleted})
 
+    # --- Cleanup purges (admin-next P7) ---------------------------------------------
+    #
+    # Two DATA-DESTRUCTIVE purges the CleanupManager runs as batched background jobs
+    # (progress + cancel, lock released between batches). Both go through the store's
+    # eviction accounting path and never touch durable crops/labels/models. The
+    # estimate endpoint shows the reclaim BEFORE the operator commits; run starts a
+    # single job (409 if one is already running); status/cancel drive it.
+
+    def _nonmotion_window(before_ts: "int | None") -> "tuple[int | None, int | None]":
+        # Resolve+snapshot the id window for a non-motion purge. Snapshotting the
+        # bounds here (not inside the running job) fixes a whole-store purge's upper
+        # bound at request time so it can't chase the live collector's newer frames,
+        # and gives the recorded purge span a stable lower bound. Empty store →
+        # (None, None). A ``before_ts`` matching no frame at-or-before it → until_id
+        # None, i.e. nothing to purge.
+        lo, hi = store.frame_id_bounds()
+        if hi is None:
+            return (None, None)
+        if before_ts is not None:
+            _, until_id = store.resolve_ts_range(None, int(before_ts))
+            if until_id is None:
+                # ``before_ts`` precedes EVERY frame → nothing qualifies. A None bound
+                # would wrongly mean "whole store" to the estimate/purge (`id <= ?`),
+                # so clamp to below the store min so zero rows match — a before-date
+                # that excludes all frames must purge nothing, not everything.
+                until_id = lo - 1
+        else:
+            until_id = hi
+        return (lo, until_id)
+
+    @app.get("/api/cleanup/estimate")
+    def api_cleanup_estimate(
+        kind: str = Query(...),
+        before_ts: "int | None" = Query(default=None),
+    ):
+        if kind == "nonmotion":
+            _, until_id = _nonmotion_window(before_ts)
+            est = store.purge_nonmotion_estimate(until_id)
+            return {"kind": "nonmotion", "until_id": until_id, **est}
+        if kind == "orphan":
+            return {"kind": "orphan", **store.orphan_estimate()}
+        raise HTTPException(status_code=400, detail=f"kind must be 'nonmotion' or 'orphan', got {kind!r}")
+
+    @app.post("/api/cleanup/run")
+    def api_cleanup_run(req: CleanupRunRequest):
+        if req.kind == "nonmotion":
+            since_id, until_id = _nonmotion_window(req.before_ts)
+            result = cleanup_manager.start_nonmotion(store, until_id, since_id)
+        elif req.kind == "orphan":
+            result = cleanup_manager.start_orphan(store)
+        else:
+            raise HTTPException(
+                status_code=400, detail=f"kind must be 'nonmotion' or 'orphan', got {req.kind!r}"
+            )
+        # A single job at a time; a concurrent request is refused rather than enqueued.
+        if not result.get("started"):
+            raise HTTPException(status_code=409, detail="a cleanup job is already running")
+        return result
+
+    @app.get("/api/cleanup/status")
+    def api_cleanup_status():
+        return cleanup_manager.status()
+
+    @app.post("/api/cleanup/cancel")
+    def api_cleanup_cancel():
+        # Idempotent: cancel signals the running job to stop at the next batch boundary
+        # (a no-op when idle) and returns the current status.
+        cleanup_manager.cancel()
+        return cleanup_manager.status()
+
     # --- Frame-range groups (the name->bounds bookmark layer) -----------------------
     #
     # A group is a saved (name, [start_id, end_id]) window; the frontend expands the
@@ -864,6 +1079,7 @@ def create_app(
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
         detections: "str | None" = Query(default=None),
+        identify: bool = Query(default=False),
     ):
         # The density viewer's decimated preview, so a wide bucket is never dumped as tens
         # of thousands of thumbs. Two strategies:
@@ -875,8 +1091,11 @@ def create_app(
         #
         # `detections` (the count branch only) attaches each sampled frame's stored
         # per-frame detection for that analyzer (the playback filmstrip/box overlay);
-        # gated against ANALYZER_NAMES like /api/frames. Not applicable to the per_ms
-        # density path, so it's ignored there.
+        # gated against ANALYZER_NAMES like /api/frames. `identify=1` (also count-branch
+        # only) attaches each frame's active-gallery identity match, resolved with the
+        # same fail-safe events() uses (Frame-review's model-evaluation overlay). Both are
+        # additive: absent them the payload is byte-identical. Neither applies to the
+        # per_ms density path, so they're ignored there.
         if per_ms is not None:
             frames = store.sample_frames_by_interval(since_id, until_id, per_ms)
         else:
@@ -885,7 +1104,9 @@ def create_app(
                     status_code=400,
                     detail=f"unknown analyzer {detections!r}; known: {ANALYZER_NAMES}",
                 )
-            frames = store.sample_frames(since_id, until_id, count, detections=detections)
+            frames = store.sample_frames(
+                since_id, until_id, count, detections=detections, identify=identify
+            )
         return {"frames": frames}
 
     @app.get("/api/timeline")
@@ -1226,6 +1447,42 @@ def create_app(
         source, params = _edge_config_params(client)
         return {"source": source, "params": params}
 
+    # --- Location setting (admin-next P1; gates the P2 day/night split) -------------
+    #
+    # Compute-side lat/lon, persisted in the same settings KV as every other flag
+    # (Store.get_location/set_location). Read contract: {latitude, longitude, source}
+    # where source is "manual" (operator POST), "edge" (seeded once from the Pi's
+    # night-light config on a prior GET), or null (never configured AND the edge is
+    # unreachable/unset) — NEVER a silent (0, 0) default. The day/night split (P2)
+    # is expected to treat a null location as "unavailable, prompt to set it".
+
+    @app.get("/api/location")
+    def api_location():
+        loc = store.get_location_with_source()
+        if loc is not None:
+            lat, lon, source = loc
+            # Coords + source come from ONE locked read, so a concurrent set_location
+            # can't pair a stale coordinate with a fresh source label. "manual" is a
+            # defensive fallback for an old/hand-edited store missing the source key.
+            return {"latitude": lat, "longitude": lon, "source": source or "manual"}
+        # Unset: try the one-time seed from the edge's night-light config. Only
+        # persisted on success, so an unreachable edge is retried on the next GET
+        # rather than latching an empty result — and a genuine "not configured on
+        # the Pi either" (see _location_from_edge_night_light) leaves it unset.
+        seeded = _location_from_edge_night_light(client)
+        if seeded is None:
+            return {"latitude": None, "longitude": None, "source": None}
+        lat, lon = seeded
+        store.set_location(lat, lon, source="edge")
+        return {"latitude": lat, "longitude": lon, "source": "edge"}
+
+    @app.post("/api/location")
+    def api_location_set(req: LocationRequest):
+        # Range validation already happened in LocationRequest (Field bounds -> 422);
+        # a manual set always wins over — and overwrites — a prior edge-seeded value.
+        store.set_location(req.latitude, req.longitude)
+        return {"latitude": req.latitude, "longitude": req.longitude, "source": "manual"}
+
     @app.post("/api/tuning/rerun")
     def api_tuning_rerun(req: TuningRerunRequest):
         # Validate slot + params FIRST (400) — a client mistake, before touching the
@@ -1265,6 +1522,7 @@ def create_app(
         oracle_floor: float = Query(default=0.30),
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
+        split: bool = Query(default=False),
     ):
         # The oracle is the fixed ground truth both scorecards score against; only a
         # registered one is valid (400 otherwise — the same gate /api/frames uses).
@@ -1309,6 +1567,29 @@ def create_app(
             pre_window = store.count_in_range(until_id=since_id - 1)
             warmup = max(0, _WARMUP_FRAMES - pre_window)
 
+        # Optional day/night split (admin-next P2). It is per-visit visit-recall, so
+        # the classifier rides into every gate_scorecard call (each buckets its OWN
+        # visits by their first present frame's recv_ts). ``is_night`` stays None —
+        # and the output byte-identical — unless split was asked for AND a location
+        # is configured AND astral can compute sun times. We never guess a boundary:
+        # an unset location or an unavailable astral reports the split unavailable
+        # with a reason rather than a confidently-wrong Day/Night column.
+        is_night = None
+        split_available = False
+        split_reason = None
+        split_location = None
+        if split:
+            coords = store.get_location()
+            if coords is None:
+                split_reason = "location_unset"
+            elif not astral_available():
+                split_reason = "astral_unavailable"
+            else:
+                lat, lon = coords
+                is_night = night_classifier(lat, lon)
+                split_available = True
+                split_location = {"latitude": lat, "longitude": lon}
+
         live = store.gate_scorecard(
             "live",
             oracle,
@@ -1319,6 +1600,7 @@ def create_app(
             oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
+            is_night=is_night,
         )
         b_min, b_max, b_pers = _slot_thresholds(store, _BASELINE_SLOT, edge_params)
         baseline = store.gate_scorecard(
@@ -1331,6 +1613,7 @@ def create_app(
             oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
+            is_night=is_night,
         )
         c_min, c_max, c_pers = _slot_thresholds(store, _CANDIDATE_SLOT, edge_params)
         candidate = store.gate_scorecard(
@@ -1343,6 +1626,7 @@ def create_app(
             oracle_floor=oracle_floor,
             since_id=since_id,
             until_id=until_id,
+            is_night=is_night,
         )
 
         # Fidelity is the baseline re-run vs. stored frames.motion — only meaningful
@@ -1351,7 +1635,7 @@ def create_app(
         fidelity = (
             None if baseline.get("needs_rerun") else store.gate_fidelity(_BASELINE_SLOT, since_id, until_id)
         )
-        return {
+        result = {
             "oracle": oracle,
             "live": live,
             "baseline": baseline,
@@ -1359,6 +1643,17 @@ def create_app(
             "fidelity": fidelity,
             "deltas": _compare_deltas(baseline, candidate),
         }
+        # Split metadata is added ONLY when split was requested, so an unasked call
+        # is byte-identical. When asked, ``split_available`` tells the UI whether the
+        # per-scorecard ``split`` keys are present; when not, ``split_reason`` says why
+        # (``location_unset`` / ``astral_unavailable``) so it can prompt for a fix.
+        if split:
+            result["split_available"] = split_available
+            if split_available:
+                result["location"] = split_location
+            else:
+                result["split_reason"] = split_reason
+        return result
 
     # --- Cat-identity annotation tool (roster CRUD + label queue + crops) -----------
     #
@@ -1497,6 +1792,58 @@ def create_app(
         # same present-frames scan instead of each re-running the JOIN+EXISTS read.
         return store.label_queue(oracle, since_id, until_id)
 
+    @app.get("/api/label/queue")
+    def api_label_queue(
+        oracle: str = Query(default=_LABEL_DEFAULT_ORACLE),
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+        limit: int = Query(default=_ANNOTATE_PAGE_DEFAULT),
+    ):
+        # The BOUNDED annotation queue (admin-next P4): the newest undecided visits,
+        # capped and — once a model is active — distance-sorted worst-first (the
+        # active-learning order). Same oracle gate + bucket scope as /api/label/visits,
+        # but scan-bounded (never a whole-store scan) and paginated via `limit`, so it
+        # stays cheap as the store grows (the unpaginated /api/label/visits is kept for
+        # the progress readout + existing callers).
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        _validate_bounds(since_id, until_id)
+        return store.annotation_queue_page(oracle, since_id, until_id, limit=limit)
+
+    @app.get("/api/label/regime-coverage")
+    def api_label_regime_coverage():
+        # Per-cat day/night labelled-crop coverage (admin-next P4) so the operator sees
+        # which resident needs night data. The day/night split needs a location + astral
+        # (same gate as the tuning split): when either is missing we report the totals
+        # with `available: False` + a reason (the UI prompts to set location) rather than
+        # guessing a boundary — a wrong location gives confidently-wrong Day/Night counts.
+        coords = store.get_location()
+        available = False
+        reason = None
+        is_night = None
+        location = None
+        if coords is None:
+            reason = "location_unset"
+        elif not astral_available():
+            reason = "astral_unavailable"
+        else:
+            lat, lon = coords
+            is_night = night_classifier(lat, lon)
+            available = True
+            location = {"latitude": lat, "longitude": lon}
+        result = {
+            "available": available,
+            "cats": store.cat_regime_coverage(is_night),
+        }
+        if available:
+            result["location"] = location
+        else:
+            result["reason"] = reason
+        return result
+
     def _validate_label(req: LabelRequest) -> "int | None":
         # Validate a label / re-label request and resolve cat_id — ALL before any crop
         # I/O, so a bad request never leaves half-written crops. Decision must be one of
@@ -1630,6 +1977,19 @@ def create_app(
         removed = store.delete_dataset_items(req.frame_ids)
         removed_files = _delete_crop_files(removed)
         return {"deleted": len(removed), "crops_removed": removed_files}
+
+    @app.post("/api/label/ignore")
+    def api_label_ignore(req: IgnoreRequest):
+        # Mark a visit's frames ``ignored`` (admin-next P4): one crop-less dataset_items
+        # row per frame — "reviewed, skip" — so the queue's "already decided" test drops
+        # the event. No crop I/O (no crop/box/quality/cat), so no _commit_label /
+        # materialize path; add_dataset_items resolves src_recv_ts, skips evicted frames,
+        # and dedups on (src_frame_id, src_recv_ts). Reversible via /api/label/delete or
+        # /api/label/relabel, like any other label. ``inserted`` < len(frame_ids) means
+        # some frames were evicted or already decided.
+        rows = [{"frame_id": int(fid), "label_kind": "ignored"} for fid in req.frame_ids]
+        inserted = store.add_dataset_items(rows)
+        return {"ignored": inserted}
 
     @app.get("/api/label/crop/{frame_id}")
     def api_label_crop(frame_id: int, box: str = Query(...)):

@@ -30,6 +30,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from typing import Callable
 
 from compute.analysis import ANALYZER_NAMES  # import-light registry (no ML); single source of oracle ids
 from compute.analysis.yolo import (  # import-light COCO class-id constants (yolo.py holds no ML at module scope)
@@ -133,10 +134,17 @@ _VISIT_MODES = ("missed", "false", "conflict")
 # Annotation-tool enums for the durable ``dataset_items`` table (see the
 # cat-identity annotation-tool spec). ``label_kind`` is the NOT NULL discriminator
 # (``cat_id`` set only for ``identified``); ``quality`` is the per-crop signal a
-# future gallery build filters on (NULL for a ``not_cat`` row, which has no crop).
-# Both are validated in ``add_dataset_items`` so a typo can never silently poison
-# the precious, eviction-surviving label set.
-_LABEL_KINDS = ("identified", "unknown_cat", "not_cat")
+# future gallery build filters on (NULL for a ``not_cat``/``ignored`` row, which has
+# no crop). Both are validated in ``add_dataset_items`` so a typo can never silently
+# poison the precious, eviction-surviving label set.
+# ``ignored`` (admin-next P4) is a crop-less "skip this event" decision: like
+# ``not_cat`` it stores no crop/cat/quality/bbox, but it means "reviewed, not worth
+# labelling" rather than "not a cat". Its only job is to mark the event DECIDED so the
+# queue's absence-of-a-row "undecided" test drops it; it is deliberately excluded from
+# every crop/gallery reader (``labeled_crops``/``count_identified_crops`` default to
+# ``identified``, ``labeled_cat_motion_floor`` to identified+unknown_cat), and it is
+# reversible via the existing delete/relabel paths like any other label.
+_LABEL_KINDS = ("identified", "unknown_cat", "not_cat", "ignored")
 _QUALITIES = ("gallery", "ok", "poor")
 
 # Minimum yolo-serial detection confidence for a frame to enter the annotation
@@ -147,6 +155,19 @@ _QUALITIES = ("gallery", "ok", "poor")
 # Mirrors the gate scorecard's default oracle floor; fixed (not per-request) because
 # the queue's clean-crop purpose wants a stable, meaningful universe, not a knob.
 _ANNOTATE_MIN_CONF = 0.3
+
+# Bounding for the paginated annotation queue (``annotation_queue_page``, admin-next
+# P4). The unpaginated ``annotation_visits`` returns EVERY undecided visit's EVERY
+# frame (changelog 57's known scaling limit); the paginated reader instead scans only
+# the newest ``_ANNOTATE_SCAN_FRAMES`` present-and-undecided frames in the window (the
+# events()/``_EVENT_SCAN_FRAMES`` technique — the queue's freshest visits live in the
+# recv_ts tail) and returns at most ``_ANNOTATE_PAGE_DEFAULT`` visits (clamped to
+# ``_ANNOTATE_PAGE_MAX``), so neither the SQL result nor the Python clustering grows
+# with the store (entries 102–104). A scan that hits the cap drops its oldest
+# (possibly head-truncated) visit and sets ``truncated`` — a narrower window sees the rest.
+_ANNOTATE_PAGE_DEFAULT = 100
+_ANNOTATE_PAGE_MAX = 500
+_ANNOTATE_SCAN_FRAMES = 50_000
 
 # Pre-calibration default for the event-subject motion floor (see ``events()`` and
 # ``labeled_cat_motion_floor``). ``min_area`` is a FRACTION of the downscaled MOG2
@@ -239,6 +260,29 @@ def _range_bounds(col: str, since_id: "int | None", until_id: "int | None") -> "
         fragments.append(f"{col} <= ?")
         params.append(int(until_id))
     return fragments, params
+
+
+def _coalesce_id_spans(spans: "list[dict]") -> "list[dict]":
+    """Merge a list of ``{"start_id", "end_id"}`` intervals into sorted, disjoint ones.
+
+    Used by ``motion_only_spans`` when it unions its motion-only step-function
+    segments with cleanup purge spans: overlapping intervals from the two sources
+    are collapsed so a consumer never double-covers the same ids. Only genuinely
+    OVERLAPPING intervals merge (``start <= running_end``) — abutting-but-disjoint
+    ranges stay separate — so a set of already-disjoint motion-only segments (the
+    no-purge case never reaches here) would round-trip unchanged. Empty in, empty out.
+    """
+    if not spans:
+        return []
+    ordered = sorted(spans, key=lambda s: (s["start_id"], s["end_id"]))
+    merged: "list[dict]" = [dict(ordered[0])]
+    for span in ordered[1:]:
+        last = merged[-1]
+        if int(span["start_id"]) <= int(last["end_id"]):
+            last["end_id"] = max(int(last["end_id"]), int(span["end_id"]))
+        else:
+            merged.append(dict(span))
+    return merged
 
 
 class Store:
@@ -439,10 +483,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS dataset_items (
               id           INTEGER PRIMARY KEY,
               cat_id       INTEGER,                     -- set iff label_kind = 'identified'
-              label_kind   TEXT    NOT NULL,            -- 'identified' | 'unknown_cat' | 'not_cat'
-              quality      TEXT,                        -- 'gallery' | 'ok' | 'poor' (NULL for not_cat)
-              bbox         TEXT,                        -- "x1,y1,x2,y2" px in the source frame (NULL for not_cat)
-              crop_path    TEXT,                        -- dataset-media-relative jpg (NULL for not_cat)
+              label_kind   TEXT    NOT NULL,            -- 'identified' | 'unknown_cat' | 'not_cat' | 'ignored'
+              quality      TEXT,                        -- 'gallery' | 'ok' | 'poor' (NULL for not_cat/ignored)
+              bbox         TEXT,                        -- "x1,y1,x2,y2" px in the source frame (NULL for not_cat/ignored)
+              crop_path    TEXT,                        -- dataset-media-relative jpg (NULL for not_cat/ignored)
               src_frame_id INTEGER NOT NULL,            -- frames.id at label time (linkage only)
               src_recv_ts  INTEGER NOT NULL,            -- frames.recv_ts, the clear()-safe dedup guard
               source       TEXT    NOT NULL DEFAULT 'detector',
@@ -485,6 +529,19 @@ class Store:
               bbox             TEXT,               -- "x1,y1,x2,y2" the crop was cut from (audit)
               ran_at           INTEGER NOT NULL,
               PRIMARY KEY (frame_id, model_version_id)
+            );
+            -- `purge_spans` marks id windows the cleanup non-motion purge stripped of
+            -- their non-motion frames (admin-next P7). Once a window's motion=0 frames
+            -- are gone, a gate MISS there (a cat present while the flag was 0) can no
+            -- longer be observed, so recall over it must read "unmeasurable" — exactly
+            -- like a motion-only capture span (changelog 32). `motion_only_spans` folds
+            -- these in so every existing scorecard/coverage consumer warns for free,
+            -- with NO change to those endpoints. Keyed to frame ids like `mode_changes`/
+            -- `groups`, so a full `clear` (which reuses rowids from 1) drops it too.
+            CREATE TABLE IF NOT EXISTS purge_spans (
+              start_id INTEGER NOT NULL,   -- inclusive lower id of the purged window
+              end_id   INTEGER NOT NULL,   -- inclusive upper id actually purged
+              at_ts    INTEGER NOT NULL    -- ms epoch the purge recorded this span
             );
             """
         )
@@ -581,25 +638,43 @@ class Store:
                 self._motion_count = 0
                 return
             for row_id, rel_path, n_bytes, motion in rows:
-                self._unlink(rel_path)
-                self._conn.execute("DELETE FROM frames WHERE id = ?", (row_id,))
-                # Cascade: drop any oracle verdicts about this frame in the same
-                # locked section, so retention can never leave an analysis row
-                # pointing at a frame (and its file) that no longer exists.
-                self._conn.execute("DELETE FROM analysis WHERE frame_id = ?", (row_id,))
-                # Same frame-keyed cascade for identifications (identification-gallery
-                # spec): an identification describes a frame, so it evicts with it —
-                # cheap to recompute from the durable gallery, so never precious.
-                self._conn.execute("DELETE FROM identifications WHERE frame_id = ?", (row_id,))
-                self._total_bytes -= int(n_bytes)
-                # Keep the in-memory counts in lockstep with the byte total (stats()
-                # reads them instead of re-scanning): every evicted frame drops the
-                # frame count, and a motion frame also drops the motion count.
-                self._count -= 1
-                if motion:
-                    self._motion_count -= 1
+                self._delete_frame_locked(row_id, rel_path, n_bytes, bool(motion))
                 if self._total_bytes <= self._max_bytes:
                     break
+
+    def _delete_frame_locked(self, row_id: int, rel_path: str, n_bytes: int, motion: bool) -> None:
+        """Delete one frame's file + row + cascaded rows; decrement counters in lockstep.
+
+        The SINGLE accounting path shared by size-based eviction (``_evict_locked``)
+        and the cleanup purges (see the CleanupManager). Caller holds the lock and
+        commits. It removes the JPEG, the ``frames`` row, and the two frame-keyed
+        cascade tables (``analysis`` + ``identifications`` — an oracle verdict or an
+        identification about a gone frame is meaningless and cheaply recomputed),
+        then subtracts the frame's recorded size from ``_total_bytes`` and drops
+        ``_count`` (and ``_motion_count`` for a motion frame). Routing every frame
+        delete through here is what keeps a purge from ever doing a raw ``DELETE``
+        that would leave the in-memory bookkeeping — and thus the retention cap
+        (changelog 104) — drifted from the DB. It NEVER touches ``dataset_items``,
+        durable crops, or ``model_versions``: those carry no FK to ``frames`` and are
+        the precious hand-made output, untouched by eviction or purge alike.
+        """
+        self._unlink(rel_path)
+        self._conn.execute("DELETE FROM frames WHERE id = ?", (row_id,))
+        # Cascade: drop any oracle verdicts about this frame in the same locked
+        # section, so retention can never leave an analysis row pointing at a frame
+        # (and its file) that no longer exists.
+        self._conn.execute("DELETE FROM analysis WHERE frame_id = ?", (row_id,))
+        # Same frame-keyed cascade for identifications (identification-gallery spec):
+        # an identification describes a frame, so it goes with it — cheap to recompute
+        # from the durable gallery, so never precious.
+        self._conn.execute("DELETE FROM identifications WHERE frame_id = ?", (row_id,))
+        self._total_bytes -= int(n_bytes)
+        # Keep the in-memory counts in lockstep with the byte total (stats() reads
+        # them instead of re-scanning): every deleted frame drops the frame count,
+        # and a motion frame also drops the motion count.
+        self._count -= 1
+        if motion:
+            self._motion_count -= 1
 
     def _unlink(self, rel_path: str) -> None:
         """Remove one media file by its DB-relative path; best-effort.
@@ -817,6 +892,11 @@ class Store:
             # collide (recv_ts advances) — see the annotation-tool + training-page +
             # identification-gallery specs.
             self._conn.execute("DELETE FROM mode_changes")
+            # Drop purge spans for the SAME rowid-reuse reason as mode_changes/groups:
+            # their [start_id, end_id] are frame ids, and a full clear resets ids from
+            # 1, so a stale purge span would spuriously flag brand-new frames as
+            # "misses unmeasurable". A cleared store has no purged history.
+            self._conn.execute("DELETE FROM purge_spans")
             self._conn.commit()
             self._total_bytes = 0
             self._count = 0
@@ -844,6 +924,86 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+            )
+            self._conn.commit()
+
+    # The compute-side location setting (admin-next P1; gates the P2 day/night
+    # split). Three plain KV keys under the same `settings` table/lock as every
+    # other flag here — no new table needed. `location_source` records HOW the
+    # coordinates were obtained ("manual" = the operator's POST, "edge" = seeded
+    # once from the Pi's night-light config) so a reader can tell a deliberate
+    # setting from a one-time borrow; `get_location()` itself is source-agnostic
+    # (the API layer reads `location_source` directly via `get_setting`, mirroring
+    # how `motion_only`/`collector_running` are read elsewhere in app.py).
+    _LOCATION_LAT_KEY = "location_lat"
+    _LOCATION_LON_KEY = "location_lon"
+    _LOCATION_SOURCE_KEY = "location_source"
+
+    def get_location(self) -> "tuple[float, float] | None":
+        """(latitude, longitude) from the settings KV, or ``None`` if unset/corrupt.
+
+        Thin projection of :meth:`get_location_with_source` (which does the ONE
+        locked read + parse) for callers — the day/night split — that don't need
+        the source label. ``None`` covers unset AND a corrupt/unparseable/non-finite
+        stored value: callers must treat that exactly like "never configured".
+        """
+        loc = self.get_location_with_source()
+        return None if loc is None else (loc[0], loc[1])
+
+    def get_location_with_source(self) -> "tuple[float, float, str | None] | None":
+        """(latitude, longitude, source) in ONE locked read, or ``None`` if unset/corrupt.
+
+        Reads all three keys in a single locked query so a concurrent
+        ``set_location`` (which writes lat/lon/source in one transaction) can't be
+        observed torn — neither a new longitude paired with the old latitude, nor a
+        fresh source label paired with stale coordinates (what ``GET /api/location``
+        would otherwise risk reading coords and source in two separate locked calls).
+        ``None`` covers unset OR a corrupt/unparseable/non-finite coordinate (never
+        raises), so every caller treats a bad store like "never configured".
+        """
+        with self._lock:
+            rows = dict(
+                self._conn.execute(
+                    "SELECT key, value FROM settings WHERE key IN (?, ?, ?)",
+                    (self._LOCATION_LAT_KEY, self._LOCATION_LON_KEY, self._LOCATION_SOURCE_KEY),
+                ).fetchall()
+            )
+        lat_raw = rows.get(self._LOCATION_LAT_KEY)
+        lon_raw = rows.get(self._LOCATION_LON_KEY)
+        if lat_raw is None or lon_raw is None:
+            return None
+        try:
+            lat, lon = float(lat_raw), float(lon_raw)
+        except (TypeError, ValueError):
+            return None
+        # float() also parses "nan"/"inf"/"-inf" without raising; a non-finite
+        # coordinate would poison the day/night classifier, so treat it exactly
+        # like a corrupt/unset value (the docstring's contract) and degrade to None.
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return None
+        return (lat, lon, rows.get(self._LOCATION_SOURCE_KEY))
+
+    def set_location(self, lat: float, lon: float, *, source: str = "manual") -> None:
+        """Persist ``(lat, lon)`` (+ how they were obtained) in the settings KV.
+
+        Writes all three keys in ONE locked transaction (not three separate
+        ``set_setting`` calls) so a concurrent ``get_location`` can never observe
+        a half-written pair. ``source`` defaults to ``"manual"`` — the shape
+        ``POST /api/location`` uses. The one-time edge-seed path (``GET
+        /api/location`` on first read, when the Pi's night-light config supplies
+        a value) passes ``source="edge"`` explicitly so a later read can tell
+        the two apart. Range validation (lat -90..90, lon -180..180) is the API
+        layer's job (422 on bad input) — the store just persists what it's given.
+        """
+        lat_str, lon_str = str(float(lat)), str(float(lon))
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                [
+                    (self._LOCATION_LAT_KEY, lat_str),
+                    (self._LOCATION_LON_KEY, lon_str),
+                    (self._LOCATION_SOURCE_KEY, source),
+                ],
             )
             self._conn.commit()
 
@@ -888,13 +1048,22 @@ class Store:
         while the motion flag is 0 — was never stored, so recall reads as
         unmeasurable rather than perfect (and BSUV / MOG2-rerun verdicts across the
         span are unreliable too, since those oracles assume contiguous frames).
+
+        Cleanup **purge spans** (a non-motion purge stripped the window of its
+        motion=0 frames — admin-next P7) are folded in here too: a purged window is
+        exactly as unmeasurable as a motion-only one, so every existing scorecard/
+        coverage consumer of this method warns over it with NO change of its own.
+        When there are no purge spans the output is byte-for-byte the motion-only
+        step-function result (the common case); purge spans are only ever ADDED,
+        never removing or altering a motion-only span.
         """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT at_id, motion_only FROM mode_changes ORDER BY at_id ASC, rowid ASC"
             ).fetchall()
-            if not rows:
-                return []
+            purge_rows = self._conn.execute(
+                "SELECT start_id, end_id FROM purge_spans"
+            ).fetchall()
             if until_id is None:
                 (store_end,) = self._conn.execute(
                     "SELECT COALESCE(MAX(id), 0) FROM frames"
@@ -921,7 +1090,229 @@ class Store:
             hi = end if until_id is None else min(end, int(until_id))
             if lo <= hi:  # overlaps the window after clipping
                 spans.append({"start_id": lo, "end_id": hi})
-        return spans
+
+        if not purge_rows:
+            # No purges recorded → identical to the historical motion-only result,
+            # including the empty-mode_changes case (spans == []).
+            return spans
+
+        # Fold in the purge spans, clipped to the same window, then coalesce the
+        # union into sorted, non-overlapping intervals so a consumer never sees a
+        # motion-only and a purge span double-cover the same ids.
+        for ps_start, ps_end in purge_rows:
+            lo = int(ps_start) if since_id is None else max(int(ps_start), int(since_id))
+            hi = int(ps_end) if until_id is None else min(int(ps_end), int(until_id))
+            if lo <= hi:
+                spans.append({"start_id": lo, "end_id": hi})
+        return _coalesce_id_spans(spans)
+
+    # --- Cleanup purges (admin-next P7) -------------------------------------
+    #
+    # Two DATA-DESTRUCTIVE operations the CleanupManager drives as batched
+    # background jobs (progress + cancel, lock released between batches — entries
+    # 102-105): dropping non-motion frames, and sweeping orphaned JPEGs. Both go
+    # through the SAME accounting path as size-based eviction so counters never
+    # drift, and NEITHER ever touches the precious hand-made output
+    # (`dataset_items`, durable crops, `model_versions`) — those have no FK to
+    # `frames` and live outside the media dir entirely.
+
+    def frame_id_bounds(self) -> "tuple[int | None, int | None]":
+        """``(min_id, max_id)`` over ``frames``, or ``(None, None)`` when empty.
+
+        Two O(1) primary-key endpoint seeks. The cleanup endpoint snapshots these
+        BEFORE a purge so a whole-store non-motion purge has a fixed upper bound
+        (``max_id`` at start) — otherwise it would chase the live collector's newer
+        non-motion frames forever — and a stable lower bound for the recorded span.
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT MIN(id), MAX(id) FROM frames").fetchone()
+        lo = int(row[0]) if row[0] is not None else None
+        hi = int(row[1]) if row[1] is not None else None
+        return (lo, hi)
+
+    def purge_nonmotion_estimate(self, until_id: "int | None") -> dict:
+        """``{"count", "bytes"}`` for the non-motion purge with ``id <= until_id``.
+
+        ``until_id`` ``None`` = the whole store. What the cleanup *estimate*
+        endpoint shows as the reclaim before the operator commits. ``count`` is
+        exact (an index-only COUNT); ``bytes`` is an ESTIMATE (count x mean frame
+        size). An exact SUM(bytes) would table-look-up every non-motion row — an
+        O(store) scan under the lock, the changelog-104 anti-pattern that starves
+        the collector — and a reclaim preview doesn't need byte-exactness.
+        """
+        clause, params = "", []
+        if until_id is not None:
+            clause = " AND id <= ?"
+            params.append(int(until_id))
+        with self._lock:
+            n = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM frames WHERE motion = 0{clause}", params
+                ).fetchone()[0]
+            )
+            mean_bytes = (self._total_bytes / self._count) if self._count else 0
+        return {"count": n, "bytes": int(n * mean_bytes)}
+
+    def purge_nonmotion_batch(
+        self, until_id: "int | None", batch_size: int
+    ) -> "tuple[int, int | None]":
+        """Delete up to ``batch_size`` non-motion frames (``id <= until_id``); one lock hold.
+
+        Returns ``(deleted, max_deleted_id)`` — ``(0, None)`` when the window is
+        drained. Each frame goes through ``_delete_frame_locked`` (the eviction
+        accounting path: file + row + analysis + identifications, and the
+        ``_total_bytes``/``_count`` decrements — ``_motion_count`` is untouched here
+        because every selected row is ``motion = 0``). The CALLER loops this,
+        releasing the lock between calls, so a millions-row purge never holds the
+        store lock across the whole store (entries 102-105). Deleting oldest-first
+        (``id ASC``) makes ``max_deleted_id`` the precise upper bound of what was
+        actually purged, so a cancel mid-run records only the span it truly stripped.
+        """
+        clause, params = "", []
+        if until_id is not None:
+            clause = " AND id <= ?"
+            params.append(int(until_id))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, path, bytes FROM frames WHERE motion = 0{clause} ORDER BY id ASC LIMIT ?",
+                (*params, int(batch_size)),
+            ).fetchall()
+            if not rows:
+                return (0, None)
+            max_id = max(int(r[0]) for r in rows)
+            try:
+                for row_id, rel_path, n_bytes in rows:
+                    self._delete_frame_locked(int(row_id), rel_path, int(n_bytes), motion=False)
+                self._conn.commit()
+            except Exception:
+                # A mid-batch failure (DB error, SQLITE_BUSY) must not leave a
+                # half-done DELETE on the shared connection for the next add()'s
+                # commit to flush while the in-memory counters — already partly
+                # decremented by _delete_frame_locked — diverge from the DB. Roll
+                # the batch back and resync counters from the committed rows,
+                # mirroring add()'s recovery, so a purge can never drift
+                # _count/_motion_count/_total_bytes.
+                self._conn.rollback()
+                row = self._conn.execute(
+                    "SELECT COALESCE(SUM(bytes), 0), COUNT(*), COALESCE(SUM(motion), 0) FROM frames"
+                ).fetchone()
+                self._total_bytes = int(row[0])
+                self._count = int(row[1])
+                self._motion_count = int(row[2])
+                raise
+        return (len(rows), max_id)
+
+    def record_purge_span(self, start_id: int, end_id: int) -> None:
+        """Append a ``purge_spans`` row marking ``[start_id, end_id]`` as non-motion-purged.
+
+        Recorded by the non-motion purge job once it finishes (or is canceled), for
+        the id range it actually stripped — so ``motion_only_spans`` folds it in and
+        later scorecards/coverage over that window warn "misses unmeasurable" rather
+        than reading a false ~100% recall (a purged window has no non-motion frames
+        left to hold an unrecorded miss). ``start_id``/``end_id`` are normalized to
+        ``min``/``max`` so click/computation order can't invert the range.
+        """
+        lo, hi = min(int(start_id), int(end_id)), max(int(start_id), int(end_id))
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO purge_spans (start_id, end_id, at_ts) VALUES (?, ?, ?)",
+                (lo, hi, now_ms),
+            )
+            self._conn.commit()
+
+    def iter_media_relpaths(self):
+        """Yield every ``.jpg`` under the FRAMES media dir, as media-root-relative paths.
+
+        A pure filesystem walk of ``_media_root`` ONLY — never the sibling
+        ``dataset``/``avatars`` dirs, whose files legitimately have no ``frames`` row
+        and must not be swept. Holds NO lock (it touches no DB), so the orphan sweep
+        can iterate it lazily and take the lock only per delete batch. A generator so
+        a huge tree is never fully materialized in memory.
+        """
+        root = self._media_root
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jpg"):
+                    continue
+                yield os.path.relpath(os.path.join(dirpath, name), root)
+
+    def delete_orphan_batch(self, rel_paths: "list[str]") -> dict:
+        """Delete the media files in ``rel_paths`` that have NO ``frames`` row; one lock hold.
+
+        Returns ``{"deleted", "bytes"}``. The orphan-sweep primitive (changelog-42
+        leak): a JPEG left on disk after a crash lost its row. Under the lock, each
+        candidate is kept if a ``frames`` row still references its path — so a file
+        the live collector is mid-write (its row+file appear atomically under this
+        same lock in ``add``) can never be swept — and removed only when genuinely
+        unreferenced. It touches ONLY files under ``_media_root`` and NO DB rows (an
+        orphan has none), so durable crops, labels, and models are structurally out
+        of reach. Dedups the input so a repeated path isn't double-counted.
+        """
+        if not rel_paths:
+            return {"deleted": 0, "bytes": 0}
+        uniq = list(dict.fromkeys(rel_paths))
+        deleted, freed = 0, 0
+        with self._lock:
+            for rel in uniq:
+                row = self._conn.execute(
+                    "SELECT 1 FROM frames WHERE path = ?", (rel,)
+                ).fetchone()
+                if row is not None:
+                    continue  # a live frame's file — never an orphan
+                abs_path = os.path.join(self._media_root, rel)
+                try:
+                    size = os.path.getsize(abs_path)
+                except OSError:
+                    size = 0
+                try:
+                    os.remove(abs_path)
+                    deleted += 1
+                    freed += size
+                except OSError:
+                    pass  # already gone / unremovable — best-effort, mirrors _unlink
+        return {"deleted": deleted, "bytes": freed}
+
+    def orphan_estimate(self, batch_size: int = 500) -> dict:
+        """``{"count", "bytes"}`` of orphaned media files (JPEG on disk with no row).
+
+        Walks ``_media_root`` in chunks, taking the lock only per chunk (never across
+        the whole walk) to test which paths lack a ``frames`` row and sum their sizes.
+        Read-only — deletes nothing. Bounds each ``IN (...)`` at ``batch_size`` well
+        under SQLite's parameter limit.
+        """
+        count, total = 0, 0
+        buf: "list[str]" = []
+
+        def _flush(paths: "list[str]") -> None:
+            nonlocal count, total
+            if not paths:
+                return
+            uniq = list(dict.fromkeys(paths))
+            placeholders = ",".join("?" for _ in uniq)
+            with self._lock:
+                existing = {
+                    r[0]
+                    for r in self._conn.execute(
+                        f"SELECT path FROM frames WHERE path IN ({placeholders})", uniq
+                    ).fetchall()
+                }
+            for rel in uniq:
+                if rel in existing:
+                    continue
+                count += 1
+                try:
+                    total += os.path.getsize(os.path.join(self._media_root, rel))
+                except OSError:
+                    pass
+
+        for rel in self.iter_media_relpaths():
+            buf.append(rel)
+            if len(buf) >= batch_size:
+                _flush(buf)
+                buf = []
+        _flush(buf)
+        return {"count": count, "bytes": total}
 
     # --- Frame-range groups -------------------------------------------------
     #
@@ -1094,6 +1485,7 @@ class Store:
     def sample_frames(
         self, since_id: "int | None", until_id: "int | None", count: int,
         detections: "str | None" = None,
+        identify: bool = False,
     ) -> "list[dict]":
         """~``count`` frames evenly spread across ``[since_id, until_id]`` by INDEX, id ASC.
 
@@ -1114,13 +1506,29 @@ class Store:
         that analyzer's stored per-frame detection over just the sampled ids and
         adds four keys per frame — ``analyzed`` (a verdict row exists, i.e. the
         frame was swept), ``score``/``box``/``cls`` (the highest-confidence
-        {cat, person, bird} box, or ``None`` when the row holds no such box). When
-        ``detections is None`` the shape is EXACTLY ``{"id", "recv_ts", "url"}`` and
-        no extra read runs, so the density/buckets viewers are byte-identical.
+        {cat, person, bird} box, or ``None`` when the row holds no such box).
+
+        ``identify`` (a flag) OPTIONALLY attaches an ``identity`` key per frame: the
+        ACTIVE gallery's nearest match, resolved through the SAME threshold/fail-safe
+        rule ``events()`` uses (uncalibrated model or a match beyond the cutoff →
+        "unknown", never a confident name — see ``_aggregate_identity`` and
+        ``_frame_identity``). ``identity`` is ``{cat_id, cat_name, is_resident,
+        distance, resolved}`` (``resolved`` ∈ resident|neighbour|unknown) when the
+        frame has an embeddable identification row for the active model, else
+        ``None`` (no active model, or the frame is un-identified / un-embeddable).
+
+        With BOTH ``detections is None`` and ``identify`` false the shape is EXACTLY
+        ``{"id", "recv_ts", "url"}`` and no extra read runs, so the density/buckets
+        viewers are byte-identical; the two overlays compose independently otherwise.
         """
         count = max(1, min(int(count), _MAX_SAMPLE))
         frags, params = _range_bounds("id", since_id, until_id)
         clause = (" WHERE " + " AND ".join(frags)) if frags else ""
+        # Read the active model OUTSIDE the store lock (active_model() acquires it
+        # itself — the lock is non-reentrant, so this mirrors events()'s ordering).
+        # A benign promotion race (a new model between here and the read below) is
+        # harmless: the old model's identifications stay valid until re-identify.
+        model = self.active_model() if identify else None
         with self._lock:
             (matched,) = self._conn.execute(
                 "SELECT COUNT(*) FROM frames" + clause, params
@@ -1136,41 +1544,86 @@ class Store:
                 params + [stride],
             ).fetchall()
             out = [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
-            if detections is None:
+            if detections is None and not identify:
+                # Byte-identical {id, recv_ts, url} path: no overlay requested, no
+                # extra read, so the density/buckets viewers are untouched.
                 return out
-            # One extra indexed read over ONLY the sampled ids (bounded by
-            # `count` <= _MAX_SAMPLE) joins the analyzer's stored detail so each
-            # tile can be colored / boxed by what YOLO detected — no re-detection.
+            # Either overlay reads ONLY the sampled ids (bounded by `count` <=
+            # _MAX_SAMPLE), so both are one indexed read over the same id set.
             ids = [f["id"] for f in out]
             placeholders = ",".join("?" for _ in ids)
-            detail_by_id = {
-                int(fid): detail
-                for fid, detail in self._conn.execute(
-                    "SELECT frame_id, detail FROM analysis"
-                    " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
-                    [detections] + ids,
+            detail_by_id: "dict[int, str | None] | None" = None
+            if detections is not None:
+                # Join the analyzer's stored detail so each tile can be colored /
+                # boxed by what YOLO detected — no re-detection.
+                detail_by_id = {
+                    int(fid): detail
+                    for fid, detail in self._conn.execute(
+                        "SELECT frame_id, detail FROM analysis"
+                        " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
+                        [detections] + ids,
+                    ).fetchall()
+                }
+            ident_by_id: "dict[int, tuple[int, float]]" = {}
+            cat_names: dict = {}
+            cat_residents: dict = {}
+            if identify and model is not None:
+                # The active gallery's nearest match per sampled frame; marker rows
+                # (cat_id NULL — a processed-but-un-embeddable frame) are dropped, as
+                # in events(). One cats lookup gives name + resident flag.
+                for fid, cat_id, dist in self._conn.execute(
+                    "SELECT frame_id, cat_id, distance FROM identifications"
+                    " WHERE model_version_id = ? AND cat_id IS NOT NULL"
+                    " AND frame_id IN (" + placeholders + ")",
+                    [int(model["id"])] + ids,
+                ).fetchall():
+                    if dist is not None:
+                        ident_by_id[int(fid)] = (int(cat_id), float(dist))
+                cat_rows = self._conn.execute(
+                    "SELECT id, name, is_resident FROM cats"
                 ).fetchall()
-            }
-        for f in out:
-            if f["id"] not in detail_by_id:
-                # No verdict row → not swept ("not measured"), distinct from a
-                # swept miss (below), so the caller can render the two differently.
-                f["analyzed"] = False
-                f["score"] = None
-                f["box"] = None
-                f["cls"] = None
-                continue
-            f["analyzed"] = True
-            best = self._best_detection_box(detail_by_id[f["id"]])
-            if best is None:
-                f["score"] = None
-                f["box"] = None
-                f["cls"] = None
-            else:
-                box, conf, cls = best
-                f["box"] = box
-                f["score"] = conf
-                f["cls"] = cls
+                cat_names = {cid: name for cid, name, _res in cat_rows}
+                cat_residents = {cid: bool(res) for cid, _name, res in cat_rows}
+        # Attach the requested overlay(s) outside the lock (pure Python over the
+        # fetched rows). They compose: a frame can carry both a detection box and an
+        # identity, keyed independently on the sampled id.
+        if detections is not None:
+            for f in out:
+                if f["id"] not in detail_by_id:
+                    # No verdict row → not swept ("not measured"), distinct from a
+                    # swept miss (below), so the caller can render the two differently.
+                    f["analyzed"] = False
+                    f["score"] = None
+                    f["box"] = None
+                    f["cls"] = None
+                    continue
+                f["analyzed"] = True
+                best = self._best_detection_box(detail_by_id[f["id"]])
+                if best is None:
+                    f["score"] = None
+                    f["box"] = None
+                    f["cls"] = None
+                else:
+                    box, conf, cls = best
+                    f["box"] = box
+                    f["score"] = conf
+                    f["cls"] = cls
+        if identify:
+            # Resolve each frame's nearest match with events()'s exact fail-safe
+            # (via _aggregate_identity on a single-frame span): a NULL threshold
+            # (uncalibrated model) or a match beyond the cutoff degrades to
+            # "unknown", never a confident name. `identity` is None when no model is
+            # active or the frame has no embeddable identification row for it.
+            threshold = model["threshold"] if model is not None else None
+            for f in out:
+                pair = ident_by_id.get(f["id"])
+                if pair is None:
+                    f["identity"] = None
+                else:
+                    agg = self._aggregate_identity(
+                        [pair], threshold, cat_names, cat_residents
+                    )
+                    f["identity"] = self._frame_identity(agg)
         return out
 
     def sample_frames_by_interval(
@@ -1854,6 +2307,7 @@ class Store:
         oracle_floor: float = 0.0,
         since_id: "int | None" = None,
         until_id: "int | None" = None,
+        is_night: "Callable[[int], bool] | None" = None,
     ) -> dict:
         """Recall / false-trigger / miss-breakdown scorecard for one (source, oracle).
 
@@ -1910,6 +2364,23 @@ class Store:
         is still honored as passed — a scoped caller supplies ``warmup=0`` because
         a scoped re-run is warm-started from the frames just before the window, so
         its first frames are already warm and must not be dropped.
+
+        ``is_night(recv_ts_ms) -> bool`` opts into a **day/night split** of the
+        visit counts (admin-next redesign, P2): when supplied, the result gains a
+        ``"split"`` key::
+
+            "split": {"day":   {"total", "caught", "wholly_missed"},
+                      "night": {"total", "caught", "wholly_missed"}}
+
+        The split is **per-visit, not per-frame** — visit recall (changelog 46) is
+        the metric, so each visit is assigned whole to one bucket by ``is_night``
+        of its **first present frame's recv_ts**; a dusk/dawn-straddling visit
+        counts once. The warm-up prefix is applied **once** (above) before
+        splitting, over the same ``interesting`` rows the combined counts use, so
+        ``split.day + split.night`` equals the combined ``visits`` counts exactly.
+        Absent ``is_night`` (the default), **no** ``"split"`` key is added and the
+        returned dict is byte-for-byte the unsplit one. The ``needs_rerun``
+        short-circuit never carries a split (nothing to score yet).
         """
         if oracle not in _SCORECARD_ORACLES:
             raise ValueError(f"oracle must be one of {_SCORECARD_ORACLES}, got {oracle!r}")
@@ -2027,7 +2498,7 @@ class Store:
 
         total_visits, caught_visits = self._cluster_visits(interesting)
 
-        return {
+        card = {
             "source": source,
             "oracle": oracle,
             "warmup": warmup,
@@ -2052,6 +2523,20 @@ class Store:
                 "wholly_missed": total_visits - caught_visits,
             },
         }
+        if is_night is not None:
+            # Additive day/night split of the visit counts, over the SAME warmed-up
+            # ``interesting`` rows — absent ``is_night`` this key is never added, so
+            # the card is byte-for-byte the unsplit one (the byte-identical contract).
+            split = self._cluster_visits_split(interesting, is_night)
+            card["split"] = {
+                bucket: {
+                    "total": total,
+                    "caught": bucket_caught,
+                    "wholly_missed": total - bucket_caught,
+                }
+                for bucket, (total, bucket_caught) in split.items()
+            }
+        return card
 
     @staticmethod
     def _gap_split(items: "list", gap_ms: int, ts_of) -> "list[list]":
@@ -2143,6 +2628,39 @@ class Store:
         spans = cls._split_into_visits(present_ts)
         caught = sum(1 for lo_ts, hi_ts in spans if cls._visit_caught(lo_ts, hi_ts, motion_ts))
         return len(spans), caught
+
+    @classmethod
+    def _cluster_visits_split(
+        cls, interesting: "list", is_night: "Callable[[int], bool]"
+    ) -> "dict[str, tuple[int, int]]":
+        """Same visit clustering as ``_cluster_visits``, split into day/night buckets.
+
+        Reuses the exact ``_split_into_visits`` / ``_visit_caught`` primitives, so a
+        split card can never cluster the frames differently from the combined one:
+        each visit is assigned to ``"night"`` or ``"day"`` by ``is_night`` applied to
+        its **first present frame's recv_ts** — the span's ``lo_ts`` (``_split_into_visits``
+        collapses each recv_ts-ascending run to ``(first, last)``). A visit that
+        straddles dusk/dawn therefore counts **once**, in the bucket of its first
+        present frame — never split into two half-visits (visit recall, changelog 46,
+        is the metric, so the unit is the whole visit). Returns
+        ``{"day": (total, caught), "night": (total, caught)}`` whose totals sum to
+        exactly ``_cluster_visits``' combined counts.
+        """
+        present_ts = sorted(ts for ts, _motion, verdict in interesting if verdict == 1)
+        if not present_ts:
+            return {"day": (0, 0), "night": (0, 0)}
+        motion_ts = sorted(ts for ts, motion, _verdict in interesting if motion == 1)
+        totals = {"day": 0, "night": 0}
+        caughts = {"day": 0, "night": 0}
+        for lo_ts, hi_ts in cls._split_into_visits(present_ts):
+            bucket = "night" if is_night(lo_ts) else "day"
+            totals[bucket] += 1
+            if cls._visit_caught(lo_ts, hi_ts, motion_ts):
+                caughts[bucket] += 1
+        return {
+            "day": (totals["day"], caughts["day"]),
+            "night": (totals["night"], caughts["night"]),
+        }
 
     def gate_fidelity(self, slot: str, since_id: "int | None" = None, until_id: "int | None" = None) -> dict:
         """How faithfully a re-run slot reproduces the live gate it was seeded from.
@@ -2842,6 +3360,38 @@ class Store:
         }
 
     @staticmethod
+    def _frame_identity(agg: "dict | None") -> "dict | None":
+        """Project an ``_aggregate_identity`` result into the per-frame identity overlay.
+
+        The frame-level counterpart to the event-level identity ``events()``
+        surfaces: it REUSES ``_aggregate_identity``'s threshold/fail-safe resolution
+        (a NULL threshold — uncalibrated model — or a match beyond the cutoff both
+        collapse to an "unknown cat", never a confident name) and reshapes it to the
+        overlay contract ``{cat_id, cat_name, is_resident, distance, resolved}``.
+
+        ``resolved`` names the outcome so a caller needn't re-derive it:
+        ``"resident"`` (one of our cats, matched within threshold), ``"neighbour"``
+        (a named foreign cat, matched within threshold), or ``"unknown"`` (no match
+        within threshold, or an uncalibrated model). ``None`` passes through as
+        ``None`` (no identity to show for the frame). ``distance`` is the matched (or,
+        when unknown, the nearest) cosine distance; ``cat_id``/``cat_name`` are
+        ``None`` for an unknown match.
+        """
+        if agg is None:
+            return None
+        if agg["cat_id"] is None:
+            resolved = "unknown"
+        else:
+            resolved = "resident" if agg["is_resident"] else "neighbour"
+        return {
+            "cat_id": agg["cat_id"],
+            "cat_name": agg["cat_name"],
+            "is_resident": agg["is_resident"],
+            "distance": agg["distance"],
+            "resolved": resolved,
+        }
+
+    @staticmethod
     def _classify_subject(
         class_conf: "dict[int, float]",
         peak_area: float,
@@ -3209,6 +3759,190 @@ class Store:
             **self.label_progress(oracle, since_id, until_id, _frames=frames),
         }
 
+    def annotation_queue_page(
+        self,
+        oracle: str,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        *,
+        limit: int = _ANNOTATE_PAGE_DEFAULT,
+        scan_frames: int = _ANNOTATE_SCAN_FRAMES,
+    ) -> dict:
+        """Bounded annotation queue: newest undecided visits, capped and optionally distance-sorted.
+
+        The scan-bounded companion to ``annotation_visits`` (which materialises EVERY
+        undecided visit's EVERY frame — changelog 57's known scaling limit). This reads
+        only the newest ``scan_frames`` present-AND-undecided frames in the window, via
+        the same DESC-recv_ts + LIMIT technique ``events()`` uses (``_EVENT_SCAN_FRAMES``:
+        the queue's freshest visits live in the recv_ts tail), then clusters them — so
+        neither the SQL result nor the Python work grows with the store (entries
+        102–104). Returns::
+
+            {visits: [...], truncated: bool, ordered_by: 'distance'|'recent', has_model: bool}
+
+        Each visit carries the same shape ``annotation_visits`` returns
+        (``frames``/``rep_frame_id``/``peak_area``/``peak_score``/``span``) plus
+        ``start_id``/``end_id`` (the frame-id span for playback + the identifications
+        join) and ``distance``/``uncertain`` (both ``None`` when no model is active).
+
+        Ordering:
+
+        - **No active model** → newest-first (``span`` start ``recv_ts`` desc,
+          ``start_id`` desc); ``ordered_by='recent'``.
+        - **Active model** → the active-learning order (``ordered_by='distance'``):
+          identified visits WORST-first by nearest distance (largest = least confident =
+          most in need of a label), never-identified visits after them (newest-first).
+          NOTE: the sort is over the recency-bounded scan (the newest ``scan_frames``),
+          so "worst-first" means worst among RECENT undecided visits — a larger-distance
+          visit older than that tail won't surface even below ``limit``. Acceptable
+          because a visit whose frames have aged out of the store can't be labelled
+          anyway; narrow the window to reach older visits that are still present.
+          ``distance`` is the visit's MINIMUM identification distance over its span (the
+          nearest gallery match any of its frames reached — the same ``distance``
+          ``events()``/``_aggregate_identity`` report), or ``None`` if no frame in the
+          span was identified against the active model. ``uncertain`` is True when the
+          visit is NOT a confident resident match — never identified, an uncalibrated
+          (``None``-threshold) model, or a nearest distance ABOVE the model's cutoff (the
+          codebase convention: ``distance <= threshold`` = confident; see
+          ``_aggregate_identity``) — i.e. exactly the "cases the model finds hard" set the
+          active-learning loop feeds back to the queue (ARCHITECTURE).
+
+        ``since_id``/``until_id`` are the same inclusive id-range scope every windowed
+        read shares; ``limit`` is clamped to ``[1, _ANNOTATE_PAGE_MAX]``. ``truncated`` is
+        True when the frame scan hit its cap (older undecided visits exist beyond the
+        window — the oldest, possibly head-truncated, visit is dropped) OR the ``limit``
+        cap dropped visits — a narrower window / more pages reach the rest. The active
+        model is read OUTSIDE the store lock (``active_model`` re-acquires it, per the
+        single-lock discipline).
+        """
+        limit = max(1, min(int(limit), _ANNOTATE_PAGE_MAX))
+        scan_frames = max(1, int(scan_frames))
+        # Active model read OUTSIDE the lock (active_model() re-acquires it).
+        model = self.active_model()
+
+        frags, params = _range_bounds("f.id", since_id, until_id)
+        and_sql = "".join(" AND " + frag for frag in frags)
+        # Newest present-AND-undecided frames only: DESC + LIMIT bounds the scan like
+        # events(); the NOT EXISTS is the same clear()-safe "undecided" predicate the
+        # queue derives from (the ABSENCE of a dataset_items row keyed on BOTH
+        # src_frame_id AND src_recv_ts). Fetch one extra to detect older frames beyond
+        # the cap. Floored at _ANNOTATE_MIN_CONF so recall-first phantoms stay out (as
+        # _present_frames does), keeping this queue and the unpaginated one the same universe.
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.id, f.recv_ts, o.detail"
+                " FROM frames f"
+                " JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+                " WHERE o.verdict = 1 AND o.score >= ?"
+                "   AND NOT EXISTS (SELECT 1 FROM dataset_items d"
+                "       WHERE d.src_frame_id = f.id AND d.src_recv_ts = f.recv_ts)"
+                + and_sql +
+                " ORDER BY f.recv_ts DESC, f.id DESC LIMIT ?",
+                [oracle, _ANNOTATE_MIN_CONF] + params + [scan_frames + 1],
+            ).fetchall()
+        scan_capped = len(rows) > scan_frames
+        rows = rows[:scan_frames]
+        rows.reverse()  # back to recv_ts ASC for gap-clustering
+
+        # Box-parse (drop no-box frames) outside the lock.
+        frames: "list[dict]" = []
+        for row_id, recv_ts, detail in rows:
+            box = self._best_box(detail)
+            if box is None:
+                continue
+            bbox, score = box
+            frames.append({"id": int(row_id), "recv_ts": recv_ts, "bbox": bbox, "score": score})
+
+        visits: "list[dict]" = []
+        for cluster in self._gap_split(frames, _VISIT_GAP_MS, lambda fr: fr["recv_ts"]):
+            ids = [fr["id"] for fr in cluster]
+            out_frames = [
+                {"id": fr["id"], "recv_ts": fr["recv_ts"], "bbox": fr["bbox"],
+                 "score": fr["score"], "url": f"/media/{fr['id']}"}
+                for fr in cluster
+            ]
+            rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            visits.append({
+                "frames": out_frames,
+                "rep_frame_id": rep["id"],
+                "peak_area": self._bbox_area(rep["bbox"]),
+                "peak_score": max(fr["score"] for fr in cluster),
+                "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
+                "start_id": min(ids),
+                "end_id": max(ids),
+                "distance": None,
+                "uncertain": None,
+            })
+
+        truncated = False
+        # When the scan hit its cap the OLDEST cluster (index 0, in recv_ts-ASC order)
+        # may be missing its head (earlier frames fell just past the tail) → drop it.
+        if scan_capped:
+            truncated = True
+            visits = visits[1:]
+
+        ordered_by = "distance" if model is not None else "recent"
+        if model is not None and visits:
+            self._attach_queue_distances(visits, model)
+            threshold = model["threshold"]
+            for v in visits:
+                d = v["distance"]
+                v["uncertain"] = d is None or threshold is None or d > threshold
+            # Identified worst-first (largest nearest distance), never-identified after;
+            # both newest-first as the tie-break. Ascending sort: identified group (0)
+            # before never-identified (1); within identified, -distance ascending =
+            # distance descending; -recv_ts / -id put the newest first on ties.
+            visits.sort(
+                key=lambda v: (
+                    0 if v["distance"] is not None else 1,
+                    -v["distance"] if v["distance"] is not None else 0.0,
+                    -v["span"][0],
+                    -v["start_id"],
+                )
+            )
+        else:
+            visits.sort(key=lambda v: (v["span"][0], v["start_id"]), reverse=True)
+
+        if len(visits) > limit:
+            truncated = True
+            visits = visits[:limit]
+
+        return {
+            "visits": visits,
+            "truncated": truncated,
+            "ordered_by": ordered_by,
+            "has_model": model is not None,
+        }
+
+    def _attach_queue_distances(self, visits: "list[dict]", model: dict) -> None:
+        """Set each visit's ``distance`` to the nearest active-gallery match over its span, or ``None``.
+
+        The identifications join for ``annotation_queue_page``'s active-model ordering,
+        mirroring ``events()``: ONE indexed read of the active model's real matches
+        (``cat_id``/``distance`` both non-NULL — skipping the un-embeddable MARKER rows)
+        across the page's overall id span, then a per-visit ``bisect`` slice over the
+        frame-id-ordered rows (visits are disjoint id ranges). A visit's ``distance`` is
+        the MINIMUM distance in its ``[start_id, end_id]`` slice (its nearest match), or
+        ``None`` when no frame in the span was identified. Mutates ``visits`` in place.
+        """
+        if not visits:
+            return
+        lo = min(v["start_id"] for v in visits)
+        hi = max(v["end_id"] for v in visits)
+        with self._lock:
+            ident_rows = self._conn.execute(
+                "SELECT frame_id, distance FROM identifications"
+                " WHERE model_version_id = ? AND frame_id BETWEEN ? AND ?"
+                "   AND cat_id IS NOT NULL AND distance IS NOT NULL"
+                " ORDER BY frame_id ASC",
+                (int(model["id"]), int(lo), int(hi)),
+            ).fetchall()
+        ident_fids = [r[0] for r in ident_rows]
+        for v in visits:
+            lo_i = bisect.bisect_left(ident_fids, v["start_id"])
+            hi_i = bisect.bisect_right(ident_fids, v["end_id"])
+            v["distance"] = min((float(r[1]) for r in ident_rows[lo_i:hi_i]), default=None)
+
     def labeled_visits(
         self, oracle: str, since_id: "int | None" = None, until_id: "int | None" = None
     ) -> "list[dict]":
@@ -3307,11 +4041,11 @@ class Store:
         per visit frame, each with keys::
 
             frame_id     (int, required)  the source frames.id
-            label_kind   (str, required)  'identified' | 'unknown_cat' | 'not_cat'
+            label_kind   (str, required)  'identified' | 'unknown_cat' | 'not_cat' | 'ignored'
             cat_id       (int|None)       set iff label_kind == 'identified'
-            quality      (str|None)       'gallery'|'ok'|'poor' (None for not_cat)
-            bbox         (list|str|None)  [x1,y1,x2,y2] or "x1,y1,x2,y2" (None for not_cat)
-            crop_path    (str|None)       dataset-root-relative jpg (None for not_cat)
+            quality      (str|None)       'gallery'|'ok'|'poor' (None for not_cat/ignored)
+            bbox         (list|str|None)  [x1,y1,x2,y2] or "x1,y1,x2,y2" (None for not_cat/ignored)
+            crop_path    (str|None)       dataset-root-relative jpg (None for not_cat/ignored)
             source       (str, optional)  defaults to 'detector'
 
         ``src_recv_ts`` is resolved from ``frames`` by ``frame_id`` AT INSERT, so it
@@ -3575,6 +4309,69 @@ class Store:
                 params,
             ).fetchone()
         return (int(n_crops), int(n_cats))
+
+    def cat_regime_coverage(
+        self, is_night: "Callable[[int], bool] | None" = None
+    ) -> "list[dict]":
+        """Per-cat ``identified``-crop counts, optionally split day vs night (admin-next P4).
+
+        Answers "which cat needs more data in which lighting regime" so the IR-night
+        gallery gets populated (a resident with ``night 0`` is unrecognizable after
+        dark). Returns ONE record per ROSTER cat — INCLUDING cats with zero crops, so a
+        never-captured-at-night resident surfaces rather than silently missing::
+
+            {cat_id, cat_name, is_resident, active, total, day, night}
+
+        ``total`` is the cat's ``identified`` crops that have a materialised crop file
+        (``crop_path`` not NULL) — the SAME universe ``labeled_crops`` /
+        ``count_identified_crops`` count, so the gallery-eligible crops are what's
+        reported. Each crop is classified by its ``src_recv_ts`` (the frame's recv_ts
+        snapshotted at label time — clear()-safe, and it survives frame eviction, unlike
+        the frame itself). ``is_night(recv_ts_ms) -> bool`` is the injected classifier
+        (the astral-backed ``compute.analysis.suntimes.night_classifier``); the store
+        stays astral-free by taking it as a callable, the same dependency-injection seam
+        the tuning day/night split uses. When ``is_night`` is ``None`` (no location
+        configured, or astral unavailable) the split cannot be computed: ``day`` and
+        ``night`` are ``None`` and only ``total`` is populated, so the caller reports the
+        totals with the split marked unavailable rather than guessing a boundary.
+        Ordered by cat id (creation order, matching ``list_cats`` — the digit-key binding
+        stays stable). Single connection, single lock; classification in plain Python.
+        """
+        with self._lock:
+            cats = self._conn.execute(
+                "SELECT id, name, is_resident, active FROM cats ORDER BY id"
+            ).fetchall()
+            rows = self._conn.execute(
+                "SELECT cat_id, src_recv_ts FROM dataset_items"
+                " WHERE label_kind = 'identified' AND cat_id IS NOT NULL"
+                "   AND crop_path IS NOT NULL"
+            ).fetchall()
+        # Tally per cat outside the lock (pure Python; classifier may be astral-backed).
+        totals: "dict[int, list]" = {int(c[0]): [0, 0, 0] for c in cats}  # [total, day, night]
+        for cat_id, src_recv_ts in rows:
+            entry = totals.get(int(cat_id))
+            if entry is None:
+                continue  # a crop for a deleted roster cat (defensive; cats are never deleted)
+            entry[0] += 1
+            if is_night is not None and is_night(int(src_recv_ts)):
+                entry[2] += 1
+            else:
+                entry[1] += 1
+        out: "list[dict]" = []
+        for cid, name, is_resident, active in cats:
+            total, day, night = totals[int(cid)]
+            out.append(
+                {
+                    "cat_id": int(cid),
+                    "cat_name": name,
+                    "is_resident": bool(is_resident),
+                    "active": bool(active),
+                    "total": total,
+                    "day": day if is_night is not None else None,
+                    "night": night if is_night is not None else None,
+                }
+            )
+        return out
 
     # --- Feasibility (validation) run history ------------------------------
     #

@@ -17,3 +17,8 @@ uvicorn[standard]
 # where a blocking client would freeze the proxy. Dev-only; usually already present as
 # a transitive dep, but declared so a fresh .venv-compute has it.
 httpx
+# Offline sunrise/sunset for the day/night tuning-scorecard split (compute/analysis/suntimes.py):
+# computes sun times for arbitrary past dates with no network call. Pure-Python and already
+# a trusted edge dependency (edge/requirements.txt, the night-light scheduler); imported
+# lazily so the collector runs without it (the split just reports "unavailable" then).
+astral

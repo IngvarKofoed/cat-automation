@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<!--
+  admin-next — streamlined compute admin (WIP, admin-next rebuild).
+
+  Self-contained single file (own CSS + JS, no sharing with /admin or / — the
+  entry-80 convention). Dark, deliberately minimal styling; the reskin comes
+  later. Pages are hash-routed; each page is a mount(view) -> teardown function
+  so a live page can poll and clean up its timers on navigation. Built per phase
+  (see docs/NEW_ADMIN_PLAN.md). Served at /admin-next so the old /admin stays
+  untouched until the final flip.
+
+  Built so far: Start (P1 — mode, collection, location, cleanup). The rest are
+  stubs filled in by their phase.
+-->
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>Admin-next · Cat Automation</title>
+
+<style>
+  :root {
+    --bg: #14161a;
+    --surface: #1b1e24;
+    --surface-2: #22262e;
+    --border: #2c313b;
+    --text: #e6e8ec;
+    --muted: #9aa2ad;
+    --accent: #5aa9e6;
+    --ok: #57b894;
+    --bad: #d9647a;
+    --warn: #d8a657;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* App bar */
+  .appbar { display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+    background: var(--surface); border-bottom: 1px solid var(--border); }
+  .wordmark { font-weight: 650; letter-spacing: .2px; }
+  .wordmark .wip { margin-left: 8px; font-size: 11px; font-weight: 600; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; vertical-align: middle; }
+  .appbar .spacer { flex: 1; }
+  .status { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); }
+  .status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .status.ok .dot { background: var(--ok); }
+  .status.bad .dot { background: var(--bad); }
+  .oldlink { font-size: 13px; color: var(--muted); }
+
+  /* Nav */
+  nav.tabs { display: flex; gap: 2px; flex-wrap: wrap; padding: 0 12px;
+    background: var(--surface); border-bottom: 1px solid var(--border); }
+  nav.tabs a { color: var(--muted); padding: 10px 14px; border-bottom: 2px solid transparent; font-size: 14px; }
+  nav.tabs a:hover { color: var(--text); text-decoration: none; }
+  nav.tabs a.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  /* Content */
+  main { max-width: 900px; margin: 0 auto; padding: 24px 20px 64px; }
+  .page-title { margin: 0 0 4px; font-size: 22px; }
+  .page-sub { margin: 0 0 20px; color: var(--muted); }
+
+  .card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 18px; margin-bottom: 16px; }
+  .card > h3 { margin: 0 0 12px; font-size: 12px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .5px; }
+  .card .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .row + .row { margin-top: 10px; }
+  .grow { flex: 1; min-width: 0; }
+
+  /* Controls */
+  button { font: inherit; cursor: pointer; border-radius: var(--radius); padding: 7px 14px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0c1117; font-weight: 600; }
+  button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+  button.on { background: var(--ok); border-color: var(--ok); color: #0c1117; font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; color: var(--muted); }
+  .seg button.sel { background: var(--accent); color: #0c1117; font-weight: 600; }
+  input[type=number], input[type=text] { font: inherit; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 9px; width: 130px; }
+  label.fld { display: inline-flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+
+  /* Stat grid */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+  .stat { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+  .stat .v { font-size: 18px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+  .pill { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+  .pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+  .mono { font-variant-numeric: tabular-nums; }
+  .note { color: var(--muted); font-size: 13px; }
+  .note.warn { color: var(--warn); }
+  .note.bad { color: var(--bad); }
+  .phase-list { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+  .phase-list li { margin: 3px 0; }
+  .stub-tag { display: inline-block; margin-bottom: 12px; font-size: 12px; font-weight: 600;
+    color: var(--accent); background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 10px; }
+  .cleanup-job { margin-top: 8px; }
+</style>
+
+<header class="appbar">
+  <span class="wordmark">Admin-next<span class="wip">WIP</span></span>
+  <span class="spacer"></span>
+  <span id="apiStatus" class="status"><span class="dot"></span><span class="label">checking…</span></span>
+  <a class="oldlink" href="/admin">old admin ↗</a>
+</header>
+
+<nav class="tabs" id="tabs"></nav>
+
+<main id="view"></main>
+
+<script>
+  // ---- tiny helpers ------------------------------------------------------
+  async function api(method, path, body) {
+    const opt = { method, headers: {} };
+    if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    const res = await fetch(path, opt);
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json()).detail || ''; } catch (_) {}
+      throw new Error(`${res.status}${detail ? ' ' + detail : ''}`);
+    }
+    const ct = res.headers.get('content-type') || '';
+    return ct.includes('json') ? res.json() : res.text();
+  }
+  const $ = (sel, root = document) => root.querySelector(sel);
+  function fmtBytes(n) {
+    if (n == null) return '—';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v < 10 && i > 0 ? 1 : 0) + ' ' + u[i];
+  }
+  function fmtInt(n) { return n == null ? '—' : n.toLocaleString('en-US'); }
+  function fmtTs(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms), p = (x) => String(x).padStart(2, '0');
+    return `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  // ---- Route table -------------------------------------------------------
+  const ROUTES = [
+    { id: 'start', title: 'Start', sub: 'Phase, persistence mode, and housekeeping', mount: mountStart },
+    { id: 'tuning', title: 'Motion tuning', sub: 'Trust the motion gate', mount: mountTuning },
+    { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', does: [
+      'Frame browser by time interval, with filters',
+      'Overlays: motion box, YOLO box + conf + class, corruption, identity',
+      'Doubles as the model-evaluation surface',
+    ]},
+    { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', does: [
+      'Keyboard-first queue; ignore (reversible)',
+      'Undo / relabel; crop quality grading',
+      'Per-cat day/night coverage readout',
+    ]},
+    { id: 'model', title: 'Model building', sub: 'Build → validate → promote', does: [
+      'Gallery build from graded crops',
+      'Validate (DINOv2 feasibility probe) before promote',
+      'Warn if a resident has no night crops; threshold + version rollback',
+    ]},
+    { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', does: [
+      'Recent visit cards with identity chips + playback',
+      'Manual backfill: Identify pass, Analyze, per-event re-analyze',
+    ]},
+  ];
+  const DEFAULT_ROUTE = 'start';
+  const routeById = Object.fromEntries(ROUTES.map(r => [r.id, r]));
+
+  // ---- Nav ---------------------------------------------------------------
+  const tabs = $('#tabs');
+  for (const r of ROUTES) {
+    const a = document.createElement('a');
+    a.href = '#' + r.id; a.dataset.route = r.id; a.textContent = r.title;
+    tabs.appendChild(a);
+  }
+
+  // ---- Router (mount / teardown) -----------------------------------------
+  const view = $('#view');
+  let teardown = null;
+  function currentRoute() {
+    const id = location.hash.slice(1);
+    return routeById[id] ? id : DEFAULT_ROUTE;
+  }
+  function render() {
+    if (teardown) { try { teardown(); } catch (_) {} teardown = null; }
+    const id = currentRoute(), r = routeById[id];
+    for (const a of tabs.querySelectorAll('a')) a.classList.toggle('active', a.dataset.route === id);
+    view.innerHTML = '';
+    const h1 = document.createElement('h1'); h1.className = 'page-title'; h1.textContent = r.title;
+    const sub = document.createElement('p'); sub.className = 'page-sub'; sub.textContent = r.sub;
+    view.append(h1, sub);
+    document.title = r.title + ' · Admin-next';
+    const body = document.createElement('div'); view.appendChild(body);
+    if (r.mount) teardown = r.mount(body) || null;
+    else renderStub(body, r);
+  }
+  function renderStub(body, r) {
+    const card = document.createElement('div'); card.className = 'card';
+    card.innerHTML = '<span class="stub-tag">Not built yet</span><h3>This page will have</h3>';
+    const ul = document.createElement('ul'); ul.className = 'phase-list';
+    for (const d of r.does) { const li = document.createElement('li'); li.textContent = d; ul.appendChild(li); }
+    card.appendChild(ul); body.appendChild(card);
+  }
+  window.addEventListener('hashchange', render);
+  if (!routeById[location.hash.slice(1)]) location.replace('#' + DEFAULT_ROUTE);
+  render();
+
+  // ---- API reachability check --------------------------------------------
+  const statusEl = $('#apiStatus');
+  function setApiStatus(state, label) { statusEl.className = 'status ' + state; $('.label', statusEl).textContent = label; }
+  fetch('/api/stats').then(r => setApiStatus(r.ok ? 'ok' : 'bad', r.ok ? 'API connected' : 'API error ' + r.status))
+    .catch(() => setApiStatus('bad', 'API unreachable'));
+
+  // =======================================================================
+  //  Start page (admin-next P1)
+  // =======================================================================
+  function mountStart(view) {
+    view.innerHTML = `
+      <div class="card">
+        <h3>Workflow phases</h3>
+        <ol class="phase-list">
+          <li><b>Motion tuning</b> — keep <i>all</i> frames (a gate miss is only visible in a stored non-motion frame).</li>
+          <li><b>Annotation</b> — motion-only capture is safe once the gate is trusted.</li>
+          <li><b>Build &amp; promote</b> a model.</li>
+          <li><b>Active learning</b> — keep annotating; relabel mistakes.</li>
+        </ol>
+        <p class="hint">Phase 1 is what licenses the disk savings in phase 2+, so persistence mode follows the phase (below).</p>
+      </div>
+
+      <div class="card">
+        <h3>Capture mode</h3>
+        <div class="row">
+          <div class="seg" id="modeSeg">
+            <button data-mo="0" title="Persist every frame — needed to measure gate misses">Tuning · keep all frames</button>
+            <button data-mo="1" title="Drop non-motion frames to save disk">Collecting · motion only</button>
+          </div>
+          <span id="modeNote" class="note"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Collection</h3>
+        <div class="row">
+          <button id="collectorBtn"></button>
+          <button id="liveIdBtn"></button>
+          <span class="grow"></span>
+          <button id="clearBtn" class="danger">Clear all frames…</button>
+        </div>
+        <p id="collectorNote" class="hint"></p>
+      </div>
+
+      <div class="card">
+        <h3>Active model</h3>
+        <div id="activeModel" class="note">…</div>
+      </div>
+
+      <div class="card">
+        <h3>Store</h3>
+        <div class="stats" id="storeStats"></div>
+      </div>
+
+      <div class="card">
+        <h3>Location <span class="note">(for the day/night split)</span></h3>
+        <div class="row">
+          <label class="fld">Latitude<input id="locLat" type="number" step="any" min="-90" max="90" /></label>
+          <label class="fld">Longitude<input id="locLon" type="number" step="any" min="-180" max="180" /></label>
+          <button id="locSave" class="primary" style="align-self:flex-end">Save</button>
+          <span id="locNote" class="note"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Cleanup</h3>
+        <div class="row">
+          <div class="grow">
+            <b>Drop non-motion frames</b>
+            <div class="note">The big reclaim (~95% of frames). Records a purge span so tuning knows the window is unmeasurable.</div>
+            <div id="nmJob" class="cleanup-job"></div>
+          </div>
+          <button data-kind="nonmotion" data-act="est">Estimate</button>
+          <button data-kind="nonmotion" data-act="run" class="danger">Drop…</button>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <div class="grow">
+            <b>Sweep orphaned files</b>
+            <div class="note">JPEGs on disk with no row (a crash leak). Frames media dir only — never crops.</div>
+            <div id="orJob" class="cleanup-job"></div>
+          </div>
+          <button data-kind="orphan" data-act="est">Estimate</button>
+          <button data-kind="orphan" data-act="run" class="danger">Sweep…</button>
+        </div>
+        <p class="hint">Event-scoped purges (ignored / labelled source frames) are deferred — see the plan.</p>
+      </div>
+    `;
+
+    let alive = true;
+
+    // --- Capture mode ---
+    const modeSeg = $('#modeSeg', view);
+    modeSeg.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button'); if (!btn) return;
+      const mo = btn.dataset.mo === '1';
+      try { await api('POST', '/api/collector/motion-only', { motion_only: mo }); await refresh(); }
+      catch (err) { $('#modeNote', view).textContent = 'Failed: ' + err.message; }
+    });
+
+    // --- Collection controls ---
+    $('#collectorBtn', view).addEventListener('click', async () => {
+      const running = $('#collectorBtn', view).dataset.running === '1';
+      try { await api('POST', running ? '/api/collector/stop' : '/api/collector/start'); await refresh(); } catch (_) {}
+    });
+    $('#liveIdBtn', view).addEventListener('click', async () => {
+      const running = $('#liveIdBtn', view).dataset.running === '1';
+      try { await api('POST', running ? '/api/live-identify/stop' : '/api/live-identify/start'); await refresh(); } catch (_) {}
+    });
+    $('#clearBtn', view).addEventListener('click', async () => {
+      if (!confirm('Delete ALL stored frames? Labels, models, and avatars are kept — only the rolling frame buffer is cleared.')) return;
+      try { await api('POST', '/api/clear'); await refresh(); } catch (err) { alert('Clear failed: ' + err.message); }
+    });
+
+    // --- Location ---
+    $('#locSave', view).addEventListener('click', async () => {
+      const lat = parseFloat($('#locLat', view).value), lon = parseFloat($('#locLon', view).value);
+      const note = $('#locNote', view);
+      if (!isFinite(lat) || !isFinite(lon)) { note.className = 'note bad'; note.textContent = 'Enter a numeric lat & lon.'; return; }
+      try {
+        const r = await api('POST', '/api/location', { latitude: lat, longitude: lon });
+        note.className = 'note ok'; note.textContent = `Saved (${r.source}).`;
+      } catch (err) { note.className = 'note bad'; note.textContent = 'Failed: ' + err.message; }
+    });
+    api('GET', '/api/location').then(loc => {
+      if (!alive) return;
+      const note = $('#locNote', view);
+      if (loc.latitude == null) { note.className = 'note warn'; note.textContent = 'Not set — the day/night split is unavailable until you set a location.'; }
+      else { $('#locLat', view).value = loc.latitude; $('#locLon', view).value = loc.longitude; note.textContent = `Source: ${loc.source}.`; }
+    }).catch(() => {});
+
+    // --- Cleanup buttons ---
+    view.querySelectorAll('button[data-kind]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const kind = btn.dataset.kind, jobEl = $(kind === 'nonmotion' ? '#nmJob' : '#orJob', view);
+        if (btn.dataset.act === 'est') {
+          jobEl.innerHTML = '<span class="note">Estimating…</span>';
+          try {
+            const e = await api('GET', `/api/cleanup/estimate?kind=${kind}`);
+            jobEl.innerHTML = `<span class="note">Would reclaim <b class="mono">${fmtInt(e.count)}</b> files · <b class="mono">${fmtBytes(e.bytes)}</b>${kind === 'nonmotion' ? ' (bytes estimated)' : ''}.</span>`;
+          } catch (err) { jobEl.innerHTML = `<span class="note bad">Estimate failed: ${err.message}</span>`; }
+        } else {
+          const label = kind === 'nonmotion' ? 'Drop all non-motion frames?' : 'Sweep orphaned files?';
+          if (!confirm(label + ' This runs as a background job and cannot be undone.')) return;
+          try { await api('POST', '/api/cleanup/run', { kind }); await refresh(); }
+          catch (err) { jobEl.innerHTML = `<span class="note bad">${err.message}</span>`; }
+        }
+      });
+    });
+
+    // --- Poll + render ---
+    function renderStats(s) {
+      const g = $('#storeStats', view);
+      g.innerHTML = [
+        ['Frames', fmtInt(s.count)], ['Motion', fmtInt(s.motion_count)],
+        ['On disk', fmtBytes(s.bytes)], ['Cap', fmtBytes(s.cap_bytes)],
+        ['Oldest', fmtTs(s.oldest_ts)], ['Newest', fmtTs(s.newest_ts)],
+      ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+
+      // Capture mode
+      for (const b of modeSeg.querySelectorAll('button')) b.classList.toggle('sel', (b.dataset.mo === '1') === !!s.motion_only);
+      $('#modeNote', view).textContent = s.motion_only ? 'Motion-only: gate misses are unmeasurable while this is on.' : 'Keeping every frame.';
+
+      // Collector
+      const cb = $('#collectorBtn', view);
+      cb.dataset.running = s.collector_running ? '1' : '0';
+      cb.textContent = s.collector_running ? 'Stop collecting' : (s.resume_available ? 'Resume collecting' : 'Start collecting');
+      cb.className = s.collector_running ? 'on' : '';
+      $('#collectorNote', view).textContent = (!s.collector_running && s.resume_available)
+        ? 'Was collecting when the process last stopped — Resume picks it back up.' : '';
+
+      // Live identify
+      const lb = $('#liveIdBtn', view);
+      const liveRunning = s.live_identify && s.live_identify.running;
+      lb.dataset.running = liveRunning ? '1' : '0';
+      lb.textContent = liveRunning ? 'Stop live naming' : 'Start live naming';
+      lb.className = liveRunning ? 'on' : '';
+    }
+    function renderCleanup(c) {
+      view.querySelectorAll('button[data-act="run"]').forEach(b => b.disabled = c.running);
+      const target = c.kind === 'orphan' ? '#orJob' : '#nmJob';
+      if (c.running) {
+        const pct = c.total ? Math.floor((c.done / c.total) * 100) + '%' : 'scanning…';
+        $(target, view).innerHTML =
+          `<span class="pill warn">running</span> <span class="mono">${fmtInt(c.done)}${c.total ? ' / ' + fmtInt(c.total) : ''}</span> ${pct}
+           <button id="cleanupCancel">Cancel</button>`;
+        const cancel = $('#cleanupCancel', view);
+        if (cancel) cancel.addEventListener('click', () => api('POST', '/api/cleanup/cancel').catch(() => {}));
+      } else if (c.result) {
+        const r = c.result;
+        const msg = r.kind === 'orphan'
+          ? `swept ${fmtInt(r.deleted)} files (${fmtBytes(r.bytes)})${r.canceled ? ', canceled' : ''}`
+          : `dropped ${fmtInt(r.deleted)} frames${r.canceled ? ', canceled' : ''}`;
+        $(r.kind === 'orphan' ? '#orJob' : '#nmJob', view).innerHTML = `<span class="pill ok">done</span> <span class="note">${msg}</span>`;
+      }
+      if (c.error) $(target, view).innerHTML = `<span class="note bad">${c.error}</span>`;
+    }
+    async function renderModel() {
+      try {
+        const m = await api('GET', '/api/training/models');
+        if (!alive) return;
+        const el = $('#activeModel', view);
+        if (!m.active) { el.innerHTML = '<span class="pill warn">none promoted</span> No model is live — visits are unnamed.'; }
+        else {
+          const t = m.active.threshold;
+          el.innerHTML = `<span class="pill ok">active</span> version <b class="mono">${m.active.id}</b> · threshold <b class="mono">${t == null ? 'uncalibrated' : t.toFixed(3)}</b>`;
+        }
+      } catch (_) {}
+    }
+
+    async function refresh() {
+      if (!alive) return;
+      try { const s = await api('GET', '/api/stats'); if (alive) renderStats(s); } catch (_) {}
+      try { const c = await api('GET', '/api/cleanup/status'); if (alive) renderCleanup(c); } catch (_) {}
+    }
+    refresh(); renderModel();
+    const timer = setInterval(refresh, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }
+
+  // =======================================================================
+  //  Motion tuning page (admin-next P2)
+  // =======================================================================
+  function mountTuning(view) {
+    // Declared inside the function (not module scope) so a direct load / refresh of
+    // #tuning — where render() runs before a later module-level const initializes —
+    // can't hit a temporal-dead-zone ReferenceError.
+    const MOG2_PARAMS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
+    const MOG2_STEP = { persistence: '1', motion_downscale: '1' };
+    view.innerHTML = `
+      <div class="card">
+        <h3>Day</h3>
+        <div class="row">
+          <label class="fld">Scope<select id="daySel"></select></label>
+          <span id="dayScope" class="note"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>YOLO oracle coverage</h3>
+        <div class="row">
+          <span id="covNote" class="note grow">…</span>
+          <button id="sweepBtn" class="primary">Sweep YOLO</button>
+        </div>
+        <div id="jobLine" class="note" style="margin-top:8px">idle</div>
+      </div>
+
+      <div class="card">
+        <h3>MOG2 candidate params</h3>
+        <div id="paramFields" class="row"></div>
+        <div class="row" style="margin-top:12px">
+          <button id="resetParams">Reset to edge baseline</button>
+          <span class="grow"></span>
+          <button id="runBaseline">Run baseline</button>
+          <button id="runCandidate" class="primary">Run candidate</button>
+        </div>
+        <p id="paramNote" class="hint"></p>
+      </div>
+
+      <div class="card">
+        <h3>Scorecards <span class="note">(visit recall)</span></h3>
+        <div class="row"><button id="compareBtn" class="primary">Compare</button><span id="splitNote" class="note"></span></div>
+        <div id="scorecards" class="stats" style="margin-top:12px"></div>
+        <div id="copyParams" class="note mono" style="margin-top:12px"></div>
+      </div>
+    `;
+
+    let alive = true;
+    let scope = { since_id: null, until_id: null };
+    let edgeParams = null;
+
+    $('#paramFields', view).innerHTML = MOG2_PARAMS.map(k =>
+      `<label class="fld">${k}<input data-k="${k}" type="number" step="${MOG2_STEP[k] || 'any'}" style="width:110px"></label>`).join('');
+    const setParams = (v) => MOG2_PARAMS.forEach(k => { const i = view.querySelector(`input[data-k="${k}"]`); if (i) i.value = v[k]; });
+    const getParams = () => Object.fromEntries(MOG2_PARAMS.map(k => [k, parseFloat(view.querySelector(`input[data-k="${k}"]`).value)]));
+
+    function buildDays(oldestMs, newestMs) {
+      const sel = $('#daySel', view); sel.innerHTML = '';
+      if (!oldestMs || !newestMs) { sel.innerHTML = '<option>—</option>'; return; }
+      const p = (x) => String(x).padStart(2, '0');
+      const d = new Date(newestMs); d.setHours(0, 0, 0, 0);
+      const oldest = new Date(oldestMs); oldest.setHours(0, 0, 0, 0);
+      let first = null;
+      while (d >= oldest) {
+        const start = d.getTime();
+        const end = new Date(d); end.setDate(end.getDate() + 1);
+        const opt = document.createElement('option');
+        opt.value = start + ':' + (end.getTime() - 1);
+        opt.textContent = `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()}`;
+        sel.appendChild(opt);
+        if (first === null) first = opt.value;
+        d.setDate(d.getDate() - 1);
+      }
+      if (first) selectScope(first);
+    }
+    async function selectScope(val) {
+      const [s, e] = val.split(':').map(Number);
+      try {
+        const r = await api('GET', `/api/frames/resolve?start_ts=${s}&end_ts=${e}`);
+        if (!alive) return;
+        scope = { since_id: r.since_id, until_id: r.until_id };
+        $('#dayScope', view).textContent = r.since_id == null
+          ? 'no frames this day' : `frames ${fmtInt(r.since_id)}–${fmtInt(r.until_id)}`;
+        loadCoverage();
+      } catch (_) { $('#dayScope', view).textContent = 'resolve failed'; }
+    }
+    $('#daySel', view).addEventListener('change', (e) => selectScope(e.target.value));
+
+    async function loadCoverage() {
+      const el = $('#covNote', view);
+      if (scope.since_id == null) { el.textContent = 'no frames in this day to sweep'; return; }
+      try {
+        const c = await api('GET', `/api/analysis/coverage?since_id=${scope.since_id}&until_id=${scope.until_id}`);
+        if (!alive) return;
+        const y = c.oracles['yolo-serial'] || { analyzed: 0, present: 0 };
+        el.textContent = `YOLO ${fmtInt(y.analyzed)} / ${fmtInt(c.total)} analyzed · ${fmtInt(y.present)} present`;
+      } catch (_) { el.textContent = 'coverage unavailable'; }
+    }
+
+    $('#sweepBtn', view).addEventListener('click', async () => {
+      if (scope.since_id == null) return;
+      try { await api('POST', '/api/analysis/run', { analyzer: 'yolo-serial', since_id: scope.since_id, until_id: scope.until_id }); pollJob(); }
+      catch (e) { $('#jobLine', view).textContent = 'enqueue failed: ' + e.message; }
+    });
+
+    $('#resetParams', view).addEventListener('click', () => { if (edgeParams) setParams(edgeParams); });
+    $('#runBaseline', view).addEventListener('click', () => runSlot('mog2:baseline', edgeParams || getParams()));
+    $('#runCandidate', view).addEventListener('click', () => runSlot('mog2:candidate', getParams()));
+    async function runSlot(slot, params) {
+      if (scope.since_id == null) { $('#paramNote', view).textContent = 'pick a day with frames first'; return; }
+      try { await api('POST', '/api/tuning/rerun', { slot, params, since_id: scope.since_id, until_id: scope.until_id }); $('#paramNote', view).textContent = slot + ' enqueued'; pollJob(); }
+      catch (e) { $('#paramNote', view).textContent = `${slot} failed: ${e.message}`; }
+    }
+
+    const rpct = (c, t) => (t ? Math.round((c / t) * 100) + '%' : '—');
+    function scorecardHtml(title, sc) {
+      if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div></div>`;
+      const split = sc.split
+        ? `<div class="note">day ${rpct(sc.split.day.caught, sc.split.day.total)} · night ${rpct(sc.split.night.caught, sc.split.night.total)}</div>` : '';
+      return `<div class="stat">
+        <div class="k">${title}</div>
+        <div class="v">${rpct(sc.visits.caught, sc.visits.total)}</div>
+        <div class="note">recall ${fmtInt(sc.visits.caught)}/${fmtInt(sc.visits.total)} visits</div>
+        <div class="note">missed ${fmtInt(sc.recall.missed)} · false ${fmtInt(sc.false_triggers.count)}</div>
+        ${split}
+      </div>`;
+    }
+    $('#compareBtn', view).addEventListener('click', compare);
+    async function compare() {
+      const el = $('#scorecards', view);
+      if (scope.since_id == null) { el.innerHTML = '<span class="note warn">Pick a day with frames first.</span>'; return; }
+      el.innerHTML = '<span class="note">Comparing…</span>';
+      const q = new URLSearchParams({ oracle: 'yolo-serial', split: 'true', since_id: scope.since_id, until_id: scope.until_id });
+      try {
+        const r = await api('GET', '/api/tuning/compare?' + q);
+        if (!alive) return;
+        el.innerHTML = scorecardHtml('Live gate', r.live) + scorecardHtml('Baseline', r.baseline) + scorecardHtml('Candidate', r.candidate);
+        const sn = $('#splitNote', view);
+        if (r.split_available && r.location) sn.textContent = `Day/Night @ ${r.location.latitude.toFixed(2)}, ${r.location.longitude.toFixed(2)}`;
+        else if (r.split_reason === 'location_unset') sn.textContent = 'Day/Night off — set a location on Start.';
+        else if (r.split_reason === 'astral_unavailable') sn.textContent = 'Day/Night off — astral unavailable.';
+        else sn.textContent = '';
+        const cp = getParams();
+        $('#copyParams', view).textContent = 'Candidate → edge: ' + MOG2_PARAMS.map(k => `${k}=${cp[k]}`).join('  ');
+      } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+
+    async function pollJob() {
+      try {
+        const s = await api('GET', '/api/analysis/status');
+        if (!alive) return;
+        const jl = $('#jobLine', view);
+        if (s.running) {
+          jl.innerHTML = `<span class="pill warn">running</span> ${s.analyzer} <span class="mono">${fmtInt(s.done)}/${fmtInt(s.total)}</span>${s.queue.length ? ' · ' + s.queue.length + ' queued' : ''} <button id="jobCancel">Cancel</button>`;
+          const jc = $('#jobCancel', view); if (jc) jc.addEventListener('click', () => api('POST', '/api/analysis/cancel').catch(() => {}));
+        } else {
+          jl.textContent = s.error ? ('last error: ' + s.error) : 'idle';
+          loadCoverage();
+        }
+      } catch (_) {}
+    }
+
+    (async () => {
+      try { const ec = await api('GET', '/api/edge/config'); if (alive) { edgeParams = ec.params; setParams(ec.params); $('#paramNote', view).textContent = `params seeded from edge (${ec.source})`; } } catch (_) {}
+      try { const st = await api('GET', '/api/stats'); if (alive) buildDays(st.oldest_ts, st.newest_ts); } catch (_) {}
+      pollJob();
+    })();
+    const timer = setInterval(pollJob, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }
+</script>

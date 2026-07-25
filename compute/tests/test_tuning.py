@@ -493,6 +493,95 @@ def test_tuning_compare_populated_assembles_cards_deltas_fidelity(make_app):
     assert body["fidelity"] == {"compared": 4, "agree": 4, "rate": 1.0}
 
 
+# --- GET /api/tuning/compare: day/night split (admin-next P2) --------------------
+#
+# The split rides an ``is_night`` classifier into every gate_scorecard call. It is
+# available only when split was asked AND a location is set AND astral can compute
+# sun times; otherwise it reports UNAVAILABLE with a reason rather than guessing a
+# boundary. Absent the ``split`` param the response is byte-identical. The astral
+# path and the classifier are monkeypatched here so the wiring is tested with no
+# astral install; the sun-time math itself lives in test_suntimes.py / test_scorecard.py.
+
+
+def test_tuning_compare_no_split_param_has_no_split_metadata(make_app):
+    # Even with a location set, an unasked call adds nothing new — the byte-identical
+    # contract: exactly the pre-split key set, no per-scorecard "split".
+    client, store = make_app(client=NoConfigClient())
+    store.set_location(55.6, 12.5)
+    _seed(store, slots=())
+
+    body = client.get("/api/tuning/compare", params={"oracle": "yolo"}).json()
+    assert set(body.keys()) == {"oracle", "live", "baseline", "candidate", "fidelity", "deltas"}
+    assert "split" not in body["live"]
+
+
+def test_tuning_compare_split_unavailable_when_location_unset(make_app):
+    # split=true but no location configured -> unavailable, reason names the fix, and
+    # NO scorecard carries a split (we never guess a boundary from a missing location).
+    client, store = make_app(client=NoConfigClient())
+    _seed(store, slots=())
+
+    body = client.get("/api/tuning/compare", params={"oracle": "yolo", "split": "true"}).json()
+    assert body["split_available"] is False
+    assert body["split_reason"] == "location_unset"
+    assert "location" not in body
+    assert "split" not in body["live"]
+
+
+def test_tuning_compare_split_unavailable_when_astral_missing(make_app, monkeypatch):
+    # A location is set, but astral can't be imported -> unavailable (honest), not a
+    # silent all-day classification.
+    import compute.api.app as appmod
+
+    monkeypatch.setattr(appmod, "astral_available", lambda: False)
+    client, store = make_app(client=NoConfigClient())
+    store.set_location(55.6, 12.5)
+    _seed(store, slots=())
+
+    body = client.get("/api/tuning/compare", params={"oracle": "yolo", "split": "true"}).json()
+    assert body["split_available"] is False
+    assert body["split_reason"] == "astral_unavailable"
+    assert "split" not in body["live"]
+
+
+def test_tuning_compare_split_available_buckets_live_visits(make_app, monkeypatch):
+    # split available: astral usable + location set. A synthetic classifier (night iff
+    # recv_ts >= boundary) is injected so this needs no astral and the buckets are
+    # deterministic. A fully-primed scoped window (>= _COMPARE_WARMUP filler frames
+    # before it) drops warmup to 0 so the two present visits are actually scored.
+    import compute.api.app as appmod
+
+    base = 1_700_000_000_000
+    boundary = base + 100_000
+    monkeypatch.setattr(appmod, "astral_available", lambda: True)
+    monkeypatch.setattr(appmod, "night_classifier", lambda lat, lon: (lambda ts: ts >= boundary))
+
+    client, store = make_app(client=NoConfigClient())
+    store.set_location(55.6, 12.5)
+    # Prime past the warmup so the window scores (filler carries no oracle verdict).
+    for j in range(_COMPARE_WARMUP):
+        store.add(_frame(frame_id=j, motion=False, area=0.0), recv_ts_ms=base + j)
+    # A day visit then a night visit, each a lone present+motion frame, > _VISIT_GAP_MS
+    # apart (separate visits) on opposite sides of the boundary.
+    day_id = store.add(_frame(frame_id=600, motion=True, area=0.05), recv_ts_ms=base + 50_000)
+    store.write_analysis(day_id, "yolo", True, 0.9, None)
+    night_id = store.add(_frame(frame_id=601, motion=True, area=0.05), recv_ts_ms=base + 150_000)
+    store.write_analysis(night_id, "yolo", True, 0.9, None)
+
+    body = client.get(
+        "/api/tuning/compare",
+        params={"oracle": "yolo", "split": "true", "since_id": day_id, "until_id": night_id},
+    ).json()
+    assert body["split_available"] is True
+    assert body["location"] == {"latitude": 55.6, "longitude": 12.5}
+    assert "split_reason" not in body
+    live = body["live"]
+    assert live["warmup"] == 0
+    assert live["visits"] == {"total": 2, "caught": 2, "wholly_missed": 0}
+    assert live["split"]["day"] == {"total": 1, "caught": 1, "wholly_missed": 0}
+    assert live["split"]["night"] == {"total": 1, "caught": 1, "wholly_missed": 0}
+
+
 # --- GET /api/tuning/compare: the warmup/scope rule -----------------------------
 #
 # Unscoped: warmup=_COMPARE_WARMUP, no bounds — exactly today. Scoped: the bounds ride

@@ -110,6 +110,28 @@
     color: var(--accent); background: var(--surface-2); border: 1px solid var(--border);
     border-radius: 999px; padding: 2px 10px; }
   .cleanup-job { margin-top: 8px; }
+
+  /* Frame review */
+  .fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+  .ftile { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface-2); cursor: pointer; }
+  .fimg { position: relative; line-height: 0; }
+  .fimg img { width: 100%; height: auto; display: block; }
+  .fbox { position: absolute; border: 2px solid var(--accent); box-sizing: border-box; pointer-events: none; }
+  .fbox.ok { border-color: var(--ok); } .fbox.warn { border-color: var(--warn); } .fbox.bad { border-color: var(--bad); }
+  .fchip { position: absolute; top: 4px; left: 4px; font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(0,0,0,.65); color: var(--text); }
+  .fchip.ok { color: var(--ok); } .fchip.warn { color: var(--warn); } .fchip.bad { color: var(--bad); }
+  .fmeta { padding: 5px 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+  .fmodal { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .fmodal .inner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-width: 92vw; max-height: 92vh; overflow: auto; }
+  .fmodal .fimg { display: inline-block; }
+  .fmodal img { max-width: 86vw; max-height: 78vh; width: auto; height: auto; display: block; }
+
+  /* Annotation */
+  .astage-imgs { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
+  .astage-crop img { max-height: 260px; max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius); display: block; }
+  .astage-full { max-width: 420px; flex: 1; min-width: 220px; }
+  .astage-full img { width: 100%; height: auto; display: block; border-radius: var(--radius); }
+  .acat { font-size: 13px; }
 </style>
 
 <header class="appbar">
@@ -155,25 +177,10 @@
   const ROUTES = [
     { id: 'start', title: 'Start', sub: 'Phase, persistence mode, and housekeeping', mount: mountStart },
     { id: 'tuning', title: 'Motion tuning', sub: 'Trust the motion gate', mount: mountTuning },
-    { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', does: [
-      'Frame browser by time interval, with filters',
-      'Overlays: motion box, YOLO box + conf + class, corruption, identity',
-      'Doubles as the model-evaluation surface',
-    ]},
-    { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', does: [
-      'Keyboard-first queue; ignore (reversible)',
-      'Undo / relabel; crop quality grading',
-      'Per-cat day/night coverage readout',
-    ]},
-    { id: 'model', title: 'Model building', sub: 'Build → validate → promote', does: [
-      'Gallery build from graded crops',
-      'Validate (DINOv2 feasibility probe) before promote',
-      'Warn if a resident has no night crops; threshold + version rollback',
-    ]},
-    { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', does: [
-      'Recent visit cards with identity chips + playback',
-      'Manual backfill: Identify pass, Analyze, per-event re-analyze',
-    ]},
+    { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', mount: mountFrames },
+    { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', mount: mountAnnotate },
+    { id: 'model', title: 'Model building', sub: 'Build → validate → promote', mount: mountModel },
+    { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', mount: mountActivity },
   ];
   const DEFAULT_ROUTE = 'start';
   const routeById = Object.fromEntries(ROUTES.map(r => [r.id, r]));
@@ -605,5 +612,550 @@
     })();
     const timer = setInterval(pollJob, 3000);
     return () => { alive = false; clearInterval(timer); };
+  }
+
+  // =======================================================================
+  //  Frame review page (admin-next P3) — per-frame YOLO + identity overlays
+  // =======================================================================
+  function mountFrames(view) {
+    // Locals (not module scope) so a direct load of #frames can't hit a TDZ.
+    const CLS = { 0: 'person', 14: 'bird', 15: 'cat' };
+    const bandOf = (c) => (c == null ? '' : c >= 0.65 ? 'ok' : c >= 0.40 ? 'warn' : 'bad');
+    const boxStyle = (b, w, h) => `left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`;
+
+    view.innerHTML = `
+      <div class="card">
+        <h3>Window</h3>
+        <div class="row">
+          <label class="fld">Day<select id="fDay"></select></label>
+          <label class="fld">Frames<input id="fCount" type="number" min="10" max="500" value="120" style="width:90px"></label>
+          <button id="fLoad" class="primary" style="align-self:flex-end">Load</button>
+          <span id="fScope" class="note"></span>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div class="seg" id="fFilters">
+            <button data-f="all" class="sel">All</button>
+            <button data-f="detected">Detected</button>
+            <button data-f="identified">Identified</button>
+          </div>
+          <span id="fCounts" class="note"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Frames <span class="note">(YOLO box + identity overlay)</span></h3>
+        <div id="fGrid" class="fgrid"><span class="note">Pick a day and Load.</span></div>
+      </div>
+    `;
+
+    let alive = true;
+    let scope = { since_id: null, until_id: null };
+    let frames = [];
+    let filter = 'all';
+    let modal = null;
+
+    function buildDays(oldestMs, newestMs) {
+      const sel = $('#fDay', view); sel.innerHTML = '';
+      if (!oldestMs || !newestMs) { sel.innerHTML = '<option>—</option>'; return; }
+      const p = (x) => String(x).padStart(2, '0');
+      const d = new Date(newestMs); d.setHours(0, 0, 0, 0);
+      const oldest = new Date(oldestMs); oldest.setHours(0, 0, 0, 0);
+      let first = null;
+      while (d >= oldest) {
+        const end = new Date(d); end.setDate(end.getDate() + 1);
+        const o = document.createElement('option');
+        o.value = d.getTime() + ':' + (end.getTime() - 1);
+        o.textContent = `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()}`;
+        sel.appendChild(o);
+        if (first === null) first = o.value;
+        d.setDate(d.getDate() - 1);
+      }
+      if (first) selectScope(first);
+    }
+    async function selectScope(val) {
+      const [s, e] = val.split(':').map(Number);
+      try {
+        const r = await api('GET', `/api/frames/resolve?start_ts=${s}&end_ts=${e}`);
+        if (!alive) return;
+        scope = { since_id: r.since_id, until_id: r.until_id };
+        $('#fScope', view).textContent = r.since_id == null ? 'no frames this day' : `frames ${fmtInt(r.since_id)}–${fmtInt(r.until_id)}`;
+      } catch (_) { $('#fScope', view).textContent = 'resolve failed'; }
+    }
+    $('#fDay', view).addEventListener('change', (e) => selectScope(e.target.value));
+
+    const passes = (f) => (filter === 'detected' ? !!f.box : filter === 'identified' ? !!f.identity : true);
+    function idChip(id) {
+      if (!id) return '';
+      const c = id.resolved === 'resident' ? 'ok' : id.resolved === 'neighbour' ? 'bad' : 'warn';
+      const label = id.resolved === 'unknown' ? 'unknown' : (id.cat_name || id.resolved);
+      return `<span class="fchip ${c}" style="left:auto;right:4px">${label}</span>`;
+    }
+    function tileHtml(f, idx) {
+      const clsChip = f.box ? `<span class="fchip">${CLS[f.cls] || f.cls}${f.score != null ? ' ' + Math.round(f.score * 100) + '%' : ''}</span>` : '';
+      const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
+      const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
+      const t = new Date(f.recv_ts); const p = (x) => String(x).padStart(2, '0');
+      return `<div class="ftile" data-i="${idx}">
+        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${clsChip}${idChip(f.identity)}</div>
+        <div class="fmeta"><span>${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}</span><span>${f.analyzed === false ? 'unswept' : ''}</span></div>
+      </div>`;
+    }
+    function placeBoxes(root) {
+      root.querySelectorAll('img[data-box]').forEach((img) => {
+        const fb = img.parentElement.querySelector('.fbox');
+        const place = () => { if (fb && img.naturalWidth) { fb.style.cssText += ';' + boxStyle(JSON.parse(img.dataset.box), img.naturalWidth, img.naturalHeight); fb.hidden = false; } };
+        if (img.complete) place(); else img.addEventListener('load', place);
+      });
+    }
+    function renderGrid() {
+      const grid = $('#fGrid', view);
+      if (!frames.length) { grid.innerHTML = '<span class="note">No frames loaded.</span>'; $('#fCounts', view).textContent = ''; return; }
+      const shown = frames.map((f, i) => [f, i]).filter(([f]) => passes(f));
+      $('#fCounts', view).textContent = `${shown.length} / ${frames.length} shown`;
+      if (!shown.length) { grid.innerHTML = '<span class="note">No frames match this filter.</span>'; return; }
+      grid.innerHTML = shown.map(([f, i]) => tileHtml(f, i)).join('');
+      placeBoxes(grid);
+      grid.querySelectorAll('.ftile').forEach((t) => t.addEventListener('click', () => openFrame(Number(t.dataset.i))));
+    }
+    function closeModal() { if (modal) { modal.remove(); modal = null; } }
+    function openFrame(idx) {
+      const f = frames[idx]; closeModal();
+      const idTxt = f.identity ? `${f.identity.resolved}${f.identity.cat_name ? ' · ' + f.identity.cat_name : ''}${f.identity.distance != null ? ' (d=' + f.identity.distance.toFixed(3) + ')' : ''}` : 'no identity';
+      const detTxt = f.box ? `${CLS[f.cls] || f.cls} ${Math.round(f.score * 100)}%` : (f.analyzed === false ? 'not swept' : 'no detection');
+      modal = document.createElement('div'); modal.className = 'fmodal';
+      modal.innerHTML = `<div class="inner">
+        <div class="fimg"><img src="${f.url}" ${f.box ? `data-box='${JSON.stringify(f.box)}'` : ''}>${f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : ''}</div>
+        <div class="note" style="margin-top:8px">${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detTxt} · id: ${idTxt}</div>
+      </div>`;
+      document.body.appendChild(modal);
+      placeBoxes(modal);
+      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+    }
+    function onKey(e) { if (e.key === 'Escape') closeModal(); }
+    document.addEventListener('keydown', onKey);
+
+    $('#fFilters', view).addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-f]'); if (!b) return;
+      filter = b.dataset.f;
+      view.querySelectorAll('#fFilters button').forEach((x) => x.classList.toggle('sel', x.dataset.f === filter));
+      renderGrid();
+    });
+    async function load() {
+      const grid = $('#fGrid', view);
+      if (scope.since_id == null) { grid.innerHTML = '<span class="note warn">Pick a day with frames.</span>'; return; }
+      const count = Math.max(10, Math.min(500, parseInt($('#fCount', view).value, 10) || 120));
+      grid.innerHTML = '<span class="note">Loading…</span>';
+      const q = new URLSearchParams({ count, since_id: scope.since_id, until_id: scope.until_id, detections: 'yolo-serial', identify: 'true' });
+      try {
+        const data = await api('GET', '/api/frames/sample?' + q);
+        if (!alive) return;
+        frames = Array.isArray(data) ? data : (data.frames || []);
+        renderGrid();
+      } catch (e) { grid.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+    $('#fLoad', view).addEventListener('click', load);
+
+    (async () => { try { const st = await api('GET', '/api/stats'); if (alive) buildDays(st.oldest_ts, st.newest_ts); } catch (_) {} })();
+    return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };
+  }
+
+  // =======================================================================
+  //  Annotation page (admin-next P4) — keyboard-first labelling queue
+  // =======================================================================
+  function mountAnnotate(view) {
+    view.innerHTML = `
+      <div class="card">
+        <div class="row"><span id="aStatus" class="note grow">Loading queue…</span><button id="aReload">Reload queue</button></div>
+      </div>
+      <div class="card">
+        <div id="aStage"><span class="note">Loading…</span></div>
+        <p class="hint">Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last</p>
+      </div>
+      <div class="card">
+        <h3>Roster</h3>
+        <div id="aRoster" class="row"></div>
+        <div class="row" style="margin-top:12px">
+          <input id="aNewCat" type="text" placeholder="new cat name" style="width:160px">
+          <label class="note"><input id="aResident" type="checkbox" checked> resident</label>
+          <button id="aAddCat">Add cat</button>
+          <span id="aCatNote" class="note"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Per-cat day/night coverage</h3>
+        <div id="aCoverage" class="note">…</div>
+      </div>
+    `;
+
+    let alive = true;
+    let visits = [], idx = 0, cats = [], hasModel = false, truncated = false, lastAction = null;
+
+    const bboxArea = (b) => (b ? Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]) : 0);
+    function seedQuality(f, v) {
+      const ratio = v.peak_area ? bboxArea(f.bbox) / v.peak_area : 0;
+      if (f.score >= 0.6 && ratio >= 0.7) return 'gallery';
+      if (f.score < 0.35 || ratio < 0.3) return 'poor';
+      return 'ok';
+    }
+    const cropUrl = (f) => `/api/label/crop/${f.id}?box=${f.bbox.map(Math.round).join(',')}`;
+    const current = () => visits[idx];
+    const flash = (m) => { $('#aStatus', view).textContent = m; };
+
+    function renderStatus() {
+      $('#aStatus', view).textContent = visits.length
+        ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}`
+        : 'Queue empty';
+    }
+    function renderVisit() {
+      renderStatus();
+      const stage = $('#aStage', view), v = current();
+      if (!v) { stage.innerHTML = '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>'; return; }
+      const rep = v.frames.find((f) => f.id === v.rep_frame_id) || v.frames[0];
+      const dist = (hasModel && v.distance != null) ? ` · nearest d=${v.distance.toFixed(3)}${v.uncertain ? ' (uncertain)' : ''}` : '';
+      stage.innerHTML = `
+        <div class="astage-imgs">
+          <div class="astage-crop"><img src="${cropUrl(rep)}" alt="crop"></div>
+          <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox warn" hidden></div></div>
+        </div>
+        <div class="note" style="margin-top:8px">${v.frames.length} frames · peak ${Math.round((v.peak_score || 0) * 100)}%${dist}</div>
+      `;
+      const img = stage.querySelector('.astage-full img'), fb = stage.querySelector('.fbox');
+      const place = () => {
+        if (fb && img.naturalWidth) {
+          const b = rep.bbox, w = img.naturalWidth, h = img.naturalHeight;
+          fb.style.cssText += `;left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`;
+          fb.hidden = false;
+        }
+      };
+      if (img.complete) place(); else img.addEventListener('load', place);
+    }
+    function advanceAfterDecision() {
+      visits.splice(idx, 1);
+      if (visits.length === 0) { loadQueue(); return; }
+      if (idx >= visits.length) idx = visits.length - 1;
+      renderVisit();
+    }
+    async function commitLabel(decision, cat_id) {
+      const v = current(); if (!v) return;
+      const withCrop = decision !== 'not_cat';
+      const frames = v.frames.map((f) => withCrop ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) } : { frame_id: f.id });
+      try { await api('POST', '/api/label', { decision, cat_id: cat_id ?? null, frames }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); loadCoverage(); }
+      catch (e) { flash('label failed: ' + e.message); }
+    }
+    async function ignoreVisit() {
+      const v = current(); if (!v) return;
+      try { await api('POST', '/api/label/ignore', { frame_ids: v.frames.map((f) => f.id) }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); }
+      catch (e) { flash('ignore failed: ' + e.message); }
+    }
+    async function undoLast() {
+      if (!lastAction) { flash('nothing to undo'); return; }
+      try { await api('POST', '/api/label/delete', { frame_ids: lastAction }); lastAction = null; loadQueue(); loadCoverage(); }
+      catch (e) { flash('undo failed: ' + e.message); }
+    }
+    function skip(delta) { if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); } }
+
+    async function loadQueue() {
+      const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading queue…</span>';
+      try { const q = await api('GET', '/api/label/queue'); if (!alive) return; visits = q.visits || []; hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0; renderVisit(); }
+      catch (e) { stage.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+
+    function labelCat(i) { const c = cats[i]; if (c) commitLabel('identified', c.id); }
+    function renderRoster() {
+      const el = $('#aRoster', view);
+      el.innerHTML = cats.length
+        ? cats.map((c, i) => `<button class="acat" data-i="${i}">${i < 9 ? (i + 1) + ' · ' : ''}${c.name}${c.is_resident ? '' : ' (foreign)'}</button>`).join('')
+        : '<span class="note">No cats yet — add one below to label residents.</span>';
+      el.querySelectorAll('.acat').forEach((b) => b.addEventListener('click', () => labelCat(Number(b.dataset.i))));
+    }
+    async function loadCats() { try { const r = await api('GET', '/api/cats'); if (alive) { cats = r.cats || []; renderRoster(); } } catch (_) {} }
+    async function addCat() {
+      const name = $('#aNewCat', view).value.trim(); if (!name) return;
+      try { await api('POST', '/api/cats', { name, is_resident: $('#aResident', view).checked }); $('#aNewCat', view).value = ''; $('#aCatNote', view).textContent = 'added ' + name; loadCats(); }
+      catch (e) { $('#aCatNote', view).textContent = e.message; }
+    }
+    $('#aAddCat', view).addEventListener('click', addCat);
+
+    async function loadCoverage() {
+      try {
+        const r = await api('GET', '/api/label/regime-coverage');
+        if (!alive) return;
+        const rows = (r.cats || []).map((c) => {
+          const dn = r.available ? ` · day ${c.day} / night ${c.night}${c.is_resident && c.night === 0 && c.total > 0 ? ' ⚠ no night' : ''}` : '';
+          return `${c.cat_name}: ${c.total}${dn}`;
+        });
+        let html = rows.length ? rows.join('<br>') : 'no labelled crops yet';
+        if (!r.available) html += `<br><span class="note warn">Day/night unavailable — ${r.reason === 'location_unset' ? 'set a location on Start' : 'astral unavailable'}.</span>`;
+        $('#aCoverage', view).innerHTML = html;
+      } catch (_) {}
+    }
+
+    function onKey(e) {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+      const k = e.key;
+      if (k >= '1' && k <= '9') { labelCat(parseInt(k, 10) - 1); e.preventDefault(); }
+      else if (k === 'u') commitLabel('unknown_cat', null);
+      else if (k === 'x') commitLabel('not_cat', null);
+      else if (k === 'g') ignoreVisit();
+      else if (k === 'n' || k === 'ArrowRight' || k === ' ') { skip(1); e.preventDefault(); }
+      else if (k === 'p' || k === 'ArrowLeft') skip(-1);
+      else if (k === 'z') undoLast();
+    }
+    document.addEventListener('keydown', onKey);
+    $('#aReload', view).addEventListener('click', () => { loadQueue(); loadCoverage(); });
+
+    loadCats(); loadQueue(); loadCoverage();
+    return () => { alive = false; document.removeEventListener('keydown', onKey); };
+  }
+
+  // =======================================================================
+  //  Model building page (admin-next P5) — build → validate → promote
+  // =======================================================================
+  function mountModel(view) {
+    const qChecks = (p) => `<span class="row" style="gap:14px">
+        <label class="note"><input type="checkbox" id="${p}Gallery" checked> gallery</label>
+        <label class="note"><input type="checkbox" id="${p}Ok"> ok</label>
+        <label class="note"><input type="checkbox" id="${p}Poor"> poor</label>
+      </span>`;
+    view.innerHTML = `
+      <div class="card"><div class="row"><span id="mJob" class="note grow">idle</span></div></div>
+      <div class="card">
+        <h3>1 · Build gallery</h3>
+        <div class="row">${qChecks('b')}<button id="mBuild" class="primary">Build</button><span id="mBuildNote" class="note"></span></div>
+        <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.</p>
+      </div>
+      <div class="card">
+        <h3>2 · Validate <span class="note">(feasibility probe, before promote)</span></h3>
+        <div class="row">${qChecks('v')}<button id="mValidate">Validate</button><span id="mValNote" class="note"></span></div>
+        <div id="mRuns" class="note" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h3>3 · Promote</h3>
+        <div id="mCovWarn" class="note warn" style="margin-bottom:6px"></div>
+        <div id="mModels"><span class="note">…</span></div>
+      </div>
+    `;
+
+    let alive = true;
+    let covWarning = '';
+
+    const getQualities = (p) => {
+      const q = [];
+      if ($(`#${p}Gallery`, view).checked) q.push('gallery');
+      if ($(`#${p}Ok`, view).checked) q.push('ok');
+      if ($(`#${p}Poor`, view).checked) q.push('poor');
+      return q.length ? q : null; // empty selection ⇒ null ⇒ all grades (backend contract)
+    };
+
+    async function build() {
+      $('#mBuildNote', view).textContent = 'starting…';
+      try {
+        const r = await api('POST', '/api/training/gallery/build', { qualities: getQualities('b') });
+        $('#mBuildNote', view).textContent = r.enough === false ? r.message : 'build enqueued';
+        if (r.enough !== false) pollJob();
+      } catch (e) { $('#mBuildNote', view).textContent = e.message; }
+    }
+    async function validate() {
+      $('#mValNote', view).textContent = 'starting…';
+      try {
+        const r = await api('POST', '/api/training/feasibility/run', { qualities: getQualities('v') });
+        $('#mValNote', view).textContent = r.enough === false ? r.message : 'validation enqueued';
+        if (r.enough !== false) pollJob();
+      } catch (e) { $('#mValNote', view).textContent = e.message; }
+    }
+    $('#mBuild', view).addEventListener('click', build);
+    $('#mValidate', view).addEventListener('click', validate);
+
+    function modelRow(m) {
+      const th = m.threshold == null ? 'uncalibrated' : m.threshold.toFixed(3);
+      const chip = m.status === 'active' ? '<span class="pill ok">active</span>' : m.status === 'retired' ? '<span class="pill">retired</span>' : '<span class="pill warn">draft</span>';
+      const btn = m.status === 'active' ? '' : m.gallery_available
+        ? `<button data-promote="${m.id}">${m.status === 'retired' ? 'Roll back to this' : 'Promote'}</button>`
+        : '<span class="note bad">gallery file missing</span>';
+      return `<div class="row" style="border-top:1px solid var(--border);padding:8px 0">
+        <span class="grow">${chip} v${m.id} · ${m.n_cats} cats · ${m.n_vectors} vectors · threshold ${th}</span>${btn}
+      </div>`;
+    }
+    async function promote(id) {
+      if (covWarning && !confirm(covWarning + '\n\nPromote anyway?')) return;
+      try { await api('POST', `/api/training/models/${id}/promote`); loadModels(); }
+      catch (e) { alert('promote failed: ' + e.message); }
+    }
+    async function loadModels() {
+      try {
+        const r = await api('GET', '/api/training/models');
+        if (!alive) return;
+        const models = r.models || [];
+        const el = $('#mModels', view);
+        el.innerHTML = models.length ? models.map(modelRow).join('') : '<span class="note">No gallery versions yet — build one above.</span>';
+        el.querySelectorAll('button[data-promote]').forEach((b) => b.addEventListener('click', () => promote(Number(b.dataset.promote))));
+        checkCoverage();
+      } catch (_) {}
+    }
+    async function checkCoverage() {
+      try {
+        const r = await api('GET', '/api/label/regime-coverage');
+        if (!alive) return;
+        const noNight = (r.available ? (r.cats || []) : []).filter((c) => c.is_resident && c.total > 0 && c.night === 0).map((c) => c.cat_name);
+        covWarning = noNight.length ? `⚠ No night crops for: ${noNight.join(', ')} — unrecognizable after dark.` : '';
+        $('#mCovWarn', view).textContent = covWarning;
+      } catch (_) {}
+    }
+    async function loadRuns() {
+      try {
+        const r = await api('GET', '/api/training/feasibility/runs');
+        if (!alive) return;
+        const runs = (r.runs || []).slice(0, 8);
+        $('#mRuns', view).innerHTML = runs.length ? runs.map((run) => {
+          const acc = run.knn_accuracy != null ? Math.round(run.knn_accuracy * 100) + '%' : '—';
+          const auc = run.auc != null ? run.auc.toFixed(3) : '—';
+          const th = run.threshold != null ? run.threshold.toFixed(3) : '—';
+          const rep = run.report_available ? `<a href="/api/training/feasibility/report/${run.run_id}" target="_blank" rel="noopener">report</a>` : '<span class="note">report pruned</span>';
+          return `<div>[${run.quality || 'all'}] kNN ${acc} · AUC ${auc} · thr ${th} · ${rep}</div>`;
+        }).join('') : '<span class="note">No validation runs yet.</span>';
+      } catch (_) {}
+    }
+
+    async function pollJob() {
+      try {
+        const s = await api('GET', '/api/training/status');
+        if (!alive) return;
+        const jl = $('#mJob', view);
+        if (s.running) {
+          jl.innerHTML = `<span class="pill warn">running</span> ${s.kind} <span class="mono">${fmtInt(s.done)}/${fmtInt(s.total)}</span>${s.queue.length ? ' · ' + s.queue.length + ' queued' : ''} <button id="mCancel">Cancel</button>`;
+          const c = $('#mCancel', view); if (c) c.addEventListener('click', () => api('POST', '/api/training/cancel').catch(() => {}));
+        } else {
+          jl.textContent = s.error ? 'last error: ' + s.error : 'idle';
+          loadModels(); loadRuns();
+        }
+      } catch (_) {}
+    }
+
+    loadModels(); loadRuns(); pollJob();
+    const timer = setInterval(pollJob, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }
+
+  // =======================================================================
+  //  Activity page (admin-next P6) — recent visits + playback + backfill
+  // =======================================================================
+  function mountActivity(view) {
+    const CLS = { 0: 'person', 14: 'bird', 15: 'cat' };
+    view.innerHTML = `
+      <div class="card">
+        <div class="row">
+          <button id="acReload">Reload</button>
+          <label class="note"><input type="checkbox" id="acHide"> Hide our cats</label>
+          <span class="grow"></span>
+          <button id="acAnalyze" title="Re-detect the loaded events' motion frames (person/bird/cat subjects)">Analyze</button>
+          <button id="acIdentify" title="Name historical visits against the active gallery">Identify</button>
+        </div>
+        <div id="acNote" class="note" style="margin-top:6px"></div>
+      </div>
+      <div class="card">
+        <h3>Recent visits <span class="note">(double-click to play)</span></h3>
+        <div id="acGrid" class="fgrid"><span class="note">Loading…</span></div>
+      </div>
+    `;
+
+    let alive = true;
+    let events = [];
+    let modal = null, playerTimer = null;
+
+    const span = () => {
+      if (!events.length) return null;
+      return { since_id: Math.min(...events.map((e) => e.start_id)), until_id: Math.max(...events.map((e) => e.end_id)) };
+    };
+    const flash = (m) => { $('#acNote', view).textContent = m; };
+
+    function evChip(ev) {
+      const id = ev.identity;
+      if (id && id.resolved === 'resident') return `<span class="fchip ok">${id.cat_name || 'resident'}</span>`;
+      if (id && id.resolved === 'neighbour') return `<span class="fchip bad">${id.cat_name || 'neighbour'}</span>`;
+      if (id && id.resolved === 'unknown') return '<span class="fchip warn">unknown cat</span>';
+      const map = { cat: 'cat', person: 'person', bird: 'bird', corrupted: 'corrupted', unrecognized: '?', motion_only: 'motion' };
+      const kind = ev.subject && ev.subject.kind;
+      return kind ? `<span class="fchip">${map[kind] || kind}</span>` : '';
+    }
+    function renderGrid() {
+      const grid = $('#acGrid', view);
+      const hide = $('#acHide', view).checked;
+      const shown = events.map((e, i) => [e, i]).filter(([e]) => !(hide && e.identity && e.identity.resolved === 'resident'));
+      if (!events.length) { grid.innerHTML = '<span class="note">No visits yet.</span>'; return; }
+      if (!shown.length) { grid.innerHTML = '<span class="note">All hidden by the filter.</span>'; return; }
+      const p = (x) => String(x).padStart(2, '0');
+      grid.innerHTML = shown.map(([ev, i]) => {
+        const t = new Date(ev.start_ts);
+        const rate = ev.detection && ev.detection.ratio != null ? Math.round(ev.detection.ratio * 100) + '%' : '—';
+        return `<div class="ftile" data-i="${i}">
+          <div class="fimg"><img loading="lazy" src="/media/${ev.rep_frame_id}">${evChip(ev)}</div>
+          <div class="fmeta"><span>${p(t.getDate())}/${p(t.getMonth() + 1)} ${p(t.getHours())}:${p(t.getMinutes())}</span><span>${rate}</span></div>
+        </div>`;
+      }).join('');
+      grid.querySelectorAll('.ftile').forEach((t) => t.addEventListener('dblclick', () => openPlayer(Number(t.dataset.i))));
+    }
+    async function loadEvents() {
+      const grid = $('#acGrid', view); grid.innerHTML = '<span class="note">Loading…</span>';
+      try { const d = await api('GET', '/api/events'); if (!alive) return; events = Array.isArray(d) ? d : (d.events || []); renderGrid(); }
+      catch (e) { grid.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+
+    function closeModal() { if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } if (modal) { modal.remove(); modal = null; } }
+    async function openPlayer(idx) {
+      const ev = events[idx]; closeModal();
+      const q = new URLSearchParams({ count: 60, since_id: ev.start_id, until_id: ev.end_id, detections: 'yolo-serial' });
+      let pf = [];
+      try { const d = await api('GET', '/api/frames/sample?' + q); pf = Array.isArray(d) ? d : (d.frames || []); } catch (_) {}
+      if (!alive || !pf.length) return;
+      modal = document.createElement('div'); modal.className = 'fmodal';
+      modal.innerHTML = `<div class="inner" style="min-width:320px">
+        <div class="fimg" id="pStage"><img id="pImg"><div class="fbox" hidden></div></div>
+        <div class="row" style="margin-top:8px;align-items:center">
+          <button id="pPlay">Pause</button>
+          <input id="pScrub" type="range" min="0" max="${pf.length - 1}" value="0" style="flex:1;min-width:0">
+          <span id="pIdx" class="note mono">1/${pf.length}</span>
+        </div>
+        <div id="pCap" class="note" style="margin-top:6px"></div>
+      </div>`;
+      document.body.appendChild(modal);
+      const img = $('#pImg', modal), fb = $('#pStage .fbox', modal);
+      let i = 0;
+      function show(n) {
+        i = n; const f = pf[i];
+        img.src = f.url;
+        $('#pScrub', modal).value = i; $('#pIdx', modal).textContent = (i + 1) + '/' + pf.length;
+        $('#pCap', modal).textContent = f.box ? `${CLS[f.cls] || f.cls} ${Math.round(f.score * 100)}%` : (f.analyzed === false ? 'unswept' : 'no detection');
+        fb.hidden = true; fb.style.cssText = 'position:absolute;border:2px solid var(--accent);box-sizing:border-box';
+        if (f.box) {
+          const place = () => { if (img.naturalWidth) { const b = f.box, w = img.naturalWidth, h = img.naturalHeight; fb.style.cssText += `;left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`; fb.hidden = false; } };
+          if (img.complete) place(); else img.onload = place;
+        }
+      }
+      const play = () => { $('#pPlay', modal).textContent = 'Pause'; playerTimer = setInterval(() => show((i + 1) % pf.length), 200); };
+      const pause = () => { $('#pPlay', modal).textContent = 'Play'; if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } };
+      $('#pPlay', modal).addEventListener('click', () => (playerTimer ? pause() : play()));
+      $('#pScrub', modal).addEventListener('input', (e) => { pause(); show(Number(e.target.value)); });
+      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+      show(0); play();
+    }
+    function onKey(e) { if (e.key === 'Escape') closeModal(); }
+    document.addEventListener('keydown', onKey);
+
+    async function identifyPass() {
+      const s = span(); if (!s) return;
+      try { await api('POST', '/api/identify/run', s); flash('Identify enqueued — progress on Model building.'); }
+      catch (e) { flash('Identify: ' + e.message); }
+    }
+    async function analyzePass() {
+      const s = span(); if (!s) return;
+      try { await api('POST', '/api/analysis/run', { analyzer: 'yolo-serial', reanalyze: true, motion_only: true, ...s }); flash('Analyze enqueued — progress on Motion tuning.'); }
+      catch (e) { flash('Analyze: ' + e.message); }
+    }
+    $('#acReload', view).addEventListener('click', loadEvents);
+    $('#acHide', view).addEventListener('change', renderGrid);
+    $('#acIdentify', view).addEventListener('click', identifyPass);
+    $('#acAnalyze', view).addEventListener('click', analyzePass);
+
+    loadEvents();
+    return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };
   }
 </script>

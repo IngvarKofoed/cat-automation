@@ -788,3 +788,31 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      candidate re-runs → visit-recall scorecards (Live / Baseline / Candidate) with the Day/Night split and a
      copy-to-edge param line. Wires the P2 backend (`/api/tuning/compare?split`, `/api/tuning/rerun`,
      `/api/analysis/*`, `/api/frames/resolve`, `/api/edge/config`).
+
+129. Frontend dev proxy now serves the LOCAL admin-next rebuild at `/admin-next` (beside `/` and `/admin`),
+     so its pages iterate on the dev box against the compute PC's live backend. `/api/*` still proxies to
+     `CAT_COMPUTE_URL`, so the compute PC must already have the admin-next BACKEND endpoints (pull + restart)
+     for the pages to work.
+
+130. admin-next Frame review page (Wave 2 P3 frontend): a time-window frame grid with per-frame YOLO box +
+     conf + class and identity overlays drawn from `/api/frames/sample?detections=yolo-serial&identify=1`
+     (the P3 read); All / Detected / Identified filters and click-to-enlarge with the box + full caption.
+     The model-evaluation surface — a box/identity chip renders only where a frame was swept/identified.
+
+131. admin-next Annotation page (Wave 2 P4 frontend): keyboard-first labelling of the worst-first queue
+     (`/api/label/queue`) — 1–9 label a roster cat, u/x unknown/not-a-cat, g ignore, n/p skip, z undo last.
+     Crop quality is AUTO-SEEDED from detection score + area ratio (gallery/ok/poor, the old tool's formula),
+     so labelling stays fast; rep crop + full-frame-with-box shown per visit, plus roster add-cat and per-cat
+     day/night coverage. Deferred: full Labelled-review relabel + manual per-frame quality editing.
+
+132. admin-next Model building page (Wave 2 P5 frontend): build gallery → validate (DINOv2 feasibility probe)
+     → promote. Quality checkboxes (gallery-only default) feed `/api/training/gallery/build` +
+     `/api/training/feasibility/run`; a shared training-job line polls status; the validation-run list shows
+     kNN/AUC/threshold with a report link; the version list promotes/rolls-back, with a night-coverage warning
+     (a resident with day crops but zero night crops) confirmed before promote. Not-enough-data + missing-torch handled.
+
+133. admin-next Activity page (Wave 2 P6 frontend) — completes Wave 2: recent visit cards (rep thumbnail +
+     identity/subject chip + detection rate) from `/api/events`, double-click to open a filmstrip player
+     (play/scrub with per-frame YOLO box overlay), plus manual backfill — Analyze (`/api/analysis/run`
+     yolo-serial reanalyze) and Identify (`/api/identify/run`) over the loaded events' span, both handling the
+     no-model / no-torch states. All six admin-next pages are now built and browser-verified; only the flip remains.

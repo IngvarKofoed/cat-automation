@@ -97,6 +97,30 @@ def _abort_put(q: "queue.Queue", item, abort: "threading.Event", timeout: float 
     return False
 
 
+class DetectAdapter:
+    """The minimal ``manager`` stand-in ``run_analysis`` needs, for a progress-less detect.
+
+    ``run_analysis`` reads only three things off its ``manager``: ``.stop_event`` (an
+    ``Event`` it polls between batches/frames to honor a cancel), ``.set_total(int)`` and
+    ``.record(bool)`` (progress hooks). The always-on workers that drive detect outside the
+    FIFO — the live-identify worker and the YOLO-oracle worker — have no progress bar, so
+    the two counter hooks are no-ops; the ``stop_event`` IS the worker's own, so a
+    ``stop()`` that sets it aborts an in-flight detect at the next batch boundary.
+
+    Lives here, next to the ``run_analysis`` contract it implements, because BOTH workers
+    need it — a per-worker copy would be two things to keep in step with that contract.
+    """
+
+    def __init__(self, stop_event: "threading.Event") -> None:
+        self.stop_event = stop_event
+
+    def set_total(self, total: int) -> None:  # noqa: D401 - no-op progress hook
+        pass
+
+    def record(self, present: bool) -> None:  # noqa: D401 - no-op progress hook
+        pass
+
+
 def run_analysis(
     store: "Store",
     analyzer: "Analyzer",

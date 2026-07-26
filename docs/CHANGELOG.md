@@ -850,3 +850,47 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `/api/tuning/rerun` `slot`, which `MogAnalyzer` rejects — that field is the BARE slot (`candidate`) and the analyzer adds
      the `mog2:` prefix itself. Now sends the bare slot, matching the old `/admin`. Pre-existing since the Wave 2 scaffold, so
      MOG2 re-runs never worked from admin-next until now.
+
+138. Always-on YOLO-oracle worker keeps FULL-coverage (motion + non-motion) `yolo-serial` verdicts pre-computed, so a
+     motion-tuning scorecard no longer waits on a per-day manual sweep. New `YoloOracleManager` ticks every 30s over the
+     un-swept tail through the SAME `run_analysis` path (verdicts byte-identical to a manual sweep), in 256-frame chunks
+     re-checking `is_busy` between them — `run_analysis` honors only `stop_event`, so a chunk boundary is the ONLY place a
+     mid-tick operator job can win. Detect-only, so it needs no promoted gallery. Toggle: Start page "YOLO all".
+     Spec: docs/specs/2026-07-26-yolo-oracle-worker.md.
+
+139. The two always-on YOLO loops (oracle + live-naming) deliberately do NOT yield to each other — only to manual jobs.
+     Safe because a same-frame detect is idempotent (`analysis` is `INSERT OR REPLACE` on `(frame_id, analyzer)`, all writes
+     serialized on the store lock), so an overlap wastes a little GPU and never corrupts. Feeding the oracle's `running` into
+     live-identify's `is_busy` would have been WRONG, not just conservative: `running` is an INTENT flag (true whenever the
+     toggle is on), so it would have suppressed naming for as long as the oracle was enabled.
+
+140. Worker on/off intent now survives a clean restart: `stop()` gained `persist` (default True) and the shutdown hook passes
+     `persist=False`. The hook's `stop()` previously wrote the OFF intent on every clean exit, so the launch-time `restore`
+     could never fire — fully exposed by the new oracle, latent in `live_identify` (masked by its
+     auto-start-when-a-model-is-promoted clause). An operator stop still remembers the off.
+
+141. `/api/clear` re-seeds both workers' frame watermarks to the post-wipe horizon. `clear()` keeps the settings KV while
+     frame rowids restart at 1, so a pre-wipe watermark sat AHEAD of every new frame and the worker looked enabled while
+     covering nothing. The idempotent resume queries can't save this — they are only consulted INSIDE the watermark's window.
+
+142. Oracle coverage is forward-only by construction: first enable seeds the watermark to the frame horizon (a full back-sweep
+     would hold the GPU for hours), and it fills only MISSING verdicts. So earlier days still need a manual sweep, and a
+     broadened detector still needs a manual `reanalyze`. It also idles under motion-only capture, where the non-motion
+     frames a gate miss lives in are never stored.
+
+143. Both always-on workers now self-heal from a frame-id REGRESSION, which previously stranded them silently.
+     `frames.id` is INTEGER PRIMARY KEY with NO AUTOINCREMENT, so SQLite REUSES rowids once the max row is deleted —
+     and the non-motion purge deletes THROUGH the current max id, almost always a non-motion frame at ~5 fps. A
+     watermark left above the horizon made every later tick a no-op: hours of zero oracle coverage, and (user-visible)
+     the Activity feed silently stopping naming. A tick now clamps `watermark > latest_id()` down and logs it.
+
+144. `reset_watermark` is epoch-guarded and no longer consumes the first-enable seed. `/api/clear` does NOT stop the
+     workers, so a tick in flight used to write its pre-wipe watermark back over the reset — undoing it and stranding
+     the worker exactly as the reset exists to prevent. It is also now a NO-OP on a never-enabled worker: writing the
+     key there consumed `_seed_horizon` permanently (it is re-derived as "no persisted key"), so clear → collect a day →
+     first enable would back-sweep the whole store — the hours-long GPU hold the seed exists to prevent.
+
+145. Start-page "YOLO all" UX hardening: a sticky `last_error` is appended as history rather than replacing the state
+     line (branching on it first hid "Idle"/"Sweeping" for the rest of the process's life after one transient fault);
+     the toggle can always be switched OFF, only ON is blocked in motion-only capture (a control you can't switch off
+     is a trap); and the disabled checkbox is dimmed once, not twice — stacked opacities rendered it invisible.

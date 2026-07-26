@@ -80,8 +80,14 @@ class _FakeStore:
         return self._model
 
     def latest_id(self):
-        # The frame horizon start() seeds the watermark to on a first-ever enable.
-        return self._latest_id
+        # The frame horizon start() seeds the watermark to on a first-ever enable, and the
+        # bound the tick clamps a regressed watermark down to. Reported as at least the newest
+        # span end, because that is an invariant of the REAL store: a visit span is derived
+        # FROM stored frames, so it can never extend past the frame horizon. A fake that
+        # returned spans above its own horizon would look like the id-regression the clamp
+        # exists to recover from, and would make these tests exercise a state that cannot occur.
+        span_max = max((hi for _lo, hi in self._spans), default=0)
+        return max(self._latest_id, span_max)
 
     def closed_visits(self, since_id, now_ms, *, gap_ms: int = 2000):
         self.closed_visits_calls.append((since_id, now_ms))
@@ -380,6 +386,107 @@ def test_start_ticks_then_stop_ends_loop():
 
     mgr.join(timeout=5)
     assert _wait(lambda: not mgr._thread.is_alive()), "worker thread did not exit after stop"
+
+
+# --- id regression + mid-tick reset: the watermark must never strand the worker ---
+
+
+def test_tick_clamps_watermark_when_frame_ids_regress():
+    # `frames.id` is INTEGER PRIMARY KEY with NO AUTOINCREMENT, so SQLite REUSES rowids once
+    # the max row is deleted — and the non-motion purge deletes THROUGH the current max id.
+    # Without a clamp, closed_visits(stale watermark) returns nothing on every later tick and
+    # naming silently stops (user-visible: the Activity feed stops naming cats) until the store
+    # regrows past the stale id.
+    store = _FakeStore(model=_MODEL_A, spans=[], latest_id=300)
+    store.settings["live_identify_watermark"] = "1000"  # from before a purge
+    mgr, parts = _manager(store, now_ms=lambda: 9000)
+
+    mgr._tick(threading.Event())
+    assert mgr.status()["watermark"] == 300, "stale watermark left above the horizon"
+    assert store.settings["live_identify_watermark"] == "300"
+
+    store._spans = [(310, 315)]  # a fresh visit on REUSED ids
+    mgr._tick(threading.Event())
+    assert parts["identify"].calls == [(310, 315)], "naming did not self-heal after the purge"
+
+
+def test_reset_watermark_mid_tick_is_not_clobbered():
+    # /api/clear does NOT stop the workers, so a reset can land while a tick is mid-span. The
+    # tick must not then write its pre-wipe-derived watermark back — that resurrects a value
+    # above every post-wipe visit and naming stops silently.
+    store = _FakeStore(model=_MODEL_A, spans=[(1, 5), (10, 15)], latest_id=20)
+    store.settings["live_identify_watermark"] = "0"
+    holder = {}
+
+    class _ClearDuringIdentify(_FakeIdentify):
+        def __call__(self, *a, **kw):
+            if (kw.get("since_id"), kw.get("until_id")) == (1, 5):
+                store._spans = []
+                store._latest_id = 0
+                holder["mgr"].reset_watermark(0)
+            return super().__call__(*a, **kw)
+
+    mgr = LiveIdentifyManager(
+        store,
+        is_busy=lambda: False,
+        detect=_FakeDetect(),
+        identify=_ClearDuringIdentify(),
+        analyzer_factory=_FakeAnalyzerFactory(),
+        embedder_factory=_FakeEmbedderFactory(),
+        gallery_loader=_FakeGalleryLoader(),
+        now_ms=lambda: 9000,
+    )
+    holder["mgr"] = mgr
+
+    mgr._tick(threading.Event())
+
+    st = mgr.status()
+    assert st["watermark"] == 0, "the in-flight tick resurrected the pre-clear watermark"
+    assert store.settings["live_identify_watermark"] == "0"
+    assert st["last_error"] is None  # abandoning the tick is not a fault
+
+
+def test_reset_watermark_preserves_first_enable_seed():
+    # /api/clear calls reset_watermark on workers that may NEVER have been enabled. Consuming
+    # the seed there would make the common clear → collect → enable-for-the-first-time flow
+    # back-IDENTIFY the whole store, which changelog 75 reserves for the manual Identify pass.
+    store = _FakeStore(model=_MODEL_A, spans=[], latest_id=0)
+    mgr, parts = _manager(store, tick_seconds=60.0)
+
+    mgr.reset_watermark(0)  # what /api/clear does to a never-enabled worker
+
+    store._latest_id = 432_000  # ...then a day of collection
+    mgr.start()  # the FIRST ever enable
+
+    assert mgr.status()["watermark"] == 432_000, "first enable back-identifies the whole store"
+    mgr.stop()
+    mgr.join(timeout=5)
+    assert parts["identify"].calls == []
+
+
+# --- shutdown vs operator stop: only a deliberate off is persisted ---
+
+
+def test_shutdown_stop_preserves_persisted_intent():
+    # The shutdown hook also calls stop(), so an unconditional persist-"0" would clear the
+    # operator's on-intent on every clean exit — leaving restore to fire only via its
+    # active-model clause, never via the intent it is meant to honor.
+    store = _FakeStore(model=_MODEL_A, spans=[])
+    store.settings["live_identify_watermark"] = "0"
+    mgr, _ = _manager(store, tick_seconds=60.0)
+
+    mgr.start()
+    assert store.settings["live_identify"] == "1"
+
+    mgr.stop(persist=False)  # a PROCESS exit
+    mgr.join(timeout=5)
+    assert mgr.running is False
+    assert store.settings["live_identify"] == "1"  # intent survives
+
+    mgr.start()
+    mgr.stop()  # an OPERATOR stop (default)
+    mgr.join(timeout=5)
+    assert store.settings["live_identify"] == "0"
 
 
 # --- first enable: seed the watermark to the horizon, don't back-identify the whole store -

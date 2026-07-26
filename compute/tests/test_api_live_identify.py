@@ -35,14 +35,17 @@ class FakeLiveIdentifyManager:
         self._running = False
         self.restore_calls: "list[bool]" = []
         self.stop_calls = 0
+        self.stop_persist: "list[bool]" = []
+        self.reset_calls: "list[int]" = []
         self.join_calls = 0
 
     def start(self) -> None:
         self._running = True
 
-    def stop(self) -> None:
+    def stop(self, persist: bool = True) -> None:
         self._running = False
         self.stop_calls += 1
+        self.stop_persist.append(persist)
 
     def join(self, timeout: "float | None" = None) -> None:
         self.join_calls += 1
@@ -51,6 +54,13 @@ class FakeLiveIdentifyManager:
         self.restore_calls.append(flag)
         if flag:
             self.start()
+
+    def reset_watermark(self, value: int) -> None:
+        # /api/clear re-seeds this worker's watermark too (a pre-wipe value would sit above
+        # every new frame and it would silently stop naming). Present here so the fake keeps
+        # matching the surface create_app touches — a drifted fake turns a real app bug into
+        # a confusing AttributeError, or hides it entirely.
+        self.reset_calls.append(value)
 
     def status(self) -> dict:
         return {
@@ -138,6 +148,14 @@ def test_stats_carries_live_identify_object(tmp_path):
     client.post("/api/live-identify/start")
     body = client.get("/api/stats").json()
     assert body["live_identify"]["running"] is True
+
+
+def test_clear_reseeds_watermark(tmp_path):
+    # Mirrors the oracle's test: /api/clear must re-point this worker's watermark at the
+    # post-wipe horizon, or a pre-wipe value sits above every new frame and naming stops.
+    client, manager = _make_app(tmp_path)
+    assert client.post("/api/clear").status_code == 200
+    assert manager.reset_calls == [0]
 
 
 def test_test_app_does_not_restore_intent(tmp_path):

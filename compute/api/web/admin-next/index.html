@@ -119,6 +119,12 @@
   input[type=checkbox]:checked::after { content: ''; position: absolute; left: 5px; top: 2px; width: 3px; height: 7px;
     border: solid #0c1117; border-width: 0 2px 2px 0; transform: rotate(45deg); }
   input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* A disabled toggle must LOOK unavailable — the custom appearance drops the native cue.
+     Deliberately NO opacity on the input: stacked with .dim's .55 it fell to ~.22 and the
+     box vanished entirely (worse than "unavailable"). One dimming layer, on the label. */
+  input[type=checkbox]:disabled { cursor: not-allowed; }
+  input[type=checkbox]:disabled:hover { border-color: var(--border); }
+  label.dim { opacity: .55; cursor: not-allowed; }
   /* No native number spinners — the params are typed; the arrows only clutter. */
   input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
   input[type=number] { -moz-appearance: textfield; appearance: textfield; }
@@ -229,6 +235,13 @@
     if (!ms) return '—';
     const d = new Date(ms), p = (x) => String(x).padStart(2, '0');
     return `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  // Time-of-day WITH seconds. For a liveness readout fmtTs's minute resolution is useless —
+  // a worker ticking every 30s and one stalled for a minute render identically.
+  function fmtClock(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms), p = (x) => String(x).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
   function fmtDuration(sec) {
     if (sec == null || !isFinite(sec) || sec < 0) return '…';
@@ -342,6 +355,17 @@
           </div>
           <span id="modeNote" class="note"></span>
         </div>
+        <div class="row">
+          <label class="note" id="oracleLabel" title="Run YOLO over every new frame as it arrives">
+            <input type="checkbox" id="oracleChk" aria-describedby="oracleNote"> YOLO all
+          </label>
+          <span id="oracleNote" class="note"></span>
+        </div>
+        <p class="hint">Runs <b>YOLO</b> continuously over new frames — motion <i>and</i> non-motion
+          — so Motion tuning finds a day already covered instead of waiting on a manual sweep.
+          Keep-all only: a gate miss lives in a non-motion frame, which motion-only capture never
+          stores. Covers frames from when you switch it on; earlier days still need a manual
+          sweep.</p>
       </div>
 
       <div class="card">
@@ -412,6 +436,26 @@
       catch (err) { $('#modeNote', view).textContent = 'Failed: ' + err.message; }
     });
 
+    // --- YOLO-all oracle (continuous full-coverage sweep) ---
+    // The checkbox is optimistic; refresh() re-renders it from the server's reported intent,
+    // so a failed POST reverts the box rather than leaving it lying about the worker's state.
+    $('#oracleChk', view).addEventListener('change', async (e) => {
+      const box = e.target, wanted = box.checked;
+      // Hold the box inert until the POST settles. `start()` best-effort-joins a just-stopped
+      // worker thread for up to 2s, so an off→on click can await that long — plenty of room
+      // for a second click to fire a concurrent /stop whose ordering at the manager lock is
+      // undefined, settling opposite to the user's last intent. refresh() re-derives disabled.
+      box.disabled = true;
+      let failed = null;
+      try { await api('POST', wanted ? '/api/yolo-oracle/start' : '/api/yolo-oracle/stop'); }
+      catch (err) { failed = err; }
+      await refresh();  // re-render from server state FIRST (reverts the box if the POST failed)
+      if (failed) {     // ...then report, so this refresh can't overwrite the message
+        const n = $('#oracleNote', view);
+        n.className = 'note bad'; n.textContent = 'Failed: ' + failed.message;
+      }
+    });
+
     // --- Collection controls ---
     $('#collectorBtn', view).addEventListener('click', async () => {
       const running = $('#collectorBtn', view).dataset.running === '1';
@@ -474,6 +518,35 @@
       // Capture mode
       for (const b of modeSeg.querySelectorAll('button')) b.classList.toggle('sel', (b.dataset.mo === '1') === !!s.motion_only);
       $('#modeNote', view).textContent = s.motion_only ? 'Motion-only: gate misses are unmeasurable while this is on.' : 'Keeping every frame.';
+
+      // YOLO-all oracle. `running` is INTENT, so it stays on while the worker idles under
+      // motion-only capture — hence the note distinguishes "idle" from "off", so an enabled
+      // but deliberately-idle worker is never mistaken for a broken one.
+      const oracle = s.yolo_oracle || {};
+      const oBox = $('#oracleChk', view), oNote = $('#oracleNote', view);
+      oBox.checked = !!oracle.running;
+      // Blocked from being turned ON in motion-only capture (it can't cover anything there),
+      // but never blocked from being turned OFF — a control you can't switch off is a trap.
+      const lockOn = !!s.motion_only && !oracle.running;
+      oBox.disabled = lockOn;
+      $('#oracleLabel', view).classList.toggle('dim', lockOn);
+
+      let cls = 'note', txt;
+      if (s.motion_only) {
+        if (oracle.running) { cls = 'note warn'; txt = 'Idle — motion-only capture drops the non-motion frames it needs.'; }
+        else { txt = 'Off — keep-all mode only.'; }
+      } else if (oracle.running) {
+        txt = `Sweeping · up to date through frame #${fmtInt(oracle.watermark)}`
+          + (oracle.last_tick_ts ? ` · last tick ${fmtClock(oracle.last_tick_ts)}` : '');
+      } else {
+        txt = 'Off — Motion tuning needs a manual YOLO sweep per day.';
+      }
+      // last_error is deliberately STICKY (it outlives the tick that set it, so a returning
+      // operator still sees it), so it is appended as history rather than replacing the state
+      // — branching on it first would hide "Idle"/"Sweeping" for the rest of the process's
+      // life after one transient fault, and read as broken while the worker swept happily.
+      if (oracle.last_error) { cls = 'note warn'; txt += ' · last error: ' + oracle.last_error; }
+      oNote.className = cls; oNote.textContent = txt;
 
       // Collector
       const cb = $('#collectorBtn', view);

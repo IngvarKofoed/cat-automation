@@ -642,6 +642,7 @@ def create_app(
     analysis_manager=None,
     training_manager=None,
     live_identify_manager=None,
+    yolo_oracle_manager=None,
     cleanup_manager=None,
 ) -> FastAPI:
     """Build the FastAPI app.
@@ -677,6 +678,13 @@ def create_app(
     injected ``training_manager`` keeps the training routes torch-free. Its persisted
     on/off intent is restored ONLY on a live app (``start_collector``): a test app
     must never auto-start a GPU worker.
+
+    ``yolo_oracle_manager`` defaults to a fresh ``YoloOracleManager`` (the always-on
+    worker that keeps FULL-coverage ``yolo-serial`` verdicts pre-computed so motion-gate
+    scorecards need no per-day manual sweep). Same construction rules as
+    ``live_identify_manager`` — built after the FIFO managers whose ``running`` it yields
+    to, lazily imported, and restored only on a live app — but restored from its persisted
+    intent ALONE (no promoted-model clause: it is a tuning tool, not a naming one).
     """
     store = store if store is not None else _store_from_env()
     autostart = _autostart_from_env() if autostart is None else autostart
@@ -774,6 +782,34 @@ def create_app(
         )
         live_identify_manager.restore(want_live)
 
+    # The always-on YOLO-oracle worker: sweeps the FULL-coverage tail (motion + non-motion)
+    # with yolo-serial so motion-gate scorecards need no per-day manual sweep. Built here for
+    # the same reason as live-identify — it must yield the shared GPU/DB-connection to a
+    # manual job — and given the SAME ``is_busy`` predicate. The two always-on YOLO loops
+    # deliberately do NOT yield to each other: a same-frame detect is idempotent (analysis is
+    # INSERT OR REPLACE on (frame_id, analyzer), all writes serialized on the store lock), and
+    # feeding this worker's INTENT flag into live-identify's ``is_busy`` would suppress naming
+    # for as long as the oracle was enabled. ``motion_only`` is the collector's live getter:
+    # with motion-only capture on, the non-motion frames don't exist, so the tick idles.
+    # Imported LAZILY, like LiveIdentifyManager, so an injected fake keeps this module (and
+    # its tests) loadable without the worker's ML deps.
+    if yolo_oracle_manager is None:
+        from compute.learning.yolo_oracle import YoloOracleManager
+
+        yolo_oracle_manager = YoloOracleManager(
+            store,
+            is_busy=(lambda: analysis_manager.running or training_manager.running),
+            motion_only=(lambda: collector_manager.current_motion_only),
+        )
+    app.state.yolo_oracle_manager = yolo_oracle_manager
+
+    # Restore the oracle at launch — ONLY on a live app (it start()s a GPU worker thread, which
+    # a test app must never do), and ONLY from the operator's persisted intent. Deliberately no
+    # "…or a model is promoted" clause like live-identify's: a promoted gallery is a naming
+    # signal, while this worker is a motion-gate tuning tool.
+    if start_collector:
+        yolo_oracle_manager.restore(store.get_setting("yolo_oracle") == "1")
+
     @app.on_event("shutdown")
     def _shutdown() -> None:
         # Wind everything down between frames/batches on process exit, THEN close the
@@ -798,9 +834,18 @@ def create_app(
         # The live-identify worker is a fourth writer of the shared connection (its
         # detect/identify passes write the store), so it too is stopped AND joined
         # before close() — same load-bearing ordering as the three above.
-        live_identify_manager.stop()
+        # ``persist=False``: this is a PROCESS exit, not an operator "off". Persisting the off
+        # intent here would clear what the operator left on, so the launch-time ``restore``
+        # could never bring the worker back — the same reason the collector's shutdown path
+        # deliberately bypasses its intent-persisting route.
+        live_identify_manager.stop(persist=False)
         live_identify_manager.join(timeout=10.0)
-        # The cleanup purge is a FIFTH writer of the shared connection (its batched
+        # The YOLO-oracle worker is likewise a writer of the shared connection (its detect
+        # pass writes verdicts + the watermark), so it too is stopped AND joined before
+        # close() — same load-bearing ordering as the writers above.
+        yolo_oracle_manager.stop(persist=False)
+        yolo_oracle_manager.join(timeout=10.0)
+        # The cleanup purge is another writer of the shared connection (its batched
         # deletes commit through the store), so it too is canceled AND joined before
         # close() — same load-bearing ordering as the workers above.
         cleanup_manager.stop_all()
@@ -920,6 +965,11 @@ def create_app(
             # last_error), so the Activity page's live-naming toggle renders from the
             # same poll the rest of the UI already makes.
             "live_identify": live_identify_manager.status(),
+            # The YOLO-oracle worker's snapshot (running/watermark/last_tick_ts/last_error),
+            # so the Start page's "YOLO all" toggle renders from this same poll. Note
+            # ``running`` is INTENT: with motion-only capture on it stays true while the tick
+            # idles, which is why the UI reads it alongside ``motion_only``.
+            "yolo_oracle": yolo_oracle_manager.status(),
         }
 
     @app.get("/media/{frame_id}")
@@ -942,6 +992,15 @@ def create_app(
         deleted = store.clear()
         if collector_manager.running:
             store.record_mode_change(collector_manager.current_motion_only)
+        # The always-on workers' frame watermarks live in that PRESERVED settings KV while
+        # frame rowids restart from 1, so a pre-wipe watermark would sit far AHEAD of every
+        # new frame — each worker's "beyond the watermark" window would then never include
+        # them and it would look enabled while covering nothing, until the store re-grew past
+        # the old id. Re-point both at the post-wipe horizon (0 for an emptied store) to
+        # restore the normal "handle what arrives from now on" contract.
+        horizon = store.latest_id()
+        live_identify_manager.reset_watermark(horizon)
+        yolo_oracle_manager.reset_watermark(horizon)
         return JSONResponse({"ok": True, "deleted": deleted})
 
     # --- Cleanup purges (admin-next P7) ---------------------------------------------
@@ -1283,6 +1342,22 @@ def create_app(
         # Symmetric to start: stop the worker and report the resulting (stopped) state.
         live_identify_manager.stop()
         return {"running": live_identify_manager.running}
+
+    @app.post("/api/yolo-oracle/start")
+    def api_yolo_oracle_start():
+        # Turn on continuous full-coverage yolo-serial sweeping of the tail, so motion-gate
+        # scorecards find their oracle coverage already computed. Like live-identify, the
+        # manager owns idempotency/thread-replacement and persists its own intent, so the
+        # route just toggles and reports. Not rejected in motion-only capture mode: the intent
+        # is legitimate and the tick simply idles until capture returns to keep-all.
+        yolo_oracle_manager.start()
+        return {"running": yolo_oracle_manager.running}
+
+    @app.post("/api/yolo-oracle/stop")
+    def api_yolo_oracle_stop():
+        # Symmetric to start: stop the worker and report the resulting (stopped) state.
+        yolo_oracle_manager.stop()
+        return {"running": yolo_oracle_manager.running}
 
     @app.post("/api/analysis/run")
     def api_analysis_run(req: AnalysisRunRequest):

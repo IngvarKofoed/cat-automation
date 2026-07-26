@@ -50,7 +50,7 @@ import time
 from typing import TYPE_CHECKING
 
 from compute.analysis import get_analyzer
-from compute.analysis.runner import run_analysis
+from compute.analysis.runner import DetectAdapter, run_analysis
 from compute.identification.embed import EmbedCancelled, Embedder
 from compute.identification.gallery import load_gallery, run_identify
 
@@ -94,27 +94,6 @@ _WATERMARK_KEY = "live_identify_watermark"
 def _default_now_ms() -> int:
     """Wall-clock milliseconds — the injectable clock's real default (tests pass a fake)."""
     return int(time.time() * 1000)
-
-
-class _DetectAdapter:
-    """The minimal ``manager`` stand-in ``run_analysis`` needs, for one tick's detect.
-
-    ``run_analysis`` reads only three things off its ``manager``: ``.stop_event`` (an
-    ``Event`` it polls between batches/frames to honor a cancel), ``.set_total(int)`` and
-    ``.record(bool)`` (progress hooks). The live worker has no progress bar, so the two
-    counter hooks are no-ops; the ``stop_event`` IS the worker's own, so a ``stop()``
-    that sets it aborts an in-flight detect at the next batch boundary — the same reason
-    the collector's ``stop`` reaches its loop.
-    """
-
-    def __init__(self, stop_event: threading.Event) -> None:
-        self.stop_event = stop_event
-
-    def set_total(self, total: int) -> None:  # noqa: D401 - no-op progress hook
-        pass
-
-    def record(self, present: bool) -> None:  # noqa: D401 - no-op progress hook
-        pass
 
 
 def run_live_identify(
@@ -229,6 +208,13 @@ class LiveIdentifyManager:
         # and the worker resumes where it left off. See start().
         self._seed_horizon = raw is None
 
+        # Bumped by every ``reset_watermark``. A tick snapshots it and refuses to advance the
+        # watermark once it has changed, because ``/api/clear`` resets mid-flight: the tick
+        # queried spans from the PRE-wipe watermark and would otherwise write its own derived
+        # value back, resurrecting a watermark above every post-wipe frame — naming would then
+        # stop silently. See ``_advance_watermark``.
+        self._epoch = 0
+
         # Observability for /api/stats: when the last tick ran, and the most-recent tick
         # error (sticky until the next error, so a returning operator still sees it).
         self._last_tick_ts: "int | None" = None
@@ -310,8 +296,29 @@ class LiveIdentifyManager:
                 # Built once and reused every span/tick; run_analysis.prepare() is idempotent.
                 self._analyzer = self._analyzer_factory()
 
-            detect_manager = _DetectAdapter(stop_event)
-            for i, (lo, hi) in enumerate(self._store.closed_visits(self._watermark, now)):
+            detect_manager = DetectAdapter(stop_event)
+            # Snapshot the watermark AND the epoch together under the lock, so this tick's span
+            # query and its staleness check agree; store reads stay outside the lock.
+            with self._lock:
+                epoch, watermark = self._epoch, self._watermark
+            latest = self._store.latest_id()
+            if watermark > latest:
+                # Frame ids REGRESSED below the watermark. ``frames.id`` is INTEGER PRIMARY KEY
+                # with NO AUTOINCREMENT, so SQLite REUSES rowids once the max row is deleted —
+                # and the non-motion purge deletes through the current max id, which at ~5 fps
+                # is almost always a non-motion frame. Left alone, ``closed_visits(watermark)``
+                # returns nothing on EVERY later tick, so naming silently stops (a
+                # user-VISIBLE outage: the Activity feed stops naming cats) until the store
+                # regrows past the stale id. Clamp so naming self-heals next tick.
+                logger.warning(
+                    "live-identify: frame ids regressed (watermark %d > latest %d) — clamping",
+                    watermark,
+                    latest,
+                )
+                if not self._advance_watermark(latest, epoch):
+                    return
+                watermark = latest
+            for i, (lo, hi) in enumerate(self._store.closed_visits(watermark, now)):
                 if i >= _MAX_SPANS_PER_TICK:
                     # Cap the tick: leave the rest of a backlog to the next interval so a
                     # single tick can't monopolize the GPU. The watermark is parked at the
@@ -348,10 +355,11 @@ class LiveIdentifyManager:
                     # intentional, not a fault — do not record it as last_error.
                     break
                 # Advance ONLY after both passes for this span succeeded — so a failure
-                # above never lets the watermark skip an un-identified span.
-                with self._lock:
-                    self._watermark = hi
-                self._store.set_setting(_WATERMARK_KEY, str(hi))
+                # above never lets the watermark skip an un-identified span. A False return
+                # means a reset landed mid-tick, so this window is stale — abandon it rather
+                # than write a pre-wipe-derived watermark.
+                if not self._advance_watermark(hi, epoch):
+                    break
         except Exception as exc:
             # A per-span (or setup) fault must not kill the always-on worker: log it,
             # surface it on status().last_error, and stop the tick here — the watermark is
@@ -359,6 +367,23 @@ class LiveIdentifyManager:
             logger.exception("live-identify: tick failed")
             with self._lock:
                 self._last_error = str(exc)
+
+    def _advance_watermark(self, value: int, epoch: int) -> bool:
+        """Set + persist the watermark, unless a ``reset_watermark`` landed since ``epoch``.
+
+        Returns False when the epoch has moved — i.e. ``/api/clear`` re-seeded the watermark
+        while this tick was in flight, so the tick's spans were queried against the PRE-wipe
+        store. Writing a value derived from it would resurrect a watermark above every
+        post-wipe frame and silently stop naming (the exact failure ``reset_watermark`` exists
+        to prevent), so the caller must abandon the tick instead. In-memory first, then
+        persisted: a crash between the two costs re-work, never a missed visit.
+        """
+        with self._lock:
+            if epoch != self._epoch:
+                return False
+            self._watermark = int(value)
+        self._store.set_setting(_WATERMARK_KEY, str(int(value)))
+        return True
 
     # --- Lifecycle (mirrors CollectorManager) --------------------------------------------
 
@@ -407,14 +432,22 @@ class LiveIdentifyManager:
         thread.start()
         self._store.set_setting(_INTENT_KEY, "1")
 
-    def stop(self) -> None:
-        """Stop the worker; idempotent. Signals the loop, flips ``running``, persists off.
+    def stop(self, persist: bool = True) -> None:
+        """Stop the worker; idempotent. Signals the loop and flips ``running``.
 
         Sets the current stop event and clears ``running`` synchronously so the next
         ``/api/stats`` poll sees "stopped" at once. It does NOT join — the thread may be
         parked in ``stop_event.wait`` or mid-detect and would only notice at the next
         boundary; the daemon winds down on its own, and ``start`` handles any leftover
         before spawning a replacement. ``join`` (below) is the shutdown-only wait.
+
+        ``persist`` distinguishes an OPERATOR stop from a PROCESS stop: the shutdown hook
+        also calls ``stop()``, so persisting "0" unconditionally would clear the operator's
+        on-intent on every clean exit — leaving ``restore`` to fire only via its
+        active-model clause, never via the intent it is meant to honor. The route passes the
+        default (a deliberate off, remembered); ``_shutdown`` passes ``persist=False`` (a
+        process exit, intent preserved). Same split the collector makes by persisting its
+        intent in the route rather than the manager.
         """
         with self._lock:
             if not self._running:
@@ -422,7 +455,8 @@ class LiveIdentifyManager:
             if self._stop_event is not None:
                 self._stop_event.set()
             self._running = False
-        self._store.set_setting(_INTENT_KEY, "0")
+        if persist:
+            self._store.set_setting(_INTENT_KEY, "0")
 
     def restore(self, flag: bool) -> None:
         """Start the worker iff the persisted intent was on — the launch-time restore.
@@ -434,6 +468,37 @@ class LiveIdentifyManager:
         """
         if flag:
             self.start()
+
+    def reset_watermark(self, value: int) -> None:
+        """Re-point the watermark (and its persisted copy) at ``value`` — for ``/api/clear``.
+
+        ``Store.clear()`` wipes the frames but deliberately KEEPS the settings KV, while
+        frame rowids restart from 1. A watermark left at the pre-wipe horizon would then sit
+        far AHEAD of every new visit, so ``closed_visits(watermark, …)`` would never return
+        one and the worker would look enabled while silently naming nothing — until the store
+        re-grew past the old id. The idempotent resume queries cannot save us here: they are
+        only consulted for spans the watermark already admitted.
+
+        Two subtleties, both load-bearing (see ``YoloOracleManager.reset_watermark``, which is
+        identical):
+
+        - It bumps ``_epoch``, so a tick already in flight (``/api/clear`` does NOT stop the
+          workers) refuses to write its pre-wipe-derived watermark back over this reset.
+        - It is a NO-OP on a worker that has never been enabled: such a worker has no stale
+          watermark to strand (it is 0, and the first ``start()`` seeds it to the THEN-current
+          horizon), so writing the key here would only consume ``_seed_horizon`` — which is
+          re-derived at construction as "no persisted key", so it would stay consumed across
+          restarts. The cost of getting that wrong is a first enable back-IDENTIFYING the
+          whole store, which changelog 75 reserves for the manual Identify pass.
+        """
+        with self._lock:
+            # Bump first and unconditionally: any in-flight tick must be invalidated even in
+            # the never-enabled case (cheap, and it keeps the invariant simple).
+            self._epoch += 1
+            if self._seed_horizon:
+                return
+            self._watermark = int(value)
+        self._store.set_setting(_WATERMARK_KEY, str(int(value)))
 
     def join(self, timeout: "float | None" = None) -> None:
         """Best-effort wait for the worker thread to exit — for shutdown only.

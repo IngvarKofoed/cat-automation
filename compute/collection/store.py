@@ -1405,7 +1405,12 @@ class Store:
             self._conn.commit()
             return cur.rowcount
 
-    def count_in_range(self, since_id: "int | None" = None, until_id: "int | None" = None) -> int:
+    def count_in_range(
+        self,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        motion_only: bool = False,
+    ) -> int:
         """Count of frames whose id is in the inclusive ``[since_id, until_id]`` range.
 
         Both bounds are optional (``None`` = unbounded on that side, so an
@@ -1414,8 +1419,15 @@ class Store:
         in the scoped window) and the range-count endpoint the UI shows as "N
         frames in range" while picking a pending range. A fast primary-key range
         scan — ``id`` is the primary key.
+
+        ``motion_only`` (opt-in) adds ``AND motion = 1`` so a caller can estimate the
+        candidate set of a motion-scoped stateless re-run without over-counting the
+        non-motion majority (the queue-view frame estimate) — mirroring
+        ``count_unanalyzed(motion_only=...)`` over a fully-cleared window.
         """
         where, params = _range_bounds("id", since_id, until_id)
+        if motion_only:
+            where = where + ["motion = 1"]
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self._lock:
             (count,) = self._conn.execute(

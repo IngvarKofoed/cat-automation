@@ -1336,6 +1336,15 @@ def create_app(
         analysis_manager.cancel()
         return analysis_manager.status()
 
+    @app.post("/api/analysis/cancel/{job_id}")
+    def api_analysis_cancel_job(job_id: int):
+        # Per-row Cancel (the queue-view column's rightmost button): cancel by the job's
+        # stable id — the RUNNING job (stop_event, then the next pending promotes) or a
+        # specific PENDING job (dropped from the deque). A stale/unknown id is a no-op, so a
+        # double-click or a click on a row that just finished is harmless.
+        analysis_manager.cancel_job(job_id)
+        return analysis_manager.status()
+
     @app.post("/api/analysis/queue/clear")
     def api_analysis_queue_clear():
         # Drop every PENDING job; the running job finishes normally then, finding an empty

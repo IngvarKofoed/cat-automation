@@ -939,3 +939,96 @@ def test_history_records_failed_state_on_fatal_error(tmp_path):
     assert st["error"] == "prepare boom"
     assert st["history"][0]["state"] == "failed"
     assert st["history"][0]["error"] == "prepare boom"
+
+
+# --- Queue-view descriptors + per-row cancel (job_id) --------------------------
+
+
+def test_count_in_range_motion_only(tmp_path):
+    # The queue-view frame estimate for a motion-scoped stateless re-run must not
+    # over-count the non-motion majority — count_in_range gains a motion filter.
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i + 1, motion=(i % 2 == 0)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(6)
+    ]  # motion on the even indices → ids 1, 3, 5
+    assert store.count_in_range() == 6
+    assert store.count_in_range(motion_only=True) == 3
+    # Scoped [ids[0], ids[2]] = ids 1,2,3 → motion at 1 and 3.
+    assert store.count_in_range(ids[0], ids[2], motion_only=True) == 2
+
+
+@_requires_cv
+def test_enqueue_exposes_descriptors_on_running_and_queued(tmp_path):
+    # job_id / category / since_ts / total ride on both the running job (from
+    # _current_job) and each queued job, so both rows render Name/day and Cancel.
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i + 1, ts=i, body=_jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(4)
+    ]
+    gated = GatedAnalyzer(name="yolo-serial")  # stateless coverage-category running job
+    manager = AnalysisManager(resolver=lambda name: gated)
+    manager.enqueue_named(store, "yolo-serial", since_id=ids[0], until_id=ids[3])
+    assert gated.entered.wait(timeout=5)
+    # A pending windowed mog2 job (won't run while pending, so no decode needed).
+    winfake = FakeAnalyzer(name="mog2:candidate", windowed=True)
+    manager.enqueue_analyzer(store, winfake, since_id=ids[1], until_id=ids[3])
+
+    st = manager.status()
+    # Running row descriptors.
+    assert st["running"] and st["category"] == "coverage"
+    assert st["since_ts"] == store.frame_recv_ts(ids[0])
+    assert isinstance(st["job_id"], int) and st["job_id"] > 0
+    # Queued row descriptors.
+    assert len(st["queue"]) == 1
+    q = st["queue"][0]
+    assert q["category"] == "mog2"
+    assert q["since_ts"] == store.frame_recv_ts(ids[1])
+    assert q["total"] == store.count_in_range(ids[1], ids[3]) == 3  # windowed → all in-window
+    # job_ids are distinct and monotonic (the pending one drawn after the running one).
+    assert q["job_id"] > st["job_id"]
+
+    manager.stop_all()
+    gated.release.set()
+    manager.join(timeout=5)
+
+
+@_requires_cv
+def test_cancel_job_removes_pending_and_cancels_running(tmp_path):
+    store = _store(tmp_path)
+    ids = [
+        store.add(_frame(frame_id=i + 1, ts=i, body=_jpeg_gray(200)), recv_ts_ms=1_700_000_000_000 + i)
+        for i in range(4)
+    ]
+    gated = GatedAnalyzer(name="gated")
+    manager = AnalysisManager(resolver=lambda name: gated)
+    manager.enqueue_named(store, "gated", since_id=ids[0], until_id=ids[3])
+    assert gated.entered.wait(timeout=5)
+    winfake = FakeAnalyzer(name="mog2:candidate", windowed=True)
+    manager.enqueue_analyzer(store, winfake, since_id=ids[0], until_id=ids[3])
+
+    st = manager.status()
+    running_id, pending_id = st["job_id"], st["queue"][0]["job_id"]
+
+    # Cancel the PENDING job → dropped; the running job is untouched.
+    manager.cancel_job(pending_id)
+    st = manager.status()
+    assert st["queue"] == [] and st["running"] is True
+
+    # Cancel the RUNNING job by id → stops at the next frame boundary.
+    manager.cancel_job(running_id)
+    gated.release.set()
+    assert _wait(lambda: not manager.running)
+    hist = manager.status()["history"]
+    assert hist[0]["state"] == "canceled"
+
+    # A stale/unknown id is a harmless no-op.
+    manager.cancel_job(999999)
+
+
+def test_cancel_job_unknown_id_is_noop_when_idle(tmp_path):
+    store = _store(tmp_path)
+    manager = AnalysisManager()
+    manager.cancel_job(42)  # nothing running, nothing pending → no error
+    assert manager.status()["running"] is False

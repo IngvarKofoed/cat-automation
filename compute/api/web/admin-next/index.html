@@ -134,10 +134,25 @@
   .cal-cell.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .cal-cell .cd { font-size: 12px; font-variant-numeric: tabular-nums; }
   .cal-cell .ce { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .cal-cell .cc { display: flex; gap: 5px; margin-top: auto; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .cal-cell .cc { display: flex; flex-direction: column; gap: 1px; margin-top: auto; font-size: 10px; font-variant-numeric: tabular-nums; }
   .cal-cell .cc .full { color: var(--ok); }
   .cal-cell .cc .part { color: var(--text); }
   .cal-cell .cc .none { color: var(--muted); }
+
+  /* Shared queue table (renderQueue) */
+  .qwrap { margin-top: 10px; overflow-x: auto; }
+  .qwrap:empty { margin-top: 0; }
+  .qtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .qtable th { text-align: left; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .4px;
+    color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .qtable td { padding: 5px 8px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; vertical-align: middle; white-space: nowrap; }
+  .qtable tr:last-child td { border-bottom: 0; }
+  .qtable td.num { text-align: right; }
+  .qtable td.qname { font-variant-numeric: normal; white-space: normal; }
+  .qstatus { display: inline-flex; align-items: center; gap: 6px; }
+  .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .qstatus.running .dot { background: var(--warn); }
+  button.qbtn { font-size: 11px; padding: 3px 10px; }
 
   .pill { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
@@ -214,6 +229,35 @@
     if (!ms) return '—';
     const d = new Date(ms), p = (x) => String(x).padStart(2, '0');
     return `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  function fmtDuration(sec) {
+    if (sec == null || !isFinite(sec) || sec < 0) return '…';
+    sec = Math.round(sec);
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return m + 'm' + (s ? ' ' + s + 's' : '');
+    const h = Math.floor(m / 60), mm = m % 60;
+    return h + 'h' + (mm ? ' ' + mm + 'm' : '');
+  }
+  // Manager-agnostic queue renderer: rows are pre-normalized
+  // {jobId, status:'running'|'queued', name, pctText, xy, fpsText, etaText}; empty rows → no
+  // table. onCancel(jobId) wires the rightmost Cancel column. Fed by any status source.
+  function renderQueue(el, rows, onCancel) {
+    if (!rows || !rows.length) { el.innerHTML = ''; return; }
+    const td = (v, cls) => `<td class="${cls || ''}">${v}</td>`;
+    el.innerHTML = '<table class="qtable"><thead><tr>'
+      + '<th>Status</th><th>Name</th><th class="num">% done</th><th class="num">Frames</th>'
+      + '<th class="num">FPS</th><th class="num">Time to complete</th><th></th></tr></thead><tbody>'
+      + rows.map((r) => '<tr>'
+        + `<td><span class="qstatus ${r.status === 'running' ? 'running' : ''}"><span class="dot"></span>`
+        + `${r.status === 'running' ? 'Running' : 'Queued'}</span></td>`
+        + td(r.name, 'qname') + td(r.pctText, 'num') + td(r.xy, 'num')
+        + td(r.fpsText, 'num') + td(r.etaText, 'num')
+        + `<td class="num"><button class="qbtn danger" data-cancel="${r.jobId}">Cancel</button></td>`
+        + '</tr>').join('')
+      + '</tbody></table>';
+    el.querySelectorAll('button[data-cancel]').forEach((b) =>
+      b.addEventListener('click', () => onCancel(Number(b.dataset.cancel))));
   }
 
   // ---- Route table -------------------------------------------------------
@@ -513,6 +557,7 @@
           <button id="sweepBtn" class="primary">Run YOLO</button>
         </div>
         <div id="jobLine" class="note" style="margin-top:8px">idle</div>
+        <div id="covQueue" class="qwrap"></div>
       </div>
 
       <div class="card">
@@ -525,6 +570,7 @@
           <button id="runCandidate" class="primary">Run candidate</button>
         </div>
         <p id="paramNote" class="hint"></p>
+        <div id="mogQueue" class="qwrap"></div>
       </div>
 
       <div class="card">
@@ -586,7 +632,7 @@
     const covCell = (label, a, t) => {
       const p = (t ? Math.round(a / t * 100) : null);
       const cls = p == null ? 'none' : p >= 100 ? 'full' : p > 0 ? 'part' : 'none';
-      return `<span class="${cls}">${label}${p == null ? '–' : p}</span>`;
+      return `<span class="${cls}">${label}: ${p == null ? '–' : p + '%'}</span>`;
     };
     function renderCalendar() {
       let html = '<div class="cal">';
@@ -601,7 +647,7 @@
         const sel = ms === selectedDayMs ? ' sel' : '';
         html += `<div class="cal-cell has${sel}" data-ms="${ms}">
           <div class="cd">${dnum}${tag}</div>
-          <div class="ce">${fmtInt(row.events)} ev</div>
+          <div class="ce">${fmtInt(row.events)} event${row.events === 1 ? '' : 's'}</div>
           <div class="cc">${covCell('Y', row.yolo, row.frames)}${covCell('B', row.baseline, row.frames)}${covCell('C', row.candidate, row.frames)}</div>
         </div>`;
       }
@@ -686,20 +732,57 @@
       } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
     }
 
+    // --- Queue tables (the shared renderer, fed from the analysis status poll) ---
+    const KIND_NAME = { 'yolo-serial': 'YOLO coverage', 'mog2:baseline': 'MOG2 baseline', 'mog2:candidate': 'MOG2 candidate' };
+    const kindName = (k) => KIND_NAME[k] || k;   // fallback: raw kind (a stray bsuv/corruption job)
+    // Bucket the label's day with the SAME fixed `off` the calendar uses (read ms+off as
+    // UTC), so a job's day label can't drift from its calendar cell across a DST/midnight edge.
+    const dayLabel = (ts) => { if (!ts) return ''; const d = new Date(ts + off), p = (x) => String(x).padStart(2, '0'); return `${WD[(d.getUTCDay() + 6) % 7]} ${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)}`; };
+    const jobName = (kind, ts, rerun) => `${kindName(kind)}${ts ? ' · ' + dayLabel(ts) : ''}${rerun ? ' · rerun' : ''}`;
+    const cancelJob = (jobId) => api('POST', '/api/analysis/cancel/' + jobId).catch(() => {}).then(() => { if (alive) pollJob(); });
+
+    // Running-job rate, ported from /admin's etaAnchor: r = frames done / seconds since the
+    // anchor, re-anchored per running-job identity (and on done<done0 for back-to-back
+    // same-analyzer jobs). Only the running row shows FPS + ETA (queued rows show '—').
+    let etaAnchor = null;
+    function runningRate(s) {
+      const key = [s.analyzer, s.since_id, s.until_id, s.total].join('|'), now = Date.now();
+      if (!etaAnchor || etaAnchor.key !== key || s.done < etaAnchor.done0) etaAnchor = { key, t0: now, done0: s.done };
+      const dt = (now - etaAnchor.t0) / 1000, dd = s.done - etaAnchor.done0;
+      if (dt <= 0 || dd <= 0 || !s.total) return { fpsText: '…', etaText: '…' };
+      const r = dd / dt;
+      return { fpsText: r.toFixed(1), etaText: fmtDuration(Math.max(0, s.total - s.done) / r) };
+    }
+
     let wasRunning = false;
     async function pollJob() {
       try {
         const s = await api('GET', '/api/analysis/status');
         if (!alive) return;
         const jl = $('#jobLine', view);
-        if (s.running) {
-          wasRunning = true;
-          jl.innerHTML = `<span class="pill warn">running</span> ${s.analyzer} <span class="mono">${fmtInt(s.done)}/${fmtInt(s.total)}</span>${s.queue.length ? ' · ' + s.queue.length + ' queued' : ''} <button id="jobCancel">Cancel</button>`;
-          const jc = $('#jobCancel', view); if (jc) jc.addEventListener('click', () => api('POST', '/api/analysis/cancel').catch(() => {}));
-        } else {
+        const rate = s.running ? runningRate(s) : null;
+        const rowsFor = (cat) => {
+          const rows = [];
+          if (s.running && s.category === cat) rows.push({
+            jobId: s.job_id, status: 'running', name: jobName(s.analyzer, s.since_ts, s.reanalyze),
+            pctText: s.total ? Math.round(s.done / s.total * 100) + '%' : '…',
+            xy: `${fmtInt(s.done)} / ${fmtInt(s.total)}`, fpsText: rate.fpsText, etaText: rate.etaText,
+          });
+          for (const j of (s.queue || [])) {
+            if (j.category !== cat) continue;
+            rows.push({
+              jobId: j.job_id, status: 'queued', name: jobName(j.kind, j.since_ts, j.reanalyze),
+              pctText: '—', xy: `0 / ${j.total != null ? fmtInt(j.total) : '…'}`, fpsText: '—', etaText: '—',
+            });
+          }
+          return rows;
+        };
+        renderQueue($('#covQueue', view), rowsFor('coverage'), cancelJob);
+        renderQueue($('#mogQueue', view), rowsFor('mog2'), cancelJob);
+        if (s.running) { wasRunning = true; jl.textContent = ''; }  // the table shows the running job
+        else {
           jl.textContent = s.error ? ('last error: ' + s.error) : 'idle';
-          // Refresh the calendar only when a sweep just finished — not every idle tick.
-          if (wasRunning) { wasRunning = false; loadCalendar(); }
+          if (wasRunning) { wasRunning = false; loadCalendar(); }  // refresh the day's coverage after a sweep
         }
       } catch (_) {}
     }

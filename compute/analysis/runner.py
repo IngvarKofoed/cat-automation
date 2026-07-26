@@ -32,6 +32,7 @@ stack even though a sweep obviously needs it.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import threading
@@ -468,6 +469,14 @@ class _Job:
     params: "tuple | None"
     label: str
     motion_only: bool = False
+    # UI-only descriptors, all computed at enqueue and never in the dedup key:
+    # ``job_id`` is the stable Cancel handle (monotonic per manager); ``category`` is the
+    # broad panel bucket ("mog2" vs "coverage"); ``since_ts`` labels the job's day;
+    # ``total`` is the enqueue-time frame estimate for the queued x/y column.
+    job_id: int = 0
+    category: str = "coverage"
+    since_ts: "int | None" = None
+    total: "int | None" = None
 
     def dedup_key(self) -> tuple:
         """The full job identity used to drop a duplicate enqueue.
@@ -514,6 +523,11 @@ class AnalysisManager:
         # (enqueue / cancel / clear / set_total / record / _run's finally), NEVER held
         # across the inference.
         self._lock = threading.Lock()
+        # Monotonic job-id source for the per-row Cancel handle. ``next()`` on an
+        # itertools.count is atomic under the GIL, so a job_id can be drawn OUTSIDE the
+        # manager lock (in enqueue_*, alongside the store counts) without racing; a
+        # deduped enqueue simply leaves a harmless gap in the sequence.
+        self._job_seq = itertools.count(1)
         self._running = False
         self._analyzer: "str | None" = None
         self._done = 0
@@ -586,8 +600,35 @@ class AnalysisManager:
             params=None,
             label=name,
             motion_only=bool(motion_only),
+            **self._descriptors(store, name, analyzer, since_id, until_id, reanalyze, motion_only),
         )
         return self._enqueue(store, job)
+
+    def _descriptors(
+        self, store, kind, analyzer, since_id, until_id, reanalyze, motion_only
+    ) -> dict:
+        """UI-only ``_Job`` descriptors, computed at enqueue OUTSIDE the manager lock.
+
+        ``job_id`` (the Cancel handle) is atomic via ``next`` on the count; ``category`` is
+        the panel bucket; ``since_ts`` labels the job's day; ``total`` is the frame estimate,
+        mirroring what ``run_analysis`` will itself count: every in-window frame for a
+        windowed analyzer, the full (motion-scoped) candidate set for a stateless re-run
+        (the pre-sweep clear makes them all outstanding), else the current un-analyzed TODO.
+        """
+        if analyzer.windowed:
+            total = store.count_in_range(since_id, until_id)
+        elif reanalyze:
+            total = store.count_in_range(since_id, until_id, motion_only=bool(motion_only))
+        else:
+            total = store.count_unanalyzed(
+                analyzer.name, since_id=since_id, until_id=until_id, motion_only=bool(motion_only)
+            )
+        return {
+            "job_id": next(self._job_seq),
+            "category": "mog2" if kind.startswith("mog2:") else "coverage",
+            "since_ts": store.frame_recv_ts(since_id),
+            "total": total,
+        }
 
     def enqueue_analyzer(
         self,
@@ -632,6 +673,9 @@ class AnalysisManager:
             params=params,
             label=analyzer.name,
             motion_only=bool(motion_only),
+            **self._descriptors(
+                store, analyzer.name, analyzer, since_id, until_id, reanalyze, motion_only
+            ),
         )
         return self._enqueue(store, job)
 
@@ -687,6 +731,26 @@ class AnalysisManager:
         with self._lock:
             if self._running:
                 self.stop_event.set()
+
+    def cancel_job(self, job_id: int) -> None:
+        """Cancel one job by its stable ``job_id`` — running or pending (the Cancel column).
+
+        Under the one lock: if ``job_id`` is the RUNNING job, set ``stop_event`` exactly as
+        ``cancel()`` (the worker stops at the next frame and promotes the next); if it is a
+        PENDING job, drop it from the deque (it never runs, and the running job is untouched
+        so the serial-drain invariant holds); if it matches neither — already finished,
+        canceled, or unknown — a harmless no-op. Pending removal cannot race a promotion:
+        promotion pops from the head under this same lock, so a job is either still pending
+        (removable here) or already the running job (handled by the ``stop_event`` branch).
+        """
+        with self._lock:
+            if self._running and self._current_job is not None and self._current_job.job_id == job_id:
+                self.stop_event.set()
+                return
+            for pending_job in self._pending:
+                if pending_job.job_id == job_id:
+                    self._pending.remove(pending_job)
+                    return
 
     def clear_pending(self) -> None:
         """Drop every pending job; leave the running job alone (it finishes normally).
@@ -862,6 +926,11 @@ class AnalysisManager:
         without re-acquiring the (non-reentrant) lock. The ``history`` list is a shallow copy
         of never-mutated records, so the caller can't perturb the deque.
         """
+        # The running job's UI descriptors (job_id/category/since_ts/reanalyze) come from the
+        # _Job itself (self._current_job) so the Running row formats its Name/day/rerun and
+        # Cancel identically to a queued row; the live done/total stay the manager counters
+        # (authoritative once run_analysis calls set_total).
+        cur = self._current_job
         return {
             "running": self._running,
             "analyzer": self._analyzer,
@@ -871,12 +940,20 @@ class AnalysisManager:
             "error": self._error,
             "since_id": self._since_id,
             "until_id": self._until_id,
+            "job_id": cur.job_id if cur is not None else None,
+            "category": cur.category if cur is not None else None,
+            "since_ts": cur.since_ts if cur is not None else None,
+            "reanalyze": cur.reanalyze if cur is not None else None,
             "queue": [
                 {
+                    "job_id": job.job_id,
                     "kind": job.kind,
+                    "category": job.category,
                     "since_id": job.since_id,
                     "until_id": job.until_id,
+                    "since_ts": job.since_ts,
                     "reanalyze": job.reanalyze,
+                    "total": job.total,
                 }
                 for job in self._pending
             ],

@@ -845,3 +845,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      coverage runs under "YOLO coverage", MOG2 reruns under "MOG2 candidate params", both VIEWS of the one serial FIFO (never
      parallel). Only the running row shows FPS + a finish ETA (ported `/admin` etaAnchor); queued rows show neither, so no
      borrowed cross-type rate is ever displayed. `count_in_range` gained a `motion_only` filter for the reanalyze estimate.
+
+137. Fixed admin-next Run baseline/candidate (400). The buttons sent the PREFIXED analyzer name (`mog2:candidate`) as the
+     `/api/tuning/rerun` `slot`, which `MogAnalyzer` rejects — that field is the BARE slot (`candidate`) and the analyzer adds
+     the `mog2:` prefix itself. Now sends the bare slot, matching the old `/admin`. Pre-existing since the Wave 2 scaffold, so
+     MOG2 re-runs never worked from admin-next until now.

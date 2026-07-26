@@ -691,8 +691,10 @@
     });
 
     $('#resetParams', view).addEventListener('click', () => { if (edgeParams) setParams(edgeParams); });
-    $('#runBaseline', view).addEventListener('click', () => runSlot('mog2:baseline', edgeParams || getParams()));
-    $('#runCandidate', view).addEventListener('click', () => runSlot('mog2:candidate', getParams()));
+    // The /api/tuning/rerun `slot` is the BARE slot ('baseline'/'candidate'); MogAnalyzer
+    // prepends the 'mog2:' itself to form its analyzer name (validated against the bare set).
+    $('#runBaseline', view).addEventListener('click', () => runSlot('baseline', edgeParams || getParams()));
+    $('#runCandidate', view).addEventListener('click', () => runSlot('candidate', getParams()));
     async function runSlot(slot, params) {
       if (scope.since_id == null) { $('#paramNote', view).textContent = 'pick a day with frames first'; return; }
       try { await api('POST', '/api/tuning/rerun', { slot, params, since_id: scope.since_id, until_id: scope.until_id }); $('#paramNote', view).textContent = slot + ' enqueued'; pollJob(); }

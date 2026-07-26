@@ -894,3 +894,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      line (branching on it first hid "Idle"/"Sweeping" for the rest of the process's life after one transient fault);
      the toggle can always be switched OFF, only ON is blocked in motion-only capture (a control you can't switch off
      is a trap); and the disabled checkbox is dimmed once, not twice — stacked opacities rendered it invisible.
+
+146. Start-page "YOLO all" toggle no longer fights its own 3s poll: an `oracleSubmitting`
+     in-flight flag makes `renderStats` skip the checkbox while a start/stop POST is pending.
+     The handler's `disabled = true` guard was being unlocked by the very next poll (which
+     re-derives `disabled`/`checked` from stale server state), so the double-click race it
+     exists to prevent was still reachable, with a visible checkbox flicker.

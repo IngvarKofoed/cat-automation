@@ -364,8 +364,9 @@
         <p class="hint">Runs <b>YOLO</b> continuously over new frames — motion <i>and</i> non-motion
           — so Motion tuning finds a day already covered instead of waiting on a manual sweep.
           Keep-all only: a gate miss lives in a non-motion frame, which motion-only capture never
-          stores. Covers frames from when you switch it on; earlier days still need a manual
-          sweep.</p>
+          stores. Covers frames from when you FIRST switch it on; earlier days still need a
+          manual sweep. Re-enabling after a pause backfills the frames captured while it was
+          off before it reaches today's, so it can lag for a while.</p>
       </div>
 
       <div class="card">
@@ -426,6 +427,9 @@
     `;
 
     let alive = true;
+    // True while a /api/yolo-oracle/{start,stop} POST is in flight, so the periodic poll's
+    // renderStats does not overwrite the checkbox the click handler is holding inert.
+    let oracleSubmitting = false;
 
     // --- Capture mode ---
     const modeSeg = $('#modeSeg', view);
@@ -446,9 +450,16 @@
       // for a second click to fire a concurrent /stop whose ordering at the manager lock is
       // undefined, settling opposite to the user's last intent. refresh() re-derives disabled.
       box.disabled = true;
+      // ...and tell the 3s poll to leave the box alone while it is. Without this, a refresh()
+      // landing mid-POST re-derives `disabled` from server state — unlocking the box the guard
+      // just locked (so the very double-click above becomes possible again) and briefly
+      // reverting `checked` to the pre-POST value. Same in-flight-flag discipline the Training
+      // page's Run button uses.
+      oracleSubmitting = true;
       let failed = null;
       try { await api('POST', wanted ? '/api/yolo-oracle/start' : '/api/yolo-oracle/stop'); }
       catch (err) { failed = err; }
+      oracleSubmitting = false;  // released BEFORE refresh, so refresh re-derives the box
       await refresh();  // re-render from server state FIRST (reverts the box if the POST failed)
       if (failed) {     // ...then report, so this refresh can't overwrite the message
         const n = $('#oracleNote', view);
@@ -524,12 +535,18 @@
       // but deliberately-idle worker is never mistaken for a broken one.
       const oracle = s.yolo_oracle || {};
       const oBox = $('#oracleChk', view), oNote = $('#oracleNote', view);
-      oBox.checked = !!oracle.running;
-      // Blocked from being turned ON in motion-only capture (it can't cover anything there),
-      // but never blocked from being turned OFF — a control you can't switch off is a trap.
-      const lockOn = !!s.motion_only && !oracle.running;
-      oBox.disabled = lockOn;
-      $('#oracleLabel', view).classList.toggle('dim', lockOn);
+      // Skipped entirely while a start/stop POST is in flight: the click handler owns the box
+      // then (it is deliberately checked-but-disabled), and rewriting it here would unlock the
+      // guard and flash the stale pre-POST value. The note below still renders — it is
+      // read-only text, and it is re-rendered by the refresh() the handler awaits.
+      if (!oracleSubmitting) {
+        oBox.checked = !!oracle.running;
+        // Blocked from being turned ON in motion-only capture (it can't cover anything there),
+        // but never blocked from being turned OFF — a control you can't switch off is a trap.
+        const lockOn = !!s.motion_only && !oracle.running;
+        oBox.disabled = lockOn;
+        $('#oracleLabel', view).classList.toggle('dim', lockOn);
+      }
 
       let cls = 'note', txt;
       if (s.motion_only) {

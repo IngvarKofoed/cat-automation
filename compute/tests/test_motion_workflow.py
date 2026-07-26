@@ -286,6 +286,89 @@ def test_analysis_coverage_scopes_to_window(tmp_path):
     assert store.analysis_coverage("bsuv", ids[0], ids[2]) == {"total": 3, "analyzed": 0, "present": 0}
 
 
+# --- Store: tuning_calendar ---------------------------------------------------
+
+
+def _utc_ms(y, mo, da, h=0, mi=0):
+    from datetime import datetime, timezone
+
+    return int(datetime(y, mo, da, h, mi, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def test_tuning_calendar_buckets_days_events_and_coverage(tmp_path):
+    store = _store(tmp_path)
+    day = 86_400_000
+    a = _utc_ms(2026, 7, 25, 12)  # Day A: two motion clusters
+    b = _utc_ms(2026, 7, 26, 9)   # Day B: one motion cluster
+    fid = 0
+
+    def add(recv, motion):
+        nonlocal fid
+        fid += 1
+        return store.add(_frame(frame_id=fid, motion=motion, area=0.05 if motion else 0.0), recv_ts_ms=recv)
+
+    # Day A: cluster1 (3), gap, cluster2 (2) → 2 events; + 2 non-motion. 7 frames.
+    a_ids = [add(a + 0, True), add(a + 400, True), add(a + 800, True),
+             add(a + 60_000, True), add(a + 60_400, True),
+             add(a + 120_000, False), add(a + 125_000, False)]
+    # Day B: one cluster (4) → 1 event; + 1 non-motion. 5 frames.
+    b_ids = [add(b + 0, True), add(b + 400, True), add(b + 800, True), add(b + 1_200, True),
+             add(b + 60_000, False)]
+
+    # Coverage: yolo-serial on 3 Day-A frames; baseline on all 5 Day-B; candidate on 2 Day-B.
+    for i in a_ids[:3]:
+        store.write_analysis(i, "yolo-serial", True, 0.9, None)
+    for i in b_ids:
+        store.write_analysis(i, "mog2:baseline", True, 0.5, None)
+    for i in b_ids[:2]:
+        store.write_analysis(i, "mog2:candidate", False, 0.1, None)
+
+    rows = store.tuning_calendar(
+        _utc_ms(2026, 7, 25), _utc_ms(2026, 7, 27) - 1, 0,
+        ("yolo-serial", "mog2:baseline", "mog2:candidate"),
+    )
+    assert [r["day_ms"] for r in rows] == [_utc_ms(2026, 7, 25), _utc_ms(2026, 7, 26)]  # ascending
+    ra, rb = rows
+    assert (ra["frames"], ra["events"]) == (7, 2)
+    assert (ra["since_id"], ra["until_id"]) == (a_ids[0], a_ids[-1])
+    assert ra["analyzed"] == {"yolo-serial": 3, "mog2:baseline": 0, "mog2:candidate": 0}
+    assert (rb["frames"], rb["events"]) == (5, 1)
+    assert rb["analyzed"] == {"yolo-serial": 0, "mog2:baseline": 5, "mog2:candidate": 2}
+    # day_ms + tz offset round-trips to the day boundary the bucket sits in.
+    assert ra["day_ms"] % day == 0
+
+
+def test_tuning_calendar_empty_window(tmp_path):
+    store = _store(tmp_path)
+    store.add(_frame(frame_id=1, motion=True), recv_ts_ms=_utc_ms(2026, 7, 25, 12))
+    # A window that no frame falls in → no rows (never a zero-filled phantom day).
+    assert store.tuning_calendar(_utc_ms(2026, 1, 1), _utc_ms(2026, 1, 2), 0, ("yolo-serial",)) == []
+
+
+def test_tuning_calendar_offset_and_midnight_straddle(tmp_path):
+    # A non-zero tz offset (UTC+2) exercises the day_ms sign/round-trip, and a motion
+    # cluster straddling a LOCAL midnight must be counted ONCE, on its START day.
+    store = _store(tmp_path)
+    day = 86_400_000
+    off = 7_200_000  # UTC+2
+    boundary = _utc_ms(2026, 7, 25, 22)  # == local midnight of 2026-07-26 in UTC+2
+    store.add(_frame(frame_id=1, motion=True, area=0.05), recv_ts_ms=boundary - 500)  # day A (25th)
+    store.add(_frame(frame_id=2, motion=True, area=0.05), recv_ts_ms=boundary + 500)  # day B (26th)
+
+    rows = store.tuning_calendar(_utc_ms(2026, 7, 25), _utc_ms(2026, 7, 27) - 1, off, ("yolo-serial",))
+    by_day = {r["day_ms"]: r for r in rows}
+    a_ms = _utc_ms(2026, 7, 24, 22)  # local midnight of the 25th (UTC+2)
+    b_ms = _utc_ms(2026, 7, 25, 22)  # local midnight of the 26th (UTC+2)
+    assert set(by_day) == {a_ms, b_ms}
+    assert by_day[a_ms]["frames"] == 1 and by_day[b_ms]["frames"] == 1
+    # The straddling cluster (frames 1s apart) is one cluster, counted on its start day.
+    assert by_day[a_ms]["events"] == 1
+    assert by_day[b_ms]["events"] == 0
+    # day_ms + offset lands exactly on a local midnight (the bucket round-trips).
+    for r in rows:
+        assert (r["day_ms"] + off) % day == 0
+
+
 # --- Store: timeline_bins -----------------------------------------------------
 
 

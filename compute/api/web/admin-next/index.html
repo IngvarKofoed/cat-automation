@@ -88,6 +88,13 @@
   .seg button.sel { background: var(--accent); color: #0c1117; font-weight: 600; }
   input[type=number], input[type=text] { font: inherit; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 9px; width: 130px; }
+  select { font: inherit; background: var(--bg); color: var(--text); cursor: pointer;
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 30px 7px 10px; min-width: 150px;
+    -webkit-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 5 6.5 8 3.5' stroke='%239aa2ad' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center; }
+  select:hover { border-color: var(--muted); }
+  select:focus { outline: none; border-color: var(--accent); }
   label.fld { display: inline-flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
 
   /* Stat grid */
@@ -95,6 +102,42 @@
   .stat { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; }
   .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
   .stat .v { font-size: 18px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  /* Timestamp tiles hold a full "dd/mm-yyyy hh:mm" — span two tracks and never wrap. */
+  .stat.ts { grid-column: span 2; }
+  .stat.ts .v { white-space: nowrap; }
+  /* Day-stats values carry "x / y" fractions — wider tiles + smaller value so they read on one line. */
+  .stats.daystats { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+  .stats.daystats .v { font-size: 15px; white-space: nowrap; }
+  .stats.daystats .stat .note { font-size: 12px; margin-top: 2px; }
+
+  /* Custom checkbox — native controls never took the dark theme. */
+  input[type=checkbox] { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; margin: 0 3px 0 0;
+    border: 1px solid var(--border); border-radius: 4px; background: var(--bg); cursor: pointer;
+    position: relative; vertical-align: -3px; flex: none; }
+  input[type=checkbox]:hover { border-color: var(--muted); }
+  input[type=checkbox]:checked { background: var(--accent); border-color: var(--accent); }
+  input[type=checkbox]:checked::after { content: ''; position: absolute; left: 5px; top: 2px; width: 3px; height: 7px;
+    border: solid #0c1117; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+  input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* No native number spinners — the params are typed; the arrows only clutter. */
+  input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+
+  /* Motion-tuning calendar / day-picker: 4 weeks × 7 days, Monday-first, compact. */
+  .cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+  .cal-h { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; text-align: center; padding-bottom: 2px; }
+  .cal-cell { border: 1px solid var(--border); border-radius: 5px; padding: 4px 6px; min-height: 56px;
+    background: var(--surface-2); display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+  .cal-cell.empty { opacity: .35; }
+  .cal-cell.has { cursor: pointer; }
+  .cal-cell.has:hover { border-color: var(--muted); }
+  .cal-cell.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .cal-cell .cd { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .cal-cell .ce { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .cal-cell .cc { display: flex; gap: 5px; margin-top: auto; font-size: 9px; font-variant-numeric: tabular-nums; }
+  .cal-cell .cc .full { color: var(--ok); }
+  .cal-cell .cc .part { color: var(--text); }
+  .cal-cell .cc .none { color: var(--muted); }
 
   .pill { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
@@ -283,8 +326,10 @@
         <div class="row">
           <label class="fld">Latitude<input id="locLat" type="number" step="any" min="-90" max="90" /></label>
           <label class="fld">Longitude<input id="locLon" type="number" step="any" min="-180" max="180" /></label>
-          <button id="locSave" class="primary" style="align-self:flex-end">Save</button>
-          <span id="locNote" class="note"></span>
+          <div class="row" style="align-self:flex-end">
+            <button id="locSave" class="primary">Save</button>
+            <span id="locNote" class="note"></span>
+          </div>
         </div>
       </div>
 
@@ -379,8 +424,8 @@
       g.innerHTML = [
         ['Frames', fmtInt(s.count)], ['Motion', fmtInt(s.motion_count)],
         ['On disk', fmtBytes(s.bytes)], ['Cap', fmtBytes(s.cap_bytes)],
-        ['Oldest', fmtTs(s.oldest_ts)], ['Newest', fmtTs(s.newest_ts)],
-      ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+        ['Oldest', fmtTs(s.oldest_ts), 'ts'], ['Newest', fmtTs(s.newest_ts), 'ts'],
+      ].map(([k, v, cls]) => `<div class="stat${cls ? ' ' + cls : ''}"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 
       // Capture mode
       for (const b of modeSeg.querySelectorAll('button')) b.classList.toggle('sel', (b.dataset.mo === '1') === !!s.motion_only);
@@ -454,18 +499,18 @@
     const MOG2_STEP = { persistence: '1', motion_downscale: '1' };
     view.innerHTML = `
       <div class="card">
-        <h3>Day</h3>
-        <div class="row">
-          <label class="fld">Scope<select id="daySel"></select></label>
-          <span id="dayScope" class="note"></span>
-        </div>
+        <h3>Day <span class="note">(last 4 weeks · click a day · Y/B/C = % swept)</span></h3>
+        <div id="cal"><span class="note">Loading…</span></div>
+        <div id="dayScope" class="note" style="margin-top:10px"></div>
+        <div id="dayStats" class="stats daystats" style="margin-top:12px"></div>
       </div>
 
       <div class="card">
-        <h3>YOLO oracle coverage</h3>
+        <h3>YOLO coverage</h3>
         <div class="row">
           <span id="covNote" class="note grow">…</span>
-          <button id="sweepBtn" class="primary">Sweep YOLO</button>
+          <label class="note"><input type="checkbox" id="rerunAll"> Rerun all</label>
+          <button id="sweepBtn" class="primary">Run YOLO</button>
         </div>
         <div id="jobLine" class="note" style="margin-top:8px">idle</div>
       </div>
@@ -499,52 +544,103 @@
     const setParams = (v) => MOG2_PARAMS.forEach(k => { const i = view.querySelector(`input[data-k="${k}"]`); if (i) i.value = v[k]; });
     const getParams = () => Object.fromEntries(MOG2_PARAMS.map(k => [k, parseFloat(view.querySelector(`input[data-k="${k}"]`).value)]));
 
-    function buildDays(oldestMs, newestMs) {
-      const sel = $('#daySel', view); sel.innerHTML = '';
-      if (!oldestMs || !newestMs) { sel.innerHTML = '<option>—</option>'; return; }
-      const p = (x) => String(x).padStart(2, '0');
-      const d = new Date(newestMs); d.setHours(0, 0, 0, 0);
-      const oldest = new Date(oldestMs); oldest.setHours(0, 0, 0, 0);
-      let first = null;
-      while (d >= oldest) {
-        const start = d.getTime();
-        const end = new Date(d); end.setDate(end.getDate() + 1);
-        const opt = document.createElement('option');
-        opt.value = start + ':' + (end.getTime() - 1);
-        opt.textContent = `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()}`;
-        sel.appendChild(opt);
-        if (first === null) first = opt.value;
-        d.setDate(d.getDate() - 1);
-      }
-      if (first) selectScope(first);
-    }
-    async function selectScope(val) {
-      const [s, e] = val.split(':').map(Number);
-      try {
-        const r = await api('GET', `/api/frames/resolve?start_ts=${s}&end_ts=${e}`);
-        if (!alive) return;
-        scope = { since_id: r.since_id, until_id: r.until_id };
-        $('#dayScope', view).textContent = r.since_id == null
-          ? 'no frames this day' : `frames ${fmtInt(r.since_id)}–${fmtInt(r.until_id)}`;
-        loadCoverage();
-      } catch (_) { $('#dayScope', view).textContent = 'resolve failed'; }
-    }
-    $('#daySel', view).addEventListener('change', (e) => selectScope(e.target.value));
+    // --- Day calendar (last 4 weeks, Monday-first) doubling as the day picker ---
+    let selectedDayMs = null, calMap = {}, calWeeks = [], off = 0;
+    const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const WD = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const mondayOf = (dt) => { const x = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; };
+    const fpct = (a, t) => (t ? Math.round((a / t) * 100) + '%' : '—');
+    const frac = (a, t) => `${fmtInt(a)} / ${fmtInt(t)}`;
+    // `off` (the fixed local tz offset, set in loadCalendar) buckets days exactly as the
+    // backend does, so a cell's key matches its day_ms even for days on the OTHER side of
+    // a DST boundary in the window; reconstruct the wall-date via (ms + off) read as UTC.
+    const fmtDay = (ms) => { const d = new Date(ms + off), p = (x) => String(x).padStart(2, '0'); return `${WD[(d.getUTCDay() + 6) % 7]} ${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)}-${d.getUTCFullYear()}`; };
 
-    async function loadCoverage() {
-      const el = $('#covNote', view);
-      if (scope.since_id == null) { el.textContent = 'no frames in this day to sweep'; return; }
+    async function loadCalendar() {
+      const today = new Date(), thisMon = mondayOf(today);
+      calWeeks = [];
+      for (let w = 3; w >= 0; w--) {                 // oldest week first, current week last
+        const mon = new Date(thisMon); mon.setDate(mon.getDate() - w * 7);
+        const days = [];
+        for (let i = 0; i < 7; i++) { const d = new Date(mon); d.setDate(d.getDate() + i); days.push(d); }
+        calWeeks.push(days);
+      }
+      const since_ts = calWeeks[0][0].getTime();
+      const until_ts = calWeeks[3][6].getTime() + 86400000 - 1;
+      off = -today.getTimezoneOffset() * 60000;  // ms to add to UTC epoch for local wall-clock (fixed for the window)
+      calMap = {};
       try {
-        const c = await api('GET', `/api/analysis/coverage?since_id=${scope.since_id}&until_id=${scope.until_id}`);
+        const r = await api('GET', `/api/tuning/calendar?since_ts=${since_ts}&until_ts=${until_ts}&tz_offset_ms=${off}`);
         if (!alive) return;
-        const y = c.oracles['yolo-serial'] || { analyzed: 0, present: 0 };
-        el.textContent = `YOLO ${fmtInt(y.analyzed)} / ${fmtInt(c.total)} analyzed · ${fmtInt(y.present)} present`;
-      } catch (_) { el.textContent = 'coverage unavailable'; }
+        for (const d of (r.days || [])) calMap[d.day_ms] = d;
+      } catch (_) { if (alive) $('#cal', view).innerHTML = '<span class="note bad">calendar unavailable</span>'; return; }
+      renderCalendar();
+      // Keep the current selection if it still holds data; else jump to the newest day with frames.
+      if (selectedDayMs != null && calMap[selectedDayMs]) selectDay(selectedDayMs);
+      else {
+        const withData = Object.keys(calMap).map(Number).sort((a, b) => b - a);
+        if (withData.length) selectDay(withData[0]);
+        else { scope = { since_id: null, until_id: null }; $('#dayScope', view).textContent = 'no frames in the last 4 weeks'; $('#dayStats', view).innerHTML = ''; $('#covNote', view).textContent = 'no frames to sweep'; }
+      }
+    }
+    const covCell = (label, a, t) => {
+      const p = (t ? Math.round(a / t * 100) : null);
+      const cls = p == null ? 'none' : p >= 100 ? 'full' : p > 0 ? 'part' : 'none';
+      return `<span class="${cls}">${label}${p == null ? '–' : p}</span>`;
+    };
+    function renderCalendar() {
+      let html = '<div class="cal">';
+      for (const h of WD) html += `<div class="cal-h">${h}</div>`;
+      for (const week of calWeeks) for (const day of week) {
+        // Key by the fixed-offset wall-midnight (== the backend's day_ms), NOT day.getTime():
+        // a DST-aware getTime() would miss calMap for days on the other side of a DST switch
+        // from today, blanking whole days that in fact have frames.
+        const ms = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate()) - off, row = calMap[ms];
+        const dnum = day.getDate(), tag = dnum === 1 ? ' ' + MON[day.getMonth()] : '';
+        if (!row) { html += `<div class="cal-cell empty"><div class="cd">${dnum}${tag}</div></div>`; continue; }
+        const sel = ms === selectedDayMs ? ' sel' : '';
+        html += `<div class="cal-cell has${sel}" data-ms="${ms}">
+          <div class="cd">${dnum}${tag}</div>
+          <div class="ce">${fmtInt(row.events)} ev</div>
+          <div class="cc">${covCell('Y', row.yolo, row.frames)}${covCell('B', row.baseline, row.frames)}${covCell('C', row.candidate, row.frames)}</div>
+        </div>`;
+      }
+      html += '</div>';
+      $('#cal', view).innerHTML = html;
+      $('#cal', view).querySelectorAll('.cal-cell.has').forEach((c) => c.addEventListener('click', () => selectDay(Number(c.dataset.ms))));
+    }
+    function selectDay(ms) {
+      selectedDayMs = ms;
+      view.querySelectorAll('.cal-cell').forEach((c) => c.classList.toggle('sel', Number(c.dataset.ms) === ms));
+      const row = calMap[ms];
+      if (!row) { scope = { since_id: null, until_id: null }; return; }
+      scope = { since_id: row.since_id, until_id: row.until_id };
+      $('#dayScope', view).textContent = `${fmtDay(ms)} · ${fmtInt(row.frames)} frames`;
+      renderDayStats(row);
+      renderCoverage(row);
+    }
+    function renderDayStats(row) {
+      const el = $('#dayStats', view), total = row.frames || 0;
+      el.innerHTML = [
+        ['Total frames', fmtInt(total)],
+        ['Events', fmtInt(row.events)],
+        ['YOLO frames', frac(row.yolo, total), fpct(row.yolo, total) + ' swept'],
+        ['Baseline frames', frac(row.baseline, total), fpct(row.baseline, total) + ' swept'],
+        ['Candidate frames', frac(row.candidate, total), fpct(row.candidate, total) + ' swept'],
+      ].map(([k, v, sub]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div>${sub ? `<div class="note">${sub}</div>` : ''}</div>`).join('');
+    }
+    function renderCoverage(row) {
+      const el = $('#covNote', view);
+      if (!row || scope.since_id == null) { el.textContent = 'no frames in this day to sweep'; return; }
+      const total = row.frames || 0, missing = Math.max(0, total - row.yolo);
+      el.innerHTML = `<b class="mono">${fmtInt(missing)}</b> frames not yet swept · <span class="mono">${fmtInt(row.yolo)} / ${fmtInt(total)}</span> done`;
     }
 
     $('#sweepBtn', view).addEventListener('click', async () => {
       if (scope.since_id == null) return;
-      try { await api('POST', '/api/analysis/run', { analyzer: 'yolo-serial', since_id: scope.since_id, until_id: scope.until_id }); pollJob(); }
+      const body = { analyzer: 'yolo-serial', since_id: scope.since_id, until_id: scope.until_id };
+      if ($('#rerunAll', view).checked) body.reanalyze = true; // re-sweep already-analyzed frames
+      try { await api('POST', '/api/analysis/run', body); pollJob(); }
       catch (e) { $('#jobLine', view).textContent = 'enqueue failed: ' + e.message; }
     });
 
@@ -590,24 +686,27 @@
       } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
     }
 
+    let wasRunning = false;
     async function pollJob() {
       try {
         const s = await api('GET', '/api/analysis/status');
         if (!alive) return;
         const jl = $('#jobLine', view);
         if (s.running) {
+          wasRunning = true;
           jl.innerHTML = `<span class="pill warn">running</span> ${s.analyzer} <span class="mono">${fmtInt(s.done)}/${fmtInt(s.total)}</span>${s.queue.length ? ' · ' + s.queue.length + ' queued' : ''} <button id="jobCancel">Cancel</button>`;
           const jc = $('#jobCancel', view); if (jc) jc.addEventListener('click', () => api('POST', '/api/analysis/cancel').catch(() => {}));
         } else {
           jl.textContent = s.error ? ('last error: ' + s.error) : 'idle';
-          loadCoverage();
+          // Refresh the calendar only when a sweep just finished — not every idle tick.
+          if (wasRunning) { wasRunning = false; loadCalendar(); }
         }
       } catch (_) {}
     }
 
     (async () => {
-      try { const ec = await api('GET', '/api/edge/config'); if (alive) { edgeParams = ec.params; setParams(ec.params); $('#paramNote', view).textContent = `params seeded from edge (${ec.source})`; } } catch (_) {}
-      try { const st = await api('GET', '/api/stats'); if (alive) buildDays(st.oldest_ts, st.newest_ts); } catch (_) {}
+      try { const ec = await api('GET', '/api/edge/config'); if (alive) { edgeParams = ec.params; setParams(ec.params); $('#paramNote', view).textContent = ec.source === 'edge' ? 'params seeded from the edge' : 'edge unreachable — using built-in defaults'; } } catch (_) {}
+      await loadCalendar();
       pollJob();
     })();
     const timer = setInterval(pollJob, 3000);

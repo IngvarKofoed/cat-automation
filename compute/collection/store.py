@@ -2012,6 +2012,98 @@ class Store:
             ).fetchone()
         return {"total": int(total), "analyzed": int(analyzed), "present": int(present)}
 
+    def tuning_calendar(
+        self, since_ts: int, until_ts: int, tz_offset_ms: int, analyzers: "tuple[str, ...]"
+    ) -> "list[dict]":
+        """Per LOCAL-day aggregates over ``recv_ts`` in ``[since_ts, until_ts]``.
+
+        Backs the Motion-tuning calendar/day-picker. Buckets frames by local day —
+        ``day = (recv_ts + tz_offset_ms) // 86_400_000`` — so a single caller-supplied
+        offset (the browser's) defines the day boundaries; a fixed offset can misplace
+        frames within ~1 h of a midnight across a DST change inside the window, which
+        is acceptable for an overview. One dict per day that HAS frames::
+
+            {day_ms, since_id, until_id, frames, events, analyzed: {name: count, ...}}
+
+        ``day_ms`` is that local midnight as an epoch-ms instant (round-trips to the
+        same browser-local date). ``events`` counts motion-frame clusters
+        (``_VISIT_GAP_MS`` gap, by cluster-START day) — the SAME clustering the
+        activity feed uses, but UNCAPPED. ``analyzed[name]`` = frames in the day
+        carrying a verdict for that analyzer (the sweep-coverage numerator; the
+        denominator is ``frames``).
+
+        Cost + concurrency: each pass scans O(window) rows — the frame count/id-span
+        and event passes are index-served (``idx_frames_recv_ts`` /
+        ``idx_frames_motion_recv``, no heap access) and the coverage pass scans only the
+        analysis rows in the window's id span (bounded by how much is swept), but a
+        fully-swept 4-week window is still millions of rows. So this read runs on its OWN
+        short-lived connection, NOT ``self._conn`` under ``self._lock``: WAL lets it read
+        the committed snapshot concurrently with the collector's writes, so a big
+        calendar scan can't stall inserts (the collector-starvation class entries 102-105
+        removed for the polled paths). Meant for on-demand use (calendar load + post-sweep
+        refresh), not polling.
+        """
+        off, s, u = int(tz_offset_ms), int(since_ts), int(until_ts)
+        DAY = 86_400_000
+        days: "dict[int, dict]" = {}
+        # A fresh reader, deliberately OFF the shared write lock — see the concurrency
+        # note above. The DB file is already WAL, so this connection inherits it and sees
+        # the last committed state; only SELECTs run here, and it is always closed.
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            # Frame count + id span per local day. COUNT(*)/MIN/MAX(id) are answered from
+            # idx_frames_recv_ts (id is the rowid the index carries), so no table scan.
+            for d, cnt, min_id, max_id in conn.execute(
+                "SELECT (recv_ts + ?) / ? AS d, COUNT(*), MIN(id), MAX(id)"
+                " FROM frames WHERE recv_ts BETWEEN ? AND ? GROUP BY d",
+                (off, DAY, s, u),
+            ).fetchall():
+                days[int(d)] = {
+                    "day_ms": int(d) * DAY - off,
+                    "since_id": int(min_id),
+                    "until_id": int(max_id),
+                    "frames": int(cnt),
+                    "events": 0,
+                    "analyzed": {a: 0 for a in analyzers},
+                }
+            if not days:
+                return []
+            # Motion-cluster (event) count per local day. A cluster begins at a motion
+            # frame whose predecessor is > _VISIT_GAP_MS earlier; it is counted on its
+            # OWN (start) day, matching events()'s start_ts bucketing. Index-served over
+            # idx_frames_motion_recv; only recv_ts is touched.
+            for d, ev in conn.execute(
+                "SELECT d, SUM(CASE WHEN prev IS NULL OR recv_ts - prev > ? THEN 1 ELSE 0 END)"
+                " FROM (SELECT recv_ts, (recv_ts + ?) / ? AS d,"
+                "              LAG(recv_ts) OVER (ORDER BY recv_ts, id) AS prev"
+                "       FROM frames WHERE motion = 1 AND recv_ts BETWEEN ? AND ?)"
+                " GROUP BY d",
+                (_VISIT_GAP_MS, off, DAY, s, u),
+            ).fetchall():
+                row = days.get(int(d))
+                if row is not None:
+                    row["events"] = int(ev)
+            # Per-analyzer sweep coverage per local day, scanning only the analysis rows
+            # whose frame_id falls in the window's id span (bounded by what's swept).
+            if analyzers:
+                win_min = min(r["since_id"] for r in days.values())
+                win_max = max(r["until_id"] for r in days.values())
+                ph = ",".join("?" * len(analyzers))
+                for d, name, cnt in conn.execute(
+                    "SELECT (f.recv_ts + ?) / ? AS d, a.analyzer, COUNT(*)"
+                    " FROM analysis a JOIN frames f ON f.id = a.frame_id"
+                    " WHERE a.frame_id BETWEEN ? AND ? AND a.analyzer IN (" + ph + ")"
+                    " GROUP BY d, a.analyzer",
+                    [off, DAY, win_min, win_max] + list(analyzers),
+                ).fetchall():
+                    row = days.get(int(d))
+                    if row is not None and name in row["analyzed"]:
+                        row["analyzed"][name] = int(cnt)
+        finally:
+            conn.close()
+        return [days[k] for k in sorted(days)]
+
     def clear_analysis(
         self,
         analyzer: str,

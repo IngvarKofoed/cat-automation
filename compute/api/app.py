@@ -159,6 +159,17 @@ _EDGE_MOTION_DEFAULTS = {
 # ValueError -> 400), so this is only the analysis-table analyzer names.
 _BASELINE_SLOT = "mog2:baseline"
 _CANDIDATE_SLOT = "mog2:candidate"
+_MOG2_SLOTS = (_BASELINE_SLOT, _CANDIDATE_SLOT)
+
+# The analyzers the Motion-tuning calendar reports sweep-coverage for, per day:
+# the YOLO oracle plus the two MOG2 re-run slots.
+_CALENDAR_ANALYZERS = ("yolo-serial", _BASELINE_SLOT, _CANDIDATE_SLOT)
+# Guardrails on the calendar request: a client can't ask for an unbounded span, the tz
+# offset must be a real one (±14 h covers every real zone incl. DST), and the absolute
+# instants must be sane epoch-ms (else an out-of-int64 value binds to a 500, not a 422).
+_CALENDAR_MAX_SPAN_MS = 60 * 86_400_000
+_MAX_TZ_OFFSET_MS = 14 * 60 * 60 * 1000
+_MAX_EPOCH_MS = 4_102_444_800_000  # 2100-01-01; comfortably past any real recv_ts
 
 # The oracles whose sweep is WINDOWED/stateful — BSUV replays temporally-contiguous
 # frames to build its background — so a motion-only span's multi-minute gaps make their
@@ -1362,13 +1373,57 @@ def create_app(
         # is the window's frame count (shared across oracles — an enqueue sweeps the same
         # frames whichever oracle); analyzed/present are per oracle. Both bounds absent =
         # whole store.
+        #
+        # ``slots`` additionally reports the two MOG2 re-run slots (baseline /
+        # candidate). They are NOT oracles, so they stay out of ``oracles`` /
+        # ANALYZER_NAMES — a tuning UI reads them to show how much of the window each
+        # re-run has covered without them leaking into oracle-selection paths.
         _validate_bounds(since_id, until_id)
         cov = {name: store.analysis_coverage(name, since_id, until_id) for name in ANALYZER_NAMES}
         total = next(iter(cov.values()))["total"] if cov else store.count_in_range(since_id, until_id)
+        slots = {name: store.analysis_coverage(name, since_id, until_id) for name in _MOG2_SLOTS}
         return {
             "total": total,
             "oracles": {name: {"analyzed": c["analyzed"], "present": c["present"]} for name, c in cov.items()},
+            "slots": {name: {"analyzed": c["analyzed"], "present": c["present"]} for name, c in slots.items()},
         }
+
+    @app.get("/api/tuning/calendar")
+    def api_tuning_calendar(
+        since_ts: int = Query(...),
+        until_ts: int = Query(...),
+        tz_offset_ms: int = Query(default=0),
+    ):
+        # Per-local-day aggregates for the Motion-tuning calendar/day-picker (the last
+        # 4 weeks): frame count, motion-event count, and per-analyzer sweep coverage,
+        # bucketed by the BROWSER-supplied tz offset (a fixed offset, so a DST switch
+        # inside the window can misplace frames within ~1 h of a midnight — fine for an
+        # overview). One `days` row per day that has frames; the UI lays them into a
+        # Monday-first grid and empty days are simply absent. On-demand (calendar load +
+        # post-sweep refresh), never polled — the coverage pass is bounded by how much
+        # of the window has actually been swept.
+        if not (0 <= since_ts < until_ts <= _MAX_EPOCH_MS):
+            raise HTTPException(status_code=422, detail="since_ts/until_ts out of range")
+        if until_ts - since_ts > _CALENDAR_MAX_SPAN_MS:
+            raise HTTPException(status_code=422, detail="requested span too large")
+        if abs(tz_offset_ms) > _MAX_TZ_OFFSET_MS:
+            raise HTTPException(status_code=422, detail="tz_offset_ms out of range")
+        rows = store.tuning_calendar(since_ts, until_ts, tz_offset_ms, _CALENDAR_ANALYZERS)
+
+        def shape(r):
+            a = r["analyzed"]
+            return {
+                "day_ms": r["day_ms"],
+                "since_id": r["since_id"],
+                "until_id": r["until_id"],
+                "frames": r["frames"],
+                "events": r["events"],
+                "yolo": a.get("yolo-serial", 0),
+                "baseline": a.get(_BASELINE_SLOT, 0),
+                "candidate": a.get(_CANDIDATE_SLOT, 0),
+            }
+
+        return {"days": [shape(r) for r in rows]}
 
     # --- Corruption review (the corrupt-frame guard's calibration page) -------------
     #

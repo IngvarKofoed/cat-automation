@@ -816,3 +816,22 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      (play/scrub with per-frame YOLO box overlay), plus manual backfill — Analyze (`/api/analysis/run`
      yolo-serial reanalyze) and Identify (`/api/identify/run`) over the loaded events' span, both handling the
      no-model / no-torch states. All six admin-next pages are now built and browser-verified; only the flip remains.
+
+134. admin-next Start + Motion-tuning polish. Start: Store timestamp tiles span two columns and never wrap
+     (dd/mm-yyyy hh:mm on one line); the Location Save button + status note now share a bottom-aligned group
+     so the note is centred on the button. Motion tuning: the Day card's id-range readout is replaced by a
+     stats panel (Total frames, Events, and YOLO/Baseline/Candidate frame coverage x/y), the day `<select>`
+     is themed, "YOLO oracle coverage" → "YOLO coverage" (shows frames-not-yet-swept, a "Run YOLO" button,
+     and a new "Rerun all" checkbox → `reanalyze`), and the "present" wording is dropped for "Events".
+     Backend: `/api/analysis/coverage` gains an additive `slots` field (mog2:baseline/candidate coverage),
+     kept OUT of `oracles`/ANALYZER_NAMES so the re-run slots never leak into oracle-selection paths.
+
+135. Motion-tuning "Day" is now a compact 4-week, Monday-first calendar (oldest week top, current week
+     bottom) that doubles as the day picker — each cell shows the day's events + Y/B/C sweep-coverage %;
+     the selected day drives the tiles (all/uncapped events, % swept on YOLO/baseline/candidate) and sweeps.
+     New `GET /api/tuning/calendar` + `Store.tuning_calendar` return per-LOCAL-day frame/event/coverage
+     aggregates, bucketed by a browser-supplied tz offset. It runs on its OWN short-lived WAL read
+     connection (NOT the shared write-locked one) so a big-window scan can't stall the collector —
+     the starvation class entries 102-105 removed. Cell keys use that SAME fixed offset as the backend,
+     so days across a DST boundary don't blank out (only the ~1h-near-midnight bucket edge remains).
+     Also: custom-styled checkboxes + removed number-input spinners; "seeded from edge (edge)" text fixed.

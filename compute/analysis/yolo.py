@@ -70,6 +70,22 @@ _DEFAULT_HALF = False
 _DEFAULT_BATCH = 8
 
 
+def _supports_quantize() -> bool:
+    """True if the installed ultralytics accepts the unified ``quantize`` predict arg.
+
+    Ultralytics >= 8.4 folded ``half``/``int8`` into one ``quantize`` scheme and now
+    warns *once per predict call* whenever ``half`` is present in the overrides — at
+    ANY value, ``half=False`` included. ``ultralytics`` is deliberately unpinned (see
+    ``compute/requirements-analysis.txt``), so we probe the installed version's cfg
+    rather than assume a spelling. Called once from ``prepare()``, never per frame.
+    """
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+    except ImportError:  # pragma: no cover - a version without that module is pre-8.4
+        return False
+    return "quantize" in DEFAULT_CFG_DICT
+
+
 class YoloAnalyzer:
     """Stateless per-frame cat detector; satisfies the ``Analyzer`` protocol.
 
@@ -129,6 +145,10 @@ class YoloAnalyzer:
         # caller bug, not a runtime condition to design around, so it fails loud.
         self._model = None
         self._device: "str | None" = None
+        # Which precision spelling the installed ultralytics accepts — resolved in
+        # prepare() (the only place the package is imported). The legacy `half=`
+        # is the conservative pre-probe value; it is never used before prepare().
+        self._quantize_arg = False
 
     def ensure_available(self) -> None:
         """Verify ``torch``/``ultralytics`` import; raise ``ImportError`` with a fix if not.
@@ -187,6 +207,7 @@ class YoloAnalyzer:
             logger.warning("CAT_YOLO_HALF ignored on device %s; FP16 benefits only CUDA", self._device)
             self._half = False
 
+        self._quantize_arg = _supports_quantize()
         self._model = YOLO(self._weights)
 
     def _predict_kwargs(self) -> dict:
@@ -205,18 +226,29 @@ class YoloAnalyzer:
         (14) to feed the event-subject classifier. Verdict/score remain cat-only
         for BOTH (see ``_result_from``) — the extra classes only populate
         ``detail['boxes']``.
+
+        PRECISION is passed only when FP16 is actually on. FP32 is the default in
+        every ultralytics version, so omitting the arg is behaviourally identical to
+        the old ``half=False`` — and it dodges the per-predict-call deprecation
+        warning ultralytics >= 8.4 emits for a present ``half`` key at any value
+        (one log line per frame on the serial persona; see ``_supports_quantize``).
+        With FP16 on, ``quantize=16`` is exactly what 8.4 maps ``half=True`` to, so
+        the inference regime is unchanged across both spellings.
         """
         if self._serial:
             classes = [_COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID, _COCO_CAT_CLASS_ID]
         else:
             classes = [_COCO_CAT_CLASS_ID]
+        precision: dict = {}
+        if self._half:
+            precision = {"quantize": 16} if self._quantize_arg else {"half": True}
         return dict(
             imgsz=self._imgsz,
             conf=self._conf,
             classes=classes,
             device=self._device,
-            half=self._half,
             verbose=False,
+            **precision,
         )
 
     def _predict(self, images: "list"):
@@ -267,6 +299,10 @@ class YoloAnalyzer:
         cat_boxes = [b for b in boxes if b[5] == _COCO_CAT_CLASS_ID]
         verdict = bool(cat_boxes)
         score = max((b[4] for b in cat_boxes), default=0.0)
+        # `half` stays the detail key even where the call site now spells it
+        # `quantize=16`: it is the recorded REGIME (FP16 on/off), and stored rows +
+        # tools/diff_yolo_batch_serial.py read `$.half`. Renaming it would split the
+        # regime across two key names with no migration.
         detail = {"boxes": boxes, "model": self._weights, "device": self._device, "half": self._half}
         return AnalysisResult(verdict=verdict, score=score, detail=detail)
 

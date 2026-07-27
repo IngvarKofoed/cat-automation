@@ -97,6 +97,26 @@ def test_serial_and_default_share_inference_params():
     assert (serial._imgsz, serial._conf, serial._half) == (default._imgsz, default._conf, default._half)
 
 
+def test_fp32_passes_no_precision_arg_at_all():
+    # Regression guard: ultralytics >= 8.4 warns ONCE PER predict call whenever a `half`
+    # key is present at any value — at yolo-serial's one call per frame that is a log
+    # line per frame. FP32 is the default in every version, so the default (FP16 off)
+    # must pass NO precision arg, which is behaviourally identical to the old half=False.
+    kwargs = YoloAnalyzer(half=False, serial=True)._predict_kwargs()
+    assert "half" not in kwargs and "quantize" not in kwargs
+
+
+def test_fp16_spells_precision_for_the_installed_ultralytics():
+    # With FP16 on the arg IS passed, spelled the way the installed version accepts:
+    # `quantize=16` (>= 8.4, exactly what it maps half=True to) or the legacy `half=True`.
+    # `_quantize_arg` is normally probed in prepare(); set it directly to cover both.
+    a = YoloAnalyzer(half=True, serial=True)
+    a._quantize_arg = True
+    assert a._predict_kwargs()["quantize"] == 16
+    a._quantize_arg = False
+    assert a._predict_kwargs()["half"] is True
+
+
 def test_scorecard_oracle_set_covers_every_registered_oracle():
     # Regression guard: the scorecard's accepted-oracle set is DERIVED from
     # ANALYZER_NAMES, not a hand-kept second list. A hardcoded copy let `yolo-serial`

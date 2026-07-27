@@ -172,9 +172,14 @@
   .stats.sccards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
   /* LABEL then value, the repo's readout idiom: the label scans as a caption, not as
      part of the number. Sentence case (as authored) — these are short words read as a
-     list, and all-caps on five of them shouts over the numbers they label. */
-  .sline { display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 3px; font-size: 12px; }
-  .sk { color: var(--muted); font-size: 11px; align-self: center; margin-right: 3px; }
+     list, and all-caps on five of them shouts over the numbers they label.
+     ONE pair per line, label left / value right (same shape as .prow below). Laying the
+     pairs out as one wrapping flex row broke at every gap in a 210px tile, so a two-pair
+     readout ate four lines with each label stranded above its number. */
+  .sline { margin-top: 3px; font-size: 12px; }
+  .srow { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 10px; padding: 1px 0; }
+  .sk { color: var(--muted); font-size: 11px; }
   .sv { font-variant-numeric: tabular-nums; }
   .plist { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
   .prow { display: flex; justify-content: space-between; gap: 8px; font-size: 11px;
@@ -1174,7 +1179,7 @@
     // A stat line reads LABEL (small caps, muted) then its value — the repo's readout
     // idiom, so the labels scan as captions rather than as part of the number.
     const sline = (pairs) => '<div class="sline">'
-      + pairs.map(([k, v]) => `<span class="sk">${k}</span><span class="sv">${v}</span>`).join('')
+      + pairs.map(([k, v]) => `<div class="srow"><span class="sk">${k}</span><span class="sv">${v}</span></div>`).join('')
       + '</div>';
     // The params BEHIND this column (from the compare response, i.e. what actually
     // produced the numbers — not whatever is currently typed in the fields above).

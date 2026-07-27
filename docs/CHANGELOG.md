@@ -1090,3 +1090,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      high-consequence surface, large non-mechanical diff, multi-agent diff, uncertainty), must say
      which one, and picks `medium`/`high` by rule. `shared/` is also now described as holding
      cross-tier LOGIC (`MotionGate`, wire format), not contracts alone.
+
+177. A scorecard readout is now ONE LINE per stat — label left, value right, the same shape as the
+     param list under it. Laid out as a single wrapping flex row, every gap broke in a 210px tile,
+     so Recall/Missed/False/Day/Night ate ten lines with each label stranded above its number.
+     Verified at the grid's 210px minimum: no row wraps or overflows. Presentation only.

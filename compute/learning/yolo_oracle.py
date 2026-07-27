@@ -33,6 +33,15 @@ Two pieces, mirroring ``compute/learning/live_identify.py`` (itself mirroring
   never stored, so full coverage is both impossible and pointless; the tick no-ops (intent
   preserved) until capture returns to keep-all.
 
+**It never backfills.** Every ``start`` — an operator switch-on *and* the launch-time
+``restore`` — seeds the watermark to the current frame horizon, so the worker only ever
+covers frames captured from that moment on. Frames stored before it was switched on (earlier
+days, or a gap while it was off) stay the manual sweep's job. This is deliberate: a backfill
+is an unbounded, hours-long GPU hold that starts the moment the toggle flips and silently
+delays coverage of *today* — the thing the worker exists to keep current. Catch-up WITHIN a
+run is unaffected: a tick that yielded to a manual job (or idled under motion-only capture)
+leaves the watermark alone and drains the tail on later ticks.
+
 **The two always-on YOLO loops deliberately do NOT yield to each other.** Both yield to a
 manual sweep/training job (``is_busy``), but neither waits on the other: a same-frame
 detect is idempotent (``analysis`` is ``PRIMARY KEY (frame_id, analyzer)`` written
@@ -73,11 +82,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TICK = 30.0
 
 # Most frames one tick will sweep before deferring the rest to the next interval. Bounds a
-# single tick's GPU hold: re-enabled after a long off-period (or after a manual job held the
-# GPU for a while), the tail beyond the watermark can be enormous, and sweeping all of it
-# back-to-back would monopolize the GPU far past one tick. Capping drains a backlog
-# GRADUALLY across ticks. (A first-EVER enable skips history entirely by seeding the
-# watermark to the horizon — see start(); this cap is for the resume-after-a-gap case.)
+# single tick's GPU hold: after a manual job (or a spell of motion-only capture) held the tick
+# off for a while, the tail beyond the watermark can be large, and sweeping all of it
+# back-to-back would monopolize the GPU far past one tick. Capping drains that backlog
+# GRADUALLY across ticks. (Frames from before the worker was switched on are never in the
+# window at all — start() seeds the watermark to the horizon, so there is no backfill to cap.)
 _MAX_FRAMES_PER_TICK = 2000
 
 # How many frame ids one ``run_analysis`` call covers — i.e. the tick's YIELD GRANULARITY.
@@ -103,9 +112,10 @@ _ANALYZER = "yolo-serial"
 # Settings-KV keys: the on/off intent (restored at launch, like the collector's motion-only
 # intent) and the frame watermark. The watermark bounds the tick to new frames;
 # ``iter_unanalyzed`` (keyed on absence of a verdict row) makes the sweep itself idempotent
-# WITHIN that window, so a lost watermark costs at most re-work — but a watermark left
-# AHEAD of the frames it should cover strands the worker, which is why ``/api/clear``
-# re-seeds it (``clear()`` keeps this KV while frame rowids reset).
+# WITHIN that window. Persisting the watermark keeps ``status()`` honest between the process
+# start and the launch-time ``restore`` (which re-seeds it to the horizon — no backfill); a
+# watermark left AHEAD of the frames it should cover strands a RUNNING worker, which is why
+# ``/api/clear`` re-seeds it too (``clear()`` keeps this KV while frame rowids reset).
 _INTENT_KEY = "yolo_oracle"
 _WATERMARK_KEY = "yolo_oracle_watermark"
 
@@ -200,24 +210,19 @@ class YoloOracleManager:
         self._analyzer: "object | None" = None
 
         # The frame watermark: the highest id already swept, so a tick only sweeps beyond it.
-        # Seeded from the persisted setting so a restart resumes where it left off (0 = from
-        # the start).
+        # Loaded from the persisted setting purely so ``status()`` reports the last covered
+        # frame before the worker is (re)started — every ``start`` re-seeds it to the horizon,
+        # so this value never causes a backfill (0 = nothing swept yet).
         raw = store.get_setting(_WATERMARK_KEY)
         self._watermark = int(raw) if raw is not None else 0
 
-        # True until the first start() when NO watermark has ever been persisted — the very
-        # first enable. start() then jumps the watermark to the current frame horizon so the
-        # worker covers only NEW frames rather than back-sweeping the whole existing store
-        # (that stays the manual sweep's job — and a full back-sweep would hold the GPU for
-        # hours). A persisted watermark (a restart / launch-time restore) is never absent, so
-        # this stays False there and the worker resumes where it left off. See start().
-        self._seed_horizon = raw is None
-
-        # Bumped by every ``reset_watermark``. A tick snapshots it and refuses to advance the
-        # watermark once it has changed, because ``/api/clear`` resets mid-flight: the tick
-        # computed its window from the PRE-wipe watermark and would otherwise write its own
-        # derived value back, resurrecting a watermark far above every post-wipe frame — the
-        # worker would then report running, error-free, and silently sweep nothing forever.
+        # Bumped by every watermark re-seed (``start``'s horizon seed and ``reset_watermark``).
+        # A tick snapshots it and refuses to advance the watermark once it has changed, because
+        # a re-seed can land mid-flight (``/api/clear`` does not stop the workers; a stop→start
+        # leaves the old thread winding down): the tick computed its window from the PREVIOUS
+        # watermark and would otherwise write its own derived value back, resurrecting a stale
+        # value — with ``/api/clear`` one far above every post-wipe frame, leaving the worker
+        # reporting running and error-free while silently sweeping nothing forever.
         self._epoch = 0
 
         # Observability for /api/stats: when the last tick ran, and the most-recent tick
@@ -361,19 +366,24 @@ class YoloOracleManager:
         old thread carries the old, set stop event and exits at its next boundary). The
         intent is persisted so a launch can restore it (see ``restore``).
 
-        On the very first enable (no watermark ever persisted) the watermark is seeded to the
-        current frame horizon, so the worker covers only new frames and does not back-sweep
-        the whole existing store — see ``_seed_horizon``.
+        **The watermark is seeded to the current frame horizon on EVERY start**, so the worker
+        never backfills: it covers frames captured from the switch-on forward, and everything
+        older — earlier days, or the gap while it was off — stays the manual sweep's job. A
+        backfill would be an unbounded, hours-long GPU hold that delays the coverage of *today*
+        this worker exists to keep current. Note this applies to the launch-time ``restore``
+        too, which is harmless: frames are only stored by the in-process collector, so a
+        process that was down stored nothing to miss.
         """
         # Seed BEFORE (and outside) the lock — it reads/writes the store, which must never
-        # happen under the manager lock. Guarded to fire once, so a start() while already
-        # running (below) is unaffected.
-        if self._seed_horizon:
-            horizon = self._store.latest_id()
-            self._store.set_setting(_WATERMARK_KEY, str(horizon))
-            with self._lock:
-                self._watermark = horizon
-            self._seed_horizon = False
+        # happen under the manager lock. Skipped when already running so an idempotent start()
+        # can't skip the tail a live worker is mid-way through draining; the authoritative
+        # not-running check is the locked one below. Two racing starts both seed, harmlessly:
+        # they resolve within milliseconds of each other, and the loop waits a full tick
+        # interval BEFORE its first tick, so no sweep can have advanced the watermark in
+        # between — both write the same horizon.
+        if self.running:
+            return
+        self._seed_watermark(self._store.latest_id())
         with self._lock:
             if self._running:
                 return
@@ -432,6 +442,10 @@ class YoloOracleManager:
         Unlike live-identify's restore there is deliberately no "…or a model is promoted"
         clause: a promoted gallery is a run-mode *naming* signal, whereas this worker is a
         motion-gate *tuning* tool, so it starts only when the operator asked for it.
+
+        Going through ``start`` means a restore also re-seeds the watermark to the horizon, so a
+        restart does not backfill either — see ``start``. Nothing is lost: frames are stored by
+        the in-process collector, so a process that was down stored none.
         """
         if flag:
             self.start()
@@ -442,32 +456,32 @@ class YoloOracleManager:
         ``Store.clear()`` wipes the frames but deliberately KEEPS the settings KV, while
         frame rowids restart from 1. A watermark left at the pre-wipe horizon would then sit
         far AHEAD of every new frame, so the tick's ``[watermark+1, …]`` window would never
-        include them and the worker would look enabled while silently covering nothing —
+        include them and a RUNNING worker would look enabled while silently covering nothing —
         until the store re-grew past the old id. ``iter_unanalyzed`` cannot save us here: it
         is only consulted *inside* the window, so frames below it are never even considered.
         Re-seeding to the post-wipe horizon restores the normal "cover what arrives from now
-        on" contract.
+        on" contract. (A *stopped* worker would be re-seeded by its next ``start`` anyway; this
+        is what covers the clear-while-running case, since ``/api/clear`` stops nothing.)
 
-        Two subtleties, both load-bearing:
+        Load-bearing detail: the ``_seed_watermark`` epoch bump means a tick already in flight
+        refuses to write its pre-wipe-derived watermark back over this reset — without that
+        guard the reset is silently undone and the worker strands exactly as described above.
+        See ``_advance_watermark``.
+        """
+        self._seed_watermark(value)
 
-        - It bumps ``_epoch``, so a tick already in flight (``/api/clear`` does NOT stop the
-          workers) refuses to write its pre-wipe-derived watermark back over this reset —
-          without that guard the reset is silently undone and the worker strands exactly as
-          described above. See ``_advance_watermark``.
-        - It is a NO-OP on a worker that has never been enabled. Such a worker has no stale
-          watermark to strand (it is 0, and the first ``start()`` seeds it to the THEN-current
-          horizon), so writing the key here would only consume ``_seed_horizon`` — which is
-          re-derived at construction as "no persisted key", so it would stay consumed across
-          restarts too. The cost of getting this wrong is large and silent: the common
-          clear → collect for a day → enable-for-the-first-time flow would back-sweep the
-          whole store, the hours-long GPU hold ``_seed_horizon`` exists to prevent.
+    def _seed_watermark(self, value: int) -> None:
+        """Force the watermark (and its persisted copy) to ``value``, invalidating in-flight ticks.
+
+        The one write path for a watermark that does NOT come from a completed sweep — the
+        horizon seed in ``start`` and ``/api/clear``'s ``reset_watermark``. Bumping ``_epoch``
+        is what makes it stick: a tick that is mid-chunk computed its window from the previous
+        watermark, so ``_advance_watermark`` must refuse its derived value rather than undo
+        this. In-memory first, then persisted, like ``_advance_watermark``: a crash between the
+        two costs at most a little re-work. The store write stays OUTSIDE the manager lock.
         """
         with self._lock:
-            # Bump first and unconditionally: any in-flight tick must be invalidated even in
-            # the never-enabled case (cheap, and it keeps the invariant simple).
             self._epoch += 1
-            if self._seed_horizon:
-                return
             self._watermark = int(value)
         self._store.set_setting(_WATERMARK_KEY, str(int(value)))
 

@@ -24,6 +24,13 @@ only while capture is in keep-all mode.
   `yolo-batch-vs-serial-diverges` finding). No identify step and **no
   `active_model()` dependency** — the worker runs regardless of whether a gallery
   is promoted.
+> **Amended 2026-07-26 (post-implementation):** the horizon seed applies to **every**
+> `start` — an operator switch-on and the launch-time `restore` — not just the first
+> enable, so the worker *never* backfills. A re-enable no longer drains the frames
+> captured while it was off (that stays a manual sweep); catch-up within a running
+> worker (after a manual job, or motion-only capture) is unaffected. This supersedes
+> "first enable" below and the `_seed_horizon` flag it describes.
+
 - **Watermark tail, seeded to horizon on first enable** (reuses). A persisted
   `yolo_oracle_watermark` bounds the tick to new frames; `iter_unanalyzed` is the
   idempotent correctness backstop only *within* the tick window, so the watermark

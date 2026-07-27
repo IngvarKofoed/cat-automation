@@ -900,3 +900,33 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      The handler's `disabled = true` guard was being unlocked by the very next poll (which
      re-derives `disabled`/`checked` from stale server state), so the double-click race it
      exists to prevent was still reachable, with a visible checkbox flicker.
+
+147. The internal analyzer slug `yolo-serial` is no longer shown to operators: `/admin`'s
+     tooltips, help text, empty states, and its oracle-picker label now say "YOLO". The slug
+     stays the registry/DB analyzer name (it is the value in `analysis.analyzer`, half of
+     `PRIMARY KEY (frame_id, analyzer)`), so this is presentation-only — renaming the
+     identifier would orphan every stored verdict without a migration. Deliberately not done.
+
+148. The oracle picker labels the two YOLO personas distinctly — "YOLO" (serial, the trusted
+     oracle) vs "YOLO (batched)". Dropping the slug had briefly made both read "YOLO", which
+     is worse than the slug: the picker chooses what a visit-recall scorecard is scored
+     against, and the batched persona over-detects (entry 54), so an indistinguishable pair
+     invites reading a scorecard against the wrong oracle.
+
+149. The always-on YOLO-oracle worker NEVER backfills: every `start` — an operator switch-on and the
+     launch-time `restore` — seeds the watermark to the current frame horizon, superseding entry 138/142's
+     first-enable-only seed. A re-enable no longer drains the frames captured while it was off (an
+     unbounded GPU hold that delays coverage of *today*, the thing the worker exists to keep current).
+     Accepted cost: a restart forgets an un-drained tail (e.g. one left by a long manual job) — those
+     frames need a manual sweep. Catch-up within a running worker is unchanged.
+
+150. `_seed_watermark` is now the single write path for a watermark that did NOT come from a completed
+     sweep (`start`'s horizon seed + `/api/clear`'s `reset_watermark`), so both carry the epoch bump that
+     stops an in-flight tick writing its stale derived value back. `_seed_horizon` is gone from the oracle
+     — with every start seeding, there is no first-enable-only flag left to accidentally consume.
+     `live_identify` keeps its own flag: it back-identifies visit spans, a different contract.
+
+151. admin-next queue tables share one fixed column geometry (`table-layout:fixed` + a `<colgroup>`):
+     Name widest, then Frames, then Status, with % done / FPS / ETA narrowest. Auto-widths had sized each
+     card's table to its own rows, so the same columns landed in different places per card. "Time to
+     complete" is now "ETA". Cleanup's Drop/Sweep lost their `…` and share one width. Presentation only.

@@ -17,8 +17,9 @@ fakes and NO torch, NO model, no CUDA:
 
 The load-bearing behaviors these cover: full-coverage sweeping (no ``motion_only``), the
 per-chunk ``is_busy`` re-check that lets an operator's job win mid-tick, the per-tick frame
-cap that stops a backlog monopolizing the GPU, and the watermark only ever advancing past a
-COMPLETED chunk.
+cap that stops a backlog monopolizing the GPU, the watermark only ever advancing past a
+COMPLETED chunk, and the no-backfill contract (every ``start`` re-seeds the watermark to the
+frame horizon, while a start on an already-running worker leaves it alone).
 """
 from __future__ import annotations
 
@@ -345,10 +346,10 @@ def test_tick_survives_detect_exception_without_advancing_watermark():
     assert mgr.status()["watermark"] == _CHUNK
 
 
-# --- first enable: seed to the horizon, don't back-sweep the whole store ---
+# --- every start seeds to the horizon: the worker never backfills ---
 
 
-def test_start_seeds_watermark_to_horizon_on_first_enable():
+def test_start_seeds_watermark_to_horizon():
     # A fresh enable against a store already holding days of frames must NOT back-sweep that
     # history (a full back-sweep would hold the GPU for hours; history stays the manual
     # sweep's job): start() jumps the watermark to the horizon, so ticks find nothing behind.
@@ -366,15 +367,38 @@ def test_start_seeds_watermark_to_horizon_on_first_enable():
     assert parts["detect"].calls == []  # nothing historical was swept
 
 
-def test_start_does_not_reseed_when_watermark_persisted():
-    # A restart (persisted watermark present) is a RESUME, not a first enable — start() must
-    # leave the watermark alone so the un-swept tail is still covered.
+def test_start_reseeds_to_horizon_so_a_re_enable_never_backfills():
+    # A re-enable (or a launch-time restore) is NOT a resume: the frames captured while the
+    # worker was off stay the manual sweep's job. Backfilling them would be an unbounded,
+    # hours-long GPU hold that delays coverage of TODAY — what the worker exists to keep
+    # current — so every start re-seeds the watermark to the current horizon.
     store = _FakeStore(latest_id=900)
-    store.settings["yolo_oracle_watermark"] = "100"
+    store.settings["yolo_oracle_watermark"] = "100"  # 800 frames arrived while it was off
+    mgr, parts = _manager(store, tick_seconds=60.0)
+
+    mgr.start()
+    assert mgr.status()["watermark"] == 900
+    assert store.settings["yolo_oracle_watermark"] == "900"
+
+    mgr._tick(threading.Event())
+    assert parts["detect"].calls == []  # the off-period gap is never swept
+    mgr.stop()
+    mgr.join(timeout=5)
+
+
+def test_start_while_running_leaves_the_watermark_alone():
+    # start() is idempotent, and an idempotent call must not re-seed: skipping to the horizon
+    # mid-run would abandon the tail a live worker is draining (after a manual job held the
+    # GPU), which is catch-up WITHIN a run, not a backfill.
+    store = _FakeStore(latest_id=10)
     mgr, _ = _manager(store, tick_seconds=60.0)
 
     mgr.start()
-    assert mgr.status()["watermark"] == 100  # untouched by start
+    assert mgr.status()["watermark"] == 10
+    store._latest_id = 4_000  # frames keep arriving while the worker is on
+    mgr.start()  # a redundant enable
+
+    assert mgr.status()["watermark"] == 10  # still where the sweep left it
     mgr.stop()
     mgr.join(timeout=5)
 
@@ -383,14 +407,14 @@ def test_start_does_not_reseed_when_watermark_persisted():
 
 
 def test_start_ticks_then_stop_ends_loop():
-    store = _FakeStore(latest_id=10)
-    store.settings["yolo_oracle_watermark"] = "0"  # a RESUME, so no horizon seeding
+    store = _FakeStore(latest_id=0)  # empty at switch-on, so the horizon seed leaves nothing behind
     mgr, parts = _manager(store, tick_seconds=0.01)
 
     mgr.start()
     assert mgr.running is True
     assert store.settings["yolo_oracle"] == "1"  # start persisted the on intent
 
+    store._latest_id = 10  # frames arrive AFTER the switch-on — these it must cover
     assert _wait(lambda: mgr.status()["watermark"] == 10), "background tick never swept"
     assert parts["detect"].calls == [(1, 10)]
 
@@ -457,7 +481,7 @@ def test_reset_watermark_repoints_and_persists():
     mgr._tick(threading.Event())
     assert parts["detect"].calls == [(1, 40)]
 
-    # And start() must NOT re-seed over the explicit reset (would strand it again).
+    # And a later start() re-seeds to the CURRENT horizon (40), so the reset is not undone.
     mgr.start()
     assert mgr.status()["watermark"] == 40
     mgr.stop()
@@ -512,21 +536,20 @@ def test_reset_watermark_mid_tick_is_not_clobbered():
     assert st["last_error"] is None  # abandoning the tick is not a fault
 
 
-def test_reset_watermark_preserves_first_enable_seed():
-    # /api/clear calls reset_watermark on workers that may NEVER have been enabled. A
-    # never-seeded worker has no stale watermark to strand (it is 0, and first start() seeds
-    # it to the then-current horizon), so the reset must not consume the seed — else the very
-    # common "clear → collect for a day → enable for the first time" flow back-sweeps the
-    # whole store, the hours-long GPU hold _seed_horizon exists to prevent.
+def test_enable_after_clear_then_a_day_of_collection_does_not_back_sweep():
+    # The common flow: /api/clear (which re-seeds the watermark to the post-wipe horizon on
+    # every worker, enabled or not), then a day of collection, then the operator switches the
+    # oracle on. That must cover only what arrives NEXT — back-sweeping a day of frames is the
+    # hours-long GPU hold the horizon seed exists to prevent.
     store = _FakeStore(latest_id=0)  # freshly cleared
     mgr, parts = _manager(store, tick_seconds=60.0)
 
-    mgr.reset_watermark(0)  # what /api/clear does to a never-enabled worker
+    mgr.reset_watermark(0)  # what /api/clear does
 
     store._latest_id = 432_000  # ...then a day of collection
-    mgr.start()  # the FIRST ever enable
+    mgr.start()
 
-    assert mgr.status()["watermark"] == 432_000, "first enable back-sweeps the whole store"
+    assert mgr.status()["watermark"] == 432_000, "enable back-sweeps the whole store"
     mgr.stop()
     mgr.join(timeout=5)
     assert parts["detect"].calls == []

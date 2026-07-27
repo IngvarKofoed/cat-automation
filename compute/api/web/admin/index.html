@@ -1686,7 +1686,7 @@
                 <div class="control-group">
                     <label>&nbsp;</label>
                     <button type="button" id="activityAnalyzeBtn" class="btn-secondary"
-                        title="Re-detect just the LOADED events' motion frames with yolo-serial (tight + fast), so cat / person / bird subjects are (re)detected. This is the DETECT step; Identify then matches detected cats to the gallery. For whole-window / non-motion coverage use Sweeps. Progress shows on Sweeps.">Analyze</button>
+                        title="Re-detect just the LOADED events' motion frames with YOLO (tight + fast), so cat / person / bird subjects are (re)detected. This is the DETECT step; Identify then matches detected cats to the gallery. For whole-window / non-motion coverage use Sweeps. Progress shows on Sweeps.">Analyze</button>
                 </div>
                 <div class="control-group">
                     <label>&nbsp;</label>
@@ -1730,7 +1730,7 @@
                     <h2 id="playerTitle">Playback</h2>
                     <div class="btn-row" style="align-items: center;">
                         <button type="button" id="playerAnalyzeBtn" class="btn-secondary"
-                                title="Re-run yolo-serial detection over THIS event's motion frames only (reanalyze), so its cat / person / bird subject is (re)detected. Progress shows on Sweeps; reload Activity to see the new subject.">Re-analyze frames</button>
+                                title="Re-run YOLO detection over THIS event's motion frames only (reanalyze), so its cat / person / bird subject is (re)detected. Progress shows on Sweeps; reload Activity to see the new subject.">Re-analyze frames</button>
                         <button type="button" id="playerCloseBtn" class="modal-close"
                                 aria-label="Close playback (Esc)" title="Close (Esc)">&times;</button>
                     </div>
@@ -2211,9 +2211,9 @@
                 </div>
             </div>
             <p class="caveat text-muted" style="margin: var(--space-3) 0 0;">
-                The queue is live yolo-serial detections, clustered into visits, minus the ones
+                The queue is live YOLO detections, clustered into visits, minus the ones
                 already labelled. Coverage is partial and concentrated early — grow the pool by
-                running more yolo-serial sweeps on the Sweeps page.
+                running more YOLO sweeps on the Sweeps page.
             </p>
         </div>
 
@@ -2271,7 +2271,7 @@
                     <button type="button" id="annotateNextBtn" class="btn-secondary">Skip / Next (j) →</button>
                 </div>
             </div>
-            <div id="annotateEmpty" class="empty hidden">No undecided visits in this window. Sweep more yolo-serial on the Sweeps page, or pick another bucket.</div>
+            <div id="annotateEmpty" class="empty hidden">No undecided visits in this window. Sweep more YOLO on the Sweeps page, or pick another bucket.</div>
             <div id="annotateRep"></div>
             <div id="annotateMeta" class="inbox-meta"></div>
             <div id="annotateFilmstrip" class="filmstrip"></div>
@@ -2381,7 +2381,7 @@
         <div class="panel">
             <h2>4. Identify</h2>
             <p class="caveat text-muted" style="margin: 0 0 var(--space-2);">
-                Matches yolo-serial-detected crops in the scoped bucket against the active
+                Matches YOLO-detected crops in the scoped bucket against the active
                 gallery and writes per-frame identifications — the names Activity then shows.
                 Runs on the shared training queue above.
             </p>
@@ -2591,9 +2591,14 @@
         const ROUTES = ['start', 'activity', 'corruption', 'buckets', 'sweeps', 'tuning', 'annotate', 'train'];
         // The single frontend source for the oracle id/label set (the backend's
         // ANALYZER_NAMES is its server-side counterpart).
+        // Ids stay the registry/DB analyzer names; only the shown LABELS drop the internal
+        // slug. The serial persona is the trusted oracle, so it gets the unqualified "YOLO";
+        // the batched one is the A/B variant (it over-detects — see changelog 54), so it stays
+        // qualified. Both labels must remain DISTINCT: this list is the oracle picker, and a
+        // scorecard read against the wrong one is misleading.
         const ANALYZERS = [
-            { id: 'yolo', label: 'YOLO' },
-            { id: 'yolo-serial', label: 'YOLO (serial)' },
+            { id: 'yolo', label: 'YOLO (batched)' },
+            { id: 'yolo-serial', label: 'YOLO' },
             { id: 'bsuv', label: 'BSUV' },
         ];
         const ANALYZER_LABELS = Object.fromEntries(ANALYZERS.map(a => [a.id, a.label]));
@@ -5340,7 +5345,7 @@
             annotateProgressEl.querySelector('.metric__val').textContent = `${annDecided} / ${annTotal}`;
             annotateCropsBadgeEl.querySelector('.metric__val').textContent = annCrops;
             if (!annVisits.length) {
-                annotateEmptyEl.textContent = 'No undecided visits in this window. Sweep more yolo-serial on the Sweeps page, or pick another bucket.';
+                annotateEmptyEl.textContent = 'No undecided visits in this window. Sweep more YOLO on the Sweeps page, or pick another bucket.';
                 annotateEmptyEl.classList.remove('hidden');
                 annotateRepEl.innerHTML = '';
                 annotateMetaEl.textContent = '';
@@ -6237,7 +6242,7 @@
                 const serial = cdata.oracles && cdata.oracles['yolo-serial'];
                 const present = serial ? serial.present : 0;
                 if (!present) {
-                    showError('Identify: no detections in this window — run a yolo-serial sweep first.');
+                    showError('Identify: no detections in this window — run a YOLO sweep first.');
                     return;
                 }
                 identifySubmitting = true;

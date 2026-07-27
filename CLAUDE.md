@@ -38,11 +38,11 @@ Each subtree has its own `CLAUDE.md` with scoped tool/skill rules:
 
 - `edge/CLAUDE.md` — Raspberry Pi thin edge: capture, clip, motion gate, the single HTTP server (`/stream`, `/frame`, control API, config UI), and optional actuator drivers. **No ML.**
 - `compute/CLAUDE.md` — NVIDIA PC "brain": detection, tracking, individual re-ID identification, the decision engine, event store, notifications, dashboard, and the learning loop.
-- `shared/CLAUDE.md` — the cross-tier contracts: data model, event/intent schemas, the Pi control-API shape, constants.
+- `shared/CLAUDE.md` — the cross-tier **contracts** (data model, event/intent schemas, the Pi control-API shape, constants) *and* the cross-tier **logic** both tiers instantiate: the `MotionGate` core and the frame wire format.
 
 ## After making changes
 
-After a non-trivial edit, **review the touched code yourself, automatically** — a code-review-grade pass over correctness, security & data-integrity, edge cases & tests, reuse, clarity, performance, and conformance to this repo's conventions — then apply every finding to the working tree. Scale the pass to the change: a careful single read of the diff for a small edit; for a substantial or high-risk change (a broad diff, or security- / data-integrity-sensitive code) **fan out across subagents with the Agent tool — one per at-risk dimension (~2–4) — and verify each finding before acting on it**. Do **not** try to invoke the `/code-review` skill for this routine pass: it is user-invoke-only (`disable-model-invocation`), so you can't call it — this per-edit pass is your own self-run review. (The `/code-review` skill stays the user's to run; see the significant-change nudge below.)
+After a non-trivial edit, **review the touched code yourself, automatically** — a code-review-grade pass over correctness, security & data-integrity, edge cases & tests, reuse, clarity, performance, and conformance to this repo's conventions — then apply every finding to the working tree. Scale the pass to the change: a careful single read of the diff for a small edit; for a substantial or high-risk change (a broad diff, or security- / data-integrity-sensitive code) **fan out across subagents with the Agent tool — one per at-risk dimension (~2–4) — and verify each finding before acting on it**. Do **not** try to invoke the `/code-review` skill for this routine pass: it is user-invoke-only (`disable-model-invocation`), so you can't call it — this per-edit pass is your own self-run review. (The `/code-review` skill stays the user's to run; see the nudge below.)
 
 Once the fixes are applied, report what changed:
 
@@ -50,7 +50,27 @@ Once the fixes are applied, report what changed:
 2. **Summarize each bucket in one line** so the user can see what was fixed without expanding every finding.
 3. Do not stop to ask which to fix — all findings are fixed by default. The user can review the diff and revert anything they disagree with.
 
-For a **significant** change — a broad or high-risk diff, or a large batch of auto-applied fixes — end the turn by suggesting the user run a deliberate `/code-review medium` pass themselves. The single self-review pass above is never independently re-reviewed, so a large diff still warrants a human-in-the-loop second look; the nudge is the checkpoint.
+### Suggesting a user-run `/code-review`
+
+**Default: say nothing.** Most turns end with the self-review report and no suggestion — the review already happened, and a reflexive "you may also want to run `/code-review`" on every diff is noise that trains the user to ignore it on the one change where it mattered. Suggest a pass only when you can **name the trigger that fired**. Can't name one? Don't suggest.
+
+**Triggers — any one is enough:**
+
+- **Heavy self-review** — you fixed a genuine blocker (a real correctness, security, or data-integrity bug), or applied should-fix changes across most of the files you touched. A handful of nits is not churn.
+- **High-consequence surface** — in this repo: the store's counter / eviction / accounting paths and anything holding the shared SQLite write lock; schema changes, or anything that deletes or purges frames, crops, or labels; the `shared/` contracts (wire format, `MotionGate`) that both tiers depend on; the durable learning-loop tables (`cats`, `dataset_items`, `model_versions`) that survive eviction; and — once it exists — actuation and its access-decision policy.
+- **Large and non-mechanical** — roughly >400 changed lines or >10 files of real logic. A rename, a formatting sweep, or a presentation-only reskin of the same size does not count.
+- **Multi-agent fan-out produced the diff** — no single agent ever saw the whole combined change.
+- **Genuine uncertainty** — you guessed at intent, left a known gap, or couldn't verify the change (nothing covers it, or it only runs on the compute PC / on the Pi).
+
+**Level — choose it, don't default to one:**
+
+- **`/code-review medium`** — the ordinary triggered case: a large refactor, a heavy self-review, or a workflow-produced diff on ordinary code.
+- **`/code-review high`** — when the high-consequence-surface trigger fired, when you fixed **more than one** blocker, or when two or more triggers fired at once. It's slower and costlier, so it needs one of those reasons — size alone isn't one.
+- Never suggest above `high`; going deeper is the user's call to make unprompted.
+
+**These do *not* trigger it:** docs- or changelog-only edits, formatting and lint fixes, dependency bumps, adding tests to existing code, a contained single-function change with tests passing, a presentation-only UI tweak, or a self-review that turned up only nits.
+
+When you do suggest: **one sentence** at the end of the turn — the code is already self-reviewed with fixes applied, a fresh independent pass would add assurance, and **which trigger fired**. Frame it as optional reassurance, not a warning that something is wrong. `/code-review` is user-invoke-only, so only the user can run it. Only claim the code was already reviewed if you actually ran the self-review above.
 
 ## Multi-agent workflows
 
@@ -64,7 +84,7 @@ The guardrail: the stage that *catches* problems (adversarial review) stays stro
 
 **Invoking a named workflow is not authoring one.** The tiers above are yours to set only when *you* write the `agent()` calls. A built-in or named workflow — e.g. `Workflow({ name: 'code-review' })` — runs its own stages on the session model; nothing tiers them for you, so a wide fan-out (the review's per-`(file,line)` verifiers most of all) silently bills every agent at the top tier. Before launching one at `high`+ effort or over a broad diff, check the `scriptPath` the run reports: if a large *checking* stage isn't tiered, edit that script to drop those agents to the mid model (leaving the finders and final synthesis strong) and re-invoke with `{ scriptPath }` instead. Keep them strong only when the diff is security-/data-integrity-critical. For `code-review` specifically: its verifier agents default to the mid model.
 
-**When a workflow returns, the after-edits self-review applies to its aggregate diff.** No single subagent saw the whole combined change, so treat the workflow's landed edits as one change and run the *After making changes* self-review over the aggregate diff. Because it's a multi-agent, no-single-author change, it's a prime case for the end-of-turn `/code-review medium` nudge.
+**When a workflow returns, the after-edits self-review applies to its aggregate diff.** No single subagent saw the whole combined change, so treat the workflow's landed edits as one change and run the *After making changes* self-review over the aggregate diff. Being a no-single-author change, it fires the *multi-agent fan-out* trigger in **Suggesting a user-run `/code-review`** above — make the suggestion, and pick the level by the rule there (`high` if it also touched a high-consequence surface, or the self-review fixed more than one blocker).
 
 This section is inert unless you actually run a multi-agent workflow.
 

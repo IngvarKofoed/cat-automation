@@ -1083,3 +1083,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      chips to opposite corners is what silently overlapped on a narrow tile or a long cat name before
      entry 153. Frame review renders it WITHOUT a bucket dot: that page holds no min/max thresholds,
      so it states the number and makes no judgement; only the missed-visit panel colours it.
+
+176. The root CLAUDE.md `/code-review` nudge now DEFAULTS TO SILENCE, instead of firing on any
+     "significant" change at a hardcoded `medium` — gated on an adjective it fired nearly every
+     turn, so the suggestion carried no signal. It fires only on a NAMED trigger (blocker fixed,
+     high-consequence surface, large non-mechanical diff, multi-agent diff, uncertainty), must say
+     which one, and picks `medium`/`high` by rule. `shared/` is also now described as holding
+     cross-tier LOGIC (`MotionGate`, wire format), not contracts alone.

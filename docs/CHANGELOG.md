@@ -1071,3 +1071,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      simply not rendering reads as "no such feature" (entry 164's lesson, re-learned). Two states now
      say which half is missing: no records at all, and records without the per-frame attribution.
      Routine, not hypothetical — the dev proxy serves a LOCAL admin-next against a REMOTE compute.
+
+174. Frame review shows each frame's MOG2 blob area, so the number behind a motion=1 frame can be
+     compared by eye against a still one — how the band thresholds get read off real data.
+     `GET /api/frames/sample?flags=1` now attaches `area` (the LIVE gate's `frames.area`, the same
+     reading as the edge UI's Area badge), free off the row it already fetched. Additive: absent
+     `flags` the payload is byte-identical.
+
+175. The area chip moved to a tile's TOP-RIGHT and is one shared renderer across both grids. It sits
+     INSIDE the wrapping `.tchips` row via `margin-left:auto`, NOT pinned to the corner — pinning
+     chips to opposite corners is what silently overlapped on a narrow tile or a long cat name before
+     entry 153. Frame review renders it WITHOUT a bucket dot: that page holds no min/max thresholds,
+     so it states the number and makes no judgement; only the missed-visit panel colours it.

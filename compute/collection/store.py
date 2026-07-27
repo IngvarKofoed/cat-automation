@@ -1581,6 +1581,13 @@ class Store:
         frame has an embeddable identification row for the active model, else
         ``None`` (no active model, or the frame is un-identified / un-embeddable).
 
+        ``flags`` also attaches ``area`` — the LIVE gate's largest-blob fraction for
+        this frame (``frames.area``, the same number the edge config UI's Area badge
+        shows), populated on EVERY frame including non-motion ones. It reads off the
+        row already fetched, so it costs nothing. Note it is always the live gate's
+        reading: a caller comparing an offline slot's re-run must use that slot's own
+        ``score``, not this.
+
         ``flags`` (a flag) OPTIONALLY attaches the two per-frame REVIEW markers a grid
         outlines its tiles by: ``motion`` (bool — the edge gate fired on this frame, read
         straight off ``frames.motion``) and ``corrupt``, which is TRI-STATE:
@@ -1610,8 +1617,8 @@ class Store:
                 return []
             stride = max(1, math.ceil(matched / count))
             rows = self._conn.execute(
-                "SELECT id, recv_ts, motion FROM ("
-                "  SELECT id, recv_ts, motion, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM frames"
+                "SELECT id, recv_ts, motion, area FROM ("
+                "  SELECT id, recv_ts, motion, area, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM frames"
                 + clause +
                 ") WHERE (rn - 1) % ? = 0 ORDER BY id ASC",
                 params + [stride],
@@ -1677,6 +1684,7 @@ class Store:
         if flags:
             for f, r in zip(out, rows):
                 f["motion"] = bool(r[2])
+                f["area"] = (float(r[3]) if r[3] is not None else None)
                 f["corrupt"] = corrupt_by_id.get(f["id"])
         if detections is not None:
             for f in out:

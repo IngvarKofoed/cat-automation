@@ -68,6 +68,31 @@ def test_flags_reports_motion_per_frame(tmp_path):
     assert all("corrupt" in r for r in rows)
 
 
+def test_flags_reports_the_live_gate_blob_area_on_every_frame(tmp_path):
+    """`area` rides along with the flags — on NON-motion frames too.
+
+    That is the point: comparing the blob area behind a motion=1 frame against the one
+    behind a still frame is how the band thresholds get read off real data, and a miss
+    only exists on a frame where motion is 0.
+    """
+    store = _store(tmp_path)
+    moving = StreamFrameMeta(frame_id=1, ts=1_000, motion=True, bbox=None, area=0.42)
+    still = StreamFrameMeta(frame_id=2, ts=2_000, motion=False, bbox=None, area=0.004)
+    store.add(StreamFrame(moving, _JPEG_BODY), recv_ts_ms=1_000)
+    store.add(StreamFrame(still, _JPEG_BODY), recv_ts_ms=2_000)
+
+    rows = store.sample_frames(None, None, 100, flags=True)
+    assert [(r["motion"], r["area"]) for r in rows] == [(True, 0.42), (False, 0.004)]
+
+
+def test_area_is_absent_without_flags(tmp_path):
+    """It rides the flags overlay, so the bare shape stays byte-identical."""
+    store = _store(tmp_path)
+    store.add(_frame(1, True), recv_ts_ms=1_000)
+    (row,) = store.sample_frames(None, None, 100)
+    assert "area" not in row
+
+
 def test_unswept_frame_reports_corrupt_none_not_false(tmp_path):
     """No corruption verdict → None (unmeasured), NEVER False (proven clean).
 

@@ -228,10 +228,14 @@
   .mv-dot.below_min { background: var(--unident); }
   .mv-dot.in_band   { background: var(--accent); }
   .mv-dot.above_max { background: var(--unrec); }
-  /* Per-frame blob area, top-left of a tile (the YOLO chip owns bottom-right). */
-  .mv-area { display: inline-flex; align-items: center; gap: 4px; background: rgba(0,0,0,.72);
-    color: var(--text); border-radius: 3px; padding: 1px 5px; font-family: var(--font-mono);
-    font-size: 10px; font-variant-numeric: tabular-nums; }
+  /* Per-frame MOG2 blob area, top-RIGHT of a tile (identity sits top-left, YOLO
+     bottom-right). It rides INSIDE the wrapping .tchips row pushed over by
+     margin-left:auto, rather than being pinned to the corner absolutely — pinning to
+     opposite corners is exactly what silently overlapped on a narrow tile or a long
+     cat name before entry 153 made this row wrap. */
+  .mv-area { margin-left: auto; display: inline-flex; align-items: center; gap: 4px;
+    background: rgba(0,0,0,.72); color: var(--text); border-radius: 3px; padding: 1px 5px;
+    font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums; }
 
   /* MOG2 parameter reference (bottom card): ranked list, each with its direction cue. */
   .pref-row { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
@@ -416,6 +420,18 @@
   }
   // Time-of-day WITH seconds. For a liveness readout fmtTs's minute resolution is useless —
   // a worker ticking every 30s and one stalled for a minute render identically.
+  // MOG2's largest-blob area as a percentage of the ROI — the same reading (and the
+  // same unit) as the edge config UI's live Area badge, so a number seen there and a
+  // number seen here mean the same thing. Sub-0.1% areas would all read "0.0%", so
+  // they fall back to 2 significant digits: "MOG2 measured something tiny" and "MOG2
+  // measured nothing" are different diagnoses and must not collapse together.
+  function fmtArea(a) {
+    if (a == null) return '—';
+    const p = a * 100;
+    if (p === 0) return '0%';
+    // Number() drops toPrecision's trailing zeros ("0.050" -> 0.05).
+    return (p < 0.1 ? String(Number(p.toPrecision(2))) : p.toFixed(1)) + '%';
+  }
   function fmtClock(ms) {
     if (!ms) return '—';
     const d = new Date(ms), p = (x) => String(x).padStart(2, '0');
@@ -494,6 +510,16 @@
   function frameDetChip(f, pos = '') {
     const state = f.box ? bandOf(f.score) : (f.analyzed === false ? 'unmeasured' : '');
     return `<span class="tchip det ${pos} ${state}" title="${esc(detTip(f))}">${detLabel(f)}</span>`;
+  }
+  // The frame's MOG2 blob area chip. `bucket` is supplied only where thresholds are
+  // known (the missed-visit panel, which has the scorecard's min/max) and then colours
+  // the dot by which gate test the frame failed; Frame review passes none, because it
+  // has no thresholds to judge against and a colour would imply a verdict it can't make.
+  function areaChip(area, bucket, note) {
+    if (area === undefined) return '';
+    const tip = `MOG2's largest blob = ${fmtArea(area)} of the ROI${note ? ' — ' + note : ''}`;
+    return `<span class="mv-area" title="${esc(tip)}">`
+      + (bucket ? `<i class="mv-dot ${bucket}"></i>` : '') + fmtArea(area) + '</span>';
   }
   // A visit's detection health as a bare traffic-light circle beside its label — the
   // user dashboard's health dot, replacing the "det NN%" pill. The three numbers behind
@@ -1400,28 +1426,14 @@
     function mvTileHtml(f, m) {
       const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
       const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
-      const r = MISS_REASON[m && m.bucket] || {};
-      // Area as a % of the ROI, the unit min_area / max_area_fraction are also in, so
-      // the number can be read straight against the fields above.
-      const chip = m
-        ? `<span class="mv-area ${m.bucket}" title="${esc(`largest blob = ${fmtArea(m.area)} of the ROI — ${r.label || m.bucket}`)}"><i class="mv-dot ${m.bucket}"></i>${fmtArea(m.area)}</span>`
-        : '';
+      // Area in the same unit min_area / max_area_fraction use, so the number reads
+      // straight against the param fields above, dotted by the test it failed.
+      const chip = m ? areaChip(m.area, m.bucket, (MISS_REASON[m.bucket] || {}).label) : '';
       return `<div class="ftile">
         <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${frameDetChip(f, 'at-br')}
           ${chip ? `<div class="tchips">${chip}</div>` : ''}</div>
         <div class="fmeta"><span>${fmtClock(f.recv_ts)}</span><span>#${f.id}</span></div>
       </div>`;
-    }
-    // Blob area as a percentage of the ROI. Sub-0.1% areas (the near-zero case) would
-    // all read "0.0%", so they fall back to 2 significant digits — "MOG2 measured
-    // something tiny" and "MOG2 measured nothing" are different diagnoses.
-    function fmtArea(a) {
-      if (a == null) return '—';
-      const p = a * 100;
-      if (p === 0) return '0%';
-      // Number() drops toPrecision's trailing zeros ("0.050" -> 0.05), so a tiny area
-      // reads 0.05% rather than 0.050%.
-      return (p < 0.1 ? String(Number(p.toPrecision(2))) : p.toFixed(1)) + '%';
     }
 
     // --- Queue tables (the shared renderer, fed from the analysis status poll) ---
@@ -1560,9 +1572,14 @@
       const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
       const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
       const t = new Date(f.recv_ts);
+      // The gate's blob area for this frame, on EVERY frame (it is measured whether or
+      // not motion fired) — so the value behind a motion=1 tile and the value behind a
+      // still one can be compared by eye against min_area / max_area_fraction. No
+      // bucket dot here: this page holds no thresholds, so it states the number and
+      // makes no judgement.
       return `<div class="ftile${tileFlag(f)}" data-i="${idx}">
         <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}
-          <div class="tchips">${identityChip(f.identity)}</div>${frameDetChip(f, 'at-br')}</div>
+          <div class="tchips">${identityChip(f.identity)}${areaChip(f.area)}</div>${frameDetChip(f, 'at-br')}</div>
         <div class="fmeta"><span>${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}</span><span>#${f.id}</span></div>
       </div>`;
     }
@@ -1584,7 +1601,11 @@
       const idTxt = identityKind(f.identity)
         ? `${identityKind(f.identity)}${f.identity.cat_name ? ' · ' + f.identity.cat_name : ''}${f.identity.distance != null ? ' (d=' + f.identity.distance.toFixed(3) + ')' : ''}`
         : 'no identity';
-      const marks = [f.motion ? 'motion' : '', f.corrupt ? 'CORRUPT' : (f.corrupt === null ? 'corruption not measured' : '')].filter(Boolean).join(' · ');
+      const marks = [
+        f.motion ? 'motion' : '',
+        f.area === undefined ? '' : `blob ${fmtArea(f.area)}`,
+        f.corrupt ? 'CORRUPT' : (f.corrupt === null ? 'corruption not measured' : ''),
+      ].filter(Boolean).join(' · ');
       openFrameModal(f, `${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detLabel(f)} · id: ${esc(idTxt)}${marks ? ' · ' + marks : ''}`);
     }
 

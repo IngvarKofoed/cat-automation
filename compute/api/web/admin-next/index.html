@@ -104,6 +104,25 @@
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .seg button { border: 0; border-radius: 0; background: transparent; color: var(--muted); }
   .seg button.sel { background: var(--accent); color: #0c1117; font-weight: 600; }
+  /* A disabled segment must not keep the selected fill (it would read as active) and
+     must not double-dim on top of button:disabled's opacity. */
+  .seg button:disabled { background: transparent; color: var(--muted); font-weight: 400; }
+  /* Lighting distribution: a bare column chart, no axes. Its ONE job is to show whether
+     the day's colourfulness falls into two separated humps and roughly where they part
+     — enough to place the cutoff, which is why the bars a saved cutoff calls night are
+     tinted rather than a line being drawn at it. */
+  .lithist { margin-top: 12px; }
+  .lithist .lbars { position: relative; display: flex; align-items: flex-end; gap: 2px;
+    height: 84px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); }
+  .lithist .lb { flex: 1; min-width: 2px; background: var(--accent); border-radius: 1px 1px 0 0; }
+  .lithist .lb.night { background: var(--muted); }
+  /* The saved cutoff at its exact position — bucket tinting is coarse by construction,
+     and this is the line the backend actually classifies on. */
+  .lithist .lcut { position: absolute; top: 0; bottom: 0; width: 0;
+    border-left: 1px dashed var(--text); opacity: .75; pointer-events: none; }
+  .lithist .lax { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 8px; margin-top: 5px; font-size: 12px; }
   input[type=number], input[type=text] { font: inherit; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 9px; width: 130px; }
   /* Wider than the numeric fields — a datetime-local holds "dd/mm/yyyy hh:mm". */
@@ -360,6 +379,12 @@
   .tchip.bird         { background: var(--bird-bg);      color: var(--bird); }
   .tchip.unrecognized { background: var(--unrec-bg);     color: var(--unrec); }
   .tchip.motion       { background: var(--unident-bg);   color: var(--unident); }
+  /* Lighting is a SCENE property, not a verdict about a cat, so it deliberately takes
+     no verdict colour (upholding changelog 43's "color = verdict"): a neutral surface
+     chip, dimmed further when the label is assumed rather than measured. */
+  .tchip.lit          { background: var(--bg); color: var(--text); font-weight: 600; }
+  .tchip.lit.dim      { color: var(--muted); font-weight: 400; }
+  .tchip.lit::before  { display: none; }
   .fmeta { padding: 5px 8px; font-size: 11px; color: var(--muted); display: flex;
     justify-content: space-between; gap: 6px; font-variant-numeric: tabular-nums; }
   .fmodal { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
@@ -525,6 +550,21 @@
     const tip = `MOG2's largest blob = ${fmtArea(area)} of the ROI${note ? ' — ' + note : ''}`;
     return `<span class="mv-area" title="${esc(tip)}">`
       + (bucket ? `<i class="mv-dot ${bucket}"></i>` : '') + fmtArea(area) + '</span>';
+  }
+  // The frame's day/night lighting chip. Shows the LABEL and the colourfulness behind
+  // it, because the number is what a threshold gets picked from. No chip at all when the
+  // frame carries no reading (`lighting` null = the lighting sweep never reached it) —
+  // absence means unmeasured, and inventing a "day" there is the trap this whole flag is
+  // built to avoid. An uncalibrated reading renders DIMMED (the same treatment "not
+  // analysed" gets), so an assumed day never looks like a measured one.
+  function lightingChip(f) {
+    if (!f || f.lighting == null) return '';
+    const c = f.colourfulness == null ? '' : ' ' + f.colourfulness.toFixed(2);
+    const dim = f.lighting_calibrated ? '' : ' dim';
+    const tip = f.lighting_calibrated
+      ? `${f.lighting} — colourfulness ${f.colourfulness == null ? '?' : f.colourfulness.toFixed(3)}`
+      : `assumed day — the colourfulness is measured (${f.colourfulness == null ? '?' : f.colourfulness.toFixed(3)}) but no cutoff is set`;
+    return `<span class="tchip lit${dim}" title="${esc(tip)}">${f.lighting}${c}</span>`;
   }
   // A visit's detection health as a bare traffic-light circle beside its label — the
   // user dashboard's health dot, replacing the "det NN%" pill. The three numbers behind
@@ -1019,6 +1059,27 @@
       </div>
 
       <div class="card">
+        <h3>Lighting <span class="note">(day / IR-night)</span></h3>
+        <div class="row">
+          <span id="litNote" class="note grow">…</span>
+          <label class="note"><input type="checkbox" id="litRerun"> Rerun all</label>
+          <button id="litRun" class="primary">Run lighting</button>
+        </div>
+        <div id="litHist" class="lithist"></div>
+        <div class="row" style="margin-top:12px">
+          <label class="fld">Night below<input id="litThresh" type="number" step="any" min="0" style="width:110px"></label>
+          <button id="litSave">Save</button>
+          <button id="litClear">Clear</button>
+          <span id="litState" class="note grow"></span>
+        </div>
+        <p class="hint">Colourfulness per frame — 0 is monochrome. Sweep a day, look for TWO
+          separated humps (colour day vs IR night), and set the cutoff where they part.
+          Until a cutoff is set every measured frame reads <b>day</b>, which is true of
+          everything captured before the NoIR swap.</p>
+        <div id="litQueue" class="qwrap"></div>
+      </div>
+
+      <div class="card">
         <h3>MOG2 candidate params</h3>
         <div id="paramFields" class="row"></div>
         <div class="row" style="margin-top:12px">
@@ -1033,7 +1094,15 @@
 
       <div class="card">
         <h3>Scorecards</h3>
-        <div class="row"><button id="compareBtn" class="primary">Compare</button><span id="splitNote" class="note"></span></div>
+        <div class="row">
+          <button id="compareBtn" class="primary">Compare</button>
+          <div id="regimeSel" class="seg">
+            <button class="sel" data-regime="">All</button>
+            <button data-regime="day">Day</button>
+            <button data-regime="night">Night</button>
+          </div>
+          <span id="splitNote" class="note"></span>
+        </div>
         <div id="scorecards" class="stats sccards" style="margin-top:12px"></div>
         <div id="missedPanel"></div>
       </div>
@@ -1122,7 +1191,7 @@
         html += `<div class="cal-cell has${sel}" data-ms="${ms}">
           <div class="cd">${dnum}${tag}</div>
           <div class="ce">${fmtInt(row.events)} event${row.events === 1 ? '' : 's'}</div>
-          <div class="cc">${covCell('YOLO', row.yolo, row.frames)}${covCell('BASE', row.baseline, row.frames)}${covCell('CAND', row.candidate, row.frames)}</div>
+          <div class="cc">${covCell('YOLO', row.yolo, row.frames)}${covCell('BASE', row.baseline, row.frames)}${covCell('CAND', row.candidate, row.frames)}${covCell('LIGHT', row.lighting, row.frames)}</div>
         </div>`;
       }
       html += '</div>';
@@ -1138,6 +1207,7 @@
       $('#dayScope', view).textContent = `${fmtDay(ms)} · ${fmtInt(row.frames)} frames`;
       renderDayStats(row);
       renderCoverage(row);
+      loadLighting();
     }
     function renderDayStats(row) {
       const el = $('#dayStats', view), total = row.frames || 0;
@@ -1147,6 +1217,7 @@
         ['YOLO frames', frac(row.yolo, total), fpct(row.yolo, total) + ' swept'],
         ['Baseline frames', frac(row.baseline, total), fpct(row.baseline, total) + ' swept'],
         ['Candidate frames', frac(row.candidate, total), fpct(row.candidate, total) + ' swept'],
+        ['Lighting frames', frac(row.lighting, total), fpct(row.lighting, total) + ' swept'],
       ].map(([k, v, sub]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div>${sub ? `<div class="note">${sub}</div>` : ''}</div>`).join('');
     }
     function renderCoverage(row) {
@@ -1163,6 +1234,94 @@
       try { await api('POST', '/api/analysis/run', body); pollJob(); }
       catch (e) { $('#jobLine', view).textContent = 'enqueue failed: ' + e.message; }
     });
+
+    // --- Lighting (day / IR-night) ------------------------------------------
+    //
+    // The sweep records a continuous COLOURFULNESS statistic; the day/night cutoff is
+    // applied at READ time from the settings KV. That split is the whole point: the
+    // sweep can run before the NoIR camera is fitted and be calibrated afterwards from
+    // the recorded distribution, with no re-sweep.
+    let litLoaded = false;                       // don't stomp a threshold mid-edit
+    async function loadLighting() {
+      if (scope.since_id == null) { $('#litNote', view).textContent = 'pick a day with frames first'; return; }
+      const q = new URLSearchParams({ since_id: scope.since_id, until_id: scope.until_id });
+      try {
+        const r = await api('GET', '/api/lighting?' + q);
+        if (!alive) return;
+        const c = r.coverage || {}, total = c.total || 0, done = c.analyzed || 0;
+        $('#litNote', view).innerHTML = `<b class="mono">${fmtInt(Math.max(0, total - done))}</b> frames not yet swept`
+          + ` · <span class="mono">${fmtInt(done)} / ${fmtInt(total)}</span> done`;
+        // Only seed the input on FIRST load: a later poll must not overwrite a value
+        // the operator is part-way through typing.
+        if (!litLoaded) { $('#litThresh', view).value = r.threshold == null ? '' : r.threshold; litLoaded = true; }
+        setLitState(r.threshold);
+        renderHist(r.histogram, r.threshold);
+      } catch (e) { $('#litNote', view).textContent = 'lighting unavailable: ' + e.message; }
+    }
+    function setLitState(t) {
+      // "Uncalibrated" is stated, not implied by a blank field — an unset cutoff means
+      // every measured frame reads `day`, and that assumption must be visible.
+      $('#litState', view).textContent = t == null
+        ? 'uncalibrated — every measured frame reads Day'
+        : `cutoff ${t} — below this reads Night`;
+    }
+    function renderHist(h, threshold) {
+      const el = $('#litHist', view);
+      if (!h || !h.count) { el.innerHTML = '<span class="note">Not swept — run lighting to see the distribution.</span>'; return; }
+      const peak = Math.max(1, ...h.buckets.map((b) => b.n));
+      const bars = h.buckets.map((b) => {
+        // Tint every bucket that CONTAINS night frames, i.e. whose low edge is below
+        // the cutoff — the backend's rule is `score < threshold`, so testing b.hi
+        // would leave the straddling bucket untinted and draw the split a whole
+        // bucket to the left of where it will actually fall. The exact position is
+        // the marker below; the tint is the coarse read.
+        const night = threshold != null && b.lo < threshold;
+        // SQRT height, not linear: the minority mode is the whole point of this
+        // chart, and at a realistic day:night ratio a linear scale renders the night
+        // hump as a ~1px sliver — the operator would conclude IR-night is
+        // indistinguishable, which is precisely the wrong answer.
+        const pct = Math.round(Math.sqrt(b.n / peak) * 100);
+        return `<div class="lb${night ? ' night' : ''}" style="height:${Math.max(b.n ? 2 : 0, pct)}%"`
+          + ` title="${b.lo.toFixed(3)}–${b.hi.toFixed(3)}: ${fmtInt(b.n)} frames"></div>`;
+      }).join('');
+      // The cutoff drawn at its EXACT position, free of bucket quantisation — this is
+      // the line the backend will actually classify on, so it is what the operator
+      // should be aiming between the humps.
+      let marker = '';
+      if (threshold != null && h.max > h.min) {
+        const at = Math.min(100, Math.max(0, ((threshold - h.min) / (h.max - h.min)) * 100));
+        marker = `<div class="lcut" style="left:${at}%" title="cutoff ${threshold} — frames left of this read Night"></div>`;
+      }
+      el.innerHTML = `<div class="lbars">${bars}${marker}</div>`
+        + `<div class="lax"><span class="mono">${h.min.toFixed(3)}</span>`
+        + `<span class="note">${fmtInt(h.count)} frames measured · √ scale</span>`
+        + `<span class="mono">${h.max.toFixed(3)}</span></div>`;
+    }
+    $('#litRun', view).addEventListener('click', async () => {
+      if (scope.since_id == null) return;
+      const body = { since_id: scope.since_id, until_id: scope.until_id };
+      if ($('#litRerun', view).checked) body.reanalyze = true;   // re-sweep after a version bump
+      try { await api('POST', '/api/lighting/run', body); pollJob(); }
+      catch (e) { $('#litNote', view).textContent = 'enqueue failed: ' + e.message; }
+    });
+    $('#litSave', view).addEventListener('click', async () => {
+      const raw = $('#litThresh', view).value.trim();
+      if (raw === '') { $('#litState', view).textContent = 'enter a cutoff, or press Clear'; return; }
+      await saveThreshold(Number(raw));
+    });
+    // Clearing is a real operation, not just emptying the box: a cutoff picked from a
+    // pre-NoIR distribution is wrong for the new sensor, and clearing says so.
+    $('#litClear', view).addEventListener('click', async () => {
+      $('#litThresh', view).value = '';
+      await saveThreshold(null);
+    });
+    async function saveThreshold(value) {
+      try {
+        const r = await api('POST', '/api/lighting', { threshold: value });
+        setLitState(r.threshold);
+        loadLighting();
+      } catch (e) { $('#litState', view).textContent = 'save failed: ' + e.message; }
+    }
 
     $('#resetParams', view).addEventListener('click', () => { if (edgeParams) setParams(edgeParams); });
     // The /api/tuning/rerun `slot` is the BARE slot ('baseline'/'candidate'); MogAnalyzer
@@ -1204,8 +1363,13 @@
     }
     function scorecardHtml(title, sc, params, live, available, key) {
       if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div>${paramList(params, live, available)}</div>`;
-      const split = sc.split
-        ? sline([['Day', rpct(sc.split.day.caught, sc.split.day.total)], ['Night', rpct(sc.split.night.caught, sc.split.night.total)]]) : '';
+      // Under a regime scope the whole card IS that regime, so the Day/Night rows would
+      // restate the headline against a denominator the other numbers no longer use.
+      // Name the scope instead, so nobody reads a scoped recall as the day's overall.
+      const split = sc.regime
+        ? sline([['Scope', sc.regime === 'night' ? 'Night only' : 'Day only']])
+        : sc.split
+          ? sline([['Day', rpct(sc.split.day.caught, sc.split.day.total)], ['Night', rpct(sc.split.night.caught, sc.split.night.total)]]) : '';
       // Offer the panel when there is something in it AND the backend sent the records.
       // When there ARE misses but no records, SAY SO rather than rendering nothing:
       // FastAPI ignores an unknown `missed` query param, so an un-updated compute PC
@@ -1228,12 +1392,25 @@
       </div>`;
     }
     $('#compareBtn', view).addEventListener('click', compare);
+    // All / Day / Night SCOPES the scoring, never the re-run's frame set — MOG2 is
+    // stateful, so filtering its input frames would shatter the rolling background.
+    // Deliberately NOT persisted: a scoring filter that survives a reload is an easy
+    // way to misread a scorecard days later, so it resets to All on every mount.
+    let regime = '';
+    $('#regimeSel', view).addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-regime]');
+      if (!b) return;
+      regime = b.dataset.regime;
+      $('#regimeSel', view).querySelectorAll('button').forEach((x) => x.classList.toggle('sel', x === b));
+      if (lastCompare) compare();                     // re-score only if there is a result to re-score
+    });
     async function compare() {
       const el = $('#scorecards', view);
       if (scope.since_id == null) { el.innerHTML = '<span class="note warn">Pick a day with frames first.</span>'; return; }
       el.innerHTML = '<span class="note">Comparing…</span>';
       closeMissed();                                  // its rows belong to the PREVIOUS response
       const q = new URLSearchParams({ oracle: 'yolo-serial', split: 'true', missed: 'true', since_id: scope.since_id, until_id: scope.until_id });
+      if (regime) q.set('regime', regime);
       try {
         const r = await api('GET', '/api/tuning/compare?' + q);
         if (!alive) return;
@@ -1248,12 +1425,61 @@
           + scorecardHtml('Candidate', r.candidate, p.candidate, p.live, has, 'candidate');
         el.querySelectorAll('.mv-btn').forEach((b) => b.addEventListener('click', () => toggleMissed(b.dataset.col)));
         const sn = $('#splitNote', view);
+        // A regime we ASKED for that the response doesn't echo means the compute is
+        // behind: FastAPI ignores an unknown query param, so it answers 200 with
+        // UNSCOPED numbers while the Night button sits selected. Say so rather than
+        // let the selector look like it did something (changelog 164/173 — the dev
+        // proxy serves a LOCAL admin-next against a REMOTE compute, so this is routine).
+        if (regime && !(r.live || {}).regime) {
+          sn.textContent = `Showing ALL — this compute build predates regime scoping; pull + restart it.`;
+          sn.classList.add('warn');
+          return;
+        }
+        sn.classList.remove('warn');
         if (r.split_available && r.location) sn.textContent = `Day/Night @ ${r.location.latitude.toFixed(2)}, ${r.location.longitude.toFixed(2)}`;
         else if (r.split_reason === 'location_unset') sn.textContent = 'Day/Night off — set a location on Start.';
         else if (r.split_reason === 'astral_unavailable') sn.textContent = 'Day/Night off — astral unavailable.';
         else sn.textContent = '';
-      } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
+        setRegimeEnabled(!!r.split_available, r.split_reason);
+      } catch (e) {
+        // A regime ask the backend can't honor 400s (no location, or no astral — the
+        // mount probe can only see the first). Left alone the buttons stay enabled and
+        // selected, every retry 400s the same way, and the operator has lost the
+        // working All scorecards with no cue that All is the way back. So disable them,
+        // fall back to All, and re-run so numbers reappear.
+        const m = /unavailable \(([a-z_]+)\)/.exec(e.message || '');
+        if (regime && m) {
+          setRegimeEnabled(false, m[1]);              // also resets `regime` to ''
+          $('#splitNote', view).textContent = m[1] === 'astral_unavailable'
+            ? 'Day/Night off — astral unavailable.' : 'Day/Night off — set a location on Start.';
+          compare();                                  // now unscoped: show All again
+          return;
+        }
+        el.innerHTML = `<span class="note bad">${e.message}</span>`;
+      }
     }
+    // A Day/Night button that silently scores nothing is worse than one that says why
+    // it can't, so they DISABLE without a location (or without astral) rather than
+    // returning a card the operator would read as that regime's numbers.
+    function setRegimeEnabled(ok, reason) {
+      $('#regimeSel', view).querySelectorAll('button[data-regime]:not([data-regime=""])').forEach((b) => {
+        b.disabled = !ok;
+        b.title = ok ? '' : (reason === 'astral_unavailable'
+          ? 'astral is unavailable on the compute box' : 'set a location on the Start page');
+      });
+      if (!ok && regime) {                            // an active scope just became invalid
+        regime = '';
+        $('#regimeSel', view).querySelectorAll('button').forEach((x) => x.classList.toggle('sel', x.dataset.regime === ''));
+      }
+    }
+    // Ask up front so the buttons are honest BEFORE the first compare, rather than
+    // looking available until someone clicks one and gets an error.
+    (async () => {
+      try {
+        const loc = await api('GET', '/api/location');
+        if (alive) setRegimeEnabled(loc && loc.latitude != null, 'location_unset');
+      } catch (_) {}
+    })();
 
     // --- Missed-visit panel -------------------------------------------------
     //
@@ -1488,10 +1714,13 @@
         };
         renderQueue($('#covQueue', view), rowsFor('coverage'), cancelJob);
         renderQueue($('#mogQueue', view), rowsFor('mog2'), cancelJob);
+        renderQueue($('#litQueue', view), rowsFor('lighting'), cancelJob);
         if (s.running) { wasRunning = true; jl.textContent = ''; }  // the table shows the running job
         else {
           jl.textContent = s.error ? ('last error: ' + s.error) : 'idle';
-          if (wasRunning) { wasRunning = false; loadCalendar(); }  // refresh the day's coverage after a sweep
+          // Refresh the day's coverage after ANY sweep finishes — a lighting run
+          // changes the histogram and the LIGHT cell just as a YOLO run changes its own.
+          if (wasRunning) { wasRunning = false; loadCalendar(); loadLighting(); }
         }
       } catch (_) {}
     }
@@ -1544,6 +1773,9 @@
           <span class="swatch f-corrupt"></span>corrupt frame (outranks motion) —
           only marked where a corruption sweep has run, so an unmarked frame is
           <i>unmeasured</i>, not proven clean.
+          The lighting chip shows DAY/NIGHT and the colourfulness behind it; a dimmed
+          one is <i>assumed</i> day (measured, but no cutoff set on Motion tuning), and
+          no chip means the lighting sweep has not reached that frame.
         </p>
         <div id="fGrid" class="fgrid"><span class="note">Pick a start time and Load.</span></div>
       </div>
@@ -1584,7 +1816,7 @@
       // makes no judgement.
       return `<div class="ftile${tileFlag(f)}" data-i="${idx}">
         <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}
-          <div class="tchips">${identityChip(f.identity)}${areaChip(f.area)}</div>${frameDetChip(f, 'at-br')}</div>
+          <div class="tchips">${identityChip(f.identity)}${lightingChip(f)}${areaChip(f.area)}</div>${frameDetChip(f, 'at-br')}</div>
         <div class="fmeta"><span>${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}</span><span>#${f.id}</span></div>
       </div>`;
     }
@@ -1610,6 +1842,9 @@
         f.motion ? 'motion' : '',
         f.area === undefined ? '' : `blob ${fmtArea(f.area)}`,
         f.corrupt ? 'CORRUPT' : (f.corrupt === null ? 'corruption not measured' : ''),
+        f.lighting == null
+          ? 'lighting not measured'
+          : `${f.lighting}${f.lighting_calibrated ? '' : ' (assumed)'} ${f.colourfulness == null ? '' : f.colourfulness.toFixed(3)}`.trim(),
       ].filter(Boolean).join(' · ');
       openFrameModal(f, `${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detLabel(f)} · id: ${esc(idTxt)}${marks ? ' · ' + marks : ''}`);
     }

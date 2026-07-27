@@ -76,6 +76,21 @@ _HISTORY_LIMIT = 20
 # consumer's blocking ``get()`` always terminate instead of hanging on an empty queue.
 _SENTINEL = object()
 
+# Which queue panel a job belongs to in the tuning UI. All jobs share ONE serial FIFO
+# — these are only VIEWS of it (changelog 136) — so a category is a display bucket,
+# never a second queue. Keyed off the job's ``kind`` (an analyzer name or "mog2:<slot>")
+# because that is what the manager already carries; a kind with no entry falls back to
+# "coverage", so registering a new oracle needs no change here.
+_MOG2_KIND_PREFIX = "mog2:"
+_JOB_CATEGORIES = {"lighting": "lighting"}
+
+
+def _job_category(kind: str) -> str:
+    """The queue panel ``kind`` renders under: ``mog2`` / ``lighting`` / ``coverage``."""
+    if kind.startswith(_MOG2_KIND_PREFIX):
+        return "mog2"
+    return _JOB_CATEGORIES.get(kind, "coverage")
+
 
 def _abort_put(q: "queue.Queue", item, abort: "threading.Event", timeout: float = 0.1) -> bool:
     """Put ``item`` on ``q``, but give up the instant ``abort`` is set. Returns whether it landed.
@@ -649,7 +664,7 @@ class AnalysisManager:
             )
         return {
             "job_id": next(self._job_seq),
-            "category": "mog2" if kind.startswith("mog2:") else "coverage",
+            "category": _job_category(kind),
             "since_ts": store.frame_recv_ts(since_id),
             "total": total,
         }

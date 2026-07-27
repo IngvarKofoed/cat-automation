@@ -38,7 +38,7 @@ from compute.analysis.yolo import (  # import-light COCO class-id constants (yol
     _COCO_CAT_CLASS_ID,
     _COCO_PERSON_CLASS_ID,
 )
-from shared.motion import corruption_thresholds  # import-light (cv2/numpy are lazy in shared.motion)
+from shared.motion import corruption_thresholds, lighting_version  # import-light (cv2/numpy are lazy in shared.motion)
 
 # Oldest-first eviction batch size: eviction selects and deletes rows in chunks
 # rather than one round-trip per row, so freeing space after a burst stays cheap.
@@ -67,6 +67,17 @@ _ALLOWED_CORRUPT_FILTER = ("all", "corrupt", "corrupt-and-cat")
 # — deliberately absent from ANALYZER_NAMES so it never appears in the scorecard /
 # disagreement / oracle-coverage paths; see compute/analysis/corruption.py).
 _CORRUPTION_ANALYZER = "corruption"
+
+# The analyzer name the day/night lighting sweep persists under — likewise NON-
+# registered (see compute/analysis/lighting.py). Its rows carry a continuous
+# colourfulness STATISTIC in ``analysis.score``; the day/night threshold that
+# interprets it lives in the settings KV and is applied at READ time, so it can be
+# recalibrated without re-sweeping.
+_LIGHTING_ANALYZER = "lighting"
+# Bucket count for ``lighting_histogram``. Coarse on purpose: its job is to show
+# whether the day's values fall into TWO separated modes (colour vs IR-mono) and
+# roughly where they part — enough to pick a threshold, not a distribution study.
+_LIGHTING_HIST_BUCKETS = 24
 
 # The cat oracles the corruption page's "cat" flag / danger filter consults: a
 # frame reads cat-present if EITHER a batched-``yolo`` or a ``yolo-serial`` verdict
@@ -1058,6 +1069,189 @@ class Store:
             )
             self._conn.commit()
 
+    # The day/night lighting threshold (see docs/specs/2026-07-27-lighting-flag.md).
+    # One plain KV key beside the location ones. Deliberately NOT part of
+    # MotionParams: the lighting statistic is not a gate knob, and binding it to the
+    # tuning params would let a MOG2 retune disturb an already-calibrated threshold.
+    _LIGHTING_THRESHOLD_KEY = "lighting_threshold"
+
+    def get_lighting_threshold(self) -> "float | None":
+        """The colourfulness cutoff below which a frame reads ``night``, or ``None``.
+
+        ``None`` means UNCALIBRATED — unset, or a corrupt/unparseable/non-finite
+        stored value, which callers must treat identically to never-configured (the
+        same contract ``get_location`` gives). An uncalibrated threshold does not
+        block reading: ``resolve_lighting`` still labels a measured frame ``day``,
+        flagging ``calibrated: false`` so the assumption stays visible.
+        """
+        raw = self.get_setting(self._LIGHTING_THRESHOLD_KEY)
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        # float() parses "nan"/"inf" without raising; a non-finite cutoff would make
+        # every comparison below it false (or true), so degrade it to uncalibrated.
+        return value if math.isfinite(value) else None
+
+    def set_lighting_threshold(self, threshold: "float | None") -> None:
+        """Persist the cutoff, or clear it (``None``) back to uncalibrated.
+
+        Clearing is a real operation, not just an absence: a threshold picked from a
+        pre-NoIR distribution is wrong for the new sensor, and removing it is how the
+        operator says "measured, but I no longer trust where the line sits" — which
+        reads back as ``calibrated: false`` rather than a stale ``night`` label.
+        Range validation is the API layer's job, as with ``set_location``.
+        """
+        if threshold is None:
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM settings WHERE key = ?", (self._LIGHTING_THRESHOLD_KEY,)
+                )
+                self._conn.commit()
+            return
+        self.set_setting(self._LIGHTING_THRESHOLD_KEY, str(float(threshold)))
+
+    @staticmethod
+    def resolve_lighting(
+        score: "float | None", threshold: "float | None"
+    ) -> "tuple[str | None, bool]":
+        """``(lighting, calibrated)`` for one frame's stored colourfulness.
+
+        The single read-time resolution rule, shared by every consumer so none of
+        them can invent its own:
+
+        =======  ==========  ==================  =============
+        swept    threshold   lighting            calibrated
+        =======  ==========  ==================  =============
+        no       any         ``None``            ``False``
+        yes      unset       ``"day"``           ``False``
+        yes      set         ``"night"``/day     ``True``
+        =======  ==========  ==================  =============
+
+        An uncalibrated but MEASURED frame reads ``"day"`` — true of the whole
+        pre-NoIR store — so consumers get a usable label from the first sweep instead
+        of a null to special-case; ``calibrated`` carries the caveat rather than the
+        label swallowing it. An UNSWEPT frame stays ``None``: there is no statistic
+        behind it, and a sweep that never ran must not present as a measurement
+        (the "unmeasured must not read as clean" rule the corruption page learned).
+        """
+        if score is None:
+            return None, False
+        if threshold is None:
+            return "day", False
+        return ("night" if score < threshold else "day"), True
+
+    def lighting_histogram(
+        self,
+        since_id: "int | None" = None,
+        until_id: "int | None" = None,
+        buckets: int = _LIGHTING_HIST_BUCKETS,
+    ) -> dict:
+        """Coarse distribution of swept colourfulness over ``[since_id, until_id]``.
+
+        This is what makes "calibrate the threshold later" actually doable: two
+        separated modes means IR-night is distinguishable from colour-day, and where
+        they part is the threshold. Without a distribution to look at, the read-time
+        threshold would be a number with nowhere to come from.
+
+        Returns ``{"count", "min", "max", "buckets": [{"lo", "hi", "n"}, ...]}`` over
+        the frames that HAVE a lighting row; ``count`` 0 (with ``min``/``max`` null and
+        no buckets) when the window is unswept. Bucket edges span the observed
+        min..max rather than a fixed range, since the statistic's useful scale depends
+        on the scene. A degenerate range (every value identical) yields one bucket.
+
+        Bucketing is done in SQL over the scoped rows — an aggregate, so it never
+        materializes a value per frame.
+
+        Runs on its OWN short-lived WAL read connection, NOT the shared write-locked
+        one — the same move ``tuning_calendar`` makes, and for the same reason. A day
+        at ~5 fps is a few hundred thousand rows, and the UI calls this on every day
+        click and after every sweep; holding the write lock for two aggregates that
+        size is exactly the collector starvation entries 102-105 removed.
+        """
+        buckets = max(1, int(buckets))
+        frags, params = _range_bounds("frame_id", since_id, until_id)
+        where = " WHERE analyzer = ?" + "".join(" AND " + f for f in frags)
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(score), MAX(score) FROM analysis" + where
+                + " AND score IS NOT NULL",
+                [_LIGHTING_ANALYZER] + params,
+            ).fetchone()
+            count = int(row[0] or 0)
+            if not count:
+                return {"count": 0, "min": None, "max": None, "buckets": []}
+            lo, hi = float(row[1]), float(row[2])
+            # A zero-width range would make the bucket index divide by zero; one
+            # bucket is the honest answer when every frame measured the same.
+            width = (hi - lo) / buckets if hi > lo else 0.0
+            if width <= 0:
+                return {
+                    "count": count, "min": lo, "max": hi,
+                    "buckets": [{"lo": lo, "hi": hi, "n": count}],
+                }
+            # MIN(..., buckets - 1) keeps the max value in the last bucket rather
+            # than overflowing into a phantom bucket of its own.
+            rows = conn.execute(
+                "SELECT MIN(CAST((score - ?) / ? AS INTEGER), ?) AS b, COUNT(*)"
+                " FROM analysis" + where + " AND score IS NOT NULL"
+                " GROUP BY b ORDER BY b",
+                [lo, width, buckets - 1, _LIGHTING_ANALYZER] + params,
+            ).fetchall()
+        finally:
+            conn.close()
+        by_bucket = {int(b): int(n) for b, n in rows}
+        return {
+            "count": count,
+            "min": lo,
+            "max": hi,
+            "buckets": [
+                {"lo": lo + i * width, "hi": lo + (i + 1) * width, "n": by_bucket.get(i, 0)}
+                for i in range(buckets)
+            ],
+        }
+
+    def lighting_staleness(
+        self, since_id: "int | None" = None, until_id: "int | None" = None
+    ) -> dict:
+        """``{analyzed, stale}`` for the ``lighting`` rows in a window.
+
+        ``stale`` = rows whose stamped ``detail.version`` differs from the current
+        ``lighting_version()`` — i.e. measured under an earlier formula. The corruption
+        page's ``corruption_staleness`` counterpart, and needed for the same reason: the
+        version stamp is only worth writing if something reads it. Without this the
+        histogram would superimpose two incompatible distributions after a bump, and the
+        operator would pick a cutoff off humps that are a version artefact rather than
+        day-vs-IR — then ``resolve_lighting`` would apply it to both populations with
+        ``calibrated: true``.
+
+        Matched with ``json_extract``, NOT corruption's substring LIKE: the stamp here
+        is a bare integer, and `"version": 1` is a substring of `"version": 10`, so a
+        LIKE would silently under-count staleness on the tenth bump. A NULL/absent
+        stamp counts stale. Runs on its own short-lived WAL read connection, off the
+        shared write lock, for the same reason ``lighting_histogram`` does.
+        """
+        frags, params = _range_bounds("frame_id", since_id, until_id)
+        where = " WHERE analyzer = ?" + "".join(" AND " + f for f in frags)
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            analyzed, current = conn.execute(
+                "SELECT COUNT(*),"
+                " COALESCE(SUM(CASE WHEN json_extract(detail, '$.version') = ?"
+                " THEN 1 ELSE 0 END), 0)"
+                " FROM analysis" + where,
+                [lighting_version(), _LIGHTING_ANALYZER] + params,
+            ).fetchone()
+        finally:
+            conn.close()
+        analyzed = int(analyzed or 0)
+        return {"analyzed": analyzed, "stale": analyzed - int(current or 0)}
+
     def record_mode_change(self, motion_only: bool) -> None:
         """Append one ``mode_changes`` row for a motion-only capture flip.
 
@@ -1647,6 +1841,7 @@ class Store:
                     ).fetchall()
                 }
             corrupt_by_id: "dict[int, bool] | None" = None
+            light_by_id: "dict[int, float] | None" = None
             if flags:
                 # The corruption sweep's verdict per sampled frame. A frame with NO row
                 # is absent from the map and reads `None` below (unmeasured), never False.
@@ -1656,6 +1851,18 @@ class Store:
                         "SELECT frame_id, verdict FROM analysis"
                         " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
                         [_CORRUPTION_ANALYZER] + ids,
+                    ).fetchall()
+                }
+                # The lighting sweep's colourfulness per sampled frame — the STATISTIC,
+                # not a label; `resolve_lighting` applies the threshold below. Same
+                # absent-means-unswept rule as corrupt above.
+                light_by_id = {
+                    int(fid): float(score)
+                    for fid, score in self._conn.execute(
+                        "SELECT frame_id, score FROM analysis"
+                        " WHERE analyzer = ? AND score IS NOT NULL"
+                        " AND frame_id IN (" + placeholders + ")",
+                        [_LIGHTING_ANALYZER] + ids,
                     ).fetchall()
                 }
             ident_by_id: "dict[int, tuple[int, float]]" = {}
@@ -1682,10 +1889,18 @@ class Store:
         # fetched rows). They compose: a frame can carry both a detection box and an
         # identity, keyed independently on the sampled id.
         if flags:
+            # One threshold read for the whole sample (it is a single KV row, and a
+            # per-frame read would take the lock N times for the same value).
+            light_threshold = self.get_lighting_threshold()
             for f, r in zip(out, rows):
                 f["motion"] = bool(r[2])
                 f["area"] = (float(r[3]) if r[3] is not None else None)
                 f["corrupt"] = corrupt_by_id.get(f["id"])
+                score = light_by_id.get(f["id"])
+                f["colourfulness"] = score
+                f["lighting"], f["lighting_calibrated"] = self.resolve_lighting(
+                    score, light_threshold
+                )
         if detections is not None:
             for f in out:
                 if f["id"] not in detail_by_id:
@@ -2500,6 +2715,7 @@ class Store:
         until_id: "int | None" = None,
         is_night: "Callable[[int], bool] | None" = None,
         missed_visits: bool = False,
+        regime: "str | None" = None,
     ) -> dict:
         """Recall / false-trigger / miss-breakdown scorecard for one (source, oracle).
 
@@ -2583,9 +2799,34 @@ class Store:
         separately, per visit, by the UI. Absent the flag no ``"missed_visits"`` key
         is added (the same additive contract as ``is_night``), and ``needs_rerun``
         never carries one.
+
+        ``regime`` (``"day"`` / ``"night"``) SCOPES the whole card to one lighting
+        state instead of reporting both side by side — what the tuning page's
+        All/Day/Night selector drives, so the headline visit-recall reflects the
+        regime being tuned rather than a blend. Requires ``is_night`` (there is no
+        other way to bucket), and raises without it. Two different — each internally
+        correct — assignment rules apply, and both are exact partitions, so day + night
+        still equals ``All``:
+
+        - **Frame** metrics (present / recall / false_triggers / confidence /
+          area_buckets) filter by each frame's OWN ``is_night(recv_ts)``: a frame at
+          03:00 is a night frame.
+        - **Visit** counts come from the same ``_cluster_visits_split`` the ``split``
+          key uses, so a visit is assigned whole by its FIRST present frame and a
+          dusk-straddling one is never cut in half.
+
+        ``analyzed`` is deliberately NOT scoped — it counts every scored row in the
+        window, including the uninteresting majority that carries no regime-relevant
+        signal, and re-deriving it would mean a second aggregate for a number nothing
+        displays. The card carries ``"regime"`` so a reader knows the rest is scoped.
         """
         if oracle not in _SCORECARD_ORACLES:
             raise ValueError(f"oracle must be one of {_SCORECARD_ORACLES}, got {oracle!r}")
+        if regime is not None:
+            if regime not in ("day", "night"):
+                raise ValueError(f"regime must be 'day' or 'night', got {regime!r}")
+            if is_night is None:
+                raise ValueError("regime scoping requires is_night (no location set?)")
         warmup = max(0, int(warmup))
         is_live = source == "live"
 
@@ -2692,8 +2933,18 @@ class Store:
                 # paths ignore them, reading rows positionally (r[0..2]). The area is
                 # ``src_area``, not ``f.area``, so a slot column attributes against the
                 # SLOT's own re-run rather than the live gate's stored reading.
+                # The present flag is THREE-valued, matching SQL's own evaluation of
+                # ``present_core``: 1 true, 0 false, NULL unknown (a positive verdict
+                # with a NULL score under a positive floor). The aggregate above counts
+                # an unknown in NEITHER ``present`` nor ``false_triggers`` — both arms
+                # test the same NULL — so collapsing it to 0 here would make the
+                # regime-scoped Python recount invent false triggers the unscoped card
+                # does not have, breaking the day + night == All partition. NULL is
+                # falsy in Python, so the counting paths that read this positionally
+                # are unaffected.
                 interesting = self._conn.execute(
-                    f"SELECT f.recv_ts, {src_motion}, CASE WHEN {present_core} THEN 1 ELSE 0 END,"
+                    f"SELECT f.recv_ts, {src_motion},"
+                    f" CASE WHEN {present_core} THEN 1 WHEN NOT {present_core} THEN 0 ELSE NULL END,"
                     f" f.id, o.score, {src_area}" + base_from
                     + " WHERE f.id >= ?" + scope_and + f" AND ({present_core} OR {src_motion} = 1)"
                     " ORDER BY f.recv_ts ASC, f.id ASC",
@@ -2702,10 +2953,37 @@ class Store:
 
         (analyzed, present, caught, missed_n, false_n, conf_high, conf_med,
          below_min, near_zero, above_max, in_band) = (int(x or 0) for x in counts)
+
+        # ``interesting`` (present OR source-motion) holds every frame the metrics
+        # below count, so a regime-scoped card recomputes them in Python from the
+        # filtered rows rather than re-running the aggregate with a Python predicate
+        # SQL cannot express. Kept AFTER the unscoped read so the visit split (which
+        # must see every visit whole) still gets the full row set.
+        scoped = interesting
+        if regime is not None:
+            want_night = regime == "night"
+            scoped = [r for r in interesting if bool(is_night(r[0])) == want_night]
+            (present, caught, missed_n, false_n, conf_high, conf_med,
+             below_min, near_zero, above_max, in_band) = self._count_interesting(
+                scoped, min_area, max_area
+            )
         # low = every miss not already high/medium, i.e. oracle score < 0.3 OR NULL.
         conf_low = missed_n - conf_high - conf_med
 
-        total_visits, caught_visits = self._cluster_visits(interesting)
+        # Computed at most ONCE and read by both the visit counts and the ``split``
+        # key — it re-sorts every visit's timestamps and re-runs the caught test, and
+        # `is_night` itself sorts a sun-event list per call, so doing it twice per
+        # scorecard (three per Compare click) is seconds of avoidable latency.
+        visit_split = (
+            self._cluster_visits_split(interesting, is_night) if is_night is not None else None
+        )
+        if regime is None:
+            total_visits, caught_visits = self._cluster_visits(interesting)
+        else:
+            # Read the SPLIT rather than clustering `scoped`: clustering the filtered
+            # rows could cut a dusk-straddling visit into two, breaking the
+            # day + night == All property the split is built to preserve.
+            total_visits, caught_visits = visit_split[regime]
 
         card = {
             "source": source,
@@ -2732,28 +3010,101 @@ class Store:
                 "wholly_missed": total_visits - caught_visits,
             },
         }
-        if is_night is not None:
+        if visit_split is not None and regime is None:
             # Additive day/night split of the visit counts, over the SAME warmed-up
             # ``interesting`` rows — absent ``is_night`` this key is never added, so
             # the card is byte-for-byte the unsplit one (the byte-identical contract).
-            split = self._cluster_visits_split(interesting, is_night)
+            #
+            # Deliberately OMITTED on a regime-scoped card: the split covers both
+            # buckets while ``visits`` covers one, so shipping both would put
+            # ``split.day.total + split.night.total`` next to a contradicting
+            # ``visits.total`` under a heading that says "Day only". On a scoped card
+            # ``visits`` IS that regime's split entry.
             card["split"] = {
                 bucket: {
                     "total": total,
                     "caught": bucket_caught,
                     "wholly_missed": total - bucket_caught,
                 }
-                for bucket, (total, bucket_caught) in split.items()
+                for bucket, (total, bucket_caught) in visit_split.items()
             }
+        if regime is not None:
+            card["regime"] = regime
         if missed_visits:
             # Built from the SAME warmed-up ``interesting`` rows the counts above
             # use, so len(...) == card["visits"]["wholly_missed"] structurally. The
             # thresholds are this source's own (the ones the area buckets above use),
             # so a slot's per-frame attribution is against the params IT ran with.
-            card["missed_visits"] = self._missed_visit_records(
+            records = self._missed_visit_records(
                 interesting, is_night, min_area, max_area
             )
+            if regime is not None:
+                # Filter on the record's OWN ``night`` field (set by
+                # _missed_visit_records from the same first-present-frame rule the
+                # visit split uses), so the list stays exactly the misses the scoped
+                # ``visits.wholly_missed`` above counts — the two cannot drift.
+                want_night = regime == "night"
+                records = [r for r in records if bool(r.get("night")) == want_night]
+            card["missed_visits"] = records
         return card
+
+    @staticmethod
+    def _count_interesting(
+        rows: "list", min_area: float, max_area: float
+    ) -> "tuple[int, ...]":
+        """Recompute the frame-level scorecard metrics from ``interesting`` rows.
+
+        The Python twin of ``gate_scorecard``'s ``SUM(CASE ...)`` aggregate, used only
+        on the regime-scoped path where the filter is a Python predicate SQL can't
+        express. Rows are ``(recv_ts, src_motion, present, f.id, o.score, src_area)``.
+
+        Mirrors SQL's NULL semantics deliberately, in two places:
+
+        - A comparison against a NULL score or area is UNKNOWN in SQL and so counts as
+          false, whereas Python's ``None < 0.1`` raises. Every comparison below guards
+          on ``is not None``.
+        - The present flag is THREE-valued (see the query that builds these rows). A
+          ``None`` means SQL could not evaluate ``present_core`` — a positive verdict
+          with a NULL score under a positive ``oracle_floor`` — and the aggregate counts
+          such a row in NEITHER ``present`` nor ``false_triggers``, because both arms
+          test the same unknown. Treating it as "not present" would fabricate a false
+          trigger and break the day + night == All partition.
+
+        Together these are what keep a scoped card's numbers equal to the unscoped
+        aggregate's when the filter admits every row.
+        """
+        present = caught = missed_n = false_n = 0
+        conf_high = conf_med = 0
+        below_min = near_zero = above_max = in_band = 0
+        near_zero_area = min_area / 10.0
+        for _ts, motion, is_present, _fid, score, area in rows:
+            if is_present is None:
+                continue                 # unknown to SQL — counted on neither side
+            motion_on = bool(motion)
+            if is_present:
+                present += 1
+                if motion_on:
+                    caught += 1
+                    continue
+                missed_n += 1
+                if score is not None:
+                    if score >= 0.5:
+                        conf_high += 1
+                    elif score >= 0.3:
+                        conf_med += 1
+                if area is not None:
+                    if area < min_area:
+                        below_min += 1
+                        if area < near_zero_area:
+                            near_zero += 1
+                    elif area > max_area:
+                        above_max += 1
+                    else:
+                        in_band += 1
+            elif motion_on:
+                false_n += 1
+        return (present, caught, missed_n, false_n, conf_high, conf_med,
+                below_min, near_zero, above_max, in_band)
 
     @staticmethod
     def _gap_split(items: "list", gap_ms: int, ts_of) -> "list[list]":

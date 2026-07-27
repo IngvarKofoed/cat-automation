@@ -49,6 +49,7 @@ from starlette.concurrency import run_in_threadpool
 
 from compute.analysis import ANALYZER_NAMES
 from compute.analysis.corruption import CorruptionAnalyzer
+from compute.analysis.lighting import LIGHTING_ANALYZER, LightingAnalyzer
 from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.analysis.suntimes import astral_available, night_classifier
@@ -57,7 +58,7 @@ from compute.collection.collector import CollectorManager
 from compute.collection.store import _ANNOTATE_PAGE_DEFAULT, _QUALITIES, Store
 from compute.dataset import crops
 from compute.learning.runner import TrainingManager
-from shared.motion import MotionParams
+from shared.motion import MotionParams, lighting_version
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 # Two independently-styled front doors sharing only the /api + /media backend:
@@ -162,8 +163,9 @@ _CANDIDATE_SLOT = "mog2:candidate"
 _MOG2_SLOTS = (_BASELINE_SLOT, _CANDIDATE_SLOT)
 
 # The analyzers the Motion-tuning calendar reports sweep-coverage for, per day:
-# the YOLO oracle plus the two MOG2 re-run slots.
-_CALENDAR_ANALYZERS = ("yolo-serial", _BASELINE_SLOT, _CANDIDATE_SLOT)
+# the YOLO oracle, the two MOG2 re-run slots, and the lighting statistic — the four
+# the cell shows as YOLO / BASE / CAND / LIGHT.
+_CALENDAR_ANALYZERS = ("yolo-serial", _BASELINE_SLOT, _CANDIDATE_SLOT, LIGHTING_ANALYZER)
 # Guardrails on the calendar request: a client can't ask for an unbounded span, the tz
 # offset must be a real one (±14 h covers every real zone incl. DST), and the absolute
 # instants must be sane epoch-ms (else an out-of-int64 value binds to a 500, not a 422).
@@ -227,6 +229,59 @@ class CorruptionRunRequest(BaseModel):
     since_id: "int | None" = None
     until_id: "int | None" = None
     motion_only: bool = False
+
+
+class LightingRunRequest(BaseModel):
+    """Body of ``POST /api/lighting/run``: enqueue a lighting sweep over a range.
+
+    Identical in shape to ``CorruptionRunRequest`` and for the same reason: lighting
+    is a single NON-registered analyzer built directly, never named through
+    ``ANALYZER_NAMES``. ``reanalyze`` clears the window's rows first — the re-sweep
+    after a ``lighting_version()`` bump. ``motion_only`` is offered for symmetry but
+    is rarely what you want here: calibration needs the whole day's distribution, and
+    motion frames are a biased ~5% sample of it.
+    """
+
+    reanalyze: bool = False
+    since_id: "int | None" = None
+    until_id: "int | None" = None
+    motion_only: bool = False
+
+
+class LightingThresholdRequest(BaseModel):
+    """Body of ``POST /api/lighting``: set (or clear) the day/night cutoff.
+
+    ``threshold`` is the colourfulness below which a frame reads ``night``.
+    Explicitly nullable: ``null`` CLEARS it back to uncalibrated, which is a real
+    operation — a cutoff picked from a pre-NoIR distribution is wrong for the new
+    sensor, and clearing says "I no longer trust where the line sits" rather than
+    leaving a stale label in place.
+
+    The field is REQUIRED (``Field(...)``) even though its value may be ``null``, so
+    clearing is always an explicit act. With a ``None`` default an empty body — a
+    retried request whose body was stripped, or a caller that meant only to read the
+    state back — would wipe a calibrated cutoff with a cheerful 200.
+
+    ``allow_inf_nan=False``, the ``ge`` bound and ``_reject_bool`` mirror
+    ``LocationRequest`` (which this docstring previously only claimed to): NaN slips
+    past a bare bound because every NaN comparison is False, then crashes the error
+    encoder as a 500; and pydantic treats ``bool`` as an int subtype, so without the
+    validator ``true`` would coerce to a 1.0 cutoff — above every real colourfulness
+    value, i.e. every frame in the store silently reclassified ``night``.
+    No upper bound: the statistic is a relative spread with no fixed ceiling, so
+    capping it would be a guess.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    threshold: "float | None" = Field(ge=0.0)
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a number or null, not a boolean")
+        return v
 
 
 class LocationRequest(BaseModel):
@@ -1488,7 +1543,13 @@ def create_app(
         _validate_bounds(since_id, until_id)
         cov = {name: store.analysis_coverage(name, since_id, until_id) for name in ANALYZER_NAMES}
         total = next(iter(cov.values()))["total"] if cov else store.count_in_range(since_id, until_id)
-        slots = {name: store.analysis_coverage(name, since_id, until_id) for name in _MOG2_SLOTS}
+        # LIGHTING_ANALYZER rides in `slots` for the same reason the MOG2 slots do:
+        # it is a non-registered analyzer whose window coverage the tuning UI shows,
+        # and putting it in `oracles` would imply it is ground truth about cats.
+        slots = {
+            name: store.analysis_coverage(name, since_id, until_id)
+            for name in (*_MOG2_SLOTS, LIGHTING_ANALYZER)
+        }
         return {
             "total": total,
             "oracles": {name: {"analyzed": c["analyzed"], "present": c["present"]} for name, c in cov.items()},
@@ -1528,6 +1589,7 @@ def create_app(
                 "yolo": a.get("yolo-serial", 0),
                 "baseline": a.get(_BASELINE_SLOT, 0),
                 "candidate": a.get(_CANDIDATE_SLOT, 0),
+                "lighting": a.get(LIGHTING_ANALYZER, 0),
             }
 
         return {"days": [shape(r) for r in rows]}
@@ -1591,6 +1653,65 @@ def create_app(
             "stale": store.corruption_staleness(since_id, until_id),
             "cat_coverage": store.cat_coverage(since_id, until_id),
         }
+
+    # --- Day/night lighting flag (docs/specs/2026-07-27-lighting-flag.md) -----------
+    #
+    # A NON-registered sweep (like corruption) recording a continuous COLOURFULNESS
+    # statistic per frame, plus the read-time threshold that turns it into a day/night
+    # label. The split lets the sweep run before the NoIR camera is fitted and be
+    # calibrated afterwards from the recorded distribution — no re-sweep.
+
+    @app.post("/api/lighting/run")
+    def api_lighting_run(req: LightingRunRequest):
+        # Same shape as the corruption sweep: a directly-built analyzer, so no
+        # ANALYZER_NAMES gate; enqueues behind any active sweep on the shared serial
+        # queue. ensure_available() is a no-op (cv2/numpy are base deps), so the 503
+        # arm below is defensive only.
+        _validate_bounds(req.since_id, req.until_id)
+        try:
+            result = analysis_manager.enqueue_analyzer(
+                store,
+                LightingAnalyzer(),
+                reanalyze=req.reanalyze,
+                since_id=req.since_id,
+                until_id=req.until_id,
+                motion_only=req.motion_only,
+            )
+        except ImportError as exc:  # defensive: the measure needs no optional deps
+            raise HTTPException(status_code=503, detail=str(exc))
+        return result
+
+    @app.get("/api/lighting")
+    def api_lighting(
+        since_id: "int | None" = Query(default=None),
+        until_id: "int | None" = Query(default=None),
+    ):
+        # The card's whole readout in one call: the current cutoff, how much of the
+        # window has been swept, and the distribution to pick a cutoff FROM. The
+        # histogram is what makes "calibrate later" actionable — two separated modes
+        # means IR-night is distinguishable, and where they part is the threshold.
+        _validate_bounds(since_id, until_id)
+        threshold = store.get_lighting_threshold()
+        return {
+            "threshold": threshold,
+            "calibrated": threshold is not None,
+            "version": lighting_version(),
+            "coverage": store.analysis_coverage(LIGHTING_ANALYZER, since_id, until_id),
+            "histogram": store.lighting_histogram(since_id, until_id),
+            # Rows measured under an older formula. Without this the version stamp is
+            # write-only, and a post-bump histogram silently mixes two distributions —
+            # so the operator would calibrate against humps that are a version
+            # artefact. Mirrors the corruption page's stale count.
+            "stale": store.lighting_staleness(since_id, until_id),
+        }
+
+    @app.post("/api/lighting")
+    def api_lighting_set(req: LightingThresholdRequest):
+        # `threshold: null` CLEARS the cutoff back to uncalibrated — a real operation,
+        # not a no-op (a pre-NoIR cutoff is wrong for the new sensor). Range/NaN
+        # validation is pydantic's, surfacing as a 422 before this body runs.
+        store.set_lighting_threshold(req.threshold)
+        return {"threshold": req.threshold, "calibrated": req.threshold is not None}
 
     # --- Edge-config proxy + offline MOG2 tuning (motion-gate-diagnostic spec) ------
     #
@@ -1686,6 +1807,7 @@ def create_app(
         until_id: "int | None" = Query(default=None),
         split: bool = Query(default=False),
         missed: bool = Query(default=False),
+        regime: "str | None" = Query(default=None),
     ):
         # The oracle is the fixed ground truth both scorecards score against; only a
         # registered one is valid (400 otherwise — the same gate /api/frames uses).
@@ -1694,6 +1816,18 @@ def create_app(
                 status_code=400,
                 detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
             )
+        # `regime` SCOPES all three cards to one lighting state (the All/Day/Night
+        # selector) instead of reporting both side by side, so the headline visit
+        # recall reflects the regime being tuned. It needs the same day/night
+        # classifier the split does, so it implies `split` — asking to score only
+        # night without a way to tell night from day is incoherent, and the 400 below
+        # covers the case where that classifier turns out to be unavailable.
+        if regime is not None and regime not in ("day", "night"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"regime must be 'day' or 'night', got {regime!r}",
+            )
+        split = split or regime is not None
         # oracle_floor re-slices "present" to verdicts at or above this confidence,
         # dropping the low-conf phantom detections that inflate visit/miss counts.
         # Both oracle scores (YOLO confidence, BSUV foreground fraction) live in
@@ -1753,6 +1887,16 @@ def create_app(
                 split_available = True
                 split_location = {"latitude": lat, "longitude": lon}
 
+        # A regime ask that can't be honored is a 400, NOT a silent fall-back to the
+        # unscoped card: the caller asked for night's numbers, and quietly answering
+        # with everything's numbers under a "Night" heading is the worst outcome
+        # available. `split_reason` names which half is missing so the UI can fix it.
+        if regime is not None and not split_available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cannot scope to {regime!r}: day/night split unavailable ({split_reason})",
+            )
+
         live = store.gate_scorecard(
             "live",
             oracle,
@@ -1765,6 +1909,7 @@ def create_app(
             until_id=until_id,
             is_night=is_night,
             missed_visits=missed,
+            regime=regime,
         )
         b_min, b_max, b_pers = _slot_thresholds(store, _BASELINE_SLOT, edge_params)
         baseline = store.gate_scorecard(
@@ -1779,6 +1924,7 @@ def create_app(
             until_id=until_id,
             is_night=is_night,
             missed_visits=missed,
+            regime=regime,
         )
         c_min, c_max, c_pers = _slot_thresholds(store, _CANDIDATE_SLOT, edge_params)
         candidate = store.gate_scorecard(
@@ -1793,6 +1939,7 @@ def create_app(
             until_id=until_id,
             is_night=is_night,
             missed_visits=missed,
+            regime=regime,
         )
 
         # Fidelity is the baseline re-run vs. stored frames.motion — only meaningful

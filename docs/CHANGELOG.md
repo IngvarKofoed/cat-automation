@@ -1102,3 +1102,50 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `quantize=16`, or legacy `half=True` pre-8.4, probed in `prepare()` (ultralytics is unpinned).
      `analysis.detail` keeps its `half` key — the recorded REGIME, and stored rows read `$.half`.
      Not a throughput fix: the warning measured ~4 us, noise against yolo11x@1280 inference.
+
+179. `docs/NOIR_SWAP.md` records what must happen before the NoIR module's motion re-tune.
+     Load-bearing item: AWB is never touched today, and its per-frame R/B gains move the
+     GRAY MOG2 runs on — so tuning before locking it calibrates against a sliding baseline.
+     NoIR is the worst case (no IR-cut: daylight NIR cast varies hourly; night has no colour
+     to estimate from). Also: only ONE param set exists, so day/night can't diverge yet;
+     night may beat day (co-axial IR hides shadows); `motion_downscale` is a noise knob.
+
+180. Day/night LIGHTING flag: a non-registered `lighting` sweep stores a continuous
+     colourfulness statistic per frame (`analysis.score`), and the day/night cutoff is applied
+     at READ time from the settings KV — so it can be swept NOW, before the NoIR camera, and
+     calibrated afterwards from the recorded distribution with no re-sweep.
+     Measured-but-uncalibrated reads `day` + `calibrated:false`; an UNSWEPT frame stays null —
+     a sweep that never ran must not present as a measurement.
+     Per-channel mean normalisation makes it blind to a constant cast, which a locked white
+     balance leaves on every IR frame; the downscale is its OWN constant, never
+     `motion_downscale`, so a MOG2 retune can't silently invalidate a saved cutoff.
+     Spec: docs/specs/2026-07-27-lighting-flag.md.
+
+181. Motion tuning gained a Lighting card (day-scoped sweep, a coarse histogram to pick the
+     cutoff from, the cutoff field) plus LIGHT calendar/day coverage; Frame review shows a
+     per-frame chip, dimmed when the label is assumed rather than measured.
+     Scorecards gained an All/Day/Night selector that scopes the SCORING — the re-run still
+     walks every frame, because MOG2's rolling background cannot survive a filtered input.
+     Day + night is an exact partition of All: frames bucket by their own timestamp, visits
+     whole by their first present frame (reusing the existing split), so neither drifts.
+     Day/Night disable without a location rather than scoring nothing; the selector resets
+     to All on every load, since a sticky scoring filter invites misreading a scorecard later.
+
+182. Review hardening of the lighting flag. `POST /api/lighting` now REQUIRES `threshold`
+     (nullable) and rejects booleans, so an empty body can't silently wipe a calibrated
+     cutoff and `true` can't coerce to a 1.0 one that reclassifies the whole store as night.
+     `lighting_histogram` + the new `lighting_staleness` run on their OWN short-lived WAL
+     read connections — the operator hits them on every day click, and two unbounded
+     `analysis` aggregates under the shared write lock is the starvation class 102-105 removed.
+     `gate_scorecard`'s `interesting` present flag is now THREE-valued, matching SQL: a
+     positive verdict with a NULL score under an `oracle_floor` is UNKNOWN and counts on
+     neither side, so the Python recount can no longer invent false triggers and break the
+     day + night == All partition. A scoped card also drops the unscoped `split` key.
+     Staleness is matched with `json_extract`, not a LIKE — `"version": 1` is a substring
+     of `"version": 10`.
+
+183. The Day/Night selector names a BEHIND BACKEND. FastAPI ignores an unknown `regime`
+     param, so an un-updated compute answers 200 with UNSCOPED numbers while the Night
+     button sits selected; the page now detects the missing `regime` echo and says so
+     instead of letting the selector look like it worked. Routine, not hypothetical —
+     the dev proxy serves a LOCAL admin-next against a REMOTE compute.

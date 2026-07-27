@@ -137,6 +137,96 @@ def classify_corruption(roi_bgr) -> "str | None":
     return None
 
 
+# --- Day/night LIGHTING statistic (see docs/specs/2026-07-27-lighting-flag.md) -------
+# Separates colour-daylight from IR-monochrome night. Like the corruption detector
+# above this is a pure, compute-side-only helper today; it lives here because the
+# edge will need the IDENTICAL measure once lighting drives live parameter
+# switching, and a second implementation would drift (the MotionGate lesson).
+#
+# _LIGHTING_DOWNSCALE is deliberately its OWN constant and NOT MotionParams.downscale:
+# the statistic's value depends on the resolution it is measured at, so reading the
+# tuning parameter would let a MOG2 retune silently invalidate an already-calibrated
+# lighting threshold. Lighting is a global property, so it needs far less resolution
+# than the motion gate does.
+_LIGHTING_DOWNSCALE = 160
+# Clamp floor for the per-channel divisor (0-255 scale). A channel mean near zero —
+# a black frame, or corruption's collapsed channel — would otherwise explode the
+# normalised spread and read as violently colourful.
+_LIGHTING_MIN_MEAN = 2.0
+# Mean luminance below which a frame is too dark to judge at all. Such a frame is
+# reported 0.0 (monochrome), which is ambiguous BY NATURE: an unlit night scene and
+# an IR-lit one both lack colour. The luma is recorded alongside the statistic so a
+# two-axis rule stays available later without a re-sweep.
+_LIGHTING_DARK_LUMA = 4.0
+# Bumped whenever the formula or the constants above change. Stamped into every
+# stored verdict's `detail` so an existing row can be told to predate the change and
+# re-swept (`reanalyze`) — the staleness job `corruption_thresholds()` does above.
+_LIGHTING_VERSION = 1
+
+
+def lighting_version() -> int:
+    """The statistic's formula version, for stamping into a stored verdict.
+
+    Bumped on any change to ``lighting_measure``'s maths or its ``_LIGHTING_*``
+    constants, so a verdict swept under an older definition is detectable and can be
+    re-swept. Mirrors ``corruption_thresholds()``'s staleness role; a plain int rather
+    than a dict because the threshold that interprets this statistic is NOT baked in
+    here — it is applied at read time (see the spec's "Statistic, not verdict").
+    """
+    return _LIGHTING_VERSION
+
+
+def lighting_measure(roi_bgr) -> "tuple[float, float]":
+    """``(colourfulness, mean_luma)`` for one ROI — the day/night lighting reading.
+
+    Under IR on a NoIR sensor a scene collapses toward R=G=B; in daylight it does
+    not. The complication is a LOCKED white balance (which the NoIR swap wants, so
+    the colour cue stays stable): it leaves a strong CONSTANT cast on IR frames that
+    a naive chroma measure would read as colour. So each channel is normalised by its
+    own mean first — removing any global cast — and only the residual per-pixel
+    spread is measured:
+
+        per-channel mean normalise -> per-pixel (max - min) -> mean over pixels
+
+    The result is therefore a RELATIVE spread, not a 0-255 one: ``0.0`` is perfectly
+    monochrome and a colourful scene lands in the low tenths. That matters because
+    the threshold interpreting it is a bare number in settings — rescaling to 8-bit
+    would be self-consistent but would silently change what a saved threshold means.
+
+    Returns ``0.0`` colourfulness for input that cannot carry colour — a non-3-channel
+    (mono/IR) ROI, mirroring ``classify_corruption``'s bypass, or a frame darker than
+    ``_LIGHTING_DARK_LUMA``. The second case is genuinely ambiguous (an unlit night
+    scene has no colour either), which is why the luma is returned rather than
+    discarded. Unlike ``classify_corruption`` this DOWNSCALES first: it hunts a global
+    property, not 1-few-row lines, and a full-day sweep is ~10^5-10^6 frames.
+
+    ``cv2``/``numpy`` are imported lazily per this module's dependency-light discipline.
+    """
+    import cv2
+    import numpy as np
+
+    # Mono/IR (2D) or single-channel ROIs have no chroma to measure. Report them as
+    # perfectly monochrome, and take luma straight off the one channel.
+    if roi_bgr.ndim != 3 or roi_bgr.shape[2] != 3:
+        return 0.0, float(np.asarray(roi_bgr).mean())
+
+    height, width = roi_bgr.shape[:2]
+    target_w = max(1, min(_LIGHTING_DOWNSCALE, int(width)))
+    target_h = max(1, round(height * (target_w / float(width))))
+    small = cv2.resize(
+        roi_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
+    ).astype(np.float64)
+
+    luma = float(small.mean())
+    if luma < _LIGHTING_DARK_LUMA:
+        return 0.0, luma
+
+    # Clamp the divisor so a collapsed/near-black channel can't explode the ratio.
+    means = np.maximum(small.reshape(-1, 3).mean(axis=0), _LIGHTING_MIN_MEAN)
+    norm = small / means
+    return float((norm.max(axis=2) - norm.min(axis=2)).mean()), luma
+
+
 class MotionParams(NamedTuple):
     """The six motion-detection parameters (the exact set the edge persists).
 

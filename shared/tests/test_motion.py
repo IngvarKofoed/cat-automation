@@ -306,3 +306,123 @@ def test_corruption_thresholds_exposes_the_constants():
     import json
 
     json.dumps(corruption_thresholds())
+
+
+# --- The day/night lighting statistic (lighting-flag spec) -------------------
+#
+# `colourfulness` separates colour-daylight from IR-monochrome night. The
+# properties pinned here are the ones the whole read-time-threshold design leans
+# on: monochrome reads 0, colour reads clearly above it, and a CONSTANT colour
+# cast does NOT inflate it (a locked white balance leaves exactly such a cast on
+# IR frames, so a cast-sensitive measure would call every IR frame colourful).
+
+
+def _c(roi) -> float:
+    """Just the colourfulness half — the tests' shorthand, kept HERE rather than
+    as a second public name in the cross-tier contract module."""
+    from shared.motion import lighting_measure
+
+    return lighting_measure(roi)[0]
+
+
+def _mono(value: int = 120, shape=(60, 80)) -> np.ndarray:
+    """A 3-channel but perfectly grey frame — what IR light produces."""
+    img = np.full((*shape, 3), value, np.uint8)
+    img[:, : shape[1] // 2] = max(0, value - 30)  # some luminance structure, no colour
+    return img
+
+
+def _colour(shape=(60, 80)) -> np.ndarray:
+    """A frame with real per-pixel colour variation — a daylight scene."""
+    img = np.zeros((*shape, 3), np.uint8)
+    img[:, : shape[1] // 2] = (40, 170, 60)
+    img[:, shape[1] // 2 :] = (170, 60, 40)
+    return img
+
+
+def test_colourfulness_is_zero_for_a_monochrome_frame():
+    from shared.motion import lighting_measure
+
+    # Grey at every pixel: R == G == B, so there is no residual spread to find.
+    assert _c(_mono()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_colourfulness_is_clearly_positive_for_a_colour_frame():
+    from shared.motion import lighting_measure
+
+    assert _c(_colour()) > 0.2
+
+
+def test_colourfulness_ignores_a_constant_colour_cast():
+    """The load-bearing property: a LOCKED white balance leaves a fixed cast on IR
+    frames. Per-channel mean normalisation removes it, so a cast-only difference
+    must not move the statistic — otherwise every IR night frame reads colourful."""
+    from shared.motion import lighting_measure
+
+    plain = _mono()
+    # A strong magenta cast: scale B and R up, leave G — a global, per-channel gain.
+    cast = plain.astype(np.float64)
+    cast[:, :, 0] *= 1.6
+    cast[:, :, 2] *= 1.4
+    cast = np.clip(cast, 0, 255).astype(np.uint8)
+
+    assert _c(cast) == pytest.approx(_c(plain), abs=0.02)
+
+
+def test_colourfulness_is_zero_for_a_too_dark_frame():
+    from shared.motion import _LIGHTING_DARK_LUMA, lighting_measure
+
+    # Below the dark floor the channel means carry no usable ratio; reporting 0.0
+    # is honest but AMBIGUOUS (an unlit night scene has no colour either), which
+    # is why lighting_measure also returns the luma.
+    dark = np.full((40, 60, 3), int(_LIGHTING_DARK_LUMA) - 2, np.uint8)
+    dark[:, :20] = (0, 1, 3)
+    assert _c(dark) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_colourfulness_is_stable_across_input_resolution():
+    """It downscales to a FIXED constant, so the same scene at two capture sizes
+    measures the same — which is what lets one saved threshold outlive a change
+    in the stored frame size."""
+    from shared.motion import lighting_measure
+
+    small = _c(_colour(shape=(60, 80)))
+    large = _c(_colour(shape=(240, 320)))
+    assert small == pytest.approx(large, abs=0.02)
+
+
+def test_lighting_downscale_is_independent_of_the_tuning_params():
+    """Regression guard for the one coupling that would silently invalidate a
+    calibrated threshold: if the measure read MotionParams.downscale, a MOG2
+    retune would change the statistic under an already-saved cutoff."""
+    import inspect
+
+    from shared import motion
+
+    src = inspect.getsource(motion.lighting_measure)
+    assert "_LIGHTING_DOWNSCALE" in src
+    assert "params" not in inspect.signature(motion.lighting_measure).parameters
+
+
+def test_lighting_measure_returns_luma_alongside():
+    from shared.motion import lighting_measure
+
+    score, luma = lighting_measure(_mono(value=200))
+    assert score == pytest.approx(0.0, abs=1e-6)
+    assert 150 < luma < 210          # the grey level, not the colour spread
+
+
+def test_lighting_measure_handles_single_channel_input():
+    """A genuinely mono (2D) source is monochrome by construction — the same
+    bypass classify_corruption takes, so a grayscale night camera can't error."""
+    from shared.motion import lighting_measure
+
+    score, luma = lighting_measure(np.full((40, 60), 90, np.uint8))
+    assert score == 0.0
+    assert luma == pytest.approx(90.0)
+
+
+def test_lighting_version_is_an_int():
+    from shared.motion import lighting_version
+
+    assert isinstance(lighting_version(), int)

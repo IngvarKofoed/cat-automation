@@ -589,6 +589,8 @@ def test_save_settings_then_load_settings_roundtrips(config_path):
         "clip": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
         "fps": 5,
         "focus": 2.5,  # non-default (a manual lens position) for the same reason
+        "awb_gains": [1.8, 2.1],  # non-default: a LOCKED white balance
+        "tuning_file": "imx708_noir.json",
         # Non-default motion values, so a roundtrip bug (e.g. load_settings
         # silently falling back to DEFAULTS) can't hide behind equal values.
         "var_threshold": 20.0,
@@ -1190,14 +1192,15 @@ def test_capabilities_null_focus_for_plain_source(client):
     # the focus control.
     resp = client.get("/api/capabilities")
     assert resp.status_code == 200
-    assert resp.get_json() == {"focus": None}
+    # `awb` rides the same capability probe; the fake has neither lens nor gains.
+    assert resp.get_json() == {"focus": None, "awb": None}
 
 
 def test_capabilities_reports_focus_range_for_focusable_source(focus_app):
     app, _source = focus_app
     resp = app.test_client().get("/api/capabilities")
     assert resp.status_code == 200
-    assert resp.get_json() == {"focus": {"min": 0.0, "max": 10.0}}
+    assert resp.get_json() == {"focus": {"min": 0.0, "max": 10.0}, "awb": None}
 
 
 # --- POST /api/config: focus ---
@@ -1321,3 +1324,183 @@ def test_picamera_set_focus_before_open_is_noop():
     source = PicameraCaptureSource(0)
     source.set_focus(2.0)  # must not raise even though picamera2 may be absent
     assert source._focus == 2.0
+
+
+# --- White balance + tuning file (docs/NOIR_SWAP.md item 1) -------------------
+#
+# A fixed door scene wants a LOCKED white balance for the same reason it wants a
+# locked lens: auto WB re-estimates the illuminant every frame, so a static scene's
+# pixels drift — which moves the day/night colourfulness statistic and smears the
+# day colour cue. These pin the plumbing without a Pi: capability gating, the
+# settle-and-lock endpoint, persistence, and the ordering that stops a tuning-file
+# change from discarding the gains pushed just before it.
+
+
+class AwbCaptureSource(FakeCaptureSource):
+    """A fake source advertising settable colour gains and a tuning file.
+
+    Records every set_awb/set_tuning_file call in ONE ordered list, because the
+    ordering is load-bearing: a tuning change rebuilds the camera, so gains pushed
+    first would be thrown away with it.
+    """
+
+    LOCK_RESULT = (1.85, 2.10)  # gains awb_lock_once() "settles" on
+
+    def __init__(self, device: "int | str" = 0) -> None:
+        super().__init__(device)
+        self.awb_value = None
+        self.tuning_value = None
+        self.calls: "list[tuple]" = []
+
+    def awb_capabilities(self) -> "dict":
+        return {"min": 0.0, "max": 32.0}
+
+    def set_awb(self, gains) -> None:
+        self.awb_value = gains
+        self.calls.append(("awb", gains))
+
+    def set_tuning_file(self, name) -> None:
+        self.tuning_value = name
+        self.calls.append(("tuning", name))
+
+    def awb_lock_once(self):
+        self.awb_value = self.LOCK_RESULT
+        return self.LOCK_RESULT
+
+
+@pytest.fixture
+def awb_app(config_path):
+    created = {}
+
+    def factory(device):
+        created["source"] = AwbCaptureSource(device)
+        return created["source"]
+
+    app = create_app(source_factory=factory, start_grabber=False)
+    return app, created["source"]
+
+
+def test_capabilities_reports_awb_range_for_an_awb_source(awb_app):
+    app, _source = awb_app
+    assert app.test_client().get("/api/capabilities").get_json()["awb"] == {
+        "min": 0.0, "max": 32.0
+    }
+
+
+def test_boot_pushes_tuning_file_before_white_balance(awb_app):
+    # Ordering, not just presence: set_tuning_file tears the camera down, so gains
+    # applied first would be discarded on the reopen and the lock silently lost.
+    _app, source = awb_app
+    kinds = [k for k, _v in source.calls]
+    assert kinds.index("tuning") < kinds.index("awb")
+
+
+def test_post_config_awb_gains_persists_and_applies(awb_app, config_path):
+    app, source = awb_app
+    client = app.test_client()
+
+    resp = client.post("/api/config", json={"awb_gains": [1.8, 2.2]})
+    assert resp.status_code == 200
+    assert resp.get_json()["awb_gains"] == [1.8, 2.2]
+    assert client.get("/api/config").get_json()["awb_gains"] == [1.8, 2.2]
+    assert json.loads(config_path.read_text())["awb_gains"] == [1.8, 2.2]
+    # Pushed to the live source as a PAIR, the shape the CaptureSource contract wants.
+    assert source.awb_value == (1.8, 2.2)
+
+
+def test_post_config_awb_null_returns_to_auto(awb_app, config_path):
+    app, source = awb_app
+    client = app.test_client()
+    client.post("/api/config", json={"awb_gains": [1.8, 2.2]})
+
+    resp = client.post("/api/config", json={"awb_gains": None})
+    assert resp.status_code == 200
+    assert resp.get_json()["awb_gains"] is None
+    assert json.loads(config_path.read_text())["awb_gains"] is None
+    assert source.awb_value is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[1.0], [1.0, 2.0, 3.0], [0, 2.0], [-1.0, 2.0], [1.0, 99.0], [True, 2.0], "auto", 1.5],
+)
+def test_post_config_rejects_bad_awb_gains(awb_app, bad):
+    # A zero or negative gain would black out a channel; a bool would coerce to 1.0
+    # silently. All rejected BEFORE reaching libcamera, as focus is.
+    app, _source = awb_app
+    resp = app.test_client().post("/api/config", json={"awb_gains": bad})
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("bad", ["../etc/passwd", "/abs/path.json", "sub\\dir.json", "", 5])
+def test_post_config_rejects_a_pathlike_tuning_file(awb_app, bad):
+    # The value is resolved against libcamera's tuning dirs, so it must stay a NAME.
+    app, _source = awb_app
+    resp = app.test_client().post("/api/config", json={"tuning_file": bad})
+    assert resp.status_code == 400
+
+
+def test_post_config_tuning_file_persists_and_applies(awb_app, config_path):
+    app, source = awb_app
+    client = app.test_client()
+
+    resp = client.post("/api/config", json={"tuning_file": "imx708_noir.json"})
+    assert resp.status_code == 200
+    assert resp.get_json()["tuning_file"] == "imx708_noir.json"
+    assert json.loads(config_path.read_text())["tuning_file"] == "imx708_noir.json"
+    assert source.tuning_value == "imx708_noir.json"
+
+
+def test_tuning_change_re_pushes_the_locked_white_balance(awb_app):
+    # The regression this ordering exists to prevent: changing the tuning file
+    # rebuilds the camera, so a previously-locked WB must be re-applied afterwards
+    # or the scene silently reverts to auto — moving every downstream colour reading.
+    app, source = awb_app
+    client = app.test_client()
+    client.post("/api/config", json={"awb_gains": [1.8, 2.2]})
+    source.calls.clear()
+
+    client.post("/api/config", json={"tuning_file": "imx708_noir.json"})
+    assert source.calls == [("tuning", "imx708_noir.json"), ("awb", (1.8, 2.2))]
+
+
+def test_awb_lock_endpoint_locks_persists_and_reports(awb_app, config_path):
+    app, source = awb_app
+    resp = app.test_client().post("/api/awb/lock")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"awb_gains": [1.85, 2.10]}
+    assert json.loads(config_path.read_text())["awb_gains"] == [1.85, 2.10]
+    assert app.test_client().get("/api/config").get_json()["awb_gains"] == [1.85, 2.10]
+    assert source.awb_value == AwbCaptureSource.LOCK_RESULT
+
+
+def test_awb_lock_on_a_camera_without_gain_control_is_422(client):
+    # The plain fake inherits the base no-op contract → awb_lock_once() returns None,
+    # which means "no hardware" (a permanent 422), NOT a transient failure (503).
+    resp = client.post("/api/awb/lock")
+    assert resp.status_code == 422
+
+
+def test_awb_lock_surfaces_a_failed_cycle_as_503(config_path):
+    # A CaptureError from a CAPABLE camera is retryable — distinct from 422 above.
+    class FailingAwb(AwbCaptureSource):
+        def awb_lock_once(self):
+            raise CaptureError("auto white balance reported no gains")
+
+    app = create_app(source_factory=lambda d: FailingAwb(d), start_grabber=False)
+    resp = app.test_client().post("/api/awb/lock")
+    assert resp.status_code == 503
+    assert "no gains" in resp.get_json()["error"]
+
+
+def test_a_camera_only_post_preserves_the_locked_white_balance(awb_app, config_path):
+    # save_settings overwrites the file wholesale, so a rotation-only POST must not
+    # drop the colour settings — the same property the night_light block relies on.
+    app, _source = awb_app
+    client = app.test_client()
+    client.post("/api/config", json={"awb_gains": [1.8, 2.2], "tuning_file": "imx708_noir.json"})
+
+    client.post("/api/config", json={"rotation": 90})
+    saved = json.loads(config_path.read_text())
+    assert saved["awb_gains"] == [1.8, 2.2]
+    assert saved["tuning_file"] == "imx708_noir.json"

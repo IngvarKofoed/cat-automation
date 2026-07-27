@@ -17,6 +17,20 @@ DEFAULTS = {
     # finds a value and stores it here. Inert on cameras without focus control
     # (Module 1/2, USB) — see the CaptureSource focus contract in capture/base.py.
     "focus": None,
+    # White balance. None = continuous auto WB. A [red, blue] pair = AWB OFF,
+    # locked at those gains. A fixed door scene wants the lock for the same reason
+    # it wants a locked lens: auto WB re-estimates the illuminant every frame, so a
+    # static scene's pixels drift — moving the day/night colourfulness statistic and
+    # smearing the day colour cue identification depends on. Critical on a NoIR
+    # sensor, where daylight's NIR component gives AWB a moving target all day. The
+    # UI's "Lock white balance" finds a pair and stores it here. Inert on cameras
+    # without gain control — see the CaptureSource AWB contract in capture/base.py.
+    "awb_gains": None,
+    # libcamera tuning file name, or None for the backend default. A NoIR sensor
+    # wants "imx708_noir.json": the default tuning assumes an IR-cut filter that
+    # isn't there, so its colour matrices and AWB priors are wrong. Applied when the
+    # camera next opens; an unloadable name falls back to the default (and logs).
+    "tuning_file": None,
     "var_threshold": 16.0,
     "learning_rate": 0.001,
     "min_area": 0.01,

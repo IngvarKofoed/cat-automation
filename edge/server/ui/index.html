@@ -315,6 +315,30 @@
             </div>
         </div>
 
+        <!-- White balance: hidden unless GET /api/capabilities reports settable
+             colour gains. A fixed door scene wants a LOCKED white balance for the
+             same reason it wants a locked lens — auto WB re-estimates every frame,
+             so a static scene's colours drift. See docs/NOIR_SWAP.md item 1. -->
+        <div id="awbGroup" class="control-group hidden">
+            <label>White balance (<span id="awbValue">auto</span>)</label>
+            <div class="btn-row">
+                <button type="button" id="awbAutoBtn" class="rot-btn">Auto</button>
+                <button type="button" id="awbLockBtn" class="btn-secondary">Lock white balance</button>
+            </div>
+            <p class="hint">Locking freezes the red/blue gains at whatever auto settles on.
+                Do it once, on a lit daytime scene, <b>before</b> tuning motion or
+                calibrating day/night lighting — both are measured against these colours.</p>
+        </div>
+
+        <div class="control-group">
+            <label for="tuningFile">Sensor tuning file</label>
+            <input type="text" id="tuningFile" placeholder="default (leave empty)">
+            <p class="hint">A NoIR camera wants <code>imx708_noir.json</code> — the default
+                tuning assumes an IR-cut filter that isn't fitted, so its colour matrices are
+                wrong. Changing this reopens the camera. An unloadable name falls back to the
+                default and logs.</p>
+        </div>
+
         <div class="control-group">
             <div class="btn-row">
                 <button id="captureBtn">Capture</button>
@@ -453,7 +477,13 @@
         const overlayBtn = document.getElementById('overlayBtn');
         const errorDiv = document.getElementById('error');
         const stillImg = document.getElementById('still');
-        const rotButtons = document.querySelectorAll('.rot-btn');
+        // Scoped by [data-deg], NOT by the class alone: `.rot-btn` is also the SHARED
+        // STYLING for the focus and white-balance "Auto" buttons, which carry no
+        // degrees. Selecting on the class swept those in too, so clicking Auto fired
+        // the rotation handler with Number(undefined) = NaN, serialized to null, and
+        // flashed a spurious "rotation must be one of 0, 90, 180, 270" error beside
+        // the real request — and the active-state sync below cleared their highlight.
+        const rotButtons = document.querySelectorAll('.rot-btn[data-deg]');
         const roiModeBtn = document.getElementById('roiModeBtn');
         const saveRoiBtn = document.getElementById('saveRoiBtn');
         const cancelRoiBtn = document.getElementById('cancelRoiBtn');
@@ -498,6 +528,13 @@
         let currentFps = 5;
         let currentFocus = null;   // null = continuous autofocus, number = manual dioptres
         let focusCaps = null;      // {min, max} dioptres, or null if the camera has no focus
+        let currentAwb = null;     // null = auto WB, [red, blue] = locked at those gains
+        let awbCaps = null;        // {min, max} gain range, or null if WB isn't settable
+        const awbGroup = document.getElementById('awbGroup');
+        const awbValueEl = document.getElementById('awbValue');
+        const awbAutoBtn = document.getElementById('awbAutoBtn');
+        const awbLockBtn = document.getElementById('awbLockBtn');
+        const tuningFileEl = document.getElementById('tuningFile');
 
         // ROI editing state.
         let roiMode = false;       // true while the raw preview + box editor is active
@@ -609,6 +646,10 @@
                 // the server sent it (0 is a valid position — infinity — so a
                 // truthiness test would wrongly coerce it to "auto").
                 currentFocus = (typeof data.focus === 'number') ? data.focus : null;
+                // White balance: null = auto, [red, blue] = locked at those gains.
+                currentAwb = Array.isArray(data.awb_gains) ? data.awb_gains : null;
+                tuningFileEl.value = data.tuning_file || '';
+                applyAwbUi();
                 applyFocusUi();
 
                 // Motion tuning fields: reflect whatever is persisted,
@@ -1132,11 +1173,102 @@
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
                 focusCaps = data.focus || null;
+                awbCaps = data.awb || null;
             } catch {
                 focusCaps = null;  // probe failed → treat as no focus, hide the control
+                awbCaps = null;    // same for white balance
             }
             applyFocusUi();
+            applyAwbUi();
         }
+
+        // Reflect currentAwb/awbCaps into the white-balance control. Hidden entirely
+        // when the camera has no settable gains; otherwise it reads either "auto" or
+        // the locked pair, so the state is never ambiguous — a drifting white balance
+        // and a locked one look identical in the preview.
+        function applyAwbUi() {
+            if (!awbCaps) {
+                awbGroup.classList.add('hidden');
+                return;
+            }
+            awbGroup.classList.remove('hidden');
+            const locked = Array.isArray(currentAwb);
+            awbAutoBtn.classList.toggle('active', !locked);
+            awbValueEl.textContent = locked
+                ? `locked R ${Number(currentAwb[0]).toFixed(2)} · B ${Number(currentAwb[1]).toFixed(2)}`
+                : 'auto';
+        }
+
+        // POST a white balance (null = auto, [r, b] = locked) and refresh, so the
+        // colour change is visible immediately.
+        async function postAwb(value) {
+            try {
+                clearError();
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ awb_gains: value })
+                });
+                if (!res.ok) {
+                    showError(`White balance error: ${await errorFromResponse(res)}`);
+                    await loadCurrentConfig();  // restore the control to the live value
+                    return;
+                }
+                currentAwb = value;
+                applyAwbUi();
+                await refreshPreview();
+            } catch (err) {
+                showError(`White balance error: ${err.message}`);
+            }
+        }
+
+        awbAutoBtn.addEventListener('click', () => postAwb(null));
+
+        // Let AWB settle on the Pi, lock the gains it found, and persist them.
+        awbLockBtn.addEventListener('click', async () => {
+            const label = awbLockBtn.textContent;
+            try {
+                clearError();
+                awbLockBtn.disabled = true;
+                awbLockBtn.textContent = 'Settling…';
+                const res = await fetch('/api/awb/lock', { method: 'POST' });
+                if (!res.ok) {
+                    showError(`White balance error: ${await errorFromResponse(res)}`);
+                    return;
+                }
+                const data = await res.json();
+                currentAwb = Array.isArray(data.awb_gains) ? data.awb_gains : null;
+                applyAwbUi();
+                await refreshPreview();
+            } catch (err) {
+                showError(`White balance error: ${err.message}`);
+            } finally {
+                awbLockBtn.disabled = false;
+                awbLockBtn.textContent = label;
+            }
+        });
+
+        // Tuning file: committed on blur/Enter, not per keystroke — each change
+        // reopens the camera. An empty field means the backend default.
+        tuningFileEl.addEventListener('change', async () => {
+            const raw = tuningFileEl.value.trim();
+            try {
+                clearError();
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tuning_file: raw === '' ? null : raw })
+                });
+                if (!res.ok) {
+                    showError(`Tuning file error: ${await errorFromResponse(res)}`);
+                    await loadCurrentConfig();
+                    return;
+                }
+                await refreshPreview();
+            } catch (err) {
+                showError(`Tuning file error: ${err.message}`);
+            }
+        });
 
         // Reflect currentFocus/focusCaps into the focus control. Hidden entirely
         // when the camera has no movable lens; otherwise the slider is live only

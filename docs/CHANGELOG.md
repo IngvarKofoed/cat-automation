@@ -1149,3 +1149,29 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      button sits selected; the page now detects the missing `regime` echo and says so
      instead of letting the selector look like it worked. Routine, not hypothetical —
      the dev proxy serves a LOCAL admin-next against a REMOTE compute.
+
+184. Recorded a decision the NoIR swap forces: `cats`/`dataset_items` survive `clear()` by
+     design, so wiping frames to "start fresh" LEAVES the old labels — and a later
+     gallery-build silently mixes crops from two different sensors, whose daylight colour
+     differs. Worse than ordinary bad crops, since the shift correlates with capture date
+     rather than with the cat. Keep them for threshold tuning only, or retire them — but
+     decide before the first build, when the mix is still visible. In docs/NOIR_SWAP.md.
+
+185. Edge can LOCK white balance and select a libcamera tuning file — the NoIR swap's
+     prerequisite (docs/NOIR_SWAP.md item 1). New `awb_gains` (null = auto, [r,b] = locked)
+     and `tuning_file` settings, `POST /api/awb/lock` (settle ~10 frames, lock what AWB
+     converged on, persist), and `awb` in `GET /api/capabilities`. Modelled on `focus`.
+     Why it matters beyond colour accuracy: auto WB re-estimates every frame, so a STATIC
+     scene's pixels drift — moving the day/night colourfulness statistic and smearing the
+     day colour cue. On a NoIR sensor daylight's NIR component makes that drift hourly.
+     Tuning file is applied BEFORE gains everywhere (boot, POST): it rebuilds the camera,
+     so gains pushed first would be discarded — and it is re-pushed after, so a reopen
+     never silently reverts a lock to auto. A bad tuning name falls back + logs, never
+     bricking capture. Both re-applied on a self-heal reopen.
+
+186. Fixed a pre-existing config-UI bug the AWB panel would have doubled: `rotButtons`
+     selected `.rot-btn`, which is also the shared STYLING for the focus (and now white
+     balance) "Auto" buttons. Clicking Auto therefore fired the rotation handler with
+     `Number(undefined)` = NaN → serialized `null` → a spurious 400 beside the real
+     request, and the active-state sync cleared the button's own highlight. Now scoped
+     to `.rot-btn[data-deg]`.

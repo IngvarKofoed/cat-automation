@@ -126,6 +126,43 @@ def _valid_focus(focus) -> bool:
     return _is_number(focus) and 0 <= focus <= 100
 
 
+# Generous cap on a colour gain, the same posture _valid_focus takes: the camera
+# clamps to its own reported range, so this only rejects the plainly-wrong (zero,
+# negative, NaN, inf, bool, non-number) before it reaches libcamera. Real red/blue
+# gains sit around 1-4; 32 is far above any sensor's usable range.
+_AWB_GAIN_MAX = 32.0
+
+
+def _valid_awb_gains(gains) -> bool:
+    """True if `gains` is None (auto WB) or a [red, blue] pair of positive numbers.
+
+    None means continuous auto white balance; a pair locks AWB off at those gains.
+    A gain of zero would black out a channel, so the range is exclusive at the
+    bottom — unlike focus, where 0 dioptres is the meaningful "infinity".
+    """
+    if gains is None:
+        return True
+    if not isinstance(gains, (list, tuple)) or len(gains) != 2:
+        return False
+    return all(_is_number(g) and 0 < g <= _AWB_GAIN_MAX for g in gains)
+
+
+def _valid_tuning_file(name) -> bool:
+    """True if `name` is None (default tuning) or a plain, path-free filename.
+
+    The value reaches ``Picamera2.load_tuning_file``, which resolves it against
+    libcamera's tuning directories. Rejecting separators and ``..`` keeps it a
+    NAME rather than a path — not a hard security boundary on a trusted LAN, but
+    it stops a stray absolute path from being silently accepted and then failing
+    at open time, far from the field that caused it.
+    """
+    if name is None:
+        return True
+    if not isinstance(name, str) or not name.strip():
+        return False
+    return "/" not in name and "\\" not in name and ".." not in name
+
+
 # Bounds shared by the night-light offset fields (load-time defaulting AND the POST
 # validator): integer minutes, generously capped so a fat-finger can't push a
 # transition wildly off. NEGATIVE is allowed and shifts the transition the OTHER
@@ -203,7 +240,10 @@ _MOTION_VALIDATORS = {
 }
 
 # Every settable config key (for the POST presence check + its error message).
-_CONFIG_KEYS = ("device", "rotation", "clip", "fps", "focus", *_MOTION_VALIDATORS)
+_CONFIG_KEYS = (
+    "device", "rotation", "clip", "fps", "focus", "awb_gains", "tuning_file",
+    *_MOTION_VALIDATORS,
+)
 
 
 def _encode_jpeg(img) -> "tuple[bool, bytes]":
@@ -315,6 +355,19 @@ def create_app(
     # focus flows straight to libcamera (no fail-safe transform), so an invalid
     # stored value falls back to the default (None = continuous autofocus).
     focus = settings["focus"] if _valid_focus(settings["focus"]) else DEFAULTS["focus"]
+    # Same fail-safe posture for the two colour settings: both flow straight to
+    # libcamera, so an invalid stored value degrades to the default (auto WB /
+    # default tuning) rather than reaching the driver.
+    awb_gains = (
+        settings["awb_gains"] if _valid_awb_gains(settings["awb_gains"]) else DEFAULTS["awb_gains"]
+    )
+    # Normalized to a tuple so the live state, the source, and the persisted config
+    # agree on shape — JSON round-trips it as a list, the source wants a pair.
+    awb_gains = None if awb_gains is None else (float(awb_gains[0]), float(awb_gains[1]))
+    tuning_file = (
+        settings["tuning_file"] if _valid_tuning_file(settings["tuning_file"])
+        else DEFAULTS["tuning_file"]
+    )
     # rotation/clip need no validation at load: the transform functions are
     # fail-safe, so a bad stored value degrades to 0°/full-frame at render time.
     state = {
@@ -324,6 +377,8 @@ def create_app(
         "clip": settings["clip"],
         "fps": fps,
         "focus": focus,
+        "awb_gains": awb_gains,
+        "tuning_file": tuning_file,
     }
     # Motion params: like fps they flow into compute (MOG2/decision rule) with no
     # fail-safe transform, so an invalid stored value falls back to the default.
@@ -341,6 +396,11 @@ def create_app(
     # Push the persisted focus onto the source. A no-op on non-focus backends;
     # on the CSI backend it's applied when the camera opens (see set_focus).
     state["source"].set_focus(focus)
+    # Tuning file BEFORE white balance: it is a construction-time choice, so
+    # setting it tears the camera down, and gains pushed first would be discarded
+    # with it. Both are no-ops on backends without the capability.
+    state["source"].set_tuning_file(tuning_file)
+    state["source"].set_awb(awb_gains)
 
     def _config_snapshot_locked() -> dict:
         """The COMPLETE persisted-config dict built from live state.
@@ -357,6 +417,10 @@ def create_app(
             "clip": state["clip"],
             "fps": state["fps"],
             "focus": state["focus"],
+            # Emitted as a list: it round-trips through JSON either way, and a list
+            # keeps the persisted file and the API response the same shape.
+            "awb_gains": None if state["awb_gains"] is None else list(state["awb_gains"]),
+            "tuning_file": state["tuning_file"],
         }
         for key in _MOTION_VALIDATORS:
             cfg[key] = state[key]
@@ -621,7 +685,13 @@ def create_app(
         # {"min","max"} dioptres on a Module 3, or null on a fixed-focus/USB cam.
         with lock:
             source = state["source"]
-        return jsonify(focus=source.focus_capabilities())
+        # `awb`: {"min","max"} colour-gain range where the white balance is
+        # settable, or null — so the AWB panel appears on the same
+        # capability-driven basis the focus slider does.
+        return jsonify(
+            focus=source.focus_capabilities(),
+            awb=source.awb_capabilities(),
+        )
 
     @app.post("/api/focus/autofocus")
     def autofocus():
@@ -648,6 +718,33 @@ def create_app(
         with lock:
             state["focus"] = lens
         return jsonify(focus=lens)
+
+    @app.post("/api/awb/lock")
+    def awb_lock():
+        # "Lock white balance" from the config UI, the exact shape of the autofocus
+        # route above: let AWB converge, lock the gains it found, and persist them
+        # so the lock survives a restart. A fixed door scene wants a stable colour
+        # transform — a drifting one moves the day/night colourfulness statistic and
+        # smears the day colour cue (docs/NOIR_SWAP.md item 1).
+        with lock:
+            source = state["source"]
+        try:
+            gains = source.awb_lock_once()
+        except CaptureError as e:
+            return jsonify(error=str(e)), 503
+        if gains is None:
+            return jsonify(error="active camera has no controllable white balance"), 422
+        pair = [float(gains[0]), float(gains[1])]
+        with lock:
+            next_config = _config_snapshot_locked()
+            next_config["awb_gains"] = pair
+        try:
+            save_settings(next_config)
+        except OSError as e:
+            return jsonify(error=f"failed to persist white balance: {e}"), 500
+        with lock:
+            state["awb_gains"] = (pair[0], pair[1])
+        return jsonify(awb_gains=pair)
 
     @app.get("/api/config")
     def get_config():
@@ -682,6 +779,14 @@ def create_app(
             return jsonify(error="fps must be a number between 1 and 30"), 400
         if "focus" in body and not _valid_focus(body["focus"]):
             return jsonify(error="focus must be null or a number in [0, 100] dioptres"), 400
+        if "awb_gains" in body and not _valid_awb_gains(body["awb_gains"]):
+            return jsonify(
+                error="awb_gains must be null or a [red, blue] pair of numbers in (0, 32]"
+            ), 400
+        if "tuning_file" in body and not _valid_tuning_file(body["tuning_file"]):
+            return jsonify(
+                error="tuning_file must be null or a filename without path separators"
+            ), 400
         for key, (validator, msg) in _MOTION_VALIDATORS.items():
             if key in body and not validator(body[key]):
                 return jsonify(error=msg), 400
@@ -707,6 +812,8 @@ def create_app(
         cur_clip = state["clip"]
         cur_fps = state["fps"]
         cur_focus = state["focus"]
+        cur_awb = state["awb_gains"]
+        cur_tuning = state["tuning_file"]
 
         # Build+validate a new source only when the device changes (a real open is
         # slow, so do it OUTSIDE the lock).
@@ -734,6 +841,14 @@ def create_app(
             "clip": body["clip"] if "clip" in body else cur_clip,
             "fps": body["fps"] if "fps" in body else cur_fps,
             "focus": body["focus"] if "focus" in body else cur_focus,
+            # Persisted as a list (JSON has no tuple); the live state below keeps the
+            # tuple the source contract wants, so the two never drift in shape.
+            "awb_gains": (
+                list(body["awb_gains"]) if body.get("awb_gains") is not None
+                else None if "awb_gains" in body
+                else (list(cur_awb) if cur_awb is not None else None)
+            ),
+            "tuning_file": body["tuning_file"] if "tuning_file" in body else cur_tuning,
             # Carried from live state (this endpoint never edits it) so a camera POST
             # preserves the schedule through the wholesale file rewrite. Edited only
             # via POST /api/night-light. Copied to avoid aliasing the live state.
@@ -771,6 +886,9 @@ def create_app(
             state["clip"] = next_config["clip"]
             state["fps"] = next_config["fps"]
             state["focus"] = next_config["focus"]
+            nxt_awb = next_config["awb_gains"]
+            state["awb_gains"] = None if nxt_awb is None else (float(nxt_awb[0]), float(nxt_awb[1]))
+            state["tuning_file"] = next_config["tuning_file"]
             for key in _MOTION_VALIDATORS:
                 state[key] = next_config[key]
             new_source = state["source"]
@@ -782,6 +900,16 @@ def create_app(
         focus_changed = "focus" in body and next_config["focus"] != cur_focus
         if device_changed or focus_changed:
             new_source.set_focus(next_config["focus"])
+        # Tuning file BEFORE white balance, same ordering as boot: changing it tears
+        # the camera down, which would discard gains pushed first.
+        tuning_changed = "tuning_file" in body and next_config["tuning_file"] != cur_tuning
+        if device_changed or tuning_changed:
+            new_source.set_tuning_file(next_config["tuning_file"])
+        awb_changed = "awb_gains" in body and state["awb_gains"] != cur_awb
+        if device_changed or tuning_changed or awb_changed:
+            # Re-pushed after a tuning change too: the teardown dropped the camera,
+            # and a reopen must not silently revert a locked white balance to auto.
+            new_source.set_awb(state["awb_gains"])
         if roi_changed:
             # Relearn the background against the new ROI (safe before grab_once,
             # which recomputes motion from the fresh model).

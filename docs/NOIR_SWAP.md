@@ -35,30 +35,25 @@ the loop wants opening.
 It also protects the identification cue — a drifting pink cast smears the day colour that
 separates the ginger from the grey cat.
 
-### What to build
+### BUILT — how to use it
 
-Currently **AWB is never touched**: `edge/capture/picamera_source.py` sets only
-`AfMode`/`LensPosition`. No `AwbEnable`, no `ColourGains`, no tuning file.
+Both controls now exist, modelled on the `focus` design (changelog 14). In the Pi's config
+UI, on a camera that reports settable gains:
 
-Locking is two controls:
+1. **Sensor tuning file** — type `imx708_noir.json` and tab out. This reopens the camera
+   (it is a construction-time choice). Do it FIRST: a tuning change rebuilds the camera, so
+   gains locked beforehand would be discarded.
+2. **White balance → Lock white balance** — lets auto WB settle for ~10 frames on the live
+   scene, then locks the gains it converged on and persists them. Do it on a **lit daytime
+   scene**, since that is the regime the colour cue matters in.
+3. The readout then shows `locked R x.xx · B y.yy` instead of `auto`. **Auto** hands it back.
 
-```python
-cam.set_controls({"AwbEnable": False, "ColourGains": (r_gain, b_gain)})
-```
+Both survive a restart and a self-heal camera reopen. An unloadable tuning-file name falls
+back to the default tuning and logs (a typo must not take the door offline). Neither control
+appears on a camera without the capability.
 
-Get the numbers by letting AWB settle on a representative scene and reading them back from
-`cam.capture_metadata()["ColourGains"]`, then persist them.
-
-**This repo already solved the identical problem once — copy the `focus` design (changelog
-14):** `null` = continuous auto, a value = locked there, applied after `cam.start()`,
-capability-gated, best-effort (never gate capture), plus `POST /api/focus/autofocus` which
-runs one auto cycle and stores the result *as* the lock. AWB wants exactly that shape: an
-`awb_gains` setting (`null` = auto, `[r, b]` = locked) and an "AWB once" endpoint. Same
-rationale too — a fixed door scene is better served by a stable transform than a hunting one.
-
-Separate but complementary: `Picamera2(self._index)` loads the default tuning. A NoIR sensor
-wants `tuning=Picamera2.load_tuning_file("imx708_noir.json")`, which carries colour matrices
-and AWB priors calibrated for a filterless sensor.
+Only then tune motion or calibrate day/night lighting — both are measured against these
+colours, and doing it the other way round calibrates against a moving target.
 
 ---
 
@@ -120,6 +115,28 @@ cat's fragments fall under that floor). On a solid blob, opening is nearly shape
 Stored oracle verdicts, the missed-visit records, and any candidate params from before the
 swap come from a **different sensor**. Scope tuning to post-swap days (the motion-tuning
 calendar day-picker makes this easy) rather than comparing across the boundary.
+
+## Decide what happens to the existing labels — BEFORE building a gallery
+
+`cats` and `dataset_items` deliberately survive eviction and `clear()` (changelog 57): the
+labels are the precious output. So a "start from scratch" that wipes frames will leave the
+old labels and their crops in place, and a later gallery build will silently mix crops from
+**two different sensors** — the pre-swap IR-cut camera and the NoIR one, whose daylight
+colour differs materially (NIR bleed, plus whatever AWB lock and tuning file land in item 1).
+
+That is the exact failure `compute/CLAUDE.md` warns about under *Protect the gallery*: crops
+that blur the embedding space. Blurring it with a systematic per-sensor colour shift is worse
+than blurring it with a few bad angles, because the shift correlates with capture date rather
+than with the cat.
+
+So make it a deliberate call, not a default:
+
+- **Keep them** only for threshold tuning and validation, never in the gallery; or
+- **Retire them** (relabel/delete via the existing annotation paths, which already remove the
+  orphaned crop files) and re-annotate from post-swap frames.
+
+Whichever way, decide it before the first `gallery-build`, because afterwards the mix is
+invisible in the model version's metrics.
 
 ---
 

@@ -72,3 +72,55 @@ class CaptureSource(ABC):
         Raises CaptureError if a supported autofocus cycle fails. Default: None.
         """
         return None
+
+    # -- optional white-balance control -----------------------------------
+    # Same capability-gated, concrete-no-op shape as focus above, and for the
+    # same reason a fixed door scene wants a LOCKED lens: it wants a locked
+    # white balance too. Auto WB re-estimates the illuminant every frame, so a
+    # static scene's pixel values drift — which moves the day/night colourfulness
+    # statistic (see shared.motion.lighting_measure) and smears the day colour
+    # cue identification depends on. A NoIR sensor is the worst case: with no
+    # IR-cut filter, daylight carries a large NIR component the ISP reads as a
+    # red cast that varies with sun angle and cloud, so AWB fights it differently
+    # every hour. See docs/NOIR_SWAP.md item 1.
+
+    def awb_capabilities(self) -> "dict | None":
+        """Describe colour-gain control, or None if the source has no AWB control.
+
+        Returns ``{"min": float, "max": float}`` — the inclusive per-channel gain
+        range — when the red/blue gains are settable, else None. May open the
+        camera to interrogate it. Default: None (unsupported).
+        """
+        return None
+
+    def set_awb(self, gains: "tuple[float, float] | None") -> None:
+        """Apply a white-balance setting; a no-op on sources without AWB control.
+
+        ``None`` re-enables continuous auto white balance; a ``(red, blue)`` pair
+        DISABLES it and locks those gains. Best-effort and never on the
+        frame-delivery path, so an unsupported or failed apply is silent. Safe to
+        call before the camera is open — the value is applied when it next opens.
+        """
+
+    def awb_lock_once(self) -> "tuple[float, float] | None":
+        """Let auto WB settle, then lock the gains it converged on and return them.
+
+        The white-balance twin of ``autofocus_once``, and the only practical way
+        for an operator to obtain plausible gains — nobody can guess a red/blue
+        pair by hand. Returns ``(red, blue)`` (and switches the source to those
+        gains, locked), or None if the source has no AWB control. Raises
+        CaptureError if a supported cycle fails. Default: None.
+        """
+        return None
+
+    # -- optional sensor tuning file --------------------------------------
+
+    def set_tuning_file(self, name: "str | None") -> None:
+        """Select the libcamera tuning file; a no-op on sources without one.
+
+        ``None`` uses the backend's default tuning. A NoIR sensor wants its own
+        (``imx708_noir.json`` for a Camera Module 3 NoIR), which carries colour
+        matrices and AWB priors calibrated for a filterless sensor — the default
+        tuning assumes an IR-cut filter that isn't there. Applied when the camera
+        next opens, since it is a construction-time choice.
+        """

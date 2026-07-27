@@ -475,10 +475,11 @@ def test_scorecard_missed_visits_records_are_chronological_with_span_bounds(tmp_
     )
     recs = card["missed_visits"]
     assert [r["start_ts"] for r in recs] == [30_000, 60_000]  # chronological, not worst-first
-    assert recs[0] == {
+    assert {k: recs[0][k] for k in ("start_id", "end_id", "start_ts", "end_ts", "n_present", "rep_frame_id")} == {
         "start_id": early, "end_id": early, "start_ts": 30_000, "end_ts": 30_000,
-        "n_present": 1, "rep_frame_id": early, "peak_score": pytest.approx(0.4),
+        "n_present": 1, "rep_frame_id": early,
     }
+    assert recs[0]["peak_score"] == pytest.approx(0.4)
     # The id span bounds the whole cluster — it is what the UI fetches the strip by.
     assert recs[1]["start_id"] == late_a
     assert recs[1]["end_id"] == late_c
@@ -590,6 +591,115 @@ def test_scorecard_missed_visits_respects_oracle_floor_and_warmup(tmp_path):
     )
     assert len(warmed["missed_visits"]) == warmed["visits"]["wholly_missed"] == 1
     assert warmed["missed_visits"][0]["start_ts"] == 40_000
+
+
+# --- missed_visits: per-frame reject attribution + the recommended knob ---------
+
+
+def test_classify_miss_mirrors_the_gate_band_test():
+    from compute.collection.store import classify_miss
+
+    mn, mx = 0.01, 0.5                        # near_zero cutoff = mn/10 = 0.001
+    assert classify_miss(0.0, mn, mx) == "near_zero"
+    assert classify_miss(0.0005, mn, mx) == "near_zero"
+    assert classify_miss(0.005, mn, mx) == "below_min"
+    assert classify_miss(0.2, mn, mx) == "in_band"       # in band -> only the debounce dropped it
+    assert classify_miss(0.7, mn, mx) == "above_max"
+    # The band is INCLUSIVE at both ends, exactly as MotionGate.process tests it.
+    assert classify_miss(mn, mn, mx) == "in_band"
+    assert classify_miss(mx, mn, mx) == "in_band"
+    # No stored reading means "MOG2 saw nothing", not an unknown to hide.
+    assert classify_miss(None, mn, mx) == "near_zero"
+
+
+def test_missed_visit_attributes_a_full_frame_cat_to_above_max(tmp_path):
+    # The case that prompted this: YOLO is certain across many frames, but every blob
+    # exceeded max_area_fraction (a cat directly under a top-down camera fills the ROI),
+    # so the gate discarded them as whole-ROI light changes.
+    store = _store(tmp_path)
+    for i in range(6):
+        _seed(store, 30_000 + i * 200, motion=False, area=0.85, yolo=(1, 0.94))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=2,
+        missed_visits=True,
+    )
+    rec = card["missed_visits"][0]
+    assert rec["buckets"] == {"near_zero": 0, "below_min": 0, "above_max": 6, "in_band": 0}
+    assert rec["reason"] == "above_max"
+    assert rec["fix"] == {"param": "max_area_fraction", "direction": "up"}
+    assert [f["bucket"] for f in rec["frames"]] == ["above_max"] * 6
+    assert rec["frames"][0]["area"] == pytest.approx(0.85)
+    assert [f["id"] for f in rec["frames"]] == sorted(f["id"] for f in rec["frames"])
+
+
+def test_missed_visit_in_band_frames_blame_the_debounce(tmp_path):
+    # Area inside the band yet motion=0 means ONLY persistence dropped it.
+    store = _store(tmp_path)
+    for i in range(4):
+        _seed(store, 30_000 + i * 200, motion=False, area=0.2, yolo=(1, 0.9))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=5,
+        missed_visits=True,
+    )
+    rec = card["missed_visits"][0]
+    assert rec["reason"] == "in_band"
+    assert rec["fix"] == {"param": "persistence", "direction": "down"}
+
+
+def test_missed_visit_near_zero_beats_below_min_on_a_tie(tmp_path):
+    # Equal counts -> _MISS_BUCKET_PRIORITY decides, and near_zero (MOG2 saw nothing)
+    # outranks below_min: at ~0 area, lowering min_area buys nothing.
+    store = _store(tmp_path)
+    _seed(store, 30_000, motion=False, area=0.0, yolo=(1, 0.9))      # near_zero
+    _seed(store, 30_200, motion=False, area=0.005, yolo=(1, 0.9))    # below_min
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=2,
+        missed_visits=True,
+    )
+    rec = card["missed_visits"][0]
+    assert rec["buckets"]["near_zero"] == 1 and rec["buckets"]["below_min"] == 1
+    assert rec["reason"] == "near_zero"
+    assert rec["fix"] == {"param": "var_threshold", "direction": "down"}
+
+
+def test_missed_visit_buckets_partition_the_visits_frames(tmp_path):
+    # Per-visit buckets are EXCLUSIVE (they must sum to n_present) — unlike the
+    # window-wide area_buckets, where near_zero is a subset of below_min.
+    store = _store(tmp_path)
+    for area in (0.0, 0.0005, 0.005, 0.2, 0.7, 0.9):
+        _seed(store, 30_000 + int(area * 1000) * 10, motion=False, area=area, yolo=(1, 0.9))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=2,
+        missed_visits=True,
+    )
+    for rec in card["missed_visits"]:
+        assert sum(rec["buckets"].values()) == rec["n_present"] == len(rec["frames"])
+
+
+def test_missed_visit_slot_attributes_against_its_own_area_not_the_live_gate(tmp_path):
+    # The reason this isn't `f.area`: a slot column must be attributed by the area ITS
+    # re-run measured. Here the live gate recorded a tiny blob but the candidate slot
+    # measured an over-max one, so the two columns must name DIFFERENT knobs.
+    store = _store(tmp_path)
+    for i in range(3):
+        _seed(store, 30_000 + i * 200, motion=False, area=0.0,
+              yolo=(1, 0.9), slot=(0, 0.85))
+
+    live = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=2,
+        missed_visits=True,
+    )
+    slot = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=2,
+        missed_visits=True,
+    )
+    assert live["missed_visits"][0]["reason"] == "near_zero"
+    assert slot["missed_visits"][0]["reason"] == "above_max"
+    assert slot["missed_visits"][0]["frames"][0]["area"] == pytest.approx(0.85)
 
 
 def test_gate_fidelity_empty_slot_is_zero(tmp_path):

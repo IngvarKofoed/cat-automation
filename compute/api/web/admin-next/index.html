@@ -205,6 +205,34 @@
   .mv-ph { max-width: 200px; }
   .mv-ph img { width: 100%; height: auto; display: block; border-radius: var(--radius); opacity: .75; }
 
+  /* Why the gate dropped this visit + the knob to turn. Deliberately NOT the verdict
+     palette (green/amber/red mean caught/missed here, per #43's "color = verdict") —
+     these four are a CATEGORY, so they get one neutral accent and are told apart by
+     the dot + label, not by hue competing with the traffic light on the tiles. */
+  .mv-why { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 8px;
+    padding: 6px 8px; border: 1px solid var(--border); border-left: 2px solid var(--accent);
+    border-radius: var(--radius); background: var(--surface); font-size: 12px; }
+  .mv-reason { font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+  .mv-fix { font-family: var(--font-mono); font-size: 11px; color: #0c1117;
+    background: var(--accent); border-radius: 3px; padding: 1px 6px; white-space: nowrap; }
+  /* near_zero's fix is a hedge, not a prescription — a shadow classification is not
+     recoverable by any parameter, so it must not read as confidently as the others. */
+  .mv-fix.weak { background: transparent; color: var(--muted); border: 1px dashed var(--border); }
+  .mv-split { display: inline-flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 11px;
+    font-variant-numeric: tabular-nums; }
+  .mv-b { display: inline-flex; align-items: center; gap: 4px; }
+  .mv-hint { flex-basis: 100%; font-size: 11px; }
+  .mv-dot { width: 7px; height: 7px; border-radius: 2px; flex: none; display: inline-block;
+    background: var(--muted); }
+  .mv-dot.near_zero { background: var(--muted); }
+  .mv-dot.below_min { background: var(--unident); }
+  .mv-dot.in_band   { background: var(--accent); }
+  .mv-dot.above_max { background: var(--unrec); }
+  /* Per-frame blob area, top-left of a tile (the YOLO chip owns bottom-right). */
+  .mv-area { display: inline-flex; align-items: center; gap: 4px; background: rgba(0,0,0,.72);
+    color: var(--text); border-radius: 3px; padding: 1px 5px; font-family: var(--font-mono);
+    font-size: 10px; font-variant-numeric: tabular-nums; }
+
   /* MOG2 parameter reference (bottom card): ranked list, each with its direction cue. */
   .pref-row { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .pref-row:last-child { border-bottom: 0; }
@@ -525,6 +553,34 @@
       if (img.complete) place(); else img.addEventListener('load', place);
     });
   }
+
+  // The enlarged-frame modal, shared by EVERY grid of .ftile frames (Frame review,
+  // the tuning missed-visit strips) so click-to-enlarge looks and behaves the same
+  // wherever a frame is shown. Only the meta line differs per page — Frame review
+  // adds identity + review marks, a tuning strip has just the detection — so the
+  // caller passes it as `caption` (already escaped by the caller).
+  let frameModal = null;
+  function closeFrameModal() { if (frameModal) { frameModal.remove(); frameModal = null; } }
+  function openFrameModal(f, caption) {
+    closeFrameModal();
+    const band = bandOf(f.score), detTxt = detLabel(f);
+    const m = document.createElement('div');
+    m.className = 'fmodal';
+    m.innerHTML = `<div class="inner">
+      <div class="fimg"><img src="${f.url}" ${f.box ? `data-box='${JSON.stringify(f.box)}'` : ''}>${f.box
+        ? `<div class="fbox ${band}" hidden><span class="boxcap ${band}">${detTxt}</span></div>` : ''}</div>
+      <div class="note" style="margin-top:8px">${caption}</div>
+    </div>`;
+    document.body.appendChild(m);
+    placeBoxes(m);
+    m.addEventListener('click', (e) => { if (e.target === m) closeFrameModal(); });
+    frameModal = m;
+  }
+  // One Escape listener for the app, not one per mounted page: the modal itself is
+  // module-level now, so its key handling belongs here too. A page's own modal (the
+  // Activity player) keeps its own handler; this one is a no-op when nothing is open.
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFrameModal(); });
+
   // Per-visit aggregates block, same three rows (and same wording) as the user dashboard.
   function statsHtml(det) {
     if (!det) return '';
@@ -1119,13 +1175,17 @@
       if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div>${paramList(params, live, available)}</div>`;
       const split = sc.split
         ? sline([['Day', rpct(sc.split.day.caught, sc.split.day.total)], ['Night', rpct(sc.split.night.caught, sc.split.night.total)]]) : '';
-      // Only offer the panel when there is something in it AND the backend actually
-      // sent the records (an older compute build answers the `missed` param with
-      // nothing, and a dead button is worse than no button — changelog 164's lesson).
+      // Offer the panel when there is something in it AND the backend sent the records.
+      // When there ARE misses but no records, SAY SO rather than rendering nothing:
+      // FastAPI ignores an unknown `missed` query param, so an un-updated compute PC
+      // answers 200 with no list, and silence there reads as "this feature doesn't
+      // exist" instead of "your backend is behind" (changelog 164's lesson — and the
+      // dev proxy serves a LOCAL admin-next against a REMOTE compute, so it is routine).
       const nMissed = sc.visits.wholly_missed;
-      const btn = (nMissed > 0 && Array.isArray(sc.missed_visits))
-        ? `<button class="mv-btn" data-col="${key}" style="margin-top:10px;width:100%">Show missed (${fmtInt(nMissed)})</button>`
-        : '';
+      const btn = nMissed === 0 ? ''
+        : Array.isArray(sc.missed_visits)
+          ? `<button class="mv-btn" data-col="${key}" style="margin-top:10px;width:100%">Show missed (${fmtInt(nMissed)})</button>`
+          : '<div class="note" style="margin-top:10px">Missed-visit review needs a newer compute build — pull + restart it.</div>';
       return `<div class="stat">
         <div class="k">${title}</div>
         <div class="v">${rpct(sc.visits.caught, sc.visits.total)}</div>
@@ -1172,6 +1232,20 @@
     // candidate recovered simply disappears.
     const COL_TITLE = { live: 'Live gate', baseline: 'Baseline', candidate: 'Candidate' };
     const MV_STRIP_MAX = 24;                   // tiles per visit; a longer visit decimates
+    // The four gate reject paths, listed by BLOB SIZE (nothing → under-min → in-band →
+    // over-max) so a split reads as a distribution rather than an arbitrary order. The
+    // hint says what actually happened: "near zero" alone doesn't explain itself.
+    const MISS_ORDER = ['near_zero', 'below_min', 'in_band', 'above_max'];
+    const MISS_REASON = {
+      near_zero: { label: 'No foreground found', short: 'none',
+        hint: 'MOG2 saw almost nothing — the cat was likely read as a SHADOW (dark cat on a lighter floor) or absorbed into the background. Lowering var threshold helps at the margin; a true shadow no parameter recovers.' },
+      below_min: { label: 'Blob under min area', short: 'small',
+        hint: 'A real blob, but smaller than min area — a distant, partial or half-entered cat.' },
+      above_max: { label: 'Blob over max area', short: 'large',
+        hint: 'The blob was bigger than max area fraction, so the gate discarded it as a whole-ROI light change. Typical of a cat directly under a top-down camera.' },
+      in_band: { label: 'Debounce dropped it', short: 'debounce',
+        hint: 'The blob was inside the band — only the persistence streak stopped it firing.' },
+    };
     let lastCompare = null, openCol = null, mvObserver = null;
 
     function closeMissed() {
@@ -1202,10 +1276,16 @@
       const caveat = spans.length
         ? `<p class="note warn" style="margin:0 0 10px">Misses are <b>unmeasurable</b> across ${spans.length} span${spans.length === 1 ? '' : 's'} of this window — it was captured motion-only, or a cleanup purge stripped its non-motion frames. Anything the gate missed there was never stored.</p>`
         : '';
+      // A backend that sends records but no `reason` is the in-between build: it has
+      // the missed-visit list but not the per-frame MOG2 attribution. Say which half is
+      // missing, rather than just quietly omitting every why-line.
+      const stale = recs.length && !recs[0].reason
+        ? '<p class="note" style="margin:0 0 10px">Per-frame MOG2 attribution (why each visit was missed) needs a newer compute build — pull + restart it.</p>'
+        : '';
       const head = `<div class="row" style="margin-bottom:10px">
           <b class="grow">${COL_TITLE[col] || col} — ${fmtInt(recs.length)} missed visit${recs.length === 1 ? '' : 's'}</b>
           <button id="mvClose">Close</button>
-        </div>${caveat}`;
+        </div>${caveat}${stale}`;
       const body = recs.length
         ? recs.map((r, i) => mvRowHtml(r, i)).join('')
         : '<span class="note">No wholly-missed visits in this window for this column.</span>';
@@ -1230,7 +1310,28 @@
           <span class="grow"></span>
           <span class="note">#${fmtInt(r.start_id)}–${fmtInt(r.end_id)}</span>
         </div>
+        ${whyHtml(r)}
         <div class="mv-body"><div class="mv-ph"><img loading="lazy" src="/media/${r.rep_frame_id}" alt=""></div></div>
+      </div>`;
+    }
+    // Why the gate dropped this visit, and the knob that would recover it. The reason
+    // is the dominant bucket across the visit's own frames (server-side, against the
+    // params THAT column ran with), with the full split beside it so a mixed visit
+    // isn't reduced to a single word.
+    function whyHtml(r) {
+      if (!r.reason || !r.buckets) return '';       // older compute build — say nothing
+      const b = MISS_REASON[r.reason] || { label: r.reason, hint: '' };
+      const split = MISS_ORDER.filter((k) => r.buckets[k]).map((k) =>
+        `<span class="mv-b"><i class="mv-dot ${k}"></i>${(MISS_REASON[k] || {}).short || k} ${fmtInt(r.buckets[k])}</span>`).join('');
+      const fix = r.fix
+        ? `<span class="mv-fix ${r.reason === 'near_zero' ? 'weak' : ''}">${MOG2_LABEL[r.fix.param] || r.fix.param} ${r.fix.direction === 'up' ? '↑ raise' : '↓ lower'}</span>`
+        : '';
+      return `<div class="mv-why">
+        <span class="mv-reason"><i class="mv-dot ${r.reason}"></i>${b.label}</span>
+        ${fix}
+        <span class="mv-split">${split}</span>
+        <span class="grow"></span>
+        <span class="note mv-hint">${b.hint}</span>
       </div>`;
     }
     // Each row fetches its own strip, and only once it scrolls into view: the list is
@@ -1263,8 +1364,18 @@
           const span = rec.end_id - rec.start_id + 1;
           const note = frames.length < span
             ? `<div class="note" style="margin-bottom:6px">${fmtInt(frames.length)} of ${fmtInt(span)} frames in this visit's span (sampled)</div>` : '';
-          body.innerHTML = note + `<div class="fgrid mv-strip">${frames.map((f) => mvTileHtml(f)).join('')}</div>`;
+          // The visit's own per-frame MOG2 readings, keyed by frame id: the strip spans
+          // the whole id range, so the frames BETWEEN detections have no reading and
+          // correctly get no chip (they were not part of the miss).
+          const mog = new Map((rec.frames || []).map((x) => [x.id, x]));
+          body.innerHTML = note + `<div class="fgrid mv-strip">${frames.map((f) => mvTileHtml(f, mog.get(f.id))).join('')}</div>`;
           placeBoxes(body);
+          // Click a tile to enlarge it, the same modal Frame review opens. The strip
+          // is rendered in `frames` order, so the tile index indexes straight back in.
+          body.querySelectorAll('.ftile').forEach((t, i) => t.addEventListener('click', () => {
+            const f = frames[i];
+            openFrameModal(f, `${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detLabel(f)} · missed visit ${fmtClock(rec.start_ts)}`);
+          }));
         } catch (e) {
           if (alive && openCol === myCol) body.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
         }
@@ -1284,13 +1395,33 @@
       mvObserver = obs;
       root.querySelectorAll('.mv-row').forEach((el) => obs.observe(el));
     }
-    function mvTileHtml(f) {
+    // `m` is this frame's MOG2 reading ({area, bucket}) when it is one of the visit's
+    // detected frames; absent for the in-between frames the id span also covers.
+    function mvTileHtml(f, m) {
       const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
       const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
+      const r = MISS_REASON[m && m.bucket] || {};
+      // Area as a % of the ROI, the unit min_area / max_area_fraction are also in, so
+      // the number can be read straight against the fields above.
+      const chip = m
+        ? `<span class="mv-area ${m.bucket}" title="${esc(`largest blob = ${fmtArea(m.area)} of the ROI — ${r.label || m.bucket}`)}"><i class="mv-dot ${m.bucket}"></i>${fmtArea(m.area)}</span>`
+        : '';
       return `<div class="ftile">
-        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${frameDetChip(f, 'at-br')}</div>
+        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${frameDetChip(f, 'at-br')}
+          ${chip ? `<div class="tchips">${chip}</div>` : ''}</div>
         <div class="fmeta"><span>${fmtClock(f.recv_ts)}</span><span>#${f.id}</span></div>
       </div>`;
+    }
+    // Blob area as a percentage of the ROI. Sub-0.1% areas (the near-zero case) would
+    // all read "0.0%", so they fall back to 2 significant digits — "MOG2 measured
+    // something tiny" and "MOG2 measured nothing" are different diagnoses.
+    function fmtArea(a) {
+      if (a == null) return '—';
+      const p = a * 100;
+      if (p === 0) return '0%';
+      // Number() drops toPrecision's trailing zeros ("0.050" -> 0.05), so a tiny area
+      // reads 0.05% rather than 0.050%.
+      return (p < 0.1 ? String(Number(p.toPrecision(2))) : p.toFixed(1)) + '%';
     }
 
     // --- Queue tables (the shared renderer, fed from the analysis status poll) ---
@@ -1356,7 +1487,8 @@
     const timer = setInterval(pollJob, 3000);
     // Disconnect the strip observer on nav: it holds refs to this view's rows, and an
     // in-flight strip fetch must not paint into a torn-down DOM (`alive` guards that).
-    return () => { alive = false; clearInterval(timer); if (mvObserver) mvObserver.disconnect(); };
+    // The enlarge modal lives on document.body, so it outlives the view unless closed.
+    return () => { alive = false; clearInterval(timer); if (mvObserver) mvObserver.disconnect(); closeFrameModal(); };
   }
 
   // =======================================================================
@@ -1403,7 +1535,6 @@
     let alive = true;
     let frames = [];
     let filter = 'all';
-    let modal = null;
 
     // datetime-local speaks LOCAL wall-clock in both directions, so a plain
     // new Date(value) round-trips it against the store's epoch-ms timestamps.
@@ -1445,27 +1576,17 @@
       placeBoxes(grid);
       grid.querySelectorAll('.ftile').forEach((t) => t.addEventListener('click', () => openFrame(Number(t.dataset.i))));
     }
-    function closeModal() { if (modal) { modal.remove(); modal = null; } }
+    // The modal itself (and its Escape handling) is the shared openFrameModal; this
+    // page only supplies the meta line, which is the richest of them — it is the one
+    // grid that loads identity and the motion/corrupt review flags.
     function openFrame(idx) {
-      const f = frames[idx]; closeModal();
+      const f = frames[idx];
       const idTxt = identityKind(f.identity)
         ? `${identityKind(f.identity)}${f.identity.cat_name ? ' · ' + f.identity.cat_name : ''}${f.identity.distance != null ? ' (d=' + f.identity.distance.toFixed(3) + ')' : ''}`
         : 'no identity';
-      const detTxt = detLabel(f);
-      const band = bandOf(f.score);
       const marks = [f.motion ? 'motion' : '', f.corrupt ? 'CORRUPT' : (f.corrupt === null ? 'corruption not measured' : '')].filter(Boolean).join(' · ');
-      modal = document.createElement('div'); modal.className = 'fmodal';
-      modal.innerHTML = `<div class="inner">
-        <div class="fimg"><img src="${f.url}" ${f.box ? `data-box='${JSON.stringify(f.box)}'` : ''}>${f.box
-          ? `<div class="fbox ${band}" hidden><span class="boxcap ${band}">${detTxt}</span></div>` : ''}</div>
-        <div class="note" style="margin-top:8px">${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detTxt} · id: ${esc(idTxt)}${marks ? ' · ' + marks : ''}</div>
-      </div>`;
-      document.body.appendChild(modal);
-      placeBoxes(modal);
-      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+      openFrameModal(f, `${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detLabel(f)} · id: ${esc(idTxt)}${marks ? ' · ' + marks : ''}`);
     }
-    function onKey(e) { if (e.key === 'Escape') closeModal(); }
-    document.addEventListener('keydown', onKey);
 
     $('#fFilters', view).addEventListener('click', (e) => {
       const b = e.target.closest('button[data-f]'); if (!b) return;
@@ -1547,7 +1668,7 @@
         $('#fScope', view).textContent = `store: ${fmtTs(st.oldest_ts)} → ${fmtTs(st.newest_ts)}`;
       } catch (_) {}
     })();
-    return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };
+    return () => { alive = false; closeFrameModal(); };
   }
 
   // =======================================================================

@@ -131,6 +131,57 @@ _EVENT_SCAN_FRAMES = 200_000
 # (YOLO vs BSUV) and ignores the ``oracle`` argument.
 _VISIT_MODES = ("missed", "false", "conflict")
 
+# Why one missed FRAME was dropped, and which MOG2 knob would recover it. The four
+# buckets mirror the gate's own reject paths in ``shared.motion.MotionGate.process``
+# (``min_area <= area <= max_area_fraction``, then the persistence debounce), so a
+# bucket names the exact test the frame failed:
+#
+#   near_zero  area < min_area/10 — MOG2 found essentially NO foreground. Usually the
+#              blob was classified as a SHADOW (detectShadows=True marks it grey 127
+#              and the 254 threshold drops it — the classic dark-cat-on-lighter-floor
+#              case) or it was absorbed into the background. Lowering var_threshold
+#              helps at the margin; a true shadow classification NO param recovers,
+#              which is why the UI renders this one's fix as a hedge, not a
+#              prescription (the other three are genuine one-knob fixes).
+#   below_min  min_area/10 <= area < min_area — a real but sub-threshold blob.
+#   above_max  area > max_area_fraction — rejected as a whole-ROI illumination jump.
+#              The common top-down case: a cat directly under the camera fills the ROI.
+#   in_band    min_area <= area <= max_area_fraction yet still no motion, so ONLY the
+#              persistence debounce dropped it (the streak never reached the count).
+#
+# NOTE these are EXCLUSIVE (each frame lands in exactly one), unlike
+# ``gate_scorecard``'s window-wide ``area_buckets`` where near_zero is a SUBSET of
+# below_min. Per-visit attribution wants a partition; the window-wide counts want the
+# subset relationship they have always had.
+_MISS_BUCKETS = ("near_zero", "below_min", "above_max", "in_band")
+_MISS_FIX = {
+    "near_zero": {"param": "var_threshold", "direction": "down"},
+    "below_min": {"param": "min_area", "direction": "down"},
+    "above_max": {"param": "max_area_fraction", "direction": "up"},
+    "in_band": {"param": "persistence", "direction": "down"},
+}
+# Tie-break when two buckets hold the same frame count: most specific diagnosis first.
+# above_max is unambiguous; near_zero beats below_min because at ~0 area lowering
+# min_area buys nothing; in_band last (it only ever means "the debounce dropped it").
+_MISS_BUCKET_PRIORITY = ("above_max", "near_zero", "below_min", "in_band")
+
+
+def classify_miss(area: "float | None", min_area: float, max_area: float) -> str:
+    """Which ``_MISS_BUCKETS`` reject path one missed frame's blob ``area`` fell down.
+
+    Mirrors ``MotionGate.process``'s band test exactly. A NULL/absent area (no stored
+    reading) is treated as 0.0 — i.e. ``near_zero``, "MOG2 saw nothing" — which is
+    what an absent measurement means here, not an unknown to be hidden.
+    """
+    a = 0.0 if area is None else float(area)
+    if a > max_area:
+        return "above_max"
+    if a < min_area / 10.0:
+        return "near_zero"
+    if a < min_area:
+        return "below_min"
+    return "in_band"
+
 # Annotation-tool enums for the durable ``dataset_items`` table (see the
 # cat-identity annotation-tool spec). ``label_kind`` is the NOT NULL discriminator
 # (``cat_id`` set only for ``identified``); ``quality`` is the per-crop signal a
@@ -2627,12 +2678,15 @@ class Store:
                 # window) — in time order, not the whole scored set. The third column
                 # is the floored present flag, not the raw verdict, so a below-floor
                 # detection that coincides with motion can't masquerade as present.
-                # Columns 4-5 (f.id, o.score) are carried ONLY so ``missed_visits``
-                # can name each wholly-missed span's frames and pick its rep; the
-                # counting paths ignore them, reading rows positionally (r[0..2]).
+                # Columns 4-6 (f.id, o.score, the SOURCE area) are carried ONLY so
+                # ``missed_visits`` can name each wholly-missed span's frames, pick its
+                # rep, and attribute each frame to the gate test it failed; the counting
+                # paths ignore them, reading rows positionally (r[0..2]). The area is
+                # ``src_area``, not ``f.area``, so a slot column attributes against the
+                # SLOT's own re-run rather than the live gate's stored reading.
                 interesting = self._conn.execute(
                     f"SELECT f.recv_ts, {src_motion}, CASE WHEN {present_core} THEN 1 ELSE 0 END,"
-                    " f.id, o.score" + base_from
+                    f" f.id, o.score, {src_area}" + base_from
                     + " WHERE f.id >= ?" + scope_and + f" AND ({present_core} OR {src_motion} = 1)"
                     " ORDER BY f.recv_ts ASC, f.id ASC",
                     join_params + [threshold_id] + scope_params,
@@ -2685,8 +2739,12 @@ class Store:
             }
         if missed_visits:
             # Built from the SAME warmed-up ``interesting`` rows the counts above
-            # use, so len(...) == card["visits"]["wholly_missed"] structurally.
-            card["missed_visits"] = self._missed_visit_records(interesting, is_night)
+            # use, so len(...) == card["visits"]["wholly_missed"] structurally. The
+            # thresholds are this source's own (the ones the area buckets above use),
+            # so a slot's per-frame attribution is against the params IT ran with.
+            card["missed_visits"] = self._missed_visit_records(
+                interesting, is_night, min_area, max_area
+            )
         return card
 
     @staticmethod
@@ -2818,7 +2876,11 @@ class Store:
 
     @classmethod
     def _missed_visit_records(
-        cls, interesting: "list", is_night: "Callable[[int], bool] | None"
+        cls,
+        interesting: "list",
+        is_night: "Callable[[int], bool] | None",
+        min_area: float,
+        max_area: float,
     ) -> "list[dict]":
         """Per-visit records for the WHOLLY-MISSED visits ``_cluster_visits`` counts.
 
@@ -2831,7 +2893,21 @@ class Store:
         Returns, per uncaught visit::
 
             {start_id, end_id, start_ts, end_ts, n_present, rep_frame_id,
-             peak_score[, night]}
+             peak_score, buckets, reason, fix, frames[, night]}
+
+        ``frames`` is the visit's present frames as ``{id, area, bucket}`` — the
+        SOURCE area (``f.area`` live, the slot's own ``score`` for a re-run) and which
+        gate test it failed (``classify_miss``). ``buckets`` counts them, ``reason`` is
+        the dominant bucket (``_MISS_BUCKET_PRIORITY`` breaks ties) and ``fix`` is the
+        ``{param, direction}`` that would recover it — so a row can say "raise
+        max_area_fraction" instead of leaving the operator to infer it. These per-visit
+        buckets are EXCLUSIVE, unlike the window-wide ``area_buckets`` (see
+        ``_MISS_BUCKETS``).
+
+        Payload note: ``frames`` makes the response O(total missed FRAMES) rather than
+        O(missed visits). Fine at real miss counts (a few scalars each), but a window
+        where the gate missed everything, with long lingering visits, ships a
+        correspondingly large list — the deliberate cost of never truncating.
 
         ``start_id``/``end_id`` bound the visit's present frames — load-bearing,
         since the UI fetches the strip via ``/api/frames/sample?since_id=&until_id=``.
@@ -2860,6 +2936,25 @@ class Store:
                 continue
             ids = [int(r[3]) for r in run]
             rep = max(run, key=lambda r: (r[4] if r[4] is not None else float("-inf"), r[3]))
+            # Attribute every present frame to the gate test it failed, then let the
+            # dominant bucket name the knob. Counted per VISIT (not window-wide), so a
+            # single lingering miss can't drown out four separate short ones the way
+            # the frame-weighted ``area_buckets`` does.
+            frames = [
+                {
+                    "id": int(r[3]),
+                    "area": (float(r[5]) if r[5] is not None else None),
+                    "bucket": classify_miss(r[5], min_area, max_area),
+                }
+                for r in run
+            ]
+            counts = {b: 0 for b in _MISS_BUCKETS}
+            for fr in frames:
+                counts[fr["bucket"]] += 1
+            reason = max(
+                _MISS_BUCKET_PRIORITY,
+                key=lambda b: (counts[b], -_MISS_BUCKET_PRIORITY.index(b)),
+            )
             record = {
                 "start_id": min(ids),
                 "end_id": max(ids),
@@ -2868,6 +2963,10 @@ class Store:
                 "n_present": len(run),
                 "rep_frame_id": int(rep[3]),
                 "peak_score": (float(rep[4]) if rep[4] is not None else None),
+                "buckets": counts,
+                "reason": reason,
+                "fix": dict(_MISS_FIX[reason]),
+                "frames": frames,
             }
             if is_night is not None:
                 record["night"] = bool(is_night(lo_ts))

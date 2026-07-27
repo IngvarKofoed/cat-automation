@@ -4,6 +4,10 @@
 - [x] Running mog2:candidate — 22981/154235 · 0.4 fps · ~101h 10m left · Day07
 
 
+WARNING 'half' is deprecated and will be removed in the future. Use 'quantize' instead.
+
+
+
 For the new admin
 1) Actiity page: YOLO dection box in admin-new is flickering. It seems to work better in the user page
 2) Actiity page: Remove the "det 100%" pill and use the same traffic light circle next to the label, also please Caps the labels
@@ -20,7 +24,7 @@ For the new admin
 13) Motion tuning page: At the bottom, list each of the MOG2 parameters in most important order and have a little description of each of them.  
 14) Motion tuning page: Could we remove the _ from the MOG2 parameter names and start Caps them?
 
-1) These "Recall
+1) Motion tuning page: These "Recall
 78/90 visits
 Missed
 1,110
@@ -30,6 +34,7 @@ Day
 94%
 Night
 22%" should not be all caps, just start with cap
+2) Motion tuning page: In "Scorecards", is it possible to, for each "Live gate", "Baseline" and "Candidate", below The stats, to show the MOG2 parameters that was used and highlight those that have changed compated to the "Live gate"
 
 
 

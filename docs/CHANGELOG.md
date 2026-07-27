@@ -1042,3 +1042,32 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      it is labelled against the span width, not the detection count: `sample_frames` decimates by a
      STRIDE and returns fewer frames than the `count` asked for, so "did it sample?" can't be tested
      against that count.
+
+169. Clicking a frame in a missed-visit filmstrip enlarges it, and the enlarge modal is now ONE
+     module-level `openFrameModal` shared with Frame review rather than a second copy — the pages
+     differ only in the meta line they pass (Frame review's adds identity + the motion/corrupt
+     markers; a tuning strip has just the detection). Escape is one app-level listener now that the
+     modal outlives any single view; the Activity player keeps its own, since it also stops playback.
+
+170. A missed visit now says WHY the gate dropped it and which knob to turn. Each record carries its
+     frames' MOG2 blob `area` bucketed into the gate's four actual reject paths — `near_zero`,
+     `below_min`, `above_max`, `in_band` — with the dominant one as `reason` and a `{param, direction}`
+     `fix` (e.g. above_max → raise max_area_fraction, the common top-down "cat fills the ROI" case).
+     `in_band` means the area PASSED the band and only the persistence debounce dropped it.
+
+171. That attribution uses each column's OWN area — `f.area` for Live, the slot's `analysis.score` for
+     a re-run — so Live and Candidate can name different knobs for the same visit. Buckets are
+     per-visit and EXCLUSIVE (they sum to `n_present`), unlike `gate_scorecard`'s window-wide
+     `area_buckets` where `near_zero` is a subset of `below_min` and one long visit dominates the
+     frame-weighted totals. New `classify_miss` mirrors `MotionGate.process`'s band test.
+
+172. `near_zero` is presented as a hedge, not a prescription: MOG2 finding ~no foreground usually means
+     the cat was classified as a SHADOW (`detectShadows=True` marks it grey 127, the 254 threshold
+     drops it — a dark cat on a lighter floor), which NO tunable param recovers. Lowering var_threshold
+     helps only at the margin, so the UI renders that one fix dashed and says so.
+
+173. Missed-visit review names a BEHIND BACKEND instead of vanishing. FastAPI ignores an unknown
+     `missed` query param, so an un-updated compute PC answers 200 with no records — and the button
+     simply not rendering reads as "no such feature" (entry 164's lesson, re-learned). Two states now
+     say which half is missing: no records at all, and records without the per-frame attribution.
+     Routine, not hypothetical — the dev proxy serves a LOCAL admin-next against a REMOTE compute.

@@ -1498,6 +1498,7 @@ class Store:
         self, since_id: "int | None", until_id: "int | None", count: int,
         detections: "str | None" = None,
         identify: bool = False,
+        flags: bool = False,
     ) -> "list[dict]":
         """~``count`` frames evenly spread across ``[since_id, until_id]`` by INDEX, id ASC.
 
@@ -1529,9 +1530,18 @@ class Store:
         frame has an embeddable identification row for the active model, else
         ``None`` (no active model, or the frame is un-identified / un-embeddable).
 
-        With BOTH ``detections is None`` and ``identify`` false the shape is EXACTLY
-        ``{"id", "recv_ts", "url"}`` and no extra read runs, so the density/buckets
-        viewers are byte-identical; the two overlays compose independently otherwise.
+        ``flags`` (a flag) OPTIONALLY attaches the two per-frame REVIEW markers a grid
+        outlines its tiles by: ``motion`` (bool — the edge gate fired on this frame, read
+        straight off ``frames.motion``) and ``corrupt``, which is TRI-STATE:
+        ``True``/``False`` from a stored ``corruption`` verdict, or ``None`` when no
+        corruption sweep has reached the frame. ``None`` must NOT be shown as clean —
+        that is the "an empty danger set reads as safe" trap the corruption page calls
+        out; it means unmeasured.
+
+        With ALL of ``detections is None``, ``identify`` false and ``flags`` false the
+        shape is EXACTLY ``{"id", "recv_ts", "url"}`` and no extra read runs, so the
+        density/buckets viewers are byte-identical; the overlays compose independently
+        otherwise.
         """
         count = max(1, min(int(count), _MAX_SAMPLE))
         frags, params = _range_bounds("id", since_id, until_id)
@@ -1549,16 +1559,18 @@ class Store:
                 return []
             stride = max(1, math.ceil(matched / count))
             rows = self._conn.execute(
-                "SELECT id, recv_ts FROM ("
-                "  SELECT id, recv_ts, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM frames"
+                "SELECT id, recv_ts, motion FROM ("
+                "  SELECT id, recv_ts, motion, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM frames"
                 + clause +
                 ") WHERE (rn - 1) % ? = 0 ORDER BY id ASC",
                 params + [stride],
             ).fetchall()
             out = [{"id": int(r[0]), "recv_ts": r[1], "url": f"/media/{int(r[0])}"} for r in rows]
-            if detections is None and not identify:
+            if detections is None and not identify and not flags:
                 # Byte-identical {id, recv_ts, url} path: no overlay requested, no
-                # extra read, so the density/buckets viewers are untouched.
+                # extra read, so the density/buckets viewers are untouched. `motion`
+                # rides along in the SELECT (free — same row) but is only surfaced
+                # under `flags`, so this shape is unchanged.
                 return out
             # Either overlay reads ONLY the sampled ids (bounded by `count` <=
             # _MAX_SAMPLE), so both are one indexed read over the same id set.
@@ -1574,6 +1586,18 @@ class Store:
                         "SELECT frame_id, detail FROM analysis"
                         " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
                         [detections] + ids,
+                    ).fetchall()
+                }
+            corrupt_by_id: "dict[int, bool] | None" = None
+            if flags:
+                # The corruption sweep's verdict per sampled frame. A frame with NO row
+                # is absent from the map and reads `None` below (unmeasured), never False.
+                corrupt_by_id = {
+                    int(fid): bool(verdict)
+                    for fid, verdict in self._conn.execute(
+                        "SELECT frame_id, verdict FROM analysis"
+                        " WHERE analyzer = ? AND frame_id IN (" + placeholders + ")",
+                        [_CORRUPTION_ANALYZER] + ids,
                     ).fetchall()
                 }
             ident_by_id: "dict[int, tuple[int, float]]" = {}
@@ -1599,6 +1623,10 @@ class Store:
         # Attach the requested overlay(s) outside the lock (pure Python over the
         # fetched rows). They compose: a frame can carry both a detection box and an
         # identity, keyed independently on the sampled id.
+        if flags:
+            for f, r in zip(out, rows):
+                f["motion"] = bool(r[2])
+                f["corrupt"] = corrupt_by_id.get(f["id"])
         if detections is not None:
             for f in out:
                 if f["id"] not in detail_by_id:

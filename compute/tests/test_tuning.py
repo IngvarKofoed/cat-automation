@@ -504,14 +504,17 @@ def test_tuning_compare_populated_assembles_cards_deltas_fidelity(make_app):
 
 
 def test_tuning_compare_no_split_param_has_no_split_metadata(make_app):
-    # Even with a location set, an unasked call adds nothing new — the byte-identical
-    # contract: exactly the pre-split key set, no per-scorecard "split".
+    # Even with a location set, an unasked call adds NO SPLIT metadata: no `split_*` top
+    # level keys and no per-scorecard "split". `params` is unconditional (it does not
+    # depend on the split), so it is part of the base key set here.
     client, store = make_app(client=NoConfigClient())
     store.set_location(55.6, 12.5)
     _seed(store, slots=())
 
     body = client.get("/api/tuning/compare", params={"oracle": "yolo"}).json()
-    assert set(body.keys()) == {"oracle", "live", "baseline", "candidate", "fidelity", "deltas"}
+    assert set(body.keys()) == {
+        "oracle", "live", "baseline", "candidate", "fidelity", "deltas", "params",
+    }
     assert "split" not in body["live"]
 
 
@@ -748,3 +751,48 @@ def test_tuning_rerun_absent_scope_forwards_none(tmp_path):
 
     _poll_until_done(client)
     assert store.analysis_summary("mog2:baseline")["analyzed"] == 3
+
+
+# --- GET /api/tuning/compare: the per-column `params` block ----------------------
+#
+# Each scorecard column carries the params that PRODUCED it, so a UI shows what a
+# column was actually run with rather than whatever is currently typed in its fields
+# (those diverge the moment the operator edits after a re-run). All three columns speak
+# the EDGE vocabulary, so they can be diffed key-for-key against the live gate.
+
+
+def test_tuning_compare_params_live_is_the_edge_config(make_app):
+    client, store = make_app(client=ConfigClient({
+        "var_threshold": 12.0, "learning_rate": 0.005, "min_area": 0.003,
+        "max_area_fraction": 0.7, "persistence": 1, "motion_downscale": 400,
+    }))
+    _seed(store, slots=())
+
+    params = client.get("/api/tuning/compare", params={"oracle": "yolo"}).json()["params"]
+    assert params["live"]["var_threshold"] == 12.0
+    assert params["live"]["motion_downscale"] == 400
+    # Slots that never ran have no params to report — not the edge config masquerading
+    # as theirs, which would read as "the slot ran with these".
+    assert params["baseline"] is None
+    assert params["candidate"] is None
+
+
+def test_tuning_compare_params_slot_uses_the_edge_vocabulary(make_app):
+    """A slot stores ``MotionParams.downscale``; the response must say ``motion_downscale``.
+
+    Without the rename a caller diffing a slot against the live config finds no
+    ``motion_downscale`` on the slot side and silently drops that knob.
+    """
+    client, store = make_app(client=NoConfigClient())
+    _seed(store, slots=("mog2:baseline", "mog2:candidate"))
+
+    params = client.get("/api/tuning/compare", params={"oracle": "yolo"}).json()["params"]
+    for slot in ("baseline", "candidate"):
+        assert params[slot]["motion_downscale"] == 256, slot
+        assert "downscale" not in params[slot], slot
+        # The five same-named knobs come through untouched.
+        assert params[slot]["var_threshold"] == 20.0
+        assert set(params[slot]) == {
+            "var_threshold", "learning_rate", "min_area",
+            "max_area_fraction", "persistence", "motion_downscale",
+        }

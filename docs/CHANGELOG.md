@@ -930,3 +930,88 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      Name widest, then Frames, then Status, with % done / FPS / ETA narrowest. Auto-widths had sized each
      card's table to its own rows, so the same columns landed in different places per card. "Time to
      complete" is now "ETA". Cleanup's Drop/Sweep lost their `…` and share one width. Presentation only.
+
+152. admin-next Activity now NAMES the cat it identified, and "Hide our cats" actually hides them.
+     `events()`'s identity carries no `resolved` key (only the per-frame overlay does), so the
+     `id.resolved` test never matched: every visit fell through to its subject chip and the
+     resident filter was a silent no-op. A shared `identityKind` derives the kind from
+     `cat_id`/`is_resident` when `resolved` is absent, so both feeds agree.
+
+153. Frame review and Activity now render ONE shared overview tile — same fonts, same 12px chips,
+     same box colours — so the two grids can't drift. Detection boxes and labels use the USER
+     dashboard's traffic light (red <40% · amber <65% · green) and its identity palette, duplicated
+     into admin-next per the entry-80 no-shared-CSS convention: change them together.
+     The YOLO label distinguishes "no det" (swept, nothing found) from "unswept" (never analysed).
+     Chips sit in a WRAPPING row, not pinned to opposite corners, which silently overlapped on a
+     narrow tile or a long cat name.
+
+154. Frame review is scoped by a start instant + a 1/5/10/15/30/60-min timespan (the corruption
+     page's picker shape) instead of a whole day, so an operator can land on the minute a visit
+     happened. The frame-count field is gone; the window's own width bounds the grid.
+     It now reports `N of M loaded (sampled)` from the window's real frame total — the sample is
+     decimated above 500 and complete below it, and the response alone can't tell the two apart —
+     plus how much of the window YOLO has swept, which is what the "unswept" chips reflect.
+
+155. Activity opens a visit on a SINGLE click (matching the user dashboard; the double-click of
+     entry 47 stays on the old `/admin`), and its player shows the same three per-visit aggregates
+     the user dashboard does — rate / peak / mean, with `—` for not-measured — under a band-coloured
+     box whose class + confidence caption sits at the box's own corner.
+
+156. admin-next playback no longer draws a GHOST detection box: `show()` cleared `fb` per frame but
+     left `img.onload` pointing at the previous frame's placement closure, so a box-less frame — which
+     never reassigns it — had the stale handler fire on its own load and paint the prior frame's box
+     under a "no detection" caption. `onload` is now reset before each `src` swap.
+     Also: the annotation rep-frame box lost its colour when `.fbox.warn` was replaced by the
+     `tl-*` traffic light; it now bands by the rep detection's own score and reuses `placeBoxes`.
+     That score is shown as "rep %" beside the visit's "peak %" — the rep can sit far below the
+     peak, so otherwise the border colour is a number the operator has no way to read.
+
+157. `GET /api/frames/sample?flags=1` attaches the two per-frame REVIEW markers a grid outlines tiles by:
+     `motion` (off `frames.motion`) and a TRI-STATE `corrupt` — True/False from a stored `corruption`
+     verdict, `None` where no corruption sweep has reached the frame. `None` is deliberately not False:
+     showing unmeasured as clean is the "an empty danger set reads as safe" trap of entry 97.
+     Additive — without the flag the payload is byte-identical.
+
+158. `GET /api/tuning/compare` now reports the params BEHIND each column (`params.{live,baseline,candidate}`),
+     so a UI shows what a scorecard was produced by instead of whatever is currently typed in the fields —
+     those diverge the moment the operator edits after a re-run. All three are normalised to the EDGE
+     vocabulary: a slot stores `MotionParams.downscale`, and without the rename a key-for-key diff would
+     silently drop `motion_downscale`. A slot that never ran reports null, not the edge config as if it were its own.
+
+159. admin-next Frame review outlines each tile by those markers — blue = the gate saw motion, violet =
+     corrupt, and corruption WINS (a corrupt frame's motion verdict isn't trustworthy). The legend says
+     an unmarked frame is unmeasured, not proven clean.
+     The YOLO pill moved to the tile's lower right, all tile labels are caps, and "unswept" is now
+     "NOT ANALYSED" (dimmed and dot-less — the least interesting state, and the one that fills every tile
+     of a window YOLO hasn't reached), still distinct from a measured "NO DETECTION".
+
+160. admin-next Activity playback no longer flickers its detection box. It hid the box and re-drew it on
+     every frame's load — a hide/show cycle 5× a second. Natural dimensions are now learned ONCE and
+     cached (every stored frame shares the camera's post-transform size), so the box is drawn
+     synchronously per frame, as the user dashboard already did. Measured: 2 visibility transitions across
+     ~15 played frames (the one genuinely box-less frame) instead of one pair per frame.
+     This also makes a stale box structurally impossible — the box is drawn from the frame being shown,
+     not from a closure the previous frame left on `onload` (entry 156's fix, now unnecessary).
+
+161. admin-next Activity cards trade the "det NN%" pill for the user dashboard's traffic-light circle
+     beside the label (same weakest-of-three band; the three numbers stay in the tooltip and in the
+     playback stats), and caps their labels.
+
+162. admin-next Motion tuning: MOG2 params are now displayed as "Var threshold", not `var_threshold`, in
+     ONE priority order everywhere — fields, per-scorecard readouts, and a new bottom reference card that
+     ranks each knob with which way to turn it and what it does (ported from `/admin`'s hints). Keys on the
+     wire stay snake_case; only the display changed.
+     Each scorecard now ends with the params that produced it, with every value differing from the live
+     gate marked amber — so "what did I change" is answerable without diffing two columns by eye. The
+     copy-to-edge param line is gone (redundant), stat labels are small-caps, and the headings are
+     "Last 4 weeks" / "YOLO" / "Scorecards"; calendar cells spell out YOLO/BASE/CAND now that the
+     header carries no legend.
+
+163. Scorecard stat labels are sentence case ("Recall", "Missed") — five short all-caps words
+     shouted over the numbers they label. The `.stat .k` column titles keep their caps.
+
+164. A scorecard whose compare response carries NO `params` now says so ("this compute build
+     predates the per-column params field; pull + restart it") instead of silently rendering
+     nothing, which read as the feature being absent. Distinct from a slot that HAS no recorded
+     params because it never re-ran. The case is real, not hypothetical: the dev proxy serves a
+     LOCAL admin-next against a REMOTE compute, so the page routinely runs ahead of its backend.

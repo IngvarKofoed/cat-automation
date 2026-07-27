@@ -547,6 +547,25 @@ def _read_slot_params(store: Store, slot: str) -> "dict | None":
     return params if isinstance(params, dict) else None
 
 
+def _slot_params_edge_vocab(store: Store, slot: str) -> "dict | None":
+    """A slot's recorded params, renamed into the EDGE vocabulary, or ``None``.
+
+    ``MogAnalyzer`` stores ``MotionParams._asdict()``, whose one divergent field name is
+    ``downscale``; every ``/api/tuning/*`` body speaks the edge's ``motion_downscale``
+    instead (see ``_MOTION_PARAM_KEYS``). Without this rename a caller comparing a slot's
+    params against the edge config would silently find no ``motion_downscale`` on the slot
+    side and quietly drop that knob from the comparison. Only the keys actually present
+    are returned — a partial detail stays partial rather than being filled with guesses.
+    """
+    params = _read_slot_params(store, slot)
+    if params is None:
+        return None
+    out = {k: v for k, v in params.items() if k != "downscale"}
+    if "downscale" in params:
+        out["motion_downscale"] = params["downscale"]
+    return out
+
+
 def _slot_thresholds(store: Store, slot: str, fallback: dict) -> "tuple[float, float, int]":
     """The ``(min_area, max_area, persistence)`` a slot's re-run used, for area bucketing.
 
@@ -1150,6 +1169,7 @@ def create_app(
         until_id: "int | None" = Query(default=None),
         detections: "str | None" = Query(default=None),
         identify: bool = Query(default=False),
+        flags: bool = Query(default=False),
     ):
         # The density viewer's decimated preview, so a wide bucket is never dumped as tens
         # of thousands of thumbs. Two strategies:
@@ -1163,9 +1183,11 @@ def create_app(
         # per-frame detection for that analyzer (the playback filmstrip/box overlay);
         # gated against ANALYZER_NAMES like /api/frames. `identify=1` (also count-branch
         # only) attaches each frame's active-gallery identity match, resolved with the
-        # same fail-safe events() uses (Frame-review's model-evaluation overlay). Both are
-        # additive: absent them the payload is byte-identical. Neither applies to the
-        # per_ms density path, so they're ignored there.
+        # same fail-safe events() uses (Frame-review's model-evaluation overlay).
+        # `flags=1` attaches the per-frame `motion` + tri-state `corrupt` review markers
+        # a review grid outlines its tiles by. All three are additive: absent them the
+        # payload is byte-identical. None applies to the per_ms density path, so they're
+        # ignored there.
         if per_ms is not None:
             frames = store.sample_frames_by_interval(since_id, until_id, per_ms)
         else:
@@ -1175,7 +1197,8 @@ def create_app(
                     detail=f"unknown analyzer {detections!r}; known: {ANALYZER_NAMES}",
                 )
             frames = store.sample_frames(
-                since_id, until_id, count, detections=detections, identify=identify
+                since_id, until_id, count,
+                detections=detections, identify=identify, flags=flags,
             )
         return {"frames": frames}
 
@@ -1781,6 +1804,18 @@ def create_app(
             "candidate": candidate,
             "fidelity": fidelity,
             "deltas": _compare_deltas(baseline, candidate),
+            # The params behind each column, so a UI can show what a scorecard was
+            # actually PRODUCED by rather than whatever is currently typed in its param
+            # fields — those diverge the moment the operator edits after a re-run.
+            # `live` is the Pi's current config (the same dict the buckets above use);
+            # a slot is its last re-run's recorded params, or None when it never ran
+            # (its scorecard is then `needs_rerun` anyway). All three are in the EDGE
+            # vocabulary, so a caller can diff them key-for-key. Additive.
+            "params": {
+                "live": edge_params,
+                "baseline": _slot_params_edge_vocab(store, _BASELINE_SLOT),
+                "candidate": _slot_params_edge_vocab(store, _CANDIDATE_SLOT),
+            },
         }
         # Split metadata is added ONLY when split was requested, so an unasked call
         # is byte-identical. When asked, ``split_available`` tells the UI whether the

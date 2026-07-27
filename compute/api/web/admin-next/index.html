@@ -19,6 +19,8 @@
 
 <style>
   :root {
+    /* Dark-only surface; also themes the native datetime picker + scrollbars. */
+    color-scheme: dark;
     --bg: #14161a;
     --surface: #1b1e24;
     --surface-2: #22262e;
@@ -30,6 +32,22 @@
     --bad: #d9647a;
     --warn: #d8a657;
     --radius: 6px;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+    /* Detection traffic light + identity/subject palettes, taken from the USER
+       dashboard's dark theme so a YOLO box, a cat's name, and a detection reading
+       mean the same colour on both surfaces. The two files deliberately share no
+       CSS, so these are duplicated on purpose — change them together. */
+    --tl-green: #57c98a;
+    --tl-amber: #f0be55;
+    --tl-red: #f2694f;
+    --resident:  #58c089;  --resident-bg:  #16301f;
+    --neighbour: #f0806a;  --neighbour-bg: #351712;
+    --unknown:   #e6b25a;  --unknown-bg:   #33260f;
+    --unident:   #9a8a78;  --unident-bg:   #241c12;
+    --person:    #7fb0e8;  --person-bg:    #16283d;
+    --bird:      #4fd0bb;  --bird-bg:      #103029;
+    --unrec:     #b79ae8;  --unrec-bg:     #2a2038;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
@@ -88,6 +106,10 @@
   .seg button.sel { background: var(--accent); color: #0c1117; font-weight: 600; }
   input[type=number], input[type=text] { font: inherit; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 9px; width: 130px; }
+  /* Wider than the numeric fields — a datetime-local holds "dd/mm/yyyy hh:mm". */
+  input[type=datetime-local] { font: inherit; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 9px; width: 210px; }
+  input[type=datetime-local]:hover { border-color: var(--muted); }
   select { font: inherit; background: var(--bg); color: var(--text); cursor: pointer;
     border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 30px 7px 10px; min-width: 150px;
     -webkit-appearance: none; appearance: none;
@@ -145,16 +167,47 @@
   .cal-cell .cc .part { color: var(--text); }
   .cal-cell .cc .none { color: var(--muted); }
 
+  /* Scorecards: each column ends with the params that PRODUCED it, changed-vs-live
+     highlighted. Wider tiles than the default stat grid — they now hold a param table. */
+  .stats.sccards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  /* LABEL then value, the repo's readout idiom: the label scans as a caption, not as
+     part of the number. Sentence case (as authored) — these are short words read as a
+     list, and all-caps on five of them shouts over the numbers they label. */
+  .sline { display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 3px; font-size: 12px; }
+  .sk { color: var(--muted); font-size: 11px; align-self: center; margin-right: 3px; }
+  .sv { font-variant-numeric: tabular-nums; }
+  .plist { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .prow { display: flex; justify-content: space-between; gap: 8px; font-size: 11px;
+    padding: 1px 0; color: var(--muted); }
+  .prow .pv { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  /* A value that differs from the live gate: amber + a marker, so "what did I change"
+     is answerable at a glance without diffing two columns by eye. */
+  .prow.chg { color: var(--warn); font-weight: 600; }
+  .prow.chg .pv::after { content: ' ✽'; }
+
+  /* MOG2 parameter reference (bottom card): ranked list, each with its direction cue. */
+  .pref-row { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .pref-row:last-child { border-bottom: 0; }
+  .pref-n { flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--surface-2);
+    border: 1px solid var(--border); color: var(--muted); font-size: 11px; line-height: 18px; text-align: center; }
+  .pref-k { font-size: 13px; font-weight: 600; }
+  .pref-dir { font-size: 11px; font-weight: 600; color: var(--accent); margin-left: 6px; }
+
   /* Shared queue table (renderQueue) */
   .qwrap { margin-top: 10px; overflow-x: auto; }
   .qwrap:empty { margin-top: 0; }
-  .qtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  /* table-layout:fixed + a <colgroup> so the columns keep ONE geometry across every card
+     (each card renders its own table, filtered by category, and auto-widths size to whatever
+     that card's rows happen to hold, so the same columns landed elsewhere per card). Widths follow how much each cell
+     actually holds: Name widest, then Frames, then Status, with % done + FPS + ETA narrowest. The
+     min-width keeps those proportions on a narrow card, scrolling .qwrap instead of squeezing. */
+  .qtable { width: 100%; min-width: 580px; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
   .qtable th { text-align: left; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .4px;
     color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
   .qtable td { padding: 5px 8px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; vertical-align: middle; white-space: nowrap; }
   .qtable tr:last-child td { border-bottom: 0; }
   .qtable td.num { text-align: right; }
-  .qtable td.qname { font-variant-numeric: normal; white-space: normal; }
+  .qtable td.qname { font-variant-numeric: normal; white-space: normal; overflow-wrap: anywhere; }
   .qstatus { display: inline-flex; align-items: center; gap: 6px; }
   .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .qstatus.running .dot { background: var(--warn); }
@@ -174,21 +227,98 @@
     color: var(--accent); background: var(--surface-2); border: 1px solid var(--border);
     border-radius: 999px; padding: 2px 10px; }
   .cleanup-job { margin-top: 8px; }
+  /* Drop / Sweep are the same control in two rows, so they share one width — "Drop" and
+     "Sweep" alone would leave the two rows' buttons ragged against the Estimate column. */
+  .cleanup-run { min-width: 84px; }
 
-  /* Frame review */
-  .fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+  /* ---- Shared overview grid (Frame review + Activity) --------------------
+     ONE tile style for both overviews: image, a band-coloured YOLO label top-left,
+     an identity/subject chip top-right, a meta line under it. Sharing the style is
+     what keeps the two grids reading identically (same fonts, same chip sizes). */
+  .fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
   .ftile { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface-2); cursor: pointer; }
+  .ftile:hover { border-color: var(--muted); }
+  /* Frame-review tile OUTLINES: the edge gate fired (motion) or the frame is corrupt.
+     A 2px inset ring rather than a thicker border, so an outlined tile keeps the exact
+     same box size as a plain one and the grid can't reflow. Only ONE is ever applied —
+     corruption wins, because a corrupt frame's motion verdict is not trustworthy. */
+  .ftile.f-motion { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
+  .ftile.f-corrupt { border-color: var(--unrec); box-shadow: inset 0 0 0 2px var(--unrec); }
+  /* Legend swatches for the two outlines above. */
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; vertical-align: -1px;
+    margin-right: 4px; box-shadow: inset 0 0 0 2px currentColor; }
+  .swatch.f-motion { color: var(--accent); }
+  .swatch.f-corrupt { color: var(--unrec); }
   .fimg { position: relative; line-height: 0; }
   .fimg img { width: 100%; height: auto; display: block; }
   .fbox { position: absolute; border: 2px solid var(--accent); box-sizing: border-box; pointer-events: none; }
-  .fbox.ok { border-color: var(--ok); } .fbox.warn { border-color: var(--warn); } .fbox.bad { border-color: var(--bad); }
-  .fchip { position: absolute; top: 4px; left: 4px; font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(0,0,0,.65); color: var(--text); }
-  .fchip.ok { color: var(--ok); } .fchip.warn { color: var(--warn); } .fchip.bad { color: var(--bad); }
-  .fmeta { padding: 5px 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+  .fbox.tl-green { border-color: var(--tl-green); }
+  .fbox.tl-amber { border-color: var(--tl-amber); }
+  .fbox.tl-red   { border-color: var(--tl-red); }
+  /* Class + confidence pinned to the BOX's own top-left corner (the user dashboard's
+     playback caption): a dark plate keeps the band-coloured text legible on any frame. */
+  .boxcap { position: absolute; left: -2px; top: -2px; font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 700; line-height: 1.35;
+    padding: 0 4px; border-radius: 3px 0 3px 0; background: rgba(0,0,0,.72); white-space: nowrap; }
+  .boxcap.tl-green { color: var(--tl-green); }
+  .boxcap.tl-amber { color: var(--tl-amber); }
+  .boxcap.tl-red   { color: var(--tl-red); }
+  /* Tile chips — 12px, not the old 10px, so a YOLO reading and a cat's name are both
+     legible at tile size; the leading dot mirrors the user dashboard's identity pill.
+     `.tchips` is a WRAPPING row for chips that share one corner (so two never silently
+     overlap on a narrow tile or a long cat name); `.at-br` pins a chip to the opposite
+     corner instead, which can't collide with the top row by construction. */
+  .tchips { position: absolute; top: 5px; left: 5px; right: 5px; display: flex; flex-wrap: wrap;
+    gap: 5px; align-items: center; }
+  .tchip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+    padding: 2px 7px; border-radius: 999px; text-transform: uppercase; letter-spacing: .3px;
+    font-size: 11px; font-weight: 700; line-height: 1.4; white-space: nowrap; overflow: hidden; }
+  .tchip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+  .tchip.at-br { position: absolute; right: 5px; bottom: 5px; max-width: calc(100% - 10px); }
+  /* Visit-detection traffic light: a bare circle beside the label (user dashboard's
+     health dot). A faint ring lifts it off whatever frame is behind it. */
+  .hdot { width: 9px; height: 9px; border-radius: 50%; flex: none;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+  .hdot.tl-green { background: var(--tl-green); }
+  .hdot.tl-amber { background: var(--tl-amber); }
+  .hdot.tl-red   { background: var(--tl-red); }
+  /* The YOLO label: dark plate, mono digits, text coloured by confidence band. */
+  .tchip.det { background: rgba(0,0,0,.72); color: var(--unident);
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  /* "Nothing was measured here" is the least interesting of the three states and the
+     most common one (a window YOLO hasn't reached is unswept in EVERY tile), so it is
+     dimmed and dot-less. It stays present — an un-swept frame must not look like a
+     measured miss — just quiet enough not to shout over 400 tiles. */
+  .tchip.det.unmeasured { opacity: .5; }
+  .tchip.det.unmeasured::before { display: none; }
+  .tchip.det.tl-green { color: var(--tl-green); }
+  .tchip.det.tl-amber { color: var(--tl-amber); }
+  .tchip.det.tl-red   { color: var(--tl-red); }
+  /* Identity / subject chips — same palette split as the user dashboard. */
+  .tchip.resident     { background: var(--resident-bg);  color: var(--resident); }
+  .tchip.neighbour    { background: var(--neighbour-bg); color: var(--neighbour); }
+  .tchip.unknown      { background: var(--unknown-bg);   color: var(--unknown); }
+  .tchip.unident      { background: var(--unident-bg);   color: var(--unident); }
+  .tchip.person       { background: var(--person-bg);    color: var(--person); }
+  .tchip.bird         { background: var(--bird-bg);      color: var(--bird); }
+  .tchip.unrecognized { background: var(--unrec-bg);     color: var(--unrec); }
+  .tchip.motion       { background: var(--unident-bg);   color: var(--unident); }
+  .fmeta { padding: 5px 8px; font-size: 11px; color: var(--muted); display: flex;
+    justify-content: space-between; gap: 6px; font-variant-numeric: tabular-nums; }
   .fmodal { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
   .fmodal .inner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-width: 92vw; max-height: 92vh; overflow: auto; }
   .fmodal .fimg { display: inline-block; }
   .fmodal img { max-width: 86vw; max-height: 78vh; width: auto; height: auto; display: block; }
+  /* The player carries controls, a caption AND three stat rows under the frame, so it
+     needs a shorter stage than the single-frame modal or the stats fall below the fold. */
+  .fmodal.player img { max-height: 58vh; }
+  /* Per-visit YOLO aggregates under the player, mirroring the user dashboard's
+     playback stats: label left, value right, one per line, '—' = not measured. */
+  .pstats { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; align-items: baseline;
+    margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .pstats .k { color: var(--muted); font-size: 13px; }
+  .pstats .v { justify-self: end; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    font-weight: 600; font-size: 13px; }
 
   /* Annotation */
   .astage-imgs { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
@@ -258,9 +388,12 @@
   function renderQueue(el, rows, onCancel) {
     if (!rows || !rows.length) { el.innerHTML = ''; return; }
     const td = (v, cls) => `<td class="${cls || ''}">${v}</td>`;
-    el.innerHTML = '<table class="qtable"><thead><tr>'
+    el.innerHTML = '<table class="qtable">'
+      + '<colgroup><col style="width:14%"><col style="width:29%"><col style="width:9%">'
+      + '<col style="width:22%"><col style="width:9%"><col style="width:9%"><col style="width:8%"></colgroup>'
+      + '<thead><tr>'
       + '<th>Status</th><th>Name</th><th class="num">% done</th><th class="num">Frames</th>'
-      + '<th class="num">FPS</th><th class="num">Time to complete</th><th></th></tr></thead><tbody>'
+      + '<th class="num">FPS</th><th class="num">ETA</th><th></th></tr></thead><tbody>'
       + rows.map((r) => '<tr>'
         + `<td><span class="qstatus ${r.status === 'running' ? 'running' : ''}"><span class="dot"></span>`
         + `${r.status === 'running' ? 'Running' : 'Queued'}</span></td>`
@@ -271,6 +404,116 @@
       + '</tbody></table>';
     el.querySelectorAll('button[data-cancel]').forEach((b) =>
       b.addEventListener('click', () => onCancel(Number(b.dataset.cancel))));
+  }
+
+  // ---- Shared detection / identity rendering ------------------------------
+  // Used by BOTH overviews (Frame review + Activity) so their tiles, chips, box
+  // colours, and fonts can't drift. Declared HERE — above the router's first
+  // render() call — because a `const` below it would be in the TDZ when a direct
+  // #frames / #activity load mounts its page.
+  //
+  // Thresholds and palette mirror the USER dashboard's playback overlay; by the
+  // entry-80 convention the two files share no CSS/JS, so this is a deliberate
+  // duplicate. Change them together.
+  const CLS_LABEL = { 0: 'person', 14: 'bird', 15: 'cat' };
+  const clsLabel = (c) => CLS_LABEL[c] || (c == null ? 'object' : 'cls ' + c);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // Raw, uncalibrated YOLO confidence → traffic-light band: red < 40% · amber < 65% · green.
+  const bandOf = (score) => (score == null ? '' : score >= 0.65 ? 'tl-green' : score >= 0.40 ? 'tl-amber' : 'tl-red');
+  // A 0–1 reading as a percent. null → '—', i.e. NOT measured — distinct from a
+  // measured 0% (swept, nothing found).
+  const detPct = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
+  // A visit's band is the WEAKEST of its three aggregates, so one strong peak frame
+  // can't mask an otherwise-poor visit. null when the span was never swept.
+  function visitBand(det) {
+    if (!det || det.ratio == null) return null;
+    const b = (v, red, amber) => (v == null ? 2 : v < red ? 0 : v < amber ? 1 : 2);
+    const worst = Math.min(b(det.ratio, .30, .60), b(det.conf_max, .40, .65), b(det.conf_mean, .30, .55));
+    return ['tl-red', 'tl-amber', 'tl-green'][worst];
+  }
+  const detTitle = (d) => `YOLO rate ${detPct(d.ratio)} · peak ${detPct(d.conf_max)} · mean ${detPct(d.conf_mean)}`;
+
+  // What YOLO says about one FRAME: class + confidence, or why there is no box.
+  // "NOT ANALYSED" (no verdict row — YOLO has never run on this frame, so nothing is
+  // known about it) is kept distinct from "NO DETECTION" (YOLO ran and found nothing,
+  // a real miss). Collapsing them would hide genuine misses among un-swept frames.
+  const detLabel = (f) => (f.box
+    ? `${clsLabel(f.cls)} ${detPct(f.score)}`.toUpperCase()
+    : (f.analyzed === false ? 'NOT ANALYSED' : 'NO DETECTION'));
+  const detTip = (f) => (f.box
+    ? `YOLO detected a ${clsLabel(f.cls)} at ${detPct(f.score)} confidence`
+    : (f.analyzed === false ? 'YOLO has never run on this frame — nothing is known about it' : 'YOLO ran on this frame and found no subject'));
+  function frameDetChip(f, pos = '') {
+    const state = f.box ? bandOf(f.score) : (f.analyzed === false ? 'unmeasured' : '');
+    return `<span class="tchip det ${pos} ${state}" title="${esc(detTip(f))}">${detLabel(f)}</span>`;
+  }
+  // A visit's detection health as a bare traffic-light circle beside its label — the
+  // user dashboard's health dot, replacing the "det NN%" pill. The three numbers behind
+  // the colour live in the tooltip and, in full, in the playback stats. Nothing at all
+  // when the span was never swept (no reading to show).
+  function healthDot(det) {
+    const band = visitBand(det);
+    return band ? `<span class="hdot ${band}" title="${esc(detTitle(det))}"></span>` : '';
+  }
+
+  // events() and /api/frames/sample?identify=1 return the same identity fields except
+  // that only the frame overlay carries `resolved` — so derive it when it's absent.
+  // (Reading `resolved` unconditionally is why the Activity chip never showed a name.)
+  function identityKind(id) {
+    if (!id) return null;
+    if (id.resolved) return id.resolved;
+    return id.cat_id == null ? 'unknown' : (id.is_resident ? 'resident' : 'neighbour');
+  }
+  function identityChip(id, pos) {
+    const kind = identityKind(id);
+    if (!kind) return '';
+    const label = kind === 'unknown' ? 'unknown cat' : (id.cat_name || `cat #${id.cat_id}`);
+    const d = id.distance != null ? ` · d=${id.distance.toFixed(3)}` : '';
+    return `<span class="tchip ${kind} ${pos || ''}" title="${esc(label + d)}">${esc(label)}</span>`;
+  }
+  // An event's chip: a cat subject routes to the identity chip (the user dashboard's
+  // rule); every other subject gets its own. One deliberate divergence from the user
+  // page — an unidentified cat still gets a muted "cat" chip here, because on the admin
+  // surface "YOLO saw a cat, no model named it" is a state worth seeing, not a blank.
+  // A subject kind maps to a fixed label + CSS class, so an unrecognized kind from a
+  // newer backend degrades to the muted styling instead of putting an unknown token in
+  // the class attribute. `corrupted` borrows the violet, as it does on the old /admin.
+  const SUBJECT_LABEL = { person: 'person', bird: 'bird', corrupted: 'corrupted', unrecognized: 'unrecognized', motion_only: 'motion only' };
+  const SUBJECT_CLASS = { person: 'person', bird: 'bird', corrupted: 'unrecognized', unrecognized: 'unrecognized', motion_only: 'motion' };
+  function eventChip(ev, pos) {
+    const kind = ev.subject && ev.subject.kind;
+    if (!kind || kind === 'cat') {
+      return identityChip(ev.identity, pos) || `<span class="tchip unident ${pos || ''}" title="a cat, not identified">cat</span>`;
+    }
+    return `<span class="tchip ${SUBJECT_CLASS[kind] || 'unident'} ${pos || ''}">${SUBJECT_LABEL[kind] || esc(kind)}</span>`;
+  }
+
+  // Position a detection box (and its caption) as a PERCENTAGE of the image's natural
+  // dimensions — bbox is in stored-JPEG pixel space, so percentages track the drawn
+  // image at any size with no resize math.
+  const boxStyle = (b, w, h) =>
+    `left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`;
+  function placeBoxes(root) {
+    root.querySelectorAll('img[data-box]').forEach((img) => {
+      const fb = img.parentElement.querySelector('.fbox');
+      const place = () => {
+        if (fb && img.naturalWidth) {
+          fb.style.cssText += ';' + boxStyle(JSON.parse(img.dataset.box), img.naturalWidth, img.naturalHeight);
+          fb.hidden = false;
+        }
+      };
+      if (img.complete) place(); else img.addEventListener('load', place);
+    });
+  }
+  // Per-visit aggregates block, same three rows (and same wording) as the user dashboard.
+  function statsHtml(det) {
+    if (!det) return '';
+    const row = (k, v, t) => `<div class="k" title="${esc(t)}">${k}</div><div class="v" title="${esc(t)}">${v}</div>`;
+    return '<div class="pstats">'
+      + row('Detection rate', detPct(det.ratio), "How often YOLO found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.")
+      + row('Peak confidence', detPct(det.conf_max), 'Highest detector confidence across the visit. “—” means not measured.')
+      + row('Mean confidence', detPct(det.conf_mean), 'Average detector confidence across the detected frames. “—” means not measured.')
+      + '</div>';
   }
 
   // ---- Route table -------------------------------------------------------
@@ -356,7 +599,7 @@
           <span id="modeNote" class="note"></span>
         </div>
         <div class="row">
-          <label class="note" id="oracleLabel" title="Run YOLO over every new frame as it arrives">
+          <label class="note" id="oracleLabel" title="Run YOLO over every new frame as it arrives — never over older ones">
             <input type="checkbox" id="oracleChk" aria-describedby="oracleNote"> YOLO all
           </label>
           <span id="oracleNote" class="note"></span>
@@ -364,9 +607,9 @@
         <p class="hint">Runs <b>YOLO</b> continuously over new frames — motion <i>and</i> non-motion
           — so Motion tuning finds a day already covered instead of waiting on a manual sweep.
           Keep-all only: a gate miss lives in a non-motion frame, which motion-only capture never
-          stores. Covers frames from when you FIRST switch it on; earlier days still need a
-          manual sweep. Re-enabling after a pause backfills the frames captured while it was
-          off before it reaches today's, so it can lag for a while.</p>
+          stores. Forward-only: switching it on (or restarting compute) starts from the newest
+          frame, so anything captured while it was off — earlier days, a pause, a restart — still
+          needs a manual sweep from Motion tuning.</p>
       </div>
 
       <div class="card">
@@ -411,7 +654,7 @@
             <div id="nmJob" class="cleanup-job"></div>
           </div>
           <button data-kind="nonmotion" data-act="est">Estimate</button>
-          <button data-kind="nonmotion" data-act="run" class="danger">Drop…</button>
+          <button data-kind="nonmotion" data-act="run" class="danger cleanup-run">Drop</button>
         </div>
         <div class="row" style="margin-top:14px">
           <div class="grow">
@@ -420,7 +663,7 @@
             <div id="orJob" class="cleanup-job"></div>
           </div>
           <button data-kind="orphan" data-act="est">Estimate</button>
-          <button data-kind="orphan" data-act="run" class="danger">Sweep…</button>
+          <button data-kind="orphan" data-act="run" class="danger cleanup-run">Sweep</button>
         </div>
         <p class="hint">Event-scoped purges (ignored / labelled source frames) are deferred — see the plan.</p>
       </div>
@@ -629,18 +872,36 @@
     // Declared inside the function (not module scope) so a direct load / refresh of
     // #tuning — where render() runs before a later module-level const initializes —
     // can't hit a temporal-dead-zone ReferenceError.
-    const MOG2_PARAMS = ['var_threshold', 'learning_rate', 'min_area', 'max_area_fraction', 'persistence', 'motion_downscale'];
+    // ONE order everywhere — fields, per-scorecard readouts and the reference list below:
+    // most-worth-changing first, so the knob you reach for is the knob you see first.
+    // The keys stay snake_case (the wire vocabulary the edge and MogAnalyzer share);
+    // MOG2_LABEL is display-only.
+    const MOG2_PARAMS = ['var_threshold', 'min_area', 'learning_rate', 'persistence', 'max_area_fraction', 'motion_downscale'];
     const MOG2_STEP = { persistence: '1', motion_downscale: '1' };
+    const MOG2_LABEL = {
+      var_threshold: 'Var threshold', min_area: 'Min area', learning_rate: 'Learning rate',
+      persistence: 'Persistence', max_area_fraction: 'Max area fraction', motion_downscale: 'Motion downscale',
+    };
+    // Which way to turn each knob, then what it actually does. Ported from /admin's
+    // per-field hints so both pages teach the same thing.
+    const MOG2_HELP = {
+      var_threshold: ['↓ lower = detect more', "MOG2's foreground sensitivity — lower lets subtler pixel changes count (dark / low-contrast night cats)."],
+      min_area: ['↓ lower = detect more', 'Smallest blob that counts, as a fraction of the ROI — lower admits smaller / distant / partial-view cats.'],
+      learning_rate: ['↓ lower = detect more', 'How fast a still object fades into the background — lower keeps a paused / lingering cat foreground longer.'],
+      persistence: ['↓ lower = detect more', 'Consecutive motion frames before it fires; 1 catches fast / brief crossings. Counted in FRAMES, not seconds — at a higher capture fps the same value spans less time.'],
+      max_area_fraction: ['↑ raise if close cats are missed', 'Largest blob that counts — rejects whole-ROI light jumps. Raise only if a cat right under the camera fills the frame.'],
+      motion_downscale: ['↑ raise if tiny blobs vanish', 'ROI width (px) fed to MOG2 — higher preserves small / distant blobs, at more CPU cost.'],
+    };
     view.innerHTML = `
       <div class="card">
-        <h3>Day <span class="note">(last 4 weeks · click a day · Y/B/C = % swept)</span></h3>
+        <h3>Last 4 weeks</h3>
         <div id="cal"><span class="note">Loading…</span></div>
         <div id="dayScope" class="note" style="margin-top:10px"></div>
         <div id="dayStats" class="stats daystats" style="margin-top:12px"></div>
       </div>
 
       <div class="card">
-        <h3>YOLO coverage</h3>
+        <h3>YOLO</h3>
         <div class="row">
           <span id="covNote" class="note grow">…</span>
           <label class="note"><input type="checkbox" id="rerunAll"> Rerun all</label>
@@ -664,10 +925,14 @@
       </div>
 
       <div class="card">
-        <h3>Scorecards <span class="note">(visit recall)</span></h3>
+        <h3>Scorecards</h3>
         <div class="row"><button id="compareBtn" class="primary">Compare</button><span id="splitNote" class="note"></span></div>
-        <div id="scorecards" class="stats" style="margin-top:12px"></div>
-        <div id="copyParams" class="note mono" style="margin-top:12px"></div>
+        <div id="scorecards" class="stats sccards" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
+        <h3>MOG2 parameters <span class="note">(most worth changing first)</span></h3>
+        <div id="paramRef" class="pref"></div>
       </div>
     `;
 
@@ -676,7 +941,16 @@
     let edgeParams = null;
 
     $('#paramFields', view).innerHTML = MOG2_PARAMS.map(k =>
-      `<label class="fld">${k}<input data-k="${k}" type="number" step="${MOG2_STEP[k] || 'any'}" style="width:110px"></label>`).join('');
+      `<label class="fld">${MOG2_LABEL[k]}<input data-k="${k}" type="number" step="${MOG2_STEP[k] || 'any'}" style="width:110px"></label>`).join('');
+    // The reference list (bottom card): each knob, which way to turn it, what it does.
+    $('#paramRef', view).innerHTML = MOG2_PARAMS.map((k, i) => {
+      const [dir, what] = MOG2_HELP[k];
+      return `<div class="pref-row">
+        <div class="pref-n">${i + 1}</div>
+        <div><div class="pref-k">${MOG2_LABEL[k]} <span class="pref-dir">${dir}</span></div>
+        <div class="note">${what}</div></div>
+      </div>`;
+    }).join('');
     const setParams = (v) => MOG2_PARAMS.forEach(k => { const i = view.querySelector(`input[data-k="${k}"]`); if (i) i.value = v[k]; });
     const getParams = () => Object.fromEntries(MOG2_PARAMS.map(k => [k, parseFloat(view.querySelector(`input[data-k="${k}"]`).value)]));
 
@@ -735,10 +1009,12 @@
         const dnum = day.getDate(), tag = dnum === 1 ? ' ' + MON[day.getMonth()] : '';
         if (!row) { html += `<div class="cal-cell empty"><div class="cd">${dnum}${tag}</div></div>`; continue; }
         const sel = ms === selectedDayMs ? ' sel' : '';
+        // Spelled-out coverage labels, not Y/B/C: the header no longer carries a legend,
+        // so each cell has to say what its three percentages are on its own.
         html += `<div class="cal-cell has${sel}" data-ms="${ms}">
           <div class="cd">${dnum}${tag}</div>
           <div class="ce">${fmtInt(row.events)} event${row.events === 1 ? '' : 's'}</div>
-          <div class="cc">${covCell('Y', row.yolo, row.frames)}${covCell('B', row.baseline, row.frames)}${covCell('C', row.candidate, row.frames)}</div>
+          <div class="cc">${covCell('YOLO', row.yolo, row.frames)}${covCell('BASE', row.baseline, row.frames)}${covCell('CAND', row.candidate, row.frames)}</div>
         </div>`;
       }
       html += '</div>';
@@ -792,16 +1068,43 @@
     }
 
     const rpct = (c, t) => (t ? Math.round((c / t) * 100) + '%' : '—');
-    function scorecardHtml(title, sc) {
-      if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div></div>`;
+    // A stat line reads LABEL (small caps, muted) then its value — the repo's readout
+    // idiom, so the labels scan as captions rather than as part of the number.
+    const sline = (pairs) => '<div class="sline">'
+      + pairs.map(([k, v]) => `<span class="sk">${k}</span><span class="sv">${v}</span>`).join('')
+      + '</div>';
+    // The params BEHIND this column (from the compare response, i.e. what actually
+    // produced the numbers — not whatever is currently typed in the fields above).
+    // Values differing from the live gate are marked, so a glance says what was changed.
+    // `available` distinguishes "this compute build doesn't report params" from "this
+    // slot never ran". Silently rendering nothing for the former looked like the feature
+    // was missing when in fact the backend was simply older than the page (the dev proxy
+    // serves a LOCAL admin-next against a REMOTE compute — changelog 129).
+    function paramList(params, live, available) {
+      if (!available) return '<div class="plist"><div class="note">Params unavailable — this compute build predates the per-column params field; pull + restart it.</div></div>';
+      if (!params) return '<div class="plist"><div class="note">No params recorded — this slot has not been re-run.</div></div>';
+      const rows = MOG2_PARAMS.map((k) => {
+        const v = params[k];
+        if (v == null) return '';
+        // Compare numerically: the edge config and a slot's stored detail can spell the
+        // same value differently (0.005 vs "0.0050"), which a string compare would
+        // report as a change.
+        const changed = live && live[k] != null && Number(live[k]) !== Number(v);
+        return `<div class="prow${changed ? ' chg' : ''}"><span class="pk">${MOG2_LABEL[k]}</span><span class="pv">${v}</span></div>`;
+      }).join('');
+      return `<div class="plist">${rows}</div>`;
+    }
+    function scorecardHtml(title, sc, params, live, available) {
+      if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div>${paramList(params, live, available)}</div>`;
       const split = sc.split
-        ? `<div class="note">day ${rpct(sc.split.day.caught, sc.split.day.total)} · night ${rpct(sc.split.night.caught, sc.split.night.total)}</div>` : '';
+        ? sline([['Day', rpct(sc.split.day.caught, sc.split.day.total)], ['Night', rpct(sc.split.night.caught, sc.split.night.total)]]) : '';
       return `<div class="stat">
         <div class="k">${title}</div>
         <div class="v">${rpct(sc.visits.caught, sc.visits.total)}</div>
-        <div class="note">recall ${fmtInt(sc.visits.caught)}/${fmtInt(sc.visits.total)} visits</div>
-        <div class="note">missed ${fmtInt(sc.recall.missed)} · false ${fmtInt(sc.false_triggers.count)}</div>
+        ${sline([['Recall', `${fmtInt(sc.visits.caught)}/${fmtInt(sc.visits.total)} visits`]])}
+        ${sline([['Missed', fmtInt(sc.recall.missed)], ['False', fmtInt(sc.false_triggers.count)]])}
         ${split}
+        ${paramList(params, live, available)}
       </div>`;
     }
     $('#compareBtn', view).addEventListener('click', compare);
@@ -813,14 +1116,19 @@
       try {
         const r = await api('GET', '/api/tuning/compare?' + q);
         if (!alive) return;
-        el.innerHTML = scorecardHtml('Live gate', r.live) + scorecardHtml('Baseline', r.baseline) + scorecardHtml('Candidate', r.candidate);
+        // The live gate is the reference every other column's params are diffed against.
+        // A response with no `params` at all is an OLDER compute build, not a store with
+        // nothing recorded — the two get different notes.
+        const p = r.params || {};
+        const has = !!r.params;
+        el.innerHTML = scorecardHtml('Live gate', r.live, p.live, null, has)
+          + scorecardHtml('Baseline', r.baseline, p.baseline, p.live, has)
+          + scorecardHtml('Candidate', r.candidate, p.candidate, p.live, has);
         const sn = $('#splitNote', view);
         if (r.split_available && r.location) sn.textContent = `Day/Night @ ${r.location.latitude.toFixed(2)}, ${r.location.longitude.toFixed(2)}`;
         else if (r.split_reason === 'location_unset') sn.textContent = 'Day/Night off — set a location on Start.';
         else if (r.split_reason === 'astral_unavailable') sn.textContent = 'Day/Night off — astral unavailable.';
         else sn.textContent = '';
-        const cp = getParams();
-        $('#copyParams', view).textContent = 'Candidate → edge: ' + MOG2_PARAMS.map(k => `${k}=${cp[k]}`).join('  ');
       } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
     }
 
@@ -892,17 +1200,19 @@
   //  Frame review page (admin-next P3) — per-frame YOLO + identity overlays
   // =======================================================================
   function mountFrames(view) {
-    // Locals (not module scope) so a direct load of #frames can't hit a TDZ.
-    const CLS = { 0: 'person', 14: 'bird', 15: 'cat' };
-    const bandOf = (c) => (c == null ? '' : c >= 0.65 ? 'ok' : c >= 0.40 ? 'warn' : 'bad');
-    const boxStyle = (b, w, h) => `left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`;
+    // A window is a START instant + a TIMESPAN (the corruption page's picker shape),
+    // so an operator can land on the minute a visit happened instead of scrolling a
+    // whole decimated day. There is no frame-count field: the window's own width
+    // bounds the grid, and F_MAX_TILES caps what a wide span can dump.
+    const SPANS = [1, 5, 10, 15, 30, 60];
+    const F_MAX_TILES = 500;
 
     view.innerHTML = `
       <div class="card">
         <h3>Window</h3>
         <div class="row">
-          <label class="fld">Day<select id="fDay"></select></label>
-          <label class="fld">Frames<input id="fCount" type="number" min="10" max="500" value="120" style="width:90px"></label>
+          <label class="fld">Start<input id="fStart" type="datetime-local" step="60"></label>
+          <label class="fld">Timespan<select id="fSpan">${SPANS.map((m) => `<option value="${m}"${m === 5 ? ' selected' : ''}>${m} min</option>`).join('')}</select></label>
           <button id="fLoad" class="primary" style="align-self:flex-end">Load</button>
           <span id="fScope" class="note"></span>
         </div>
@@ -917,74 +1227,56 @@
       </div>
       <div class="card">
         <h3>Frames <span class="note">(YOLO box + identity overlay)</span></h3>
-        <div id="fGrid" class="fgrid"><span class="note">Pick a day and Load.</span></div>
+        <p class="hint" style="margin-top:0">
+          <span class="swatch f-motion"></span>the edge gate saw motion ·
+          <span class="swatch f-corrupt"></span>corrupt frame (outranks motion) —
+          only marked where a corruption sweep has run, so an unmarked frame is
+          <i>unmeasured</i>, not proven clean.
+        </p>
+        <div id="fGrid" class="fgrid"><span class="note">Pick a start time and Load.</span></div>
       </div>
     `;
 
     let alive = true;
-    let scope = { since_id: null, until_id: null };
     let frames = [];
     let filter = 'all';
     let modal = null;
 
-    function buildDays(oldestMs, newestMs) {
-      const sel = $('#fDay', view); sel.innerHTML = '';
-      if (!oldestMs || !newestMs) { sel.innerHTML = '<option>—</option>'; return; }
-      const p = (x) => String(x).padStart(2, '0');
-      const d = new Date(newestMs); d.setHours(0, 0, 0, 0);
-      const oldest = new Date(oldestMs); oldest.setHours(0, 0, 0, 0);
-      let first = null;
-      while (d >= oldest) {
-        const end = new Date(d); end.setDate(end.getDate() + 1);
-        const o = document.createElement('option');
-        o.value = d.getTime() + ':' + (end.getTime() - 1);
-        o.textContent = `${p(d.getDate())}/${p(d.getMonth() + 1)}-${d.getFullYear()}`;
-        sel.appendChild(o);
-        if (first === null) first = o.value;
-        d.setDate(d.getDate() - 1);
-      }
-      if (first) selectScope(first);
-    }
-    async function selectScope(val) {
-      const [s, e] = val.split(':').map(Number);
-      try {
-        const r = await api('GET', `/api/frames/resolve?start_ts=${s}&end_ts=${e}`);
-        if (!alive) return;
-        scope = { since_id: r.since_id, until_id: r.until_id };
-        $('#fScope', view).textContent = r.since_id == null ? 'no frames this day' : `frames ${fmtInt(r.since_id)}–${fmtInt(r.until_id)}`;
-      } catch (_) { $('#fScope', view).textContent = 'resolve failed'; }
-    }
-    $('#fDay', view).addEventListener('change', (e) => selectScope(e.target.value));
+    // datetime-local speaks LOCAL wall-clock in both directions, so a plain
+    // new Date(value) round-trips it against the store's epoch-ms timestamps.
+    const p2 = (x) => String(x).padStart(2, '0');
+    const toLocalInput = (ms) => {
+      const d = new Date(ms);
+      return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}`;
+    };
+    const windowMs = () => {
+      const v = $('#fStart', view).value;
+      if (!v) return null;
+      const start = new Date(v).getTime();
+      if (!isFinite(start)) return null;
+      const span = Number($('#fSpan', view).value) * 60000;
+      return { start, end: start + span - 1 };
+    };
 
     const passes = (f) => (filter === 'detected' ? !!f.box : filter === 'identified' ? !!f.identity : true);
-    function idChip(id) {
-      if (!id) return '';
-      const c = id.resolved === 'resident' ? 'ok' : id.resolved === 'neighbour' ? 'bad' : 'warn';
-      const label = id.resolved === 'unknown' ? 'unknown' : (id.cat_name || id.resolved);
-      return `<span class="fchip ${c}" style="left:auto;right:4px">${label}</span>`;
-    }
+    // Corruption outranks motion: a corrupt frame's motion verdict isn't trustworthy, so
+    // saying "the gate fired here" would be the more misleading of the two labels.
+    const tileFlag = (f) => (f.corrupt ? ' f-corrupt' : f.motion ? ' f-motion' : '');
     function tileHtml(f, idx) {
-      const clsChip = f.box ? `<span class="fchip">${CLS[f.cls] || f.cls}${f.score != null ? ' ' + Math.round(f.score * 100) + '%' : ''}</span>` : '';
       const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
       const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
-      const t = new Date(f.recv_ts); const p = (x) => String(x).padStart(2, '0');
-      return `<div class="ftile" data-i="${idx}">
-        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${clsChip}${idChip(f.identity)}</div>
-        <div class="fmeta"><span>${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}</span><span>${f.analyzed === false ? 'unswept' : ''}</span></div>
+      const t = new Date(f.recv_ts);
+      return `<div class="ftile${tileFlag(f)}" data-i="${idx}">
+        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}
+          <div class="tchips">${identityChip(f.identity)}</div>${frameDetChip(f, 'at-br')}</div>
+        <div class="fmeta"><span>${p2(t.getHours())}:${p2(t.getMinutes())}:${p2(t.getSeconds())}</span><span>#${f.id}</span></div>
       </div>`;
-    }
-    function placeBoxes(root) {
-      root.querySelectorAll('img[data-box]').forEach((img) => {
-        const fb = img.parentElement.querySelector('.fbox');
-        const place = () => { if (fb && img.naturalWidth) { fb.style.cssText += ';' + boxStyle(JSON.parse(img.dataset.box), img.naturalWidth, img.naturalHeight); fb.hidden = false; } };
-        if (img.complete) place(); else img.addEventListener('load', place);
-      });
     }
     function renderGrid() {
       const grid = $('#fGrid', view);
       if (!frames.length) { grid.innerHTML = '<span class="note">No frames loaded.</span>'; $('#fCounts', view).textContent = ''; return; }
       const shown = frames.map((f, i) => [f, i]).filter(([f]) => passes(f));
-      $('#fCounts', view).textContent = `${shown.length} / ${frames.length} shown`;
+      $('#fCounts', view).textContent = `${fmtInt(shown.length)} / ${fmtInt(frames.length)} match filter`;
       if (!shown.length) { grid.innerHTML = '<span class="note">No frames match this filter.</span>'; return; }
       grid.innerHTML = shown.map(([f, i]) => tileHtml(f, i)).join('');
       placeBoxes(grid);
@@ -993,12 +1285,17 @@
     function closeModal() { if (modal) { modal.remove(); modal = null; } }
     function openFrame(idx) {
       const f = frames[idx]; closeModal();
-      const idTxt = f.identity ? `${f.identity.resolved}${f.identity.cat_name ? ' · ' + f.identity.cat_name : ''}${f.identity.distance != null ? ' (d=' + f.identity.distance.toFixed(3) + ')' : ''}` : 'no identity';
-      const detTxt = f.box ? `${CLS[f.cls] || f.cls} ${Math.round(f.score * 100)}%` : (f.analyzed === false ? 'not swept' : 'no detection');
+      const idTxt = identityKind(f.identity)
+        ? `${identityKind(f.identity)}${f.identity.cat_name ? ' · ' + f.identity.cat_name : ''}${f.identity.distance != null ? ' (d=' + f.identity.distance.toFixed(3) + ')' : ''}`
+        : 'no identity';
+      const detTxt = detLabel(f);
+      const band = bandOf(f.score);
+      const marks = [f.motion ? 'motion' : '', f.corrupt ? 'CORRUPT' : (f.corrupt === null ? 'corruption not measured' : '')].filter(Boolean).join(' · ');
       modal = document.createElement('div'); modal.className = 'fmodal';
       modal.innerHTML = `<div class="inner">
-        <div class="fimg"><img src="${f.url}" ${f.box ? `data-box='${JSON.stringify(f.box)}'` : ''}>${f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : ''}</div>
-        <div class="note" style="margin-top:8px">${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detTxt} · id: ${idTxt}</div>
+        <div class="fimg"><img src="${f.url}" ${f.box ? `data-box='${JSON.stringify(f.box)}'` : ''}>${f.box
+          ? `<div class="fbox ${band}" hidden><span class="boxcap ${band}">${detTxt}</span></div>` : ''}</div>
+        <div class="note" style="margin-top:8px">${fmtTs(f.recv_ts)} · frame ${f.id} · det: ${detTxt} · id: ${esc(idTxt)}${marks ? ' · ' + marks : ''}</div>
       </div>`;
       document.body.appendChild(modal);
       placeBoxes(modal);
@@ -1013,22 +1310,80 @@
       view.querySelectorAll('#fFilters button').forEach((x) => x.classList.toggle('sel', x.dataset.f === filter));
       renderGrid();
     });
+    // One Load does both steps: resolve the clock window to the id bounds every scoped
+    // read shares, then sample it. Nothing is fetched until the operator asks.
     async function load() {
-      const grid = $('#fGrid', view);
-      if (scope.since_id == null) { grid.innerHTML = '<span class="note warn">Pick a day with frames.</span>'; return; }
-      const count = Math.max(10, Math.min(500, parseInt($('#fCount', view).value, 10) || 120));
+      const grid = $('#fGrid', view), scopeEl = $('#fScope', view);
+      const w = windowMs();
+      if (!w) { grid.innerHTML = '<span class="note warn">Pick a start time.</span>'; return; }
       grid.innerHTML = '<span class="note">Loading…</span>';
-      const q = new URLSearchParams({ count, since_id: scope.since_id, until_id: scope.until_id, detections: 'yolo-serial', identify: 'true' });
+      scopeEl.textContent = 'resolving…';
+      let scope;
       try {
-        const data = await api('GET', '/api/frames/sample?' + q);
+        const r = await api('GET', `/api/frames/resolve?start_ts=${w.start}&end_ts=${w.end}`);
+        if (!alive) return;
+        scope = r;
+      } catch (e) {
+        frames = []; $('#fCounts', view).textContent = '';
+        scopeEl.textContent = 'resolve failed';
+        grid.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+        return;
+      }
+      if (scope.since_id == null) {
+        scopeEl.textContent = 'no frames in this window';
+        frames = []; $('#fCounts', view).textContent = '';
+        grid.innerHTML = '<span class="note warn">No frames in this window.</span>';
+        return;
+      }
+      scopeEl.textContent = `frames ${fmtInt(scope.since_id)}–${fmtInt(scope.until_id)}`;
+      const q = new URLSearchParams({ count: F_MAX_TILES, since_id: scope.since_id, until_id: scope.until_id, detections: 'yolo-serial', identify: 'true', flags: 'true' });
+      const cq = `?since_id=${scope.since_id}&until_id=${scope.until_id}`;
+      try {
+        // The sample is decimated ABOVE F_MAX_TILES and complete below it, and the
+        // response can't tell the two apart — so read the window's real frame total
+        // (and its YOLO sweep coverage, which is what the "unswept" chips reflect)
+        // rather than implying the whole window is on screen. Coverage is advisory:
+        // if it fails the grid still renders, just without the denominator.
+        const [data, cov] = await Promise.all([
+          api('GET', '/api/frames/sample?' + q),
+          api('GET', '/api/analysis/coverage' + cq).catch(() => null),
+        ]);
         if (!alive) return;
         frames = Array.isArray(data) ? data : (data.frames || []);
         renderGrid();
-      } catch (e) { grid.innerHTML = `<span class="note bad">${e.message}</span>`; }
+        const parts = [`frames ${fmtInt(scope.since_id)}–${fmtInt(scope.until_id)}`];
+        if (cov && cov.total != null) {
+          parts.push(`${fmtInt(frames.length)} of ${fmtInt(cov.total)} loaded${frames.length < cov.total ? ' (sampled)' : ''}`);
+          const swept = cov.oracles && cov.oracles['yolo-serial'];
+          if (swept) parts.push(`${fmtInt(swept.analyzed)} swept by YOLO`);
+        } else {
+          parts.push(`${fmtInt(frames.length)} loaded`);
+        }
+        scopeEl.textContent = parts.join(' · ');
+      } catch (e) {
+        // Drop the previous window's frames: the scope readout now describes THIS
+        // window, so keeping them would let a filter click re-render stale tiles under
+        // the new window's label.
+        frames = []; $('#fCounts', view).textContent = '';
+        grid.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+      }
     }
     $('#fLoad', view).addEventListener('click', load);
+    // Re-widen/narrow an ALREADY-loaded window in place; before the first Load a span
+    // change must not fetch anything on its own.
+    $('#fSpan', view).addEventListener('change', () => { if (frames.length) load(); });
 
-    (async () => { try { const st = await api('GET', '/api/stats'); if (alive) buildDays(st.oldest_ts, st.newest_ts); } catch (_) {} })();
+    // Default the picker to the newest frames, minus the span, so the first Load lands
+    // on real data instead of an empty window.
+    (async () => {
+      try {
+        const st = await api('GET', '/api/stats');
+        if (!alive || !st.newest_ts) return;
+        const span = Number($('#fSpan', view).value) * 60000;
+        $('#fStart', view).value = toLocalInput(st.newest_ts - span);
+        $('#fScope', view).textContent = `store: ${fmtTs(st.oldest_ts)} → ${fmtTs(st.newest_ts)}`;
+      } catch (_) {}
+    })();
     return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };
   }
 
@@ -1088,19 +1443,18 @@
       stage.innerHTML = `
         <div class="astage-imgs">
           <div class="astage-crop"><img src="${cropUrl(rep)}" alt="crop"></div>
-          <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox warn" hidden></div></div>
+          <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
         </div>
-        <div class="note" style="margin-top:8px">${v.frames.length} frames · peak ${Math.round((v.peak_score || 0) * 100)}%${dist}</div>
+        <div class="note" style="margin-top:8px">${v.frames.length} frames · rep ${detPct(rep.score)} · peak ${Math.round((v.peak_score || 0) * 100)}%${dist}</div>
       `;
-      const img = stage.querySelector('.astage-full img'), fb = stage.querySelector('.fbox');
-      const place = () => {
-        if (fb && img.naturalWidth) {
-          const b = rep.bbox, w = img.naturalWidth, h = img.naturalHeight;
-          fb.style.cssText += `;left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`;
-          fb.hidden = false;
-        }
-      };
-      if (img.complete) place(); else img.addEventListener('load', place);
+      // Same box placement (and the same confidence traffic light) the two overviews use —
+      // the local copy predated placeBoxes() being hoisted to module scope, and its `warn`
+      // class no longer exists on .fbox, so the box had silently reverted to the accent.
+      // The box is the REP frame's, so it bands by the REP's own score, which can sit well
+      // below the visit's peak — hence "rep %" beside "peak %" above, or the border colour
+      // would be a number the operator can't see (and .fbox takes no pointer events, so a
+      // title tooltip wouldn't reach it).
+      placeBoxes(stage);
     }
     function advanceAfterDecision() {
       visits.splice(idx, 1);
@@ -1313,7 +1667,6 @@
   //  Activity page (admin-next P6) — recent visits + playback + backfill
   // =======================================================================
   function mountActivity(view) {
-    const CLS = { 0: 'person', 14: 'bird', 15: 'cat' };
     view.innerHTML = `
       <div class="card">
         <div class="row">
@@ -1326,7 +1679,7 @@
         <div id="acNote" class="note" style="margin-top:6px"></div>
       </div>
       <div class="card">
-        <h3>Recent visits <span class="note">(double-click to play)</span></h3>
+        <h3>Recent visits <span class="note">(click to play)</span></h3>
         <div id="acGrid" class="fgrid"><span class="note">Loading…</span></div>
       </div>
     `;
@@ -1334,6 +1687,12 @@
     let alive = true;
     let events = [];
     let modal = null, playerTimer = null;
+    // Serializes overlapping openPlayer() calls. It fetches its frames BEFORE building
+    // the modal, so two clicks during that fetch would each build one — the first left
+    // orphaned in the DOM with its playback interval still ticking. Now only the newest
+    // call survives its await. Reachable in practice since a click (not a double-click)
+    // opens a visit.
+    let playerSeq = 0;
 
     const span = () => {
       if (!events.length) return null;
@@ -1341,31 +1700,22 @@
     };
     const flash = (m) => { $('#acNote', view).textContent = m; };
 
-    function evChip(ev) {
-      const id = ev.identity;
-      if (id && id.resolved === 'resident') return `<span class="fchip ok">${id.cat_name || 'resident'}</span>`;
-      if (id && id.resolved === 'neighbour') return `<span class="fchip bad">${id.cat_name || 'neighbour'}</span>`;
-      if (id && id.resolved === 'unknown') return '<span class="fchip warn">unknown cat</span>';
-      const map = { cat: 'cat', person: 'person', bird: 'bird', corrupted: 'corrupted', unrecognized: '?', motion_only: 'motion' };
-      const kind = ev.subject && ev.subject.kind;
-      return kind ? `<span class="fchip">${map[kind] || kind}</span>` : '';
-    }
     function renderGrid() {
       const grid = $('#acGrid', view);
       const hide = $('#acHide', view).checked;
-      const shown = events.map((e, i) => [e, i]).filter(([e]) => !(hide && e.identity && e.identity.resolved === 'resident'));
+      const shown = events.map((e, i) => [e, i]).filter(([e]) => !(hide && identityKind(e.identity) === 'resident'));
       if (!events.length) { grid.innerHTML = '<span class="note">No visits yet.</span>'; return; }
       if (!shown.length) { grid.innerHTML = '<span class="note">All hidden by the filter.</span>'; return; }
       const p = (x) => String(x).padStart(2, '0');
       grid.innerHTML = shown.map(([ev, i]) => {
         const t = new Date(ev.start_ts);
-        const rate = ev.detection && ev.detection.ratio != null ? Math.round(ev.detection.ratio * 100) + '%' : '—';
         return `<div class="ftile" data-i="${i}">
-          <div class="fimg"><img loading="lazy" src="/media/${ev.rep_frame_id}">${evChip(ev)}</div>
-          <div class="fmeta"><span>${p(t.getDate())}/${p(t.getMonth() + 1)} ${p(t.getHours())}:${p(t.getMinutes())}</span><span>${rate}</span></div>
+          <div class="fimg"><img loading="lazy" src="/media/${ev.rep_frame_id}">
+            <div class="tchips">${eventChip(ev)}${healthDot(ev.detection)}</div></div>
+          <div class="fmeta"><span>${p(t.getDate())}/${p(t.getMonth() + 1)} ${p(t.getHours())}:${p(t.getMinutes())}</span><span>${fmtInt(ev.n_frames)}f</span></div>
         </div>`;
       }).join('');
-      grid.querySelectorAll('.ftile').forEach((t) => t.addEventListener('dblclick', () => openPlayer(Number(t.dataset.i))));
+      grid.querySelectorAll('.ftile').forEach((t) => t.addEventListener('click', () => openPlayer(Number(t.dataset.i))));
     }
     async function loadEvents() {
       const grid = $('#acGrid', view); grid.innerHTML = '<span class="note">Loading…</span>';
@@ -1375,34 +1725,60 @@
 
     function closeModal() { if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } if (modal) { modal.remove(); modal = null; } }
     async function openPlayer(idx) {
-      const ev = events[idx]; closeModal();
+      const ev = events[idx]; if (!ev) return;
+      const seq = ++playerSeq;
+      closeModal();
       const q = new URLSearchParams({ count: 60, since_id: ev.start_id, until_id: ev.end_id, detections: 'yolo-serial' });
       let pf = [];
-      try { const d = await api('GET', '/api/frames/sample?' + q); pf = Array.isArray(d) ? d : (d.frames || []); } catch (_) {}
-      if (!alive || !pf.length) return;
-      modal = document.createElement('div'); modal.className = 'fmodal';
+      try { const d = await api('GET', '/api/frames/sample?' + q); pf = Array.isArray(d) ? d : (d.frames || []); } catch (e) { flash('Playback: ' + e.message); return; }
+      if (!alive || seq !== playerSeq) return;
+      if (!pf.length) { flash('No frames left for that visit — they may have been evicted.'); return; }
+      closeModal();
+      modal = document.createElement('div'); modal.className = 'fmodal player';
       modal.innerHTML = `<div class="inner" style="min-width:320px">
-        <div class="fimg" id="pStage"><img id="pImg"><div class="fbox" hidden></div></div>
+        <div class="fimg" id="pStage"><img id="pImg"><div class="fbox" hidden><span class="boxcap"></span></div></div>
         <div class="row" style="margin-top:8px;align-items:center">
           <button id="pPlay">Pause</button>
           <input id="pScrub" type="range" min="0" max="${pf.length - 1}" value="0" style="flex:1;min-width:0">
           <span id="pIdx" class="note mono">1/${pf.length}</span>
         </div>
         <div id="pCap" class="note" style="margin-top:6px"></div>
+        ${statsHtml(ev.detection)}
       </div>`;
       document.body.appendChild(modal);
-      const img = $('#pImg', modal), fb = $('#pStage .fbox', modal);
+      const img = $('#pImg', modal), fb = $('#pStage .fbox', modal), cap = $('.boxcap', fb);
       let i = 0;
+      // Natural dimensions are learned ONCE from this visit's first frame and cached, so
+      // drawBox runs SYNCHRONOUSLY on every frame change. Waiting for each frame's load
+      // meant hiding the box and re-showing it 5× a second — the flicker. Safe because
+      // the cache is per OPEN VISIT (seconds of frames from one camera config), not
+      // global: an ROI/rotation change between visits just re-learns on the next open.
+      // It also makes a stale box impossible — the box is drawn from the frame being
+      // shown, never from a closure the previous frame left behind on `onload`.
+      let natW = null, natH = null;
+      const capEl = $('#pCap', modal);
+      function drawBox(f) {
+        const band = bandOf(f.score);
+        const txt = detLabel(f);
+        capEl.textContent = txt;
+        if (!f.box || !natW) { fb.hidden = true; return; }
+        // Per-FRAME truth, so a person box can show mid-cat visit; the band matches the
+        // Frame-review and user-dashboard colouring for the same confidence.
+        fb.className = 'fbox ' + band;
+        fb.style.cssText = 'position:absolute;box-sizing:border-box;' + boxStyle(f.box, natW, natH);
+        cap.className = 'boxcap ' + band;
+        cap.textContent = txt;
+        fb.hidden = false;
+      }
+      img.addEventListener('load', () => {
+        if (natW == null && img.naturalWidth) { natW = img.naturalWidth; natH = img.naturalHeight; }
+        drawBox(pf[i]);   // the first frame's box, now that dimensions are known
+      });
       function show(n) {
         i = n; const f = pf[i];
         img.src = f.url;
         $('#pScrub', modal).value = i; $('#pIdx', modal).textContent = (i + 1) + '/' + pf.length;
-        $('#pCap', modal).textContent = f.box ? `${CLS[f.cls] || f.cls} ${Math.round(f.score * 100)}%` : (f.analyzed === false ? 'unswept' : 'no detection');
-        fb.hidden = true; fb.style.cssText = 'position:absolute;border:2px solid var(--accent);box-sizing:border-box';
-        if (f.box) {
-          const place = () => { if (img.naturalWidth) { const b = f.box, w = img.naturalWidth, h = img.naturalHeight; fb.style.cssText += `;left:${b[0] / w * 100}%;top:${b[1] / h * 100}%;width:${(b[2] - b[0]) / w * 100}%;height:${(b[3] - b[1]) / h * 100}%`; fb.hidden = false; } };
-          if (img.complete) place(); else img.onload = place;
-        }
+        drawBox(f);
       }
       const play = () => { $('#pPlay', modal).textContent = 'Pause'; playerTimer = setInterval(() => show((i + 1) % pf.length), 200); };
       const pause = () => { $('#pPlay', modal).textContent = 'Play'; if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } };

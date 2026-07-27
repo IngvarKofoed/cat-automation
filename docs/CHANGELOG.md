@@ -1015,3 +1015,30 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      nothing, which read as the feature being absent. Distinct from a slot that HAS no recorded
      params because it never re-ran. The case is real, not hypothetical: the dev proxy serves a
      LOCAL admin-next against a REMOTE compute, so the page routinely runs ahead of its backend.
+
+165. Each admin-next scorecard can now SHOW the visits it missed, not just count them:
+     `gate_scorecard(missed_visits=True)` returns per-visit records for the wholly-missed spans it
+     already clusters, so `len(missed_visits)` IS `visits.wholly_missed` and the two cannot drift.
+     Deliberately not `Store.visits`, which judges caught against the LIVE gate only and ignores
+     warm-up + `oracle_floor` — under a Baseline/Candidate heading it would list the wrong column's
+     misses. `interesting` rows grew `f.id`/`o.score`; the counting paths now read them positionally.
+     Spec: docs/specs/2026-07-27-tuning-missed-visits.md.
+
+166. Missed-visit records are CHRONOLOGICAL, not `visits()`' worst-first. One column's panel is open
+     at a time, so a stable time order makes toggling Live gate → Candidate a visual diff: rows hold
+     their place and a recovered visit simply disappears. Worst-first reshuffles every row per column
+     and defeats the comparison the page exists for. The list is also uncapped — a reader must never
+     wonder whether they are looking at a sample.
+
+167. `/api/tuning/compare?missed=1` carries `motion_only_spans` alongside the records, and the panel
+     banners them even when the list is EMPTY. Across a motion-only or purge span the non-motion
+     frames a miss lives in were never stored, so a short list there is an absence of evidence, not
+     good recall — the "an empty danger set reads as safe" trap of entries 97/126, whose sharpest
+     instance is a page whose whole job is showing what was missed.
+
+168. admin-next tuning: each missed visit's filmstrip loads only when its row scrolls into view
+     (`IntersectionObserver`), which is what makes the uncapped list affordable — an eager panel
+     would fire one `/api/frames/sample` per miss on open. The strip covers the visit's id SPAN, so
+     it is labelled against the span width, not the detection count: `sample_frames` decimates by a
+     STRIDE and returns fewer frames than the `count` asked for, so "did it sample?" can't be tested
+     against that count.

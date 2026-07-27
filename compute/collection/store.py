@@ -2440,6 +2440,7 @@ class Store:
         since_id: "int | None" = None,
         until_id: "int | None" = None,
         is_night: "Callable[[int], bool] | None" = None,
+        missed_visits: bool = False,
     ) -> dict:
         """Recall / false-trigger / miss-breakdown scorecard for one (source, oracle).
 
@@ -2513,6 +2514,16 @@ class Store:
         Absent ``is_night`` (the default), **no** ``"split"`` key is added and the
         returned dict is byte-for-byte the unsplit one. The ``needs_rerun``
         short-circuit never carries a split (nothing to score yet).
+
+        ``missed_visits=True`` additionally returns the per-visit records for the
+        WHOLLY-MISSED visits — the same spans the ``visits.wholly_missed`` count is
+        derived from (see ``_missed_visit_records``), so the list length equals that
+        count and cannot drift from it. Deliberately **uncapped**: a reader must
+        never wonder whether they are looking at a sample. Affordable because each
+        record is a handful of scalars — the expensive part (the frames) is fetched
+        separately, per visit, by the UI. Absent the flag no ``"missed_visits"`` key
+        is added (the same additive contract as ``is_night``), and ``needs_rerun``
+        never carries one.
         """
         if oracle not in _SCORECARD_ORACLES:
             raise ValueError(f"oracle must be one of {_SCORECARD_ORACLES}, got {oracle!r}")
@@ -2616,8 +2627,12 @@ class Store:
                 # window) — in time order, not the whole scored set. The third column
                 # is the floored present flag, not the raw verdict, so a below-floor
                 # detection that coincides with motion can't masquerade as present.
+                # Columns 4-5 (f.id, o.score) are carried ONLY so ``missed_visits``
+                # can name each wholly-missed span's frames and pick its rep; the
+                # counting paths ignore them, reading rows positionally (r[0..2]).
                 interesting = self._conn.execute(
-                    f"SELECT f.recv_ts, {src_motion}, CASE WHEN {present_core} THEN 1 ELSE 0 END" + base_from
+                    f"SELECT f.recv_ts, {src_motion}, CASE WHEN {present_core} THEN 1 ELSE 0 END,"
+                    " f.id, o.score" + base_from
                     + " WHERE f.id >= ?" + scope_and + f" AND ({present_core} OR {src_motion} = 1)"
                     " ORDER BY f.recv_ts ASC, f.id ASC",
                     join_params + [threshold_id] + scope_params,
@@ -2668,6 +2683,10 @@ class Store:
                 }
                 for bucket, (total, bucket_caught) in split.items()
             }
+        if missed_visits:
+            # Built from the SAME warmed-up ``interesting`` rows the counts above
+            # use, so len(...) == card["visits"]["wholly_missed"] structurally.
+            card["missed_visits"] = self._missed_visit_records(interesting, is_night)
         return card
 
     @staticmethod
@@ -2743,9 +2762,11 @@ class Store:
     def _cluster_visits(cls, interesting: "list") -> "tuple[int, int]":
         """Cluster oracle-present frames into visits and count how many were caught.
 
-        ``interesting`` is ``(recv_ts, source_motion, present_flag)`` rows in
-        recv_ts order (only present-or-motion rows), where ``present_flag`` is the
-        oracle verdict after ``gate_scorecard``'s ``oracle_floor`` (1 = present).
+        ``interesting`` is ``(recv_ts, source_motion, present_flag, frame_id,
+        oracle_score)`` rows in recv_ts order (only present-or-motion rows), where
+        ``present_flag`` is the oracle verdict after ``gate_scorecard``'s
+        ``oracle_floor`` (1 = present). Read POSITIONALLY (``r[0..2]``): the last
+        two columns exist only for ``_missed_visit_records`` and are ignored here.
         Present frames split into a new visit wherever the recv_ts gap exceeds
         ``_VISIT_GAP_MS``; a visit is
         caught when any source-motion frame lands in its span ±``_VISIT_WINDOW_MS``.
@@ -2753,10 +2774,10 @@ class Store:
         reports, now computed over the shared ``_split_into_visits`` /
         ``_visit_caught`` primitives so it can never drift from ``visits``.
         """
-        present_ts = sorted(ts for ts, _motion, verdict in interesting if verdict == 1)
+        present_ts = sorted(r[0] for r in interesting if r[2] == 1)
         if not present_ts:
             return 0, 0
-        motion_ts = sorted(ts for ts, motion, _verdict in interesting if motion == 1)
+        motion_ts = sorted(r[0] for r in interesting if r[1] == 1)
         spans = cls._split_into_visits(present_ts)
         caught = sum(1 for lo_ts, hi_ts in spans if cls._visit_caught(lo_ts, hi_ts, motion_ts))
         return len(spans), caught
@@ -2776,12 +2797,13 @@ class Store:
         present frame — never split into two half-visits (visit recall, changelog 46,
         is the metric, so the unit is the whole visit). Returns
         ``{"day": (total, caught), "night": (total, caught)}`` whose totals sum to
-        exactly ``_cluster_visits``' combined counts.
+        exactly ``_cluster_visits``' combined counts. Rows are read positionally
+        (``r[0..2]``), like ``_cluster_visits``.
         """
-        present_ts = sorted(ts for ts, _motion, verdict in interesting if verdict == 1)
+        present_ts = sorted(r[0] for r in interesting if r[2] == 1)
         if not present_ts:
             return {"day": (0, 0), "night": (0, 0)}
-        motion_ts = sorted(ts for ts, motion, _verdict in interesting if motion == 1)
+        motion_ts = sorted(r[0] for r in interesting if r[1] == 1)
         totals = {"day": 0, "night": 0}
         caughts = {"day": 0, "night": 0}
         for lo_ts, hi_ts in cls._split_into_visits(present_ts):
@@ -2793,6 +2815,65 @@ class Store:
             "day": (totals["day"], caughts["day"]),
             "night": (totals["night"], caughts["night"]),
         }
+
+    @classmethod
+    def _missed_visit_records(
+        cls, interesting: "list", is_night: "Callable[[int], bool] | None"
+    ) -> "list[dict]":
+        """Per-visit records for the WHOLLY-MISSED visits ``_cluster_visits`` counts.
+
+        Same ``interesting`` rows, same ``_gap_split`` gap, same ``_visit_caught``
+        test as ``_cluster_visits`` — it just keeps the present *rows* per run
+        instead of collapsing each to a ``(lo_ts, hi_ts)`` pair, so a span can name
+        its frames. That shared derivation is the point: ``len(...)`` is exactly the
+        ``visits.wholly_missed`` count, and neither can drift from the other.
+
+        Returns, per uncaught visit::
+
+            {start_id, end_id, start_ts, end_ts, n_present, rep_frame_id,
+             peak_score[, night]}
+
+        ``start_id``/``end_id`` bound the visit's present frames — load-bearing,
+        since the UI fetches the strip via ``/api/frames/sample?since_id=&until_id=``.
+        ``rep_frame_id`` is the highest-oracle-score present frame (ties by id),
+        matching ``visits()``' ``missed`` rule *including* its NULL handling: an
+        unscored row sorts as ``-inf`` so it never beats a scored peer, and
+        ``peak_score`` is ``None`` when the whole span is unscored.
+
+        Ordered **chronologically** by ``start_ts``, deliberately NOT ``visits()``'
+        worst-first: one column's panel is open at a time, so a stable time order
+        makes toggling Live gate → Candidate a visual diff (a recovered visit simply
+        disappears) rather than a reshuffle of every row.
+
+        ``night`` is added per visit only when ``is_night`` is supplied, bucketed by
+        the span's FIRST present frame exactly as ``_cluster_visits_split`` does, so
+        a dusk-straddling visit is tagged the same way it is counted.
+        """
+        present = sorted((r for r in interesting if r[2] == 1), key=lambda r: (r[0], r[3]))
+        if not present:
+            return []
+        motion_ts = sorted(r[0] for r in interesting if r[1] == 1)
+        out: "list[dict]" = []
+        for run in cls._gap_split(present, _VISIT_GAP_MS, lambda r: r[0]):
+            lo_ts, hi_ts = int(run[0][0]), int(run[-1][0])
+            if cls._visit_caught(lo_ts, hi_ts, motion_ts):
+                continue
+            ids = [int(r[3]) for r in run]
+            rep = max(run, key=lambda r: (r[4] if r[4] is not None else float("-inf"), r[3]))
+            record = {
+                "start_id": min(ids),
+                "end_id": max(ids),
+                "start_ts": lo_ts,
+                "end_ts": hi_ts,
+                "n_present": len(run),
+                "rep_frame_id": int(rep[3]),
+                "peak_score": (float(rep[4]) if rep[4] is not None else None),
+            }
+            if is_night is not None:
+                record["night"] = bool(is_night(lo_ts))
+            out.append(record)
+        out.sort(key=lambda rec: (rec["start_ts"], rec["start_id"]))
+        return out
 
     def gate_fidelity(self, slot: str, since_id: "int | None" = None, until_id: "int | None" = None) -> dict:
         """How faithfully a re-run slot reproduces the live gate it was seeded from.

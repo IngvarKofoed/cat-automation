@@ -493,6 +493,67 @@ def test_tuning_compare_populated_assembles_cards_deltas_fidelity(make_app):
     assert body["fidelity"] == {"compared": 4, "agree": 4, "rate": 1.0}
 
 
+# --- GET /api/tuning/compare: missed-visit records (admin-next) ------------------
+#
+# ``missed=1`` threads ``missed_visits=True`` into all three gate_scorecard calls and
+# attaches the window's ``motion_only_spans`` — the unmeasurability caveat, since a
+# short/empty missed list across a motion-only or purge span is an absence of evidence
+# rather than good recall. Absent the param the response is byte-identical.
+
+
+def test_tuning_compare_no_missed_param_adds_no_missed_keys(make_app):
+    client, store = make_app(client=NoConfigClient())
+    _seed(store, slots=())
+
+    body = client.get("/api/tuning/compare", params={"oracle": "yolo"}).json()
+    assert "motion_only_spans" not in body
+    assert "missed_visits" not in body["live"]
+
+
+def test_tuning_compare_missed_attaches_records_and_motion_only_spans(make_app):
+    # Wiring: every scoreable card gains the list, an unrun slot still short-circuits
+    # to needs_rerun (no key), and the caveat spans ride along at the top level.
+    client, store = make_app(client=NoConfigClient())
+    _seed(store, slots=())
+
+    body = client.get("/api/tuning/compare", params={"oracle": "yolo", "missed": "true"}).json()
+    assert isinstance(body["motion_only_spans"], list)
+    assert isinstance(body["live"]["missed_visits"], list)
+    # Slots never ran -> needs_rerun short-circuit, which carries no missed_visits.
+    assert body["baseline"] == {"source": "mog2:baseline", "oracle": "yolo", "needs_rerun": True}
+    assert "missed_visits" not in body["candidate"]
+
+
+def test_tuning_compare_missed_records_match_the_headline_count(make_app):
+    # End-to-end through the route: the listed misses ARE the wholly_missed count, on
+    # a scoped, fully-primed window holding one caught visit and one wholly-missed one.
+    client, store = make_app(client=NoConfigClient())
+    base = 1_700_000_000_000
+    for j in range(_COMPARE_WARMUP):
+        store.add(_frame(frame_id=j, motion=False, area=0.0), recv_ts_ms=base + j)
+    caught = store.add(_frame(frame_id=600, motion=True, area=0.05), recv_ts_ms=base + 50_000)
+    store.write_analysis(caught, "yolo", True, 0.9, None)
+    # A wholly-missed visit: two still frames the oracle calls present, far from motion.
+    miss_a = store.add(_frame(frame_id=601, motion=False, area=0.002), recv_ts_ms=base + 150_000)
+    store.write_analysis(miss_a, "yolo", True, 0.7, None)
+    miss_b = store.add(_frame(frame_id=602, motion=False, area=0.003), recv_ts_ms=base + 150_500)
+    store.write_analysis(miss_b, "yolo", True, 0.8, None)
+
+    body = client.get(
+        "/api/tuning/compare",
+        params={"oracle": "yolo", "missed": "true", "since_id": caught, "until_id": miss_b},
+    ).json()
+    live = body["live"]
+    assert live["visits"] == {"total": 2, "caught": 1, "wholly_missed": 1}
+    recs = live["missed_visits"]
+    assert len(recs) == live["visits"]["wholly_missed"] == 1
+    assert recs[0]["start_id"] == miss_a
+    assert recs[0]["end_id"] == miss_b
+    assert recs[0]["n_present"] == 2
+    assert recs[0]["rep_frame_id"] == miss_b       # highest oracle score (0.8)
+    assert recs[0]["peak_score"] == pytest.approx(0.8)
+
+
 # --- GET /api/tuning/compare: day/night split (admin-next P2) --------------------
 #
 # The split rides an ``is_night`` classifier into every gate_scorecard call. It is

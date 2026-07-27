@@ -425,6 +425,173 @@ def test_scorecard_split_needs_rerun_slot_carries_no_split(tmp_path):
     assert card == {"source": "mog2:candidate", "oracle": "yolo", "needs_rerun": True}
 
 
+# --- gate_scorecard: missed_visits records -----------------------------------
+
+
+def test_scorecard_missed_visits_absent_flag_adds_no_key(tmp_path):
+    store = _store(tmp_path)
+    _seed(store, 10_000, motion=False, area=0.005, yolo=(1, 0.9))
+    card = store.gate_scorecard("live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3)
+    assert "missed_visits" not in card
+
+
+def test_scorecard_missed_visits_length_equals_wholly_missed(tmp_path):
+    # THE invariant the whole design exists for: the list is derived from the same
+    # spans the count is, so it can never disagree with the headline number.
+    store = _store(tmp_path)
+    # Caught visit.
+    _seed(store, 10_000, motion=True, area=0.05, yolo=(1, 0.9))
+    _seed(store, 10_500, motion=False, area=0.05, yolo=(1, 0.8))
+    # Two wholly-missed visits, far apart and far from any motion frame.
+    _seed(store, 30_000, motion=False, area=0.005, yolo=(1, 0.7))
+    _seed(store, 30_500, motion=False, area=0.006, yolo=(1, 0.6))
+    _seed(store, 60_000, motion=False, area=0.007, yolo=(1, 0.5))
+    # A false trigger, far from every visit: motion without an oracle verdict.
+    _seed(store, 90_000, motion=True, area=0.02, yolo=(0, 0.05))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    assert card["visits"]["wholly_missed"] == 2
+    assert len(card["missed_visits"]) == card["visits"]["wholly_missed"]
+    # And the CAUGHT visit is absent — the list is misses only.
+    assert all(rec["start_ts"] >= 30_000 for rec in card["missed_visits"])
+
+
+def test_scorecard_missed_visits_records_are_chronological_with_span_bounds(tmp_path):
+    # Deliberately NOT visits()' worst-first: a stable time order is what makes
+    # toggling between two columns' panels a visual diff. Seeded so a worst-first
+    # sort (n_present desc) would invert the two records.
+    store = _store(tmp_path)
+    early = _seed(store, 30_000, motion=False, area=0.005, yolo=(1, 0.4))  # 1 frame
+    late_a = _seed(store, 60_000, motion=False, area=0.006, yolo=(1, 0.9))  # 3 frames
+    late_b = _seed(store, 60_500, motion=False, area=0.007, yolo=(1, 0.5))
+    late_c = _seed(store, 61_000, motion=False, area=0.008, yolo=(1, 0.6))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    recs = card["missed_visits"]
+    assert [r["start_ts"] for r in recs] == [30_000, 60_000]  # chronological, not worst-first
+    assert recs[0] == {
+        "start_id": early, "end_id": early, "start_ts": 30_000, "end_ts": 30_000,
+        "n_present": 1, "rep_frame_id": early, "peak_score": pytest.approx(0.4),
+    }
+    # The id span bounds the whole cluster — it is what the UI fetches the strip by.
+    assert recs[1]["start_id"] == late_a
+    assert recs[1]["end_id"] == late_c
+    assert recs[1]["end_ts"] == 61_000
+    assert recs[1]["n_present"] == 3
+    # rep = highest oracle score in the cluster (0.9), NOT the last frame.
+    assert recs[1]["rep_frame_id"] == late_a
+    assert recs[1]["peak_score"] == pytest.approx(0.9)
+    assert late_b not in (recs[1]["rep_frame_id"],)
+
+
+def test_scorecard_missed_visits_unscored_rows_never_win_the_rep_pick(tmp_path):
+    # NULL oracle score sorts as -inf (visits()' rule), so a scored peer always wins;
+    # an all-unscored span reports peak_score None rather than fabricating a number.
+    store = _store(tmp_path)
+    _seed(store, 30_000, motion=False, area=0.005, yolo=(1, None))
+    scored = _seed(store, 30_500, motion=False, area=0.006, yolo=(1, 0.2))
+    _seed(store, 30_900, motion=False, area=0.007, yolo=(1, None))
+    # A second, wholly unscored visit.
+    _seed(store, 60_000, motion=False, area=0.005, yolo=(1, None))
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    recs = card["missed_visits"]
+    assert len(recs) == 2
+    assert recs[0]["rep_frame_id"] == scored
+    assert recs[0]["peak_score"] == pytest.approx(0.2)
+    assert recs[1]["peak_score"] is None
+
+
+def test_scorecard_missed_visits_night_tag_matches_split_bucketing(tmp_path):
+    # The per-record night flag must agree with how the SPLIT counted the same
+    # visit — both bucket by the span's FIRST present frame.
+    store = _store(tmp_path)
+    _seed(store, 30_000, motion=False, area=0.005, yolo=(1, 0.9))   # day
+    _seed(store, 60_000, motion=False, area=0.005, yolo=(1, 0.9))   # night
+    _seed(store, 60_500, motion=False, area=0.005, yolo=(1, 0.9))   # same visit
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        is_night=lambda ts: ts >= 40_000, missed_visits=True,
+    )
+    assert [r["night"] for r in card["missed_visits"]] == [False, True]
+    assert card["split"]["day"]["wholly_missed"] == 1
+    assert card["split"]["night"]["wholly_missed"] == 1
+
+
+def test_scorecard_missed_visits_no_night_key_without_is_night(tmp_path):
+    store = _store(tmp_path)
+    _seed(store, 30_000, motion=False, area=0.005, yolo=(1, 0.9))
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    assert "night" not in card["missed_visits"][0]
+
+
+def test_scorecard_missed_visits_needs_rerun_slot_carries_no_key(tmp_path):
+    store = _store(tmp_path)
+    _seed(store, 1_000, motion=True, area=0.05, yolo=(1, 0.9))
+    card = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    assert card == {"source": "mog2:candidate", "oracle": "yolo", "needs_rerun": True}
+
+
+def test_scorecard_missed_visits_for_a_slot_uses_slot_verdicts_not_live_motion(tmp_path):
+    # The whole reason this isn't Store.visits: a slot column's misses must be judged
+    # against the SLOT's verdicts. Here the live gate fired but the candidate slot did
+    # not, so the visit is a miss for the slot and caught for live.
+    store = _store(tmp_path)
+    _seed(store, 30_000, motion=True, area=0.05, yolo=(1, 0.9), slot=(0, 0.001))
+    _seed(store, 30_500, motion=True, area=0.05, yolo=(1, 0.8), slot=(0, 0.001))
+
+    live = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    slot = store.gate_scorecard(
+        "mog2:candidate", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        missed_visits=True,
+    )
+    assert live["missed_visits"] == []
+    assert len(slot["missed_visits"]) == 1
+    assert slot["missed_visits"][0]["n_present"] == 2
+
+
+def test_scorecard_missed_visits_respects_oracle_floor_and_warmup(tmp_path):
+    # The records come from the same warmed-up, floored ``interesting`` rows the
+    # counts do — so a phantom floored out of the count is absent from the list too.
+    store = _store(tmp_path)
+    _seed(store, 10_000, motion=False, area=0.005, yolo=(1, 0.2))   # phantom, floored out
+    _seed(store, 40_000, motion=False, area=0.005, yolo=(1, 0.9))   # real miss
+
+    card = store.gate_scorecard(
+        "live", "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+        oracle_floor=0.3, missed_visits=True,
+    )
+    assert card["visits"]["wholly_missed"] == 1
+    assert [r["start_ts"] for r in card["missed_visits"]] == [40_000]
+
+    # Warm-up drops the oldest scored row, taking its visit out of both count and list.
+    warmed = store.gate_scorecard(
+        "live", "yolo", warmup=1, min_area=0.01, max_area=0.5, persistence=3,
+        oracle_floor=0.0, missed_visits=True,
+    )
+    assert len(warmed["missed_visits"]) == warmed["visits"]["wholly_missed"] == 1
+    assert warmed["missed_visits"][0]["start_ts"] == 40_000
+
+
 def test_gate_fidelity_empty_slot_is_zero(tmp_path):
     store = _store(tmp_path)
     _seed(store, 1_000, motion=True, area=0.05, yolo=(1, 0.9))

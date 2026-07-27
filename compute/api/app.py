@@ -1685,6 +1685,7 @@ def create_app(
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
         split: bool = Query(default=False),
+        missed: bool = Query(default=False),
     ):
         # The oracle is the fixed ground truth both scorecards score against; only a
         # registered one is valid (400 otherwise — the same gate /api/frames uses).
@@ -1763,6 +1764,7 @@ def create_app(
             since_id=since_id,
             until_id=until_id,
             is_night=is_night,
+            missed_visits=missed,
         )
         b_min, b_max, b_pers = _slot_thresholds(store, _BASELINE_SLOT, edge_params)
         baseline = store.gate_scorecard(
@@ -1776,6 +1778,7 @@ def create_app(
             since_id=since_id,
             until_id=until_id,
             is_night=is_night,
+            missed_visits=missed,
         )
         c_min, c_max, c_pers = _slot_thresholds(store, _CANDIDATE_SLOT, edge_params)
         candidate = store.gate_scorecard(
@@ -1789,6 +1792,7 @@ def create_app(
             since_id=since_id,
             until_id=until_id,
             is_night=is_night,
+            missed_visits=missed,
         )
 
         # Fidelity is the baseline re-run vs. stored frames.motion — only meaningful
@@ -1827,6 +1831,14 @@ def create_app(
                 result["location"] = split_location
             else:
                 result["split_reason"] = split_reason
+        # The misses' unmeasurability caveat, attached only alongside the misses
+        # themselves (so an unasked call stays byte-identical). Under motion-only
+        # capture — or across a cleanup purge span — the non-motion frames a miss
+        # LIVES IN were never stored, so a short or empty missed list there is an
+        # absence of evidence, not good recall. The same signal /api/visits and
+        # /api/timeline already carry, for the same reason.
+        if missed:
+            result["motion_only_spans"] = store.motion_only_spans(since_id, until_id)
         return result
 
     # --- Cat-identity annotation tool (roster CRUD + label queue + crops) -----------

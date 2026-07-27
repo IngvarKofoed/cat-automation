@@ -185,6 +185,26 @@
   .prow.chg { color: var(--warn); font-weight: 600; }
   .prow.chg .pv::after { content: ' ✽'; }
 
+  /* Missed-visit panel: one column's wholly-missed visits, each an inline filmstrip.
+     Full width (below the three cards) — a strip inside a 210px .stat tile would be
+     postage stamps. Chronological, so toggling columns reads as a diff. */
+  .mv-open { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .mv-row { border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface-2); padding: 10px; margin-bottom: 10px; }
+  .mv-row:last-child { margin-bottom: 0; }
+  .mv-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-bottom: 8px;
+    font-size: 12px; font-variant-numeric: tabular-nums; }
+  .mv-when { font-weight: 600; font-size: 13px; }
+  .mv-head .mv-k { color: var(--muted); font-size: 11px; margin-right: 3px; }
+  .mv-tag { font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; }
+  /* The strip reuses the shared .fgrid/.ftile chrome, at a tighter tile size. */
+  .mv-strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+  .mv-strip .fmeta { font-size: 10px; }
+  /* Placeholder shown until the row scrolls into view and its strip loads. */
+  .mv-ph { max-width: 200px; }
+  .mv-ph img { width: 100%; height: auto; display: block; border-radius: var(--radius); opacity: .75; }
+
   /* MOG2 parameter reference (bottom card): ranked list, each with its direction cue. */
   .pref-row { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .pref-row:last-child { border-bottom: 0; }
@@ -928,6 +948,7 @@
         <h3>Scorecards</h3>
         <div class="row"><button id="compareBtn" class="primary">Compare</button><span id="splitNote" class="note"></span></div>
         <div id="scorecards" class="stats sccards" style="margin-top:12px"></div>
+        <div id="missedPanel"></div>
       </div>
 
       <div class="card">
@@ -1094,10 +1115,17 @@
       }).join('');
       return `<div class="plist">${rows}</div>`;
     }
-    function scorecardHtml(title, sc, params, live, available) {
+    function scorecardHtml(title, sc, params, live, available, key) {
       if (!sc || sc.needs_rerun) return `<div class="stat"><div class="k">${title}</div><div class="note">not run yet</div>${paramList(params, live, available)}</div>`;
       const split = sc.split
         ? sline([['Day', rpct(sc.split.day.caught, sc.split.day.total)], ['Night', rpct(sc.split.night.caught, sc.split.night.total)]]) : '';
+      // Only offer the panel when there is something in it AND the backend actually
+      // sent the records (an older compute build answers the `missed` param with
+      // nothing, and a dead button is worse than no button — changelog 164's lesson).
+      const nMissed = sc.visits.wholly_missed;
+      const btn = (nMissed > 0 && Array.isArray(sc.missed_visits))
+        ? `<button class="mv-btn" data-col="${key}" style="margin-top:10px;width:100%">Show missed (${fmtInt(nMissed)})</button>`
+        : '';
       return `<div class="stat">
         <div class="k">${title}</div>
         <div class="v">${rpct(sc.visits.caught, sc.visits.total)}</div>
@@ -1105,6 +1133,7 @@
         ${sline([['Missed', fmtInt(sc.recall.missed)], ['False', fmtInt(sc.false_triggers.count)]])}
         ${split}
         ${paramList(params, live, available)}
+        ${btn}
       </div>`;
     }
     $('#compareBtn', view).addEventListener('click', compare);
@@ -1112,7 +1141,8 @@
       const el = $('#scorecards', view);
       if (scope.since_id == null) { el.innerHTML = '<span class="note warn">Pick a day with frames first.</span>'; return; }
       el.innerHTML = '<span class="note">Comparing…</span>';
-      const q = new URLSearchParams({ oracle: 'yolo-serial', split: 'true', since_id: scope.since_id, until_id: scope.until_id });
+      closeMissed();                                  // its rows belong to the PREVIOUS response
+      const q = new URLSearchParams({ oracle: 'yolo-serial', split: 'true', missed: 'true', since_id: scope.since_id, until_id: scope.until_id });
       try {
         const r = await api('GET', '/api/tuning/compare?' + q);
         if (!alive) return;
@@ -1121,15 +1151,146 @@
         // nothing recorded — the two get different notes.
         const p = r.params || {};
         const has = !!r.params;
-        el.innerHTML = scorecardHtml('Live gate', r.live, p.live, null, has)
-          + scorecardHtml('Baseline', r.baseline, p.baseline, p.live, has)
-          + scorecardHtml('Candidate', r.candidate, p.candidate, p.live, has);
+        lastCompare = r;
+        el.innerHTML = scorecardHtml('Live gate', r.live, p.live, null, has, 'live')
+          + scorecardHtml('Baseline', r.baseline, p.baseline, p.live, has, 'baseline')
+          + scorecardHtml('Candidate', r.candidate, p.candidate, p.live, has, 'candidate');
+        el.querySelectorAll('.mv-btn').forEach((b) => b.addEventListener('click', () => toggleMissed(b.dataset.col)));
         const sn = $('#splitNote', view);
         if (r.split_available && r.location) sn.textContent = `Day/Night @ ${r.location.latitude.toFixed(2)}, ${r.location.longitude.toFixed(2)}`;
         else if (r.split_reason === 'location_unset') sn.textContent = 'Day/Night off — set a location on Start.';
         else if (r.split_reason === 'astral_unavailable') sn.textContent = 'Day/Night off — astral unavailable.';
         else sn.textContent = '';
       } catch (e) { el.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+
+    // --- Missed-visit panel -------------------------------------------------
+    //
+    // One column's wholly-missed visits, chronological, each an inline filmstrip.
+    // Only ONE column is open at a time and the order is stable by time, so toggling
+    // Live gate -> Candidate reads as a DIFF: rows hold their place and a visit the
+    // candidate recovered simply disappears.
+    const COL_TITLE = { live: 'Live gate', baseline: 'Baseline', candidate: 'Candidate' };
+    const MV_STRIP_MAX = 24;                   // tiles per visit; a longer visit decimates
+    let lastCompare = null, openCol = null, mvObserver = null;
+
+    function closeMissed() {
+      openCol = null;
+      if (mvObserver) { mvObserver.disconnect(); mvObserver = null; }
+      const el = $('#missedPanel', view);
+      // Drop the class too, not just the content: .mv-open carries a top border and
+      // padding that would otherwise leave a stray rule under an empty panel.
+      if (el) { el.className = ''; el.innerHTML = ''; }
+      view.querySelectorAll('.mv-btn').forEach((b) => b.classList.remove('primary'));
+    }
+    function toggleMissed(col) {
+      const reopening = openCol === col;
+      closeMissed();
+      if (!reopening) renderMissed(col);
+    }
+    function renderMissed(col) {
+      const sc = lastCompare && lastCompare[col];
+      const recs = (sc && sc.missed_visits) || [];
+      openCol = col;
+      const btn = view.querySelector(`.mv-btn[data-col="${col}"]`);
+      if (btn) btn.classList.add('primary');
+      // Under motion-only capture (or across a cleanup purge) the non-motion frames a
+      // miss LIVES IN were never stored, so a short/empty list there is an absence of
+      // evidence, not good recall. Shown even when the list is empty — that is the
+      // case it exists for.
+      const spans = (lastCompare && lastCompare.motion_only_spans) || [];
+      const caveat = spans.length
+        ? `<p class="note warn" style="margin:0 0 10px">Misses are <b>unmeasurable</b> across ${spans.length} span${spans.length === 1 ? '' : 's'} of this window — it was captured motion-only, or a cleanup purge stripped its non-motion frames. Anything the gate missed there was never stored.</p>`
+        : '';
+      const head = `<div class="row" style="margin-bottom:10px">
+          <b class="grow">${COL_TITLE[col] || col} — ${fmtInt(recs.length)} missed visit${recs.length === 1 ? '' : 's'}</b>
+          <button id="mvClose">Close</button>
+        </div>${caveat}`;
+      const body = recs.length
+        ? recs.map((r, i) => mvRowHtml(r, i)).join('')
+        : '<span class="note">No wholly-missed visits in this window for this column.</span>';
+      const el = $('#missedPanel', view);
+      el.className = 'mv-open';
+      el.innerHTML = head + body;
+      $('#mvClose', el).addEventListener('click', closeMissed);
+      observeStrips(el, recs);
+    }
+    function mvRowHtml(r, i) {
+      const dur = Math.max(0, r.end_ts - r.start_ts) / 1000;
+      const tag = r.night === true ? '<span class="mv-tag">night</span>'
+        : r.night === false ? '<span class="mv-tag">day</span>' : '';
+      const peak = r.peak_score == null ? '—' : Math.round(r.peak_score * 100) + '%';
+      return `<div class="mv-row" data-i="${i}">
+        <div class="mv-head">
+          <span class="mv-when">${fmtClock(r.start_ts)}</span>
+          <span><span class="mv-k">for</span>${dur.toFixed(1)}s</span>
+          <span><span class="mv-k">detected</span>${fmtInt(r.n_present)}</span>
+          <span><span class="mv-k">peak</span>${peak}</span>
+          ${tag}
+          <span class="grow"></span>
+          <span class="note">#${fmtInt(r.start_id)}–${fmtInt(r.end_id)}</span>
+        </div>
+        <div class="mv-body"><div class="mv-ph"><img loading="lazy" src="/media/${r.rep_frame_id}" alt=""></div></div>
+      </div>`;
+    }
+    // Each row fetches its own strip, and only once it scrolls into view: the list is
+    // uncapped, so an eager load would fire one request per miss the instant the panel
+    // opens. Results are cached on the row, so scrolling back up re-renders from memory.
+    function observeStrips(root, recs) {
+      if (mvObserver) mvObserver.disconnect();
+      const loaded = new Set();
+      // Pin the column this observer belongs to: an in-flight strip fetch must not
+      // paint after the operator has switched columns (its row is detached by then,
+      // so it would be silent wasted work rather than a wrong render).
+      const myCol = openCol;
+      const load = async (rowEl, rec) => {
+        const body = $('.mv-body', rowEl);
+        try {
+          const q = new URLSearchParams({
+            count: MV_STRIP_MAX, since_id: rec.start_id, until_id: rec.end_id, detections: 'yolo-serial',
+          });
+          const data = await api('GET', '/api/frames/sample?' + q);
+          if (!alive || openCol !== myCol) return;
+          const frames = Array.isArray(data) ? data : (data.frames || []);
+          if (!frames.length) { body.innerHTML = '<span class="note">No frames — they may have been evicted.</span>'; return; }
+          // The strip covers the visit's whole id SPAN, so it also holds the frames
+          // between the detections — `n_present` is not its denominator, and neither
+          // is MV_STRIP_MAX (the server decimates by a stride, so a capped response
+          // lands BELOW the count it was asked for). The span width is the honest
+          // denominator; an eviction gap inside it would over-report sampling, which
+          // is the safe direction — never claim the whole visit is on screen when it
+          // isn't (the honesty entry 154 had to retrofit onto Frame review).
+          const span = rec.end_id - rec.start_id + 1;
+          const note = frames.length < span
+            ? `<div class="note" style="margin-bottom:6px">${fmtInt(frames.length)} of ${fmtInt(span)} frames in this visit's span (sampled)</div>` : '';
+          body.innerHTML = note + `<div class="fgrid mv-strip">${frames.map((f) => mvTileHtml(f)).join('')}</div>`;
+          placeBoxes(body);
+        } catch (e) {
+          if (alive && openCol === myCol) body.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+        }
+      };
+      // Hold the observer in a local: closeMissed() nulls `mvObserver`, and a callback
+      // already queued when it did would then throw on `.unobserve`.
+      const obs = new IntersectionObserver((entries) => {
+        for (const en of entries) {
+          if (!en.isIntersecting) continue;
+          const i = Number(en.target.dataset.i);
+          if (loaded.has(i)) continue;
+          loaded.add(i);
+          obs.unobserve(en.target);
+          load(en.target, recs[i]);
+        }
+      }, { root: null, rootMargin: '200px' });
+      mvObserver = obs;
+      root.querySelectorAll('.mv-row').forEach((el) => obs.observe(el));
+    }
+    function mvTileHtml(f) {
+      const boxDiv = f.box ? `<div class="fbox ${bandOf(f.score)}" hidden></div>` : '';
+      const boxAttr = f.box ? `data-box='${JSON.stringify(f.box)}'` : '';
+      return `<div class="ftile">
+        <div class="fimg"><img loading="lazy" src="${f.url}" ${boxAttr}>${boxDiv}${frameDetChip(f, 'at-br')}</div>
+        <div class="fmeta"><span>${fmtClock(f.recv_ts)}</span><span>#${f.id}</span></div>
+      </div>`;
     }
 
     // --- Queue tables (the shared renderer, fed from the analysis status poll) ---
@@ -1193,7 +1354,9 @@
       pollJob();
     })();
     const timer = setInterval(pollJob, 3000);
-    return () => { alive = false; clearInterval(timer); };
+    // Disconnect the strip observer on nav: it holds refs to this view's rows, and an
+    // in-flight strip fetch must not paint into a torn-down DOM (`alive` guards that).
+    return () => { alive = false; clearInterval(timer); if (mvObserver) mvObserver.disconnect(); };
   }
 
   // =======================================================================

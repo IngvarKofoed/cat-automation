@@ -1,12 +1,12 @@
 """Local frontend dev server: serve the LOCAL web/ HTML, proxy everything else to the real compute PC.
 
-Iterate on ``compute/api/web/{user,admin}/index.html`` on your dev box against the
-REAL backend's data (cats, events, media, models) with a plain browser reload — no
+Iterate on ``compute/api/web/*/index.html`` on your dev box against the REAL
+backend's data (cats, events, media, models) with a plain browser reload — no
 backend changes, no data copy, no CORS. Because the frontend uses same-origin
 absolute paths (``/api/...``, ``/media/...``), a same-origin reverse proxy is all it
-takes: this server answers ``/``, ``/admin``, and ``/admin-next`` from your local
-files (served no-store, so an edit shows on refresh) and forwards every other
-request to ``CAT_COMPUTE_URL`` unchanged.
+takes: this server answers ``/``, ``/admin`` (+ its ``/admin-next`` alias), and
+``/admin-old`` from your local files (served no-store, so an edit shows on refresh)
+and forwards every other request to ``CAT_COMPUTE_URL`` unchanged.
 
 **Fully async + streaming**, and that is load-bearing, not incidental. The user
 dashboard opens a long-lived **SSE** stream (``/api/events/stream``, a keepalive every
@@ -27,7 +27,7 @@ Usage (from the repo root, after ``./compute.sh`` has built ``.venv-compute`` on
     ./frontend-dev.sh http://<compute-pc-ip>:8001      # backend as an arg
     CAT_COMPUTE_URL=http://<compute-pc-ip>:8001 .venv-compute/bin/python compute/tools/frontend_dev_proxy.py
 
-Then open http://localhost:8080/ (user), /admin (workbench), or /admin-next (rebuild).
+Then open http://localhost:8080/ (user), /admin (console), or /admin-old (retired console).
 
 Env:
     CAT_COMPUTE_URL   real compute backend base URL (default http://localhost:8001)
@@ -46,8 +46,10 @@ from starlette.background import BackgroundTask
 
 _WEB = Path(__file__).resolve().parents[1] / "api" / "web"
 _USER_HTML = _WEB / "user" / "index.html"
-_ADMIN_HTML = _WEB / "admin" / "index.html"
-_ADMIN_NEXT_HTML = _WEB / "admin-next" / "index.html"
+# Same mapping the real app uses after the flip (NEW_ADMIN_PLAN.md P8): the
+# admin-next rebuild IS `/admin`; the console it replaced answers `/admin-old`.
+_ADMIN_HTML = _WEB / "admin-next" / "index.html"
+_ADMIN_OLD_HTML = _WEB / "admin" / "index.html"
 
 _BACKEND = os.environ.get("CAT_COMPUTE_URL", "http://localhost:8001").rstrip("/")
 _PORT = int(os.environ.get("CAT_DEV_PORT", "8080"))
@@ -95,16 +97,18 @@ def user_index() -> Response:
 
 
 @app.get("/admin")
+@app.get("/admin-next")
 def admin_index() -> Response:
+    # Served from your LOCAL file so a frontend edit shows on refresh, while its
+    # /api/* calls proxy to the real backend — which must already have the endpoints
+    # the page calls (pull + restart the compute PC first). Several admin pages name
+    # a "behind backend" state for exactly this reason (changelog 164/173/183).
     return _serve_local(_ADMIN_HTML, "admin page")
 
 
-@app.get("/admin-next")
-def admin_next_index() -> Response:
-    # The in-progress rebuild — served from your LOCAL file so a frontend edit shows
-    # on refresh, while its /api/* calls proxy to the real backend (which must already
-    # have the admin-next BACKEND endpoints — pull + restart the compute PC first).
-    return _serve_local(_ADMIN_NEXT_HTML, "admin-next page")
+@app.get("/admin-old")
+def admin_old_index() -> Response:
+    return _serve_local(_ADMIN_OLD_HTML, "old admin page")
 
 
 @app.api_route(
@@ -112,8 +116,8 @@ def admin_next_index() -> Response:
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
 )
 async def proxy(full_path: str, request: Request) -> Response:
-    # Everything that isn't a locally-served page (/, /admin) is reverse-proxied to
-    # the real backend: same method, query string, headers, and body.
+    # Everything that isn't a locally-served page (the routes above) is reverse-proxied
+    # to the real backend: same method, query string, headers, and body.
     client: httpx.AsyncClient = request.app.state.client
     url = f"{_BACKEND}/{full_path}"
     body = await request.body()

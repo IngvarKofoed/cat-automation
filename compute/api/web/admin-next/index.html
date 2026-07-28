@@ -1,21 +1,21 @@
 <!DOCTYPE html>
 <!--
-  admin-next — streamlined compute admin (WIP, admin-next rebuild).
+  The compute admin console — served at /admin (and /admin-next, the route it was
+  built under). The workbench it replaced is at /admin-old until it is retired.
 
-  Self-contained single file (own CSS + JS, no sharing with /admin or / — the
+  Self-contained single file (own CSS + JS, no sharing with /admin-old or / — the
   entry-80 convention). Dark, deliberately minimal styling; the reskin comes
   later. Pages are hash-routed; each page is a mount(view) -> teardown function
   so a live page can poll and clean up its timers on navigation. Built per phase
-  (see docs/NEW_ADMIN_PLAN.md). Served at /admin-next so the old /admin stays
-  untouched until the final flip.
+  (see docs/NEW_ADMIN_PLAN.md).
 
-  Built so far: Start (P1 — mode, collection, location, cleanup). The rest are
-  stubs filled in by their phase.
+  Pages: Start · Motion tuning · Frame review · Annotation · Model building ·
+  Activity. Not carried over from the old console: buckets, corruption review.
 -->
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" href="data:," />
-<title>Admin-next · Cat Automation</title>
+<title>Admin · Cat Automation</title>
 
 <style>
   :root {
@@ -411,10 +411,10 @@
 </style>
 
 <header class="appbar">
-  <span class="wordmark">Admin-next<span class="wip">WIP</span></span>
+  <span class="wordmark">Admin</span>
   <span class="spacer"></span>
   <span id="apiStatus" class="status"><span class="dot"></span><span class="label">checking…</span></span>
-  <a class="oldlink" href="/admin">old admin ↗</a>
+  <a class="oldlink" href="/admin-old">old admin ↗</a>
 </header>
 
 <nav class="tabs" id="tabs"></nav>
@@ -698,7 +698,7 @@
     const h1 = document.createElement('h1'); h1.className = 'page-title'; h1.textContent = r.title;
     const sub = document.createElement('p'); sub.className = 'page-sub'; sub.textContent = r.sub;
     view.append(h1, sub);
-    document.title = r.title + ' · Admin-next';
+    document.title = r.title + ' · Admin';
     const body = document.createElement('div'); view.appendChild(body);
     if (r.mount) teardown = r.mount(body) || null;
     else renderStub(body, r);

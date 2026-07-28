@@ -9,7 +9,7 @@
 #   CAT_COMPUTE_URL=http://host:8001 ./frontend-dev.sh
 #   CAT_DEV_PORT=9090 ./frontend-dev.sh              # different local port (default 8080)
 #
-# Then open http://localhost:8080/ (user) or http://localhost:8080/admin (workbench).
+# Then open http://localhost:8080/ (user), /admin (console), /admin-old (retired console).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,5 +30,5 @@ export CAT_COMPUTE_URL
 export CAT_DEV_PORT="${CAT_DEV_PORT:-8080}"
 
 echo "[frontend-dev] backend:      $CAT_COMPUTE_URL"
-echo "[frontend-dev] local server: http://localhost:${CAT_DEV_PORT}   (/ user, /admin workbench; Ctrl-C to stop)"
+echo "[frontend-dev] local server: http://localhost:${CAT_DEV_PORT}   (/ user, /admin console; Ctrl-C to stop)"
 exec "$PY" compute/tools/frontend_dev_proxy.py

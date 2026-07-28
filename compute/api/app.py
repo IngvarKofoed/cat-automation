@@ -61,16 +61,19 @@ from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams, lighting_version
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
-# Two independently-styled front doors sharing only the /api + /media backend:
-# the near-blank user page at `/`, the full workbench SPA at `/admin`. Separate
-# files (each its own inline <style>) are what keep their CSS isolated — see
+# Independently-styled front doors sharing only the /api + /media backend: the
+# user dashboard at `/`, the admin console at `/admin`. Separate files (each its
+# own inline <style>) are what keep their CSS isolated — see
 # docs/specs/2026-07-22-admin-user-area-split.md.
 _USER_HTML = _WEB_DIR / "user" / "index.html"
-_ADMIN_HTML = _WEB_DIR / "admin" / "index.html"
-# admin-next: the streamlined rebuild of /admin, served at its own route so /admin
-# stays untouched until the final flip (see docs/NEW_ADMIN_PLAN.md and
-# docs/specs/2026-07-25-admin-next-redesign.md).
-_ADMIN_NEXT_HTML = _WEB_DIR / "admin-next" / "index.html"
+# The admin-next rebuild is now THE admin (NEW_ADMIN_PLAN.md P8 — the flip): it
+# serves `/admin`, and the workbench it replaced moved to `/admin-old`, kept until
+# the new one is trusted (see docs/specs/2026-07-25-admin-next-redesign.md). The
+# directories keep their build-time names — renaming them would churn the dev proxy
+# and every spec reference for no gain, and `admin/` is deleted outright once the
+# old console is retired.
+_ADMIN_HTML = _WEB_DIR / "admin-next" / "index.html"
+_ADMIN_OLD_HTML = _WEB_DIR / "admin" / "index.html"
 # Home-screen icon for the pinned user app (served at the root paths iOS probes).
 _APPLE_TOUCH_ICON = _WEB_DIR / "user" / "apple-touch-icon.png"
 
@@ -943,21 +946,25 @@ def create_app(
         return FileResponse(_USER_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
     @app.get("/admin")
+    @app.get("/admin-next")
     def admin():
-        # The full workbench SPA (Start/Activity/Buckets/Sweeps/Tuning/Annotate/
-        # Training). Its own document, own CSS; hash routing → /admin#activity.
+        # The admin console (Start/Motion tuning/Frame review/Annotation/Model
+        # building/Activity). Its own document, own CSS; hash routing → /admin#start.
+        # `/admin-next` stays an alias so the route the rebuild was developed under
+        # keeps resolving — the same page either way, so a stale bookmark is harmless.
         if not _ADMIN_HTML.is_file():
             raise HTTPException(status_code=404, detail="admin UI not built")
         return FileResponse(_ADMIN_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
-    @app.get("/admin-next")
-    def admin_next():
-        # The streamlined admin rebuild (WIP), at its own route so /admin keeps
-        # working byte-for-byte until the final flip. Own document, own CSS; hash
-        # routing → /admin-next#start. 404 until the file exists (same as /admin).
-        if not _ADMIN_NEXT_HTML.is_file():
-            raise HTTPException(status_code=404, detail="admin-next UI not built")
-        return FileResponse(_ADMIN_NEXT_HTML, media_type="text/html", headers=_SHELL_HEADERS)
+    @app.get("/admin-old")
+    def admin_old():
+        # The workbench the rebuild replaced (Buckets/Sweeps/Corruption/Training…),
+        # kept reachable until the new console is trusted, then deleted. Some views
+        # here have no admin-next equivalent yet (buckets, corruption review), so this
+        # is a working fallback, not only a rollback.
+        if not _ADMIN_OLD_HTML.is_file():
+            raise HTTPException(status_code=404, detail="old admin UI not built")
+        return FileResponse(_ADMIN_OLD_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
     @app.get("/apple-touch-icon.png")
     @app.get("/apple-touch-icon-precomposed.png")

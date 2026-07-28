@@ -408,6 +408,16 @@
   .astage-full { max-width: 420px; flex: 1; min-width: 220px; }
   .astage-full img { width: 100%; height: auto; display: block; border-radius: var(--radius); }
   .acat { font-size: 13px; }
+
+  /* Cats roster — reuses .qtable's cell styling with its own colgroup geometry. */
+  .qtable.ctable { min-width: 760px; }
+  .ctable td.cedit { white-space: normal; }
+  .ctable input[type=text] { width: 100%; padding: 3px 6px; font-size: 12px; }
+  .ctable td.ckey { color: var(--muted); font-size: 11px; }
+  /* Retired rows stay IN PLACE (id order is the roster's identity) and are only dimmed. */
+  .ctable tr.retired td { opacity: .5; }
+  .ctable tr.cerr td { border-bottom: 0; padding: 0 8px 6px; color: var(--bad);
+    font-size: 12px; white-space: normal; }
 </style>
 
 <header class="appbar">
@@ -669,6 +679,7 @@
     { id: 'tuning', title: 'Motion tuning', sub: 'Trust the motion gate', mount: mountTuning },
     { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', mount: mountFrames },
     { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', mount: mountAnnotate },
+    { id: 'cats', title: 'Cats', sub: 'The household roster', mount: mountCats },
     { id: 'model', title: 'Model building', sub: 'Build → validate → promote', mount: mountModel },
     { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', mount: mountActivity },
   ];
@@ -1947,16 +1958,8 @@
       <div class="card">
         <h3>Roster</h3>
         <div id="aRoster" class="row"></div>
-        <div class="row" style="margin-top:12px">
-          <input id="aNewCat" type="text" placeholder="new cat name" style="width:160px">
-          <label class="note"><input id="aResident" type="checkbox" checked> resident</label>
-          <button id="aAddCat">Add cat</button>
-          <span id="aCatNote" class="note"></span>
-        </div>
-      </div>
-      <div class="card">
-        <h3>Per-cat day/night coverage</h3>
-        <div id="aCoverage" class="note">…</div>
+        <p class="hint">The digit legend, not a roster editor — add, rename, retire, and read
+          per-cat crop coverage on <a href="#cats">Cats</a>.</p>
       </div>
     `;
 
@@ -2011,7 +2014,7 @@
       const v = current(); if (!v) return;
       const withCrop = decision !== 'not_cat';
       const frames = v.frames.map((f) => withCrop ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) } : { frame_id: f.id });
-      try { await api('POST', '/api/label', { decision, cat_id: cat_id ?? null, frames }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); loadCoverage(); }
+      try { await api('POST', '/api/label', { decision, cat_id: cat_id ?? null, frames }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); }
       catch (e) { flash('label failed: ' + e.message); }
     }
     async function ignoreVisit() {
@@ -2021,7 +2024,7 @@
     }
     async function undoLast() {
       if (!lastAction) { flash('nothing to undo'); return; }
-      try { await api('POST', '/api/label/delete', { frame_ids: lastAction }); lastAction = null; loadQueue(); loadCoverage(); }
+      try { await api('POST', '/api/label/delete', { frame_ids: lastAction }); lastAction = null; loadQueue(); }
       catch (e) { flash('undo failed: ' + e.message); }
     }
     function skip(delta) { if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); } }
@@ -2032,35 +2035,24 @@
       catch (e) { stage.innerHTML = `<span class="note bad">${e.message}</span>`; }
     }
 
-    function labelCat(i) { const c = cats[i]; if (c) commitLabel('identified', c.id); }
+    // Retired cats are not labellable, so the digit binding runs over the ACTIVE roster
+    // only — the same derivation the Cats page shows in its Key column. Retiring a cat
+    // therefore shifts the digits after it; deliberate, and rare enough to prefer over a
+    // departed cat holding key 2 forever.
+    const pickable = () => cats.filter((c) => c.active);
+    function labelCat(i) { const c = pickable()[i]; if (c) commitLabel('identified', c.id); }
     function renderRoster() {
-      const el = $('#aRoster', view);
-      el.innerHTML = cats.length
-        ? cats.map((c, i) => `<button class="acat" data-i="${i}">${i < 9 ? (i + 1) + ' · ' : ''}${c.name}${c.is_resident ? '' : ' (foreign)'}</button>`).join('')
-        : '<span class="note">No cats yet — add one below to label residents.</span>';
+      const el = $('#aRoster', view), usable = pickable();
+      // Three states, not two: an empty roster and an all-retired one both leave no
+      // buttons, but only the second needs to explain why.
+      el.innerHTML = usable.length
+        ? usable.map((c, i) => `<button class="acat" data-i="${i}">${i < 9 ? (i + 1) + ' · ' : ''}${esc(c.name)}${c.is_resident ? '' : ' (foreign)'}</button>`).join('')
+        : (cats.length
+          ? `<span class="note warn">Every cat on the roster is retired — un-retire one on <a href="#cats">Cats</a> to label by name.</span>`
+          : `<span class="note">No cats yet — add one on <a href="#cats">Cats</a> to label residents.</span>`);
       el.querySelectorAll('.acat').forEach((b) => b.addEventListener('click', () => labelCat(Number(b.dataset.i))));
     }
     async function loadCats() { try { const r = await api('GET', '/api/cats'); if (alive) { cats = r.cats || []; renderRoster(); } } catch (_) {} }
-    async function addCat() {
-      const name = $('#aNewCat', view).value.trim(); if (!name) return;
-      try { await api('POST', '/api/cats', { name, is_resident: $('#aResident', view).checked }); $('#aNewCat', view).value = ''; $('#aCatNote', view).textContent = 'added ' + name; loadCats(); }
-      catch (e) { $('#aCatNote', view).textContent = e.message; }
-    }
-    $('#aAddCat', view).addEventListener('click', addCat);
-
-    async function loadCoverage() {
-      try {
-        const r = await api('GET', '/api/label/regime-coverage');
-        if (!alive) return;
-        const rows = (r.cats || []).map((c) => {
-          const dn = r.available ? ` · day ${c.day} / night ${c.night}${c.is_resident && c.night === 0 && c.total > 0 ? ' ⚠ no night' : ''}` : '';
-          return `${c.cat_name}: ${c.total}${dn}`;
-        });
-        let html = rows.length ? rows.join('<br>') : 'no labelled crops yet';
-        if (!r.available) html += `<br><span class="note warn">Day/night unavailable — ${r.reason === 'location_unset' ? 'set a location on Start' : 'astral unavailable'}.</span>`;
-        $('#aCoverage', view).innerHTML = html;
-      } catch (_) {}
-    }
 
     function onKey(e) {
       if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
@@ -2074,10 +2066,182 @@
       else if (k === 'z') undoLast();
     }
     document.addEventListener('keydown', onKey);
-    $('#aReload', view).addEventListener('click', () => { loadQueue(); loadCoverage(); });
+    $('#aReload', view).addEventListener('click', () => { loadCats(); loadQueue(); });
 
-    loadCats(); loadQueue(); loadCoverage();
+    loadCats(); loadQueue();
     return () => { alive = false; document.removeEventListener('keydown', onKey); };
+  }
+
+  // =======================================================================
+  //  Cats page — the household roster (rename / resident / retire / notes)
+  // =======================================================================
+  // Two GETs, joined on id: /api/cats/overview (roster + last_seen_ts) and
+  // /api/label/regime-coverage (per-cat crop totals + the day/night split, keyed
+  // cat_id). Every edit is a PATCH /api/cats/{id} carrying ONLY the field that
+  // changed, so two operators editing different columns can't clobber each other.
+  function mountCats(view) {
+    view.innerHTML = `
+      <div class="card">
+        <div class="row"><span id="kStatus" class="note grow">Loading roster…</span><button id="kReload">Reload</button></div>
+        <div id="kWrap" class="qwrap"></div>
+        <div id="kCovNote" class="note warn" style="margin-top:8px"></div>
+        <p class="hint">Retiring a cat drops it from the annotation picker and the household
+          dashboard immediately, but it stays in the <i>promoted</i> gallery — still being named
+          on new visits — until you build and promote again. Its labels and crops are never
+          touched, so un-retiring and rebuilding brings it back. <b>Resident</b> is different:
+          it is read when an event is rendered, so a flip shows up on the next load.</p>
+      </div>
+      <div class="card">
+        <h3>Add a cat</h3>
+        <div class="row">
+          <input id="kNewCat" type="text" placeholder="new cat name" style="width:180px">
+          <label class="note"><input id="kResident" type="checkbox" checked> resident</label>
+          <button id="kAdd" class="primary">Add cat</button>
+          <span id="kAddNote" class="note"></span>
+        </div>
+        <p class="hint">A cat you name but leave un-resident is a known neighbour — identified by
+          name, but never counted as one of ours.</p>
+      </div>
+    `;
+
+    let alive = true;
+    let cats = [], cov = {}, covAvail = false, covReason = null;
+    const errors = {};   // cat id -> the last failed edit's message, cleared on success
+
+    // The 1-9 binding the Annotation picker uses: ACTIVE cats in id order. Derived the
+    // same way in both places, so the digit shown here is the digit that labels there.
+    const pickable = () => cats.filter((c) => c.active);
+
+    function render() {
+      const wrap = $('#kWrap', view), status = $('#kStatus', view);
+      status.textContent = cats.length
+        ? `${cats.length} cat${cats.length === 1 ? '' : 's'} · ${pickable().length} active`
+        : 'Empty roster';
+      if (!cats.length) {
+        wrap.innerHTML = '<span class="note">No cats yet — add the first one below.</span>';
+        return;
+      }
+      const keyOf = {};
+      pickable().forEach((c, i) => { if (i < 9) keyOf[c.id] = i + 1; });
+      const body = cats.map((c) => {
+        const cv = cov[c.id] || {};
+        const dn = covAvail ? `${fmtInt(cv.day || 0)} / ${fmtInt(cv.night || 0)}` : '—';
+        const err = errors[c.id];
+        return `<tr class="crow${c.active ? '' : ' retired'}" data-id="${c.id}">
+            <td class="num ckey">${keyOf[c.id] || ''}</td>
+            <td class="cedit"><input class="cname" type="text" value="${esc(c.name)}" aria-label="name"></td>
+            <td><input class="cres" type="checkbox"${c.is_resident ? ' checked' : ''} aria-label="resident"></td>
+            <td><input class="cact" type="checkbox"${c.active ? ' checked' : ''} aria-label="active"></td>
+            <td class="cedit"><input class="cnotes" type="text" value="${esc(c.notes || '')}" placeholder="—" aria-label="notes"></td>
+            <td class="num">${fmtInt(cv.total || 0)}</td>
+            <td class="num">${dn}</td>
+            <td class="num">${fmtTs(c.last_seen_ts)}</td>
+          </tr>` + (err ? `<tr class="cerr"><td colspan="8">${esc(err)}</td></tr>` : '');
+      }).join('');
+      wrap.innerHTML = '<table class="qtable ctable">'
+        + '<colgroup><col style="width:44px"><col style="width:23%"><col style="width:76px">'
+        + '<col style="width:62px"><col><col style="width:66px"><col style="width:94px">'
+        + '<col style="width:130px"></colgroup>'
+        + '<thead><tr><th>Key</th><th>Name</th><th>Resident</th><th>Active</th><th>Notes</th>'
+        + '<th class="num">Crops</th><th class="num">Day / night</th><th class="num">Last seen</th>'
+        + '</tr></thead><tbody>' + body + '</tbody></table>';
+      wire();
+    }
+
+    // Re-rendering replaces every input, so a checkbox the operator just clicked would
+    // lose focus mid-pass. Remember which control it was (row id + class) and restore it.
+    function withFocus(fn) {
+      const el = document.activeElement, row = el && el.closest ? el.closest('.crow') : null;
+      // First class token only — the control's identity (cname/cnotes/cres/cact). Taking
+      // the whole className would build an invalid selector the day one gains a second class.
+      const id = row && row.dataset.id, cls = row && el.className.split(' ')[0];
+      fn();
+      if (!id || !cls) return;
+      const back = view.querySelector(`.crow[data-id="${id}"] .${cls}`);
+      if (back) back.focus();
+    }
+
+    async function patch(id, fields) {
+      try {
+        const updated = await api('PATCH', `/api/cats/${id}`, fields);
+        if (!alive) return;
+        delete errors[id];
+        cats = cats.map((c) => (c.id === id ? { ...c, ...updated } : c));
+      } catch (e) {
+        if (!alive) return;
+        // The row reverts to the server value on re-render, so the table never shows an
+        // edit that didn't persist (a duplicate name is the common case — 400 UNIQUE).
+        errors[id] = e.message;
+      }
+      withFocus(render);
+    }
+
+    function wire() {
+      for (const row of view.querySelectorAll('.crow')) {
+        const id = Number(row.dataset.id);
+        const name = $('.cname', row), notes = $('.cnotes', row);
+        const cat = cats.find((c) => c.id === id) || {};
+        // Blur is the single commit point; Enter just blurs, so one edit is one request.
+        name.addEventListener('blur', () => {
+          const v = name.value.trim();
+          if (v === (cat.name || '')) return;          // untouched — don't spend a request
+          if (!v) { name.value = cat.name; return; }   // empty name is rejected server-side anyway
+          patch(id, { name: v });
+        });
+        notes.addEventListener('blur', () => {
+          const v = notes.value.trim();
+          if (v === (cat.notes || '')) return;
+          patch(id, { notes: v || null });
+        });
+        for (const el of [name, notes]) {
+          el.addEventListener('keydown', (e) => { if (e.key === 'Enter') el.blur(); });
+        }
+        $('.cres', row).addEventListener('change', (e) => patch(id, { is_resident: e.target.checked }));
+        $('.cact', row).addEventListener('change', (e) => patch(id, { active: e.target.checked }));
+      }
+    }
+
+    async function load() {
+      try {
+        const [overview, coverage] = await Promise.all([
+          api('GET', '/api/cats/overview'),
+          api('GET', '/api/label/regime-coverage'),
+        ]);
+        if (!alive) return;
+        cats = overview.cats || [];
+        cov = {};
+        for (const c of coverage.cats || []) cov[c.cat_id] = c;
+        covAvail = !!coverage.available;
+        covReason = coverage.reason || null;
+        $('#kCovNote', view).textContent = covAvail ? '' : (
+          covReason === 'location_unset'
+            ? 'Day / night is unavailable — set a location on Start.'
+            : 'Day / night is unavailable — astral is not installed on the compute PC.');
+        render();
+      } catch (e) {
+        if (alive) $('#kStatus', view).innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+      }
+    }
+
+    async function addCat() {
+      const field = $('#kNewCat', view), note = $('#kAddNote', view);
+      const name = field.value.trim();
+      if (!name) return;
+      try {
+        await api('POST', '/api/cats', { name, is_resident: $('#kResident', view).checked });
+        if (!alive) return;
+        field.value = '';
+        note.className = 'note ok'; note.textContent = 'Added ' + name + '.';
+        load();
+      } catch (e) { note.className = 'note bad'; note.textContent = e.message; }
+    }
+
+    $('#kAdd', view).addEventListener('click', addCat);
+    $('#kNewCat', view).addEventListener('keydown', (e) => { if (e.key === 'Enter') addCat(); });
+    $('#kReload', view).addEventListener('click', load);
+
+    load();
+    return () => { alive = false; };
   }
 
   // =======================================================================

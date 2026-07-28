@@ -620,6 +620,34 @@ def test_api_cats_patch_empty_body_is_400(make_app):
     assert resp.status_code == 400
 
 
+def test_api_cats_patch_notes_round_trip(make_app):
+    client, _store = make_app()
+    cat_id = client.post("/api/cats", json={"name": "Mittens"}).json()["id"]
+    assert client.get("/api/cats").json()["cats"][0]["notes"] is None
+
+    resp = client.patch(f"/api/cats/{cat_id}", json={"notes": "  white bib  "})
+    assert resp.status_code == 200
+    assert resp.json()["notes"] == "white bib"     # stripped
+    assert resp.json()["name"] == "Mittens"        # a notes-only PATCH touches nothing else
+
+    # Blank and null both clear it, so "no note" has ONE stored representation.
+    assert client.patch(f"/api/cats/{cat_id}", json={"notes": "   "}).json()["notes"] is None
+    client.patch(f"/api/cats/{cat_id}", json={"notes": "back"})
+    assert client.patch(f"/api/cats/{cat_id}", json={"notes": None}).json()["notes"] is None
+
+
+def test_api_cats_patch_omitting_notes_leaves_it_alone(make_app):
+    # exclude_unset is what separates "not mentioned" from "explicitly cleared" — without
+    # it every PATCH would carry notes=None and silently wipe the note.
+    client, _store = make_app()
+    cat_id = client.post("/api/cats", json={"name": "Mittens"}).json()["id"]
+    client.patch(f"/api/cats/{cat_id}", json={"notes": "white bib"})
+    resp = client.patch(f"/api/cats/{cat_id}", json={"is_resident": True})
+    assert resp.status_code == 200
+    assert resp.json()["notes"] == "white bib"
+    assert resp.json()["is_resident"] is True
+
+
 # --- API: GET /api/label/visits ---------------------------------------------------
 
 

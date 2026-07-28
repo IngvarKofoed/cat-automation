@@ -1182,3 +1182,30 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `/admin-next` stays an alias (same page) so a bookmark still resolves; the dev proxy
      mirrors the mapping. Directories keep their build-time names: renaming `admin-next/`
      would churn every spec reference, and `admin/` is deleted outright when it is retired.
+
+188. New admin `#cats` page owns the roster: rename, resident/foreign, retire, and a `notes`
+     field (the schema column existed and was never written). Edits go through the existing
+     `PATCH /api/cats/{id}`, which had no caller — a rename used to need SQL. Reads reuse
+     `/api/cats/overview` + `/api/label/regime-coverage`; no new endpoint.
+     Annotation keeps only the digit picker; add-cat and the day/night coverage card moved.
+     Spec: docs/specs/2026-07-28-cats-roster-page.md.
+
+189. "Retire" now means something — it had no working consumer. Retired cats leave the
+     annotation picker, the user dashboard's Cats view, and (via `labeled_crops(active_only=)`)
+     gallery build + the feasibility probe. Labels and crops are never touched, so it is
+     reversible; identification only changes on the next build+promote, never from the
+     checkbox itself. Consequence: retiring shifts the 1-9 digit bindings after that cat.
+
+190. The user dashboard's retired-cat filter never worked: it tested `c.active !== 0` against
+     a JSON **boolean**, and `false !== 0` is true. Latent until now only because nothing
+     could set `active` false. Fixed to a truthiness test.
+
+191. `count_identified_crops` gained the same `active_only` flag and the build/probe
+     endpoints + CLI pass it. It is the PRE-CHECK guarding those jobs, so counting retired
+     cats the job then filters out would wave through a build that returns
+     `insufficient_labels` — the guard must count exactly what the work embeds.
+
+192. `labeled_crops(active_only=True)` is NULL-safe (`d.cat_id IS NULL OR c.active = 1`).
+     The join is a LEFT JOIN, so a catless kind (`unknown_cat`) has a NULL `c.active`; a bare
+     `c.active = 1` would silently drop every catless crop, which is not a retired cat's crop.
+     Default stays `False`, so the two opt-in callers are explicit and greppable.

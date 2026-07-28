@@ -210,7 +210,10 @@ def run_feasibility_probe(
     with the headline metrics. Does NOT touch the DB.
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
-    labels = store.labeled_crops(("identified",), qualities)
+    # active_only: score the CURRENT household. A retired cat is one we no longer
+    # need to tell apart, and leaving it in would move the separability numbers
+    # away from the gallery that actually gets built (which excludes it too).
+    labels = store.labeled_crops(("identified",), qualities, active_only=True)
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:

@@ -85,7 +85,7 @@ def main(argv: "list[str]") -> int:
     # Cheap pre-count so the console shows the "Embedding N crops …" download hint
     # only when there is actually enough to embed; the probe re-reads authoritatively
     # and owns the cold-start verdict (its structured result, printed below).
-    n_crops, n_cats = store.count_identified_crops(qualities)
+    n_crops, n_cats = store.count_identified_crops(qualities, active_only=True)
     if n_crops >= 2 and n_cats >= 2:
         print(f"Embedding {n_crops} crops across {n_cats} cats (quality: {quality_label}) … "
               "(first run downloads DINOv2)")

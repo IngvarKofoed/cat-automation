@@ -53,7 +53,10 @@ def build_gallery(
 ) -> dict:
     """Embed the labelled ``identified`` crops into a versioned gallery under ``out_dir``.
 
-    Reads ``store.labeled_crops(("identified",), qualities)``, embeds the crop files
+    Reads ``store.labeled_crops(("identified",), qualities, active_only=True)`` —
+    a RETIRED roster cat is excluded, which is what makes retiring one stop it
+    being enrolled. Its crops are untouched, so un-retiring and rebuilding brings
+    it back. Embeds the crop files
     with a fresh ``Embedder`` (first run downloads the backbone), computes a suggested
     same/different distance threshold, and writes ``<out_dir>/gallery.npz``
     (``vectors`` RAW float32 ``(N,D)``, ``cat_ids`` int64 ``(N,)``, plus the resolved
@@ -74,7 +77,7 @@ def build_gallery(
     falsy return raises ``EmbedCancelled``, left to propagate here as in the probe).
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
-    labels = store.labeled_crops(("identified",), qualities)
+    labels = store.labeled_crops(("identified",), qualities, active_only=True)
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:

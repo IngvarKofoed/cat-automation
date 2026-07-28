@@ -57,7 +57,14 @@ def _label(store: Store, cat_id: int, frame_id: int, quality: str = "gallery") -
     ``src_recv_ts`` from a live frame, so each labelled crop needs one added first.
     The ``crop_path`` is a plain string (never a real file) — fine here since
     ``count_identified_crops``/the fake manager never open it.
+
+    The ROSTER row is created too, so ``cat_id`` names a real cat as it always does in
+    production (labels only ever come from the roster, and cats are never deleted).
+    The build/probe pre-check filters on ``cats.active``, so a label pointing at a
+    non-existent cat would count as retired and make the fixture unrepresentative.
     """
+    while len(store.list_cats()) < cat_id:
+        store.create_cat(f"cat{len(store.list_cats()) + 1}")
     row_id = store.add(_frame(frame_id=frame_id, ts=frame_id * 1000), recv_ts_ms=frame_id * 1000)
     n = store.add_dataset_items(
         [

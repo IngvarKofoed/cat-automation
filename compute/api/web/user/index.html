@@ -1511,7 +1511,10 @@
         }
 
         function renderCats(data) {
-            const cats = (data.cats || []).filter(c => c.active !== 0);
+            // Retired cats are hidden — this is a glance at who's around now. Truthiness,
+            // NOT `!== 0`: the API serialises `active` as a JSON boolean, so `false !== 0`
+            // is true and the old test never filtered anything.
+            const cats = (data.cats || []).filter(c => c.active);
             const residents = cats.filter(c => c.is_resident);
             const neighbours = cats.filter(c => !c.is_resident);
 

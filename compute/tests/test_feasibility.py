@@ -132,3 +132,78 @@ def test_labeled_crops_quality_filter(tmp_path):
     # A bad grade is rejected, never silently ignored.
     with pytest.raises(ValueError):
         store.labeled_crops(("identified",), ("mint",))
+
+
+def test_labeled_crops_active_only_excludes_retired_cats(tmp_path):
+    # What makes "retire" mean "stop enrolling this cat": the gallery build and the
+    # feasibility probe pass active_only=True, so a retired cat's crops stop feeding
+    # the model WITHOUT any label being deleted.
+    store = _store(tmp_path)
+    a = store.create_cat("A")
+    b = store.create_cat("B")
+    f1, f2 = (_add_frame(store, i) for i in (1, 2))
+    store.add_dataset_items(
+        [
+            {"frame_id": f1, "label_kind": "identified", "cat_id": a["id"], "quality": "gallery",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{a['id']}/1.jpg"},
+            {"frame_id": f2, "label_kind": "identified", "cat_id": b["id"], "quality": "gallery",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{b['id']}/2.jpg"},
+        ]
+    )
+    assert len(store.labeled_crops(("identified",), active_only=True)) == 2
+
+    store.update_cat(b["id"], {"active": False})
+    kept = store.labeled_crops(("identified",), active_only=True)
+    assert [r["cat_name"] for r in kept] == ["A"]
+    # Default stays False, so every existing caller is unchanged by omission — and the
+    # retired cat's crop row is still there to come back on un-retire.
+    assert len(store.labeled_crops(("identified",))) == 2
+    store.update_cat(b["id"], {"active": True})
+    assert len(store.labeled_crops(("identified",), active_only=True)) == 2
+
+
+def test_count_identified_crops_active_only_matches_labeled_crops(tmp_path):
+    # The pre-check guards the build/probe, so it must count exactly what they embed.
+    # If it counted retired cats the endpoint would wave through a build that then
+    # returns insufficient_labels.
+    store = _store(tmp_path)
+    a = store.create_cat("A")
+    b = store.create_cat("B")
+    f1, f2 = (_add_frame(store, i) for i in (1, 2))
+    store.add_dataset_items(
+        [
+            {"frame_id": f1, "label_kind": "identified", "cat_id": a["id"], "quality": "gallery",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{a['id']}/1.jpg"},
+            {"frame_id": f2, "label_kind": "identified", "cat_id": b["id"], "quality": "gallery",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{b['id']}/2.jpg"},
+        ]
+    )
+    assert store.count_identified_crops(None, active_only=True) == (2, 2)
+
+    store.update_cat(b["id"], {"active": False})
+    counted = store.count_identified_crops(None, active_only=True)
+    embedded = store.labeled_crops(("identified",), None, active_only=True)
+    assert counted == (1, 1)
+    assert counted[0] == len(embedded)                              # guard == work
+    assert counted[1] == len({r["cat_id"] for r in embedded})
+    # Unfiltered still sees both, so the default-off contract holds.
+    assert store.count_identified_crops(None) == (2, 2)
+
+
+def test_labeled_crops_active_only_keeps_catless_crops(tmp_path):
+    # The join is a LEFT JOIN, so an unknown_cat row has a NULL c.active. A bare
+    # `c.active = 1` would drop every catless crop — which is not a retired cat's crop.
+    store = _store(tmp_path)
+    a = store.create_cat("A")
+    f1, f2 = (_add_frame(store, i) for i in (1, 2))
+    store.add_dataset_items(
+        [
+            {"frame_id": f1, "label_kind": "identified", "cat_id": a["id"], "quality": "ok",
+             "bbox": [0, 0, 1, 1], "crop_path": f"cat_{a['id']}/1.jpg"},
+            {"frame_id": f2, "label_kind": "unknown_cat", "cat_id": None, "quality": "ok",
+             "bbox": [0, 0, 1, 1], "crop_path": "cat_unknown_cat/2.jpg"},
+        ]
+    )
+    store.update_cat(a["id"], {"active": False})
+    rows = store.labeled_crops(("identified", "unknown_cat"), active_only=True)
+    assert [r["label_kind"] for r in rows] == ["unknown_cat"]

@@ -4825,6 +4825,7 @@ class Store:
         self,
         label_kinds: "tuple[str, ...]" = ("identified",),
         qualities: "tuple[str, ...] | None" = None,
+        active_only: bool = False,
     ) -> "list[dict]":
         """Durable labelled crops for the feasibility / gallery experiments.
 
@@ -4849,8 +4850,19 @@ class Store:
         requested kinds). A quality filter excludes NULL-``quality`` rows — a crop
         with no grade can't satisfy ``IN (...)``, which is correct: an un-graded
         crop is not gallery-grade. An explicitly empty tuple selects nothing
-        (``[]``), symmetric with an empty ``label_kinds``. The store stays cv2-free:
-        it hands back paths, never pixels."""
+        (``[]``), symmetric with an empty ``label_kinds``.
+
+        ``active_only`` drops crops belonging to a RETIRED (``cats.active = 0``)
+        roster cat — what makes "retire" mean "stop enrolling this cat" for the
+        gallery build and the feasibility probe, which pass ``True``. It defaults
+        ``False`` so every other caller's result set is unchanged by omission, and
+        the two opt-ins stay explicit and greppable. The test is NULL-safe
+        (``d.cat_id IS NULL OR c.active = 1``) because the join is a LEFT JOIN and
+        a non-``identified`` kind (e.g. ``unknown_cat``) has no ``cat_id``: a bare
+        ``c.active = 1`` would silently drop every catless crop, which is not a
+        retired cat's crop and has no business being filtered here.
+
+        The store stays cv2-free: it hands back paths, never pixels."""
         kinds = tuple(label_kinds)
         if not kinds:
             return []
@@ -4866,6 +4878,8 @@ class Store:
         if quals is not None:
             where += " AND d.quality IN (%s)" % ",".join("?" for _ in quals)
             params += list(quals)
+        if active_only:
+            where += " AND (d.cat_id IS NULL OR c.active = 1)"
         with self._lock:
             rows = self._conn.execute(
                 "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id"
@@ -4945,7 +4959,7 @@ class Store:
         }
 
     def count_identified_crops(
-        self, qualities: "tuple[str, ...] | None"
+        self, qualities: "tuple[str, ...] | None", active_only: bool = False
     ) -> "tuple[int, int]":
         """The (crop count, distinct-cat count) of ``identified`` crops for a quality filter.
 
@@ -4961,6 +4975,13 @@ class Store:
         tuple selects nothing (``(0, 0)``). A grade outside ``_QUALITIES`` raises
         ``ValueError``, exactly as ``labeled_crops`` does, so a bad request is a 400,
         not a silent empty result. Returns ``(n_crops, n_cats)``.
+
+        ``active_only`` mirrors ``labeled_crops``' flag and MUST match whatever the
+        guarded job passes, or the pre-check and the work disagree: the build/probe
+        filter out retired cats, so a guard that counted them would wave through a
+        build that then returns ``insufficient_labels``. No NULL-safety clause is
+        needed here (unlike ``labeled_crops``) because ``label_kind = 'identified'``
+        already implies a non-NULL ``cat_id``.
         """
         quals = tuple(qualities) if qualities is not None else None
         if quals is not None:
@@ -4974,6 +4995,8 @@ class Store:
         if quals is not None:
             where += " AND quality IN (%s)" % ",".join("?" for _ in quals)
             params += list(quals)
+        if active_only:
+            where += " AND cat_id IN (SELECT id FROM cats WHERE active = 1)"
         with self._lock:
             n_crops, n_cats = self._conn.execute(
                 f"SELECT COUNT(*), COUNT(DISTINCT cat_id) FROM dataset_items WHERE {where}",
@@ -5594,7 +5617,7 @@ class Store:
         return self._cat_to_dict((cat_id, name, resident, 1, None, created_ts))
 
     def update_cat(self, cat_id: int, fields: dict) -> dict:
-        """Update a roster cat's ``name`` / ``is_resident`` / ``active``; return the row.
+        """Update a roster cat's ``name`` / ``is_resident`` / ``active`` / ``notes``; return the row.
 
         ``fields`` is a partial dict — only the keys present are changed (retire by
         setting ``active`` False without deleting the cat's labels; ``cat_id`` on
@@ -5602,6 +5625,12 @@ class Store:
         empty ``name``, or an unknown ``cat_id`` → ``ValueError``; a duplicate
         ``name`` → ``ValueError`` (UNIQUE), each rolling back so the connection stays
         clean. ``is_resident``/``active`` are coerced to 0/1.
+
+        ``notes`` is free text with no other consumer — the slot for per-cat detail
+        that isn't worth a schema column. It is stripped, and blank stores as NULL so
+        "cleared" has ONE representation rather than ``''`` and ``NULL`` both meaning
+        empty. Unlike ``name`` an empty value is legal here: clearing a note is a
+        normal edit, where clearing a name would leave the cat unnameable.
         """
         cat_id = int(cat_id)
         sets: "list[str]" = []
@@ -5618,8 +5647,14 @@ class Store:
         if "active" in fields:
             sets.append("active = ?")
             params.append(1 if fields["active"] else 0)
+        if "notes" in fields:
+            notes = (fields["notes"] or "").strip()
+            sets.append("notes = ?")
+            params.append(notes or None)
         if not sets:
-            raise ValueError("no updatable fields provided (name / is_resident / active)")
+            raise ValueError(
+                "no updatable fields provided (name / is_resident / active / notes)"
+            )
         with self._lock:
             try:
                 cur = self._conn.execute(

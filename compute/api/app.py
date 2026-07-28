@@ -383,15 +383,20 @@ class CatCreateRequest(BaseModel):
 class CatUpdateRequest(BaseModel):
     """Body of ``PATCH /api/cats/{id}``: a partial roster edit.
 
-    All three fields default ``None`` and only the ones the client actually SENT are
+    All four fields default ``None`` and only the ones the client actually SENT are
     forwarded (via ``model_dump(exclude_unset=True)``), so PATCHing just ``active``
     can't blank the name. An empty body, an empty ``name``, an unknown id, or a
     duplicate ``name`` → ``ValueError`` → 400 (``Store.update_cat``). Retire a cat by
     setting ``active`` False rather than deleting it, so its labels keep resolving.
+
+    ``notes`` is nullable ON PURPOSE, and ``exclude_unset`` is what makes the two
+    cases distinguishable: omitting the key leaves the note alone, while sending
+    ``null`` (or ``""``) clears it.
     """
 
     name: "str | None" = None
     is_resident: "bool | None" = None
+    notes: "str | None" = None
     active: "bool | None" = None
 
 
@@ -2382,7 +2387,9 @@ def create_app(
         # Ordering this ABOVE the dep check matters: on a box without the analysis extras a
         # first-run operator with no labels should be told to LABEL DATA (the real next step),
         # not to install torch — the dependency only blocks once there is data to embed.
-        n_crops, n_cats = store.count_identified_crops(tuple(qualities) if qualities else None)
+        n_crops, n_cats = store.count_identified_crops(
+            tuple(qualities) if qualities else None, active_only=True
+        )
         if n_crops < 2 or n_cats < 2:
             return {
                 "enough": False,
@@ -2490,7 +2497,9 @@ def create_app(
         # (seconds-long, torch-importing) ensure_available. Same ordering rationale
         # as feasibility: an operator with no labels yet should be told to LABEL
         # DATA, not to install torch.
-        n_crops, n_cats = store.count_identified_crops(tuple(qualities) if qualities else None)
+        n_crops, n_cats = store.count_identified_crops(
+            tuple(qualities) if qualities else None, active_only=True
+        )
         if n_crops < 2 or n_cats < 2:
             return {
                 "enough": False,

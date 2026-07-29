@@ -50,6 +50,10 @@
     --unrec:     #b79ae8;  --unrec-bg:     #2a2038;
   }
   * { box-sizing: border-box; }
+  /* The UA's [hidden] rule is just `display:none` at author-stylesheet-losing specificity, so ANY
+     class here that sets display (`.row{display:flex}`) silently defeats el.hidden = true. Every
+     toggle in this file means "gone", so make the attribute win outright. */
+  [hidden] { display: none !important; }
   html, body { margin: 0; }
   body {
     background: var(--bg); color: var(--text);
@@ -288,10 +292,21 @@
   .qtable tr:last-child td { border-bottom: 0; }
   .qtable td.num { text-align: right; }
   .qtable td.qname { font-variant-numeric: normal; white-space: normal; overflow-wrap: anywhere; }
+  /* The 8-column variants (validation runs, gallery versions) — the same cells and geometry
+     discipline, just more of them, so they need more room before .qwrap starts scrolling. */
+  .qtable.wtable { min-width: 720px; }
   .qstatus { display: inline-flex; align-items: center; gap: 6px; }
   .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .qstatus.running .dot { background: var(--warn); }
   button.qbtn { font-size: 11px; padding: 3px 10px; }
+  /* A link that must READ as a button. The validation report opens in a tab, so it stays a
+     real <a> — middle-click, copy-link, no JS — while matching button.qbtn's geometry. Own
+     rule because every button rule above is `button`-scoped; it also has to beat the base
+     `a` colour + hover underline. */
+  a.qbtn { display: inline-block; font: inherit; font-size: 11px; padding: 3px 10px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface-2); color: var(--text); text-decoration: none; }
+  a.qbtn:hover { border-color: var(--muted); text-decoration: none; }
 
   .pill { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--muted); }
@@ -538,25 +553,38 @@
   // Manager-agnostic queue renderer: rows are pre-normalized
   // {jobId, status:'running'|'queued', name, pctText, xy, fpsText, etaText}; empty rows → no
   // table. onCancel(jobId) wires the rightmost Cancel column. Fed by any status source.
-  function renderQueue(el, rows, onCancel) {
+  //
+  // `opts` renames the two UNIT-BEARING headers, because not every manager counts frames:
+  // TrainingManager counts crops embedded for a gallery build / validation and frames for an
+  // identify pass, so "Frames · FPS" would be wrong on that card. Geometry, cells, and the
+  // remaining headers stay identical, which is the point (entry 151) — one column layout
+  // wherever a queue is shown.
+  //
+  // A row may set `cancelable:false` to render no button. TrainingManager exposes no
+  // per-PENDING-job cancel (its queue rows carry no job id — only "cancel the running job"
+  // and "clear all pending"), so a per-row button on a queued training job would be a lie
+  // about what it does; that card offers one "Clear queue" instead.
+  function renderQueue(el, rows, onCancel, opts) {
     if (!rows || !rows.length) { el.innerHTML = ''; return; }
+    const o = opts || {};
     const td = (v, cls) => `<td class="${cls || ''}">${v}</td>`;
     el.innerHTML = '<table class="qtable">'
       + '<colgroup><col style="width:14%"><col style="width:29%"><col style="width:9%">'
       + '<col style="width:22%"><col style="width:9%"><col style="width:9%"><col style="width:8%"></colgroup>'
       + '<thead><tr>'
-      + '<th>Status</th><th>Name</th><th class="num">% done</th><th class="num">Frames</th>'
-      + '<th class="num">FPS</th><th class="num">ETA</th><th></th></tr></thead><tbody>'
+      + `<th>Status</th><th>Name</th><th class="num">% done</th><th class="num">${o.countHead || 'Frames'}</th>`
+      + `<th class="num">${o.rateHead || 'FPS'}</th><th class="num">ETA</th><th></th></tr></thead><tbody>`
       + rows.map((r) => '<tr>'
         + `<td><span class="qstatus ${r.status === 'running' ? 'running' : ''}"><span class="dot"></span>`
         + `${r.status === 'running' ? 'Running' : 'Queued'}</span></td>`
         + td(r.name, 'qname') + td(r.pctText, 'num') + td(r.xy, 'num')
         + td(r.fpsText, 'num') + td(r.etaText, 'num')
-        + `<td class="num"><button class="qbtn danger" data-cancel="${r.jobId}">Cancel</button></td>`
+        + `<td class="num">${r.cancelable === false ? ''
+          : `<button class="qbtn danger" data-cancel="${r.jobId == null ? '' : r.jobId}">Cancel</button>`}</td>`
         + '</tr>').join('')
       + '</tbody></table>';
     el.querySelectorAll('button[data-cancel]').forEach((b) =>
-      b.addEventListener('click', () => onCancel(Number(b.dataset.cancel))));
+      b.addEventListener('click', () => onCancel(b.dataset.cancel === '' ? null : Number(b.dataset.cancel))));
   }
 
   // ---- Shared detection / identity rendering ------------------------------
@@ -729,7 +757,7 @@
     { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', mount: mountFrames },
     { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', mount: mountAnnotate },
     { id: 'cats', title: 'Cats', sub: 'The household roster', mount: mountCats },
-    { id: 'model', title: 'Model building', sub: 'Build → validate → promote', mount: mountModel },
+    { id: 'model', title: 'Model building', sub: 'Validate → build → promote', mount: mountModel },
     { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', mount: mountActivity },
   ];
   const DEFAULT_ROUTE = 'start';
@@ -2617,26 +2645,42 @@
         <label class="note"><input type="checkbox" id="${p}Poor"> poor</label>
       </span>`;
     view.innerHTML = `
-      <div class="card"><div class="row"><span id="mJob" class="note grow">idle</span></div></div>
       <div class="card">
-        <h3>1 · Build gallery</h3>
-        <div class="row">${qChecks('b')}<button id="mBuild" class="primary">Build</button><span id="mBuildNote" class="note"></span></div>
-        <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.</p>
+        <h3>Jobs</h3>
+        <span id="mJob" class="note"></span>
+        <div id="mQueue" class="qwrap"><span class="note">…</span></div>
+        <div class="row" id="mQueueCtl" style="margin-top:10px" hidden>
+          <span class="grow"></span><button id="mClearQ" class="qbtn">Clear queue</button>
+        </div>
       </div>
       <div class="card">
-        <h3>2 · Validate <span class="note">(feasibility probe, before promote)</span></h3>
+        <h3>1 · Validate <span class="note">(optional)</span></h3>
         <div class="row">${qChecks('v')}<button id="mValidate">Validate</button><span id="mValNote" class="note"></span></div>
-        <div id="mRuns" class="note" style="margin-top:10px"></div>
+        <p class="hint">Scores the LABELLED CROPS at those grades — how separable the cats are,
+          measured with a pretrained DINOv2 + kNN. It reads no gallery, so it comes FIRST: it
+          answers "is this data separable enough to build from", and a run belongs to no
+          version. Skippable — a build recomputes the same threshold over the crops it
+          actually enrols.</p>
+        <div id="mRuns" class="qwrap"><span class="note">…</span></div>
+      </div>
+      <div class="card">
+        <h3>2 · Build gallery</h3>
+        <div class="row">${qChecks('b')}<button id="mBuild" class="primary">Build</button><span id="mBuildNote" class="note"></span></div>
+        <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.
+          Build embeds the SAME crop set a Validate run at the same grades scored, so those
+          numbers forecast this gallery — mismatch the grades and they describe something else.</p>
       </div>
       <div class="card">
         <h3>3 · Promote</h3>
         <div id="mCovWarn" class="note warn" style="margin-bottom:6px"></div>
-        <div id="mModels"><span class="note">…</span></div>
+        <div id="mModels" class="qwrap"><span class="note">…</span></div>
       </div>
     `;
 
     let alive = true;
     let covWarning = '';
+    const pct = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
+    const f3 = (x) => (x == null ? '—' : x.toFixed(3));
 
     const getQualities = (p) => {
       const q = [];
@@ -2665,20 +2709,55 @@
     $('#mBuild', view).addEventListener('click', build);
     $('#mValidate', view).addEventListener('click', validate);
 
-    function modelRow(m) {
-      const th = m.threshold == null ? 'uncalibrated' : m.threshold.toFixed(3);
-      const chip = m.status === 'active' ? '<span class="pill ok">active</span>' : m.status === 'retired' ? '<span class="pill">retired</span>' : '<span class="pill warn">draft</span>';
-      const btn = m.status === 'active' ? '' : m.gallery_available
-        ? `<button data-promote="${m.id}">${m.status === 'retired' ? 'Roll back to this' : 'Promote'}</button>`
-        : '<span class="note bad">gallery file missing</span>';
-      return `<div class="row" style="border-top:1px solid var(--border);padding:8px 0">
-        <span class="grow">${chip} v${m.id} · ${m.n_cats} cats · ${m.n_vectors} vectors · threshold ${th}</span>${btn}
-      </div>`;
+    // "Crops" is `model_versions.n_vectors` — the gallery holds exactly ONE vector per
+    // enrolled crop (`build_gallery` returns the same integer for both), so the column is
+    // shown as crops to match the validation-runs table's Crops. Presentation only: the
+    // wire/DB name stays `n_vectors`, like the `yolo-serial` slug (entry 147).
+    const CROPS_TIP = 'Crops enrolled — the gallery holds one embedding vector per crop';
+
+    // The version list, in the queue table's geometry: one row per gallery build, newest
+    // first. `threshold` stays a WORD when NULL — an uncalibrated model resolves every event
+    // to "unknown cat" (entry 70), so "uncalibrated" is the reading, not a missing number.
+    function modelsTable(models) {
+      if (!models.length) return '<span class="note">No gallery versions yet — build one above.</span>';
+      const chip = (s) => (s === 'active' ? '<span class="pill ok">active</span>'
+        : s === 'retired' ? '<span class="pill">retired</span>' : '<span class="pill warn">draft</span>');
+      // The active version offers nothing: it can't be promoted again, and deleting the
+      // gallery identification reads every tick is refused server-side anyway.
+      const action = (m) => (m.status === 'active' ? ''
+        : (m.gallery_available
+            ? `<button class="qbtn" data-promote="${m.id}">${m.status === 'retired' ? 'Roll back' : 'Promote'}</button>`
+            : '<span class="note bad" title="This version\'s gallery.npz is gone from disk — it cannot be promoted; rebuild instead.">no gallery file</span>')
+          + ` <button class="qbtn danger" data-del="${m.id}" title="Delete this version, its gallery file, and the identities it produced">Delete</button>`);
+      return '<table class="qtable wtable">'
+        + '<colgroup><col style="width:12%"><col style="width:8%"><col style="width:14%"><col style="width:8%">'
+        + '<col style="width:10%"><col style="width:12%"><col style="width:14%"><col style="width:22%"></colgroup>'
+        + '<thead><tr><th>Status</th><th class="num">Version</th><th>Grades</th>'
+        + `<th class="num" title="${CROPS_TIP}">Crops</th><th class="num">Cats</th>`
+        + '<th class="num">Threshold</th><th class="num">Built</th><th></th></tr></thead><tbody>'
+        // Grades · Crops · Cats in the SAME order as the validation-runs table above, so the
+        // two can be read down the page: a version built at the grades a run scored covers
+        // (about) the same crops, which is the only sense in which a run "belongs" to it.
+        + models.map((m) => `<tr><td>${chip(m.status)}</td><td class="num">v${m.id}</td>`
+          + `<td class="qname">${esc(m.quality || 'all')}</td>`
+          + `<td class="num">${fmtInt(m.n_vectors)}</td><td class="num">${fmtInt(m.n_cats)}</td>`
+          + `<td class="num">${m.threshold == null ? '<span class="note warn">uncalibrated</span>' : f3(m.threshold)}</td>`
+          + `<td class="num">${fmtTs(m.created_ts)}</td><td class="num">${action(m)}</td></tr>`).join('')
+        + '</tbody></table>';
     }
     async function promote(id) {
       if (covWarning && !confirm(covWarning + '\n\nPromote anyway?')) return;
       try { await api('POST', `/api/training/models/${id}/promote`); loadModels(); }
       catch (e) { alert('promote failed: ' + e.message); }
+    }
+    // Irreversible, and it takes more than the row: name what goes, because "delete a
+    // draft" reads harmless while the identities that version produced go with it.
+    async function deleteModel(m) {
+      if (!confirm(`Delete gallery v${m.id} (${m.status})?\n\n`
+        + `Its gallery file and the identities it produced are removed, and it can no `
+        + `longer be rolled back to. Labels and crops are untouched — you can rebuild.`)) return;
+      try { await api('DELETE', `/api/training/models/${m.id}`); loadModels(); }
+      catch (e) { alert('delete failed: ' + e.message); }
     }
     async function loadModels() {
       try {
@@ -2686,8 +2765,10 @@
         if (!alive) return;
         const models = r.models || [];
         const el = $('#mModels', view);
-        el.innerHTML = models.length ? models.map(modelRow).join('') : '<span class="note">No gallery versions yet — build one above.</span>';
+        el.innerHTML = modelsTable(models);
+        const byId = new Map(models.map((m) => [String(m.id), m]));
         el.querySelectorAll('button[data-promote]').forEach((b) => b.addEventListener('click', () => promote(Number(b.dataset.promote))));
+        el.querySelectorAll('button[data-del]').forEach((b) => b.addEventListener('click', () => deleteModel(byId.get(b.dataset.del))));
         checkCoverage();
       } catch (_) {}
     }
@@ -2700,35 +2781,138 @@
         $('#mCovWarn', view).textContent = covWarning;
       } catch (_) {}
     }
+    // Validation history in the same geometry, one row per run, newest first. A run is
+    // identified by WHAT IT MEASURED — the crop grades and the crop/cat counts — because it
+    // scores the labelled set, not a model version (there is no version to name).
+    function runsTable(runs) {
+      if (!runs.length) return '<span class="note">No validation runs yet.</span>';
+      // Report stays an <a> (styled as a button) so it keeps a link's affordances —
+      // middle-click, copy-link — while reading like the row's other control. A pruned
+      // report is a DISABLED button rather than a "pruned" note, so the column keeps one
+      // shape and the row still says what it would have offered.
+      const report = (r) => (r.report_available
+        ? `<a class="qbtn" href="/api/training/feasibility/report/${r.run_id}" target="_blank" rel="noopener">Report</a>`
+        : '<button class="qbtn" disabled title="This run\'s report was pruned from disk — its metrics remain; re-run to regenerate it.">Report</button>');
+      return '<table class="qtable wtable">'
+        + '<colgroup><col style="width:16%"><col style="width:14%"><col style="width:9%"><col style="width:8%">'
+        + '<col style="width:9%"><col style="width:9%"><col style="width:11%"><col style="width:24%"></colgroup>'
+        + '<thead><tr><th>Ran</th><th>Grades</th><th class="num" title="Crops scored — the labelled crops at those grades">Crops</th><th class="num">Cats</th>'
+        + '<th class="num">kNN</th><th class="num">AUC</th><th class="num">Threshold</th><th></th></tr></thead><tbody>'
+        + runs.map((r) => `<tr><td>${fmtTs(r.ts)}</td><td class="qname">${esc(r.quality || 'all')}</td>`
+          + `<td class="num">${fmtInt(r.n_crops)}</td><td class="num">${fmtInt(r.n_cats)}</td>`
+          + `<td class="num">${pct(r.knn_accuracy)}</td><td class="num">${f3(r.auc)}</td><td class="num">${f3(r.threshold)}</td>`
+          + `<td class="num">${report(r)}`
+          + ` <button class="qbtn danger" data-delrun="${r.run_id}" title="Delete this validation run and its report">Delete</button>`
+          + '</td></tr>').join('')
+        + '</tbody></table>';
+    }
+    // A run is only a measurement — nothing references it, so this needs no in-use guard;
+    // the confirm exists because the numbers are gone for good (re-running measures TODAY's
+    // labels, which by then are a different set).
+    async function deleteRun(r) {
+      if (!confirm(`Delete the validation run from ${fmtTs(r.ts)} (${r.quality || 'all'})?\n\n`
+        + `Its metrics and report are removed. Labels and crops are untouched, but re-running `
+        + `measures today's labels, not the set this run scored.`)) return;
+      try { await api('DELETE', `/api/training/feasibility/runs/${r.run_id}`); loadRuns(); }
+      catch (e) { alert('delete failed: ' + e.message); }
+    }
+    const RUNS_SHOWN = 8;
     async function loadRuns() {
       try {
         const r = await api('GET', '/api/training/feasibility/runs');
         if (!alive) return;
-        const runs = (r.runs || []).slice(0, 8);
-        $('#mRuns', view).innerHTML = runs.length ? runs.map((run) => {
-          const acc = run.knn_accuracy != null ? Math.round(run.knn_accuracy * 100) + '%' : '—';
-          const auc = run.auc != null ? run.auc.toFixed(3) : '—';
-          const th = run.threshold != null ? run.threshold.toFixed(3) : '—';
-          const rep = run.report_available ? `<a href="/api/training/feasibility/report/${run.run_id}" target="_blank" rel="noopener">report</a>` : '<span class="note">report pruned</span>';
-          return `<div>[${run.quality || 'all'}] kNN ${acc} · AUC ${auc} · thr ${th} · ${rep}</div>`;
-        }).join('') : '<span class="note">No validation runs yet.</span>';
+        const runs = r.runs || [];
+        // Say when the list is a slice. A capped list with nothing marking the cap reads as
+        // "these are all the runs", which is how a comparison gets made against the wrong set.
+        const more = runs.length > RUNS_SHOWN
+          ? `<div class="note" style="margin-top:6px">Showing the ${RUNS_SHOWN} most recent of ${fmtInt(runs.length)} runs.</div>` : '';
+        const shown = runs.slice(0, RUNS_SHOWN);
+        const el = $('#mRuns', view);
+        el.innerHTML = runsTable(shown) + more;
+        const byId = new Map(shown.map((r) => [String(r.run_id), r]));
+        el.querySelectorAll('button[data-delrun]').forEach((b) =>
+          b.addEventListener('click', () => deleteRun(byId.get(b.dataset.delrun))));
       } catch (_) {}
     }
 
+    // --- The job queue (the shared renderQueue, fed from the training status poll) ---
+    // All three kinds land on the ONE TrainingManager FIFO, so they render as one table:
+    // a build queued behind an identify really does wait for it.
+    const KIND_NAME = { 'gallery-build': 'Gallery build', feasibility: 'Validation', identify: 'Identify' };
+    function jobName(kind, params) {
+      const base = KIND_NAME[kind] || kind;
+      if (!params || !params.length) return base;
+      // identify's params are its [since_id, until_id] frame bounds (either may be null =
+      // open end); a build's / validation's are the crop grades it embeds.
+      if (kind === 'identify') {
+        const a = params[0], b = params[1];
+        if (a == null && b == null) return base;
+        return `${base} · #${a == null ? '…' : a}–#${b == null ? '…' : b}`;
+      }
+      return `${base} · ${esc(params.join('+'))}`;
+    }
+    // Running-job rate, the same client-side anchor the tuning page uses: items done /
+    // seconds since the anchor, re-anchored on job identity (and on done going backwards,
+    // for back-to-back jobs of the same kind). Only the running row gets a rate + ETA, so no
+    // queued row ever shows a rate borrowed from a different kind of work.
+    let etaAnchor = null;
+    function runningRate(s) {
+      const key = [s.kind, (s.params || []).join(','), s.total].join('|'), now = Date.now();
+      if (!etaAnchor || etaAnchor.key !== key || s.done < etaAnchor.done0) etaAnchor = { key, t0: now, done0: s.done };
+      const dt = (now - etaAnchor.t0) / 1000, dd = s.done - etaAnchor.done0;
+      if (dt <= 0 || dd <= 0 || !s.total) return { fpsText: '…', etaText: '…' };
+      const r = dd / dt;
+      return { fpsText: r.toFixed(1), etaText: fmtDuration(Math.max(0, s.total - s.done) / r) };
+    }
+    const cancelRunning = () => api('POST', '/api/training/cancel').catch(() => {}).then(() => { if (alive) pollJob(); });
+
+    // The two lists refresh once per FINISHED job rather than on every idle poll — both are
+    // whole-table reads on the shared store connection and nothing changes them while the
+    // manager sits idle. "Finished" is caught two ways because neither alone is enough:
+    // running→idle misses a job that finishes with another already promoted behind it, and a
+    // changed `result` misses a canceled/failed job (which leaves the prior result untouched).
+    let wasRunning = false, resultSig = null, polled = false;
     async function pollJob() {
       try {
         const s = await api('GET', '/api/training/status');
         if (!alive) return;
-        const jl = $('#mJob', view);
+        const sig = s.result ? JSON.stringify(s.result) : '';
+        // The first poll only ADOPTS the signature: mount already loaded both lists, and a
+        // result left over from an earlier session must not read as "a job just finished".
+        const finished = (wasRunning && !s.running) || (polled && sig !== resultSig);
+        resultSig = sig; polled = true; wasRunning = s.running;
+        const queued = s.queue || [];
+        const rows = [];
         if (s.running) {
-          jl.innerHTML = `<span class="pill warn">running</span> ${s.kind} <span class="mono">${fmtInt(s.done)}/${fmtInt(s.total)}</span>${s.queue.length ? ' · ' + s.queue.length + ' queued' : ''} <button id="mCancel">Cancel</button>`;
-          const c = $('#mCancel', view); if (c) c.addEventListener('click', () => api('POST', '/api/training/cancel').catch(() => {}));
-        } else {
-          jl.textContent = s.error ? 'last error: ' + s.error : 'idle';
-          loadModels(); loadRuns();
+          const rate = runningRate(s);
+          rows.push({
+            jobId: null, status: 'running', name: jobName(s.kind, s.params),
+            pctText: s.total ? Math.round(s.done / s.total * 100) + '%' : '…',
+            xy: `${fmtInt(s.done)} / ${fmtInt(s.total)}`, fpsText: rate.fpsText, etaText: rate.etaText,
+          });
         }
+        // A pending training job carries no id and no denominator yet (its crop/frame count is
+        // resolved when it starts), so its numeric cells are honestly blank and it offers no
+        // per-row cancel — "Clear queue" above drops all pending.
+        for (const j of queued) rows.push({
+          status: 'queued', name: jobName(j.kind, j.params), cancelable: false,
+          pctText: '—', xy: '—', fpsText: '—', etaText: '—',
+        });
+        // The card always stands — an operator looking for "is anything running" should find the
+        // answer in a fixed place, not a card that only exists while it is busy. With no jobs
+        // that answer is an EMPTY-STATE line (the convention every other list here uses), not an
+        // "idle" status line beside controls, which is the sweep cards' shape and not this one's.
+        const q = $('#mQueue', view);
+        if (rows.length) renderQueue(q, rows, cancelRunning, { countHead: 'Items', rateHead: 'Rate' });
+        else q.innerHTML = '<span class="note">Nothing running or queued.</span>';
+        $('#mQueueCtl', view).hidden = !queued.length;
+        $('#mJob', view).textContent = s.error && !s.running ? 'last error: ' + s.error : '';
+        if (finished) { loadModels(); loadRuns(); }
       } catch (_) {}
     }
+
+    $('#mClearQ', view).addEventListener('click', () =>
+      api('POST', '/api/training/queue/clear').catch(() => {}).then(() => { if (alive) pollJob(); }));
 
     loadModels(); loadRuns(); pollJob();
     const timer = setInterval(pollJob, 3000);

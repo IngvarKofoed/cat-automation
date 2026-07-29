@@ -2472,6 +2472,17 @@ def create_app(
             return Response(status_code=404)
         return FileResponse(path, media_type="text/html")
 
+    @app.delete("/api/training/feasibility/runs/{run_id}")
+    def api_training_feasibility_run_delete(run_id: int):
+        # Discard one validation run: its metrics row AND its report dir. Nothing
+        # references a run (validation scores the labelled data, not a gallery), so there
+        # is no in-use case to refuse — only a 404 for an unknown id. Distinct from
+        # prune_feasibility_reports, which frees disk but keeps every row.
+        try:
+            return store.delete_feasibility_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
     # --- Training page: gallery build + promote; Activity/Training: identify -------
     #
     # The learning loop's remaining Train -> Run surface (see the
@@ -2549,6 +2560,20 @@ def create_app(
         # (a real conflict — the artifact this row names no longer exists).
         try:
             return store.promote_model(model_id)
+        except ValueError as exc:
+            msg = str(exc)
+            status_code = 404 if "no such model" in msg else 409
+            raise HTTPException(status_code=status_code, detail=msg)
+
+    @app.delete("/api/training/models/{model_id}")
+    def api_training_models_delete(model_id: int):
+        # Discard a version that isn't in use: its row, its identifications, and its
+        # gallery.npz dir. Synchronous like promote (one small txn + one rmtree). An
+        # unknown id is a 404; the ACTIVE version is a 409 — identification reads it, so
+        # promote another version first. Irreversible: the version can no longer be
+        # rolled back to and the visits it named lose their identity rows.
+        try:
+            return store.delete_model_version(model_id)
         except ValueError as exc:
             msg = str(exc)
             status_code = 404 if "no such model" in msg else 409

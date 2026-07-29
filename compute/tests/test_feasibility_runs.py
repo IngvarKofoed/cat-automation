@@ -180,6 +180,62 @@ def test_prune_noop_when_fewer_than_keep(tmp_path):
     assert os.path.isdir(os.path.join(store.training_root, "only"))
 
 
+# --- delete_feasibility_run ------------------------------------------------
+#
+# The per-RUN counterpart to pruning (which frees disk but keeps every row):
+# this discards the row too, so each guard gets a test.
+
+
+def test_delete_feasibility_run_removes_row_and_report_dir(tmp_path):
+    store = _store(tmp_path)
+    keep = store.add_feasibility_run("all", 4, 2, 0.7, 0.7, 0.3, "keep")
+    drop = store.add_feasibility_run("gallery", 4, 2, 0.7, 0.7, 0.3, "drop")
+    _write_report(store, "keep")
+    _write_report(store, "drop")
+
+    assert store.delete_feasibility_run(drop) == {"run_id": drop, "report_removed": True}
+
+    assert [r["run_id"] for r in store.feasibility_runs()] == [keep]
+    assert not os.path.exists(os.path.join(store.training_root, "drop"))
+    assert os.path.isfile(os.path.join(store.training_root, "keep", "feasibility.html"))
+
+
+def test_delete_feasibility_run_unknown_id_raises(tmp_path):
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="no such feasibility run"):
+        store.delete_feasibility_run(999_999)
+
+
+def test_delete_feasibility_run_without_report_dir(tmp_path):
+    store = _store(tmp_path)
+    rid = store.add_feasibility_run("all", 4, 2, 0.7, 0.7, 0.3, "never-written")
+    result = store.delete_feasibility_run(rid)
+    # A run whose report was already pruned is exactly what an operator clears out, so
+    # a missing dir is not an error.
+    assert result["report_removed"] is False
+    assert store.feasibility_runs() == []
+
+
+def test_delete_feasibility_run_never_escapes_training_root(tmp_path):
+    """A `report_dir` resolving outside training_root must not be rmtree'd.
+
+    `report_dir` is written by the probe as a bare basename, but this recursively
+    deletes a directory NAMED BY A DB COLUMN — a hand-edited row must not turn it
+    into "remove any path".
+    """
+    store = _store(tmp_path)
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("do not delete")
+    rid = store.add_feasibility_run("all", 4, 2, 0.7, 0.7, 0.3, os.path.join("..", "precious"))
+
+    result = store.delete_feasibility_run(rid)
+
+    assert result["report_removed"] is False
+    assert (outside / "keep.txt").is_file()      # untouched
+    assert store.feasibility_runs() == []        # the row still goes
+
+
 # --- count_identified_crops ------------------------------------------------
 
 

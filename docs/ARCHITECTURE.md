@@ -524,17 +524,35 @@ the queue back into Annotate:
   resident identity, or mark stranger / not-a-cat. Three feeders reach the queue:
   collection-mode captures, run-mode uncertain samples, and corrections of wrong
   identifications.
+- **Validation.** Before building, the owner can score the **labelled data itself**:
+  embed the crops of the selected quality grades and measure how separable the cats
+  are (leave-one-out kNN accuracy, a same-vs-different distance AUC, and a suggested
+  threshold). This reads *no* gallery — it asks "is this data separable enough to
+  build from", so it belongs **before** the build and its result belongs to no model
+  version. It is optional and skippable: a build recomputes the same threshold over
+  the crops it actually enrols. Because build and validation embed the *same* crop
+  set with the *same* backbone, a validation run at given grades forecasts the gallery
+  built at those grades — at different grades it describes a different set. Treat its
+  numbers as an optimistic bound: the probe scores crops against their own labelled
+  peers, while Run matches *unseen* frames and must also reject strangers.
 - **Training.** The owner triggers a training job over the labelled data. With
   the embedding + gallery approach this is usually just **rebuilding the gallery**
   from the annotated crops — cheap and fast; a full fine-tune of the embedding
-  model is the heavier, rarer path. Training produces a new **model version**.
+  model is the heavier, rarer path. Training produces a new **model version**,
+  carrying its own suggested threshold and separability metrics computed from the
+  vectors it enrolled (one vector per enrolled crop).
   Keep the gallery built from *clean, representative* crops of each cat; blurry or
   extreme-angle hard cases are useful for tuning the threshold and for validation,
   but folding them into the gallery would blur the embedding space (a stranger's
   blurry crop could then match a resident).
-- **Promotion.** A new version is validated, then promoted to the active model
-  that Run uses. Versions are retained in the model store so a bad one can be
-  rolled back.
+- **Promotion.** A built version is promoted to the active model that Run uses —
+  exactly one is active at a time. Versions are retained in the model store so a bad
+  one can be rolled back (by promoting the retired one). A version that is not active
+  can be deleted outright, which discards its gallery artifact and the identities it
+  produced; the labels and crops it was built from are never touched, so it can always
+  be rebuilt. **Deliberately not done:** validating a *built version* (scoring its own
+  artifact, held out, and recording the result against it). Validation today measures
+  the data, so "re-validate an older version" is not a thing the model store supports.
 
 Registering a new resident is just collection + annotation focused on that one
 cat, followed by a gallery rebuild — no separate mechanism.

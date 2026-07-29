@@ -211,7 +211,20 @@ def _measure(rows: "list[tuple]", media_root: str) -> "tuple[list[dict], int]":
     an orphaned row) — reported rather than silently dropped, since a large count
     would mean the plot covers less of the window than it appears to.
     """
-    import cv2
+    # Catch Exception, not ImportError: a cv2 built against NumPy 1.x surfaces under
+    # NumPy 2.x as BOTH an AttributeError (_ARRAY_API not found) and a trailing
+    # ImportError, behind a wall of traceback whose own advice ("rebuild the module")
+    # points away from the actual cause — running the system Python instead of the venv.
+    try:
+        import cv2
+    except Exception as exc:  # noqa: BLE001 - any import failure means the same fix
+        raise SystemExit(
+            f"cv2 failed to import ({type(exc).__name__}: {exc}).\n"
+            "This tool needs the project venv, not the system Python — .venv-compute\n"
+            "pins numpy and opencv-python-headless together. Run it as:\n"
+            "  Windows:    .\\.venv-compute\\Scripts\\python.exe -m compute.tools.ir_lamp_timeline ...\n"
+            "  Linux/macOS: .venv-compute/bin/python -m compute.tools.ir_lamp_timeline ..."
+        ) from exc
 
     samples: "list[dict]" = []
     missing = 0
@@ -428,7 +441,7 @@ def main() -> None:
     )
     if not rows:
         raise SystemExit("no frames in that window — check the dates and the store root")
-    print(f"sampled  {len(rows)} frames, decoding…")
+    print(f"sampled  {len(rows)} frames, decoding…", flush=True)
 
     samples, missing = _measure(rows, media_root)
     if not samples:

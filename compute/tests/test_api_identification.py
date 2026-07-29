@@ -286,6 +286,74 @@ def test_promote_happy_flips_status_and_appears_as_active(make_app):
     assert any(m["id"] == version_id and m["status"] == "active" for m in models["models"])
 
 
+# --- DELETE /api/training/feasibility/runs/{id} ------------------------------------
+
+
+def test_delete_feasibility_run_unknown_is_404(make_app):
+    client, _store, _manager = make_app()
+    assert client.delete("/api/training/feasibility/runs/999").status_code == 404
+
+
+def test_delete_feasibility_run_removes_it_from_the_list(make_app):
+    client, store, _manager = make_app()
+    keep = store.add_feasibility_run("all", 4, 2, 0.7, 0.7, 0.3, "keep")
+    drop = store.add_feasibility_run("gallery", 4, 2, 0.8, 0.8, 0.4, "drop")
+
+    resp = client.delete(f"/api/training/feasibility/runs/{drop}")
+    assert resp.status_code == 200
+    assert resp.json()["run_id"] == drop
+
+    runs = client.get("/api/training/feasibility/runs").json()["runs"]
+    assert [r["run_id"] for r in runs] == [keep]
+
+
+# --- DELETE /api/training/models/{id} ---------------------------------------------
+
+
+def _draft_version(store, gallery_dir: str = "v1", *, write_file: bool = True) -> int:
+    if write_file:
+        _write_gallery_npz(os.path.join(store.models_root, gallery_dir, "gallery.npz"))
+    return store.add_model_version(
+        status="draft",
+        kind="gallery",
+        backbone="dinov2_vits14",
+        imgsz=224,
+        n_cats=2,
+        n_vectors=2,
+        threshold=0.3,
+        quality="gallery",
+        metrics=None,
+        gallery_dir=gallery_dir,
+    )
+
+
+def test_delete_unknown_model_is_404(make_app):
+    client, _store, _manager = make_app()
+    assert client.delete("/api/training/models/999").status_code == 404
+
+
+def test_delete_draft_model_removes_it_from_the_list(make_app):
+    client, store, _manager = make_app()
+    version_id = _draft_version(store)
+
+    resp = client.delete(f"/api/training/models/{version_id}")
+    assert resp.status_code == 200
+    assert resp.json()["version_id"] == version_id
+    assert client.get("/api/training/models").json()["models"] == []
+
+
+def test_delete_active_model_is_409(make_app):
+    client, store, _manager = make_app()
+    version_id = _draft_version(store)
+    client.post(f"/api/training/models/{version_id}/promote")
+
+    # The active gallery backs every identification read, so it is never deletable —
+    # promote another version first.
+    assert client.delete(f"/api/training/models/{version_id}").status_code == 409
+    body = client.get("/api/training/models").json()
+    assert body["active"]["id"] == version_id
+
+
 # --- POST /api/identify/run -------------------------------------------------------
 
 

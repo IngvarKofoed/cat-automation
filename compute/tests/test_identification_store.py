@@ -260,6 +260,90 @@ def test_promote_missing_gallery_artifact_raises_value_error(tmp_path):
     assert _active_count(store) == 0  # nothing became active
 
 
+# --- delete_model_version --------------------------------------------------
+#
+# The only removal path for the otherwise append-forever `model_versions`
+# registry, and it takes files + identification rows with it — so each guard
+# gets a test.
+
+
+def _write_ident(store: Store, frame_id: int, model_id: int) -> None:
+    """Insert an ``identifications`` row directly (no frame needed for these tests)."""
+    store._conn.execute(
+        "INSERT INTO identifications (frame_id, model_version_id, cat_id, distance, bbox, ran_at)"
+        " VALUES (?, ?, 1, 0.2, '1,2,3,4', 1000)",
+        (frame_id, model_id),
+    )
+    store._conn.commit()
+
+
+def test_delete_model_version_removes_row_identifications_and_dir(tmp_path):
+    store = _store(tmp_path)
+    keep = _add_version(store, gallery_dir="keep")
+    drop = _add_version(store, gallery_dir="drop")
+    _write_ident(store, 1, drop)
+    _write_ident(store, 2, drop)
+    _write_ident(store, 1, keep)
+
+    result = store.delete_model_version(drop)
+
+    assert result == {"version_id": drop, "n_identifications": 2, "gallery_removed": True}
+    assert [v["id"] for v in store.list_model_versions()] == [keep]
+    # Only the deleted version's identifications went; the other version's row stayed.
+    assert store._conn.execute(
+        "SELECT model_version_id FROM identifications"
+    ).fetchall() == [(keep,)]
+    assert not os.path.exists(os.path.join(store.models_root, "drop"))
+    assert os.path.isfile(os.path.join(store.models_root, "keep", "gallery.npz"))
+
+
+def test_delete_active_model_version_refused(tmp_path):
+    store = _store(tmp_path)
+    vid = _add_version(store, gallery_dir="g1")
+    store.promote_model(vid)
+    with pytest.raises(ValueError, match="cannot delete the active model version"):
+        store.delete_model_version(vid)
+    # Nothing removed: identification reads this gallery every tick.
+    assert [v["id"] for v in store.list_model_versions()] == [vid]
+    assert os.path.isfile(os.path.join(store.models_root, "g1", "gallery.npz"))
+
+
+def test_delete_unknown_model_version_raises(tmp_path):
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="no such model version"):
+        store.delete_model_version(999_999)
+
+
+def test_delete_model_version_with_missing_gallery_file(tmp_path):
+    store = _store(tmp_path)
+    vid = _add_version(store, gallery_dir="ghost", write_file=False)
+    result = store.delete_model_version(vid)
+    # The row is the point — a version whose artifact is already gone is exactly
+    # what an operator wants to clear, so a missing dir is not an error.
+    assert result["gallery_removed"] is False
+    assert store.list_model_versions() == []
+
+
+def test_delete_model_version_never_escapes_models_root(tmp_path):
+    """A `gallery_dir` that resolves outside models_root must not be rmtree'd.
+
+    `gallery_dir` is written by our own builder as a bare basename, but this is the
+    one call that recursively deletes a directory named by a DB column, so a
+    hand-edited row must not turn it into "remove any path".
+    """
+    store = _store(tmp_path)
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("do not delete")
+    vid = _add_version(store, gallery_dir=os.path.join("..", "precious"), write_file=False)
+
+    result = store.delete_model_version(vid)
+
+    assert result["gallery_removed"] is False
+    assert (outside / "keep.txt").is_file()   # untouched
+    assert store.list_model_versions() == []  # the row still goes
+
+
 # --- active_model: none / present / missing-artifact -----------------------
 
 

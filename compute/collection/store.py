@@ -5211,6 +5211,48 @@ class Store:
         path = os.path.join(self.training_root, row[0], "feasibility.html")
         return path if os.path.isfile(path) else None
 
+    def delete_feasibility_run(self, run_id: int) -> dict:
+        """Delete ONE validation run: its ``feasibility_runs`` row and its report dir.
+
+        The per-run counterpart to ``prune_feasibility_reports`` (which frees disk while
+        KEEPING every metrics row): this discards the run entirely, for clearing out a
+        measurement that is no longer interesting. Nothing depends on a run — no model
+        version references one (validation scores the labelled data, not a gallery) — so
+        there is no in-use case to refuse, unlike ``delete_model_version``.
+
+        Raises ``ValueError("no such feasibility run: ...")`` for an unknown id. Row first
+        in one locked txn, then the dir AFTER the commit and outside the lock (filesystem
+        work must not hold the shared write lock), and the resolved dir is confirmed to sit
+        under ``training_root`` before the rmtree — ``report_dir`` is a bare basename
+        written by us, but this recursively deletes a directory NAMED BY A DB COLUMN.
+
+        Returns ``{run_id, report_removed}``.
+        """
+        run_id = int(run_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT report_dir FROM feasibility_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such feasibility run: {run_id}")
+            report_dir = row[0]
+            self._conn.execute("DELETE FROM feasibility_runs WHERE id = ?", (run_id,))
+            self._conn.commit()
+        root = os.path.realpath(self.training_root)
+        path = os.path.realpath(os.path.join(self.training_root, report_dir))
+        inside = path != root and path.startswith(root + os.sep)
+        removed = False
+        if inside and os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+                removed = True
+            except OSError:
+                # Swallowed like prune_feasibility_reports: on the Windows compute PC a
+                # report file open in a served FileResponse raises a sharing violation,
+                # and the row is already gone — the leftover dir is inert.
+                pass
+        return {"run_id": run_id, "report_removed": removed}
+
     def prune_feasibility_reports(self, keep: int) -> int:
         """Delete all but the newest ``keep`` runs' report DIRS from disk; return dirs removed.
 
@@ -5445,6 +5487,62 @@ class Store:
                 self._conn.commit()
                 model["status"] = "active"
         return model
+
+    def delete_model_version(self, version_id: int) -> dict:
+        """Delete a NON-ACTIVE version: its row, its ``identifications``, and its gallery dir.
+
+        The only removal path for ``model_versions``, which otherwise accumulates a row
+        AND a ``gallery.npz`` per build forever (it survives eviction and ``clear`` by
+        design). Raises ``ValueError("no such model version: ...")`` for an unknown id
+        and ``ValueError("cannot delete the active model version: ...")`` for the active
+        one — identification reads it every tick, so it is never deletable; retire it by
+        promoting another version first.
+
+        Its ``identifications`` rows go too. They are unreachable once the row is gone —
+        every read is scoped to a specific ``model_version_id`` and ``id`` is
+        ``AUTOINCREMENT`` (never reused, so no future model can inherit them) — so
+        keeping them would only hold space. The named visits that version produced are
+        therefore discarded, which is the real cost of a delete: the version cannot be
+        rolled back to and its naming work is gone. Row + rows are one locked txn;
+        the dir is removed AFTER the commit and outside the lock (filesystem work must
+        not hold the shared write lock), so a failed removal leaves an inert orphan dir
+        rather than a row promising a file that isn't there.
+
+        Returns ``{version_id, n_identifications, gallery_removed}``.
+        """
+        version_id = int(version_id)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._MODEL_COLUMNS} FROM model_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such model version: {version_id}")
+            model = self._model_row_to_dict(row)
+            if model["status"] == "active":
+                raise ValueError(f"cannot delete the active model version: {version_id}")
+            cur = self._conn.execute(
+                "DELETE FROM identifications WHERE model_version_id = ?", (version_id,)
+            )
+            n_ident = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            self._conn.execute("DELETE FROM model_versions WHERE id = ?", (version_id,))
+            self._conn.commit()
+        removed = False
+        # `gallery_dir` is written by our own builder as a bare basename, but this is an
+        # rmtree: confirm the resolved path really sits under models_root before removing,
+        # so a hand-edited row can never turn a delete into "remove any directory".
+        root = os.path.realpath(self.models_root)
+        path = os.path.realpath(os.path.join(self.models_root, model["gallery_dir"]))
+        inside = path != root and path.startswith(root + os.sep)
+        if inside and os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+                removed = True
+            except OSError:
+                # Swallowed like prune_feasibility_reports: on the Windows compute PC a
+                # file still open in a served response raises a sharing violation, and the
+                # row is already gone — the leftover dir is inert.
+                pass
+        return {"version_id": version_id, "n_identifications": n_ident, "gallery_removed": removed}
 
     def iter_unidentified(
         self,

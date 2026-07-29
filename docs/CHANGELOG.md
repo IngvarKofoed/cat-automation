@@ -1249,3 +1249,94 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      Do not tune night MOG2 params, calibrate the lighting cutoff, or build night IR crops from
      that data — a bad night scorecard reflects a broken lamp, not the gate. Leading cause is
      thermal (3 W emitter, half-enclosed back). Separately, `catpi` runs permanently under-volted.
+
+200. Model building's three readouts are now tables in the sweep-queue style, not one-liners.
+     The running/queued TRAINING jobs render through the shared `renderQueue` — build,
+     validation and identify together, since they share one FIFO — with a per-run rate + ETA;
+     `renderQueue` gained optional unit-bearing headers ("Items · Rate", the manager counts
+     crops not frames) and a `cancelable:false` row. A pending training job carries no job id,
+     so only the running row offers Cancel and one "Clear queue" drops the pending — a per-row
+     button there would have lied about what it does.
+     Validation runs and gallery versions became 8-column tables of the same geometry.
+
+201. The Model page's version + validation lists refresh once per FINISHED job instead of on
+     every 3s idle poll (two whole-table reads on the shared store connection, for data that
+     cannot change while the manager idles). "Finished" needs BOTH signals: running→idle misses
+     a job that completes with the next already promoted behind it, and a changed `result`
+     misses a canceled/failed one, which leaves the prior result untouched.
+
+202. The validation-run list says when it is a SLICE ("showing the 8 most recent of N"). It
+     always showed 8 of up to 100 with nothing marking the cap, which reads as "these are all
+     the runs" — and comparing a gallery against the wrong set of runs is the mistake the page
+     exists to prevent.
+
+203. The Model page's Jobs card is the queue and nothing else — no "idle" status line, no Reload
+     button (that pairing is the sweep cards' shape, which sit under their own controls). It is
+     ALWAYS shown, so "is anything running" has one fixed place to look; with no jobs it carries
+     an empty-state line, the convention every other list on the page already uses.
+
+204. `[hidden] { display: none !important }` now backs the whole admin-next shell. The UA's
+     `[hidden]` rule is plain `display:none` at losing specificity, so any class setting display
+     — `.row{display:flex}` — silently defeated `el.hidden = true`; the Jobs card's Clear-queue
+     row stayed visible with an empty queue. Every `hidden` toggle in the file means "gone".
+
+205. A gallery version can now be DELETED — `Store.delete_model_version` + `DELETE
+     /api/training/models/{id}`, a Delete button on every non-active row. `model_versions`
+     survives eviction and `clear` by design, so it accumulated a row plus a `gallery.npz`
+     per build with no way to clear either. The version's `identifications` go too: every
+     read is scoped to a `model_version_id` and the id is AUTOINCREMENT (never reused), so
+     they are unreachable once the row is gone.
+     The ACTIVE version is refused (409) — identification reads it every tick; promote
+     another first. Irreversible: no rollback to it, and the visits it named lose their
+     names. Labels and crops are never touched, so a rebuild restores it.
+
+206. `delete_model_version` verifies the resolved gallery dir sits under `models_root`
+     before the rmtree. `gallery_dir` is a bare basename written by our own builder, but
+     this is the one call that recursively deletes a directory NAMED BY A DB COLUMN — a
+     hand-edited row must not turn it into "remove any path". Row + identifications are one
+     locked txn; the dir goes after the commit, outside the lock (filesystem work must not
+     hold the shared write lock), so a failed removal leaves an inert orphan dir rather
+     than a row promising a file that is not there.
+
+207. Recorded what "Validate" actually measures, on the page itself: the feasibility probe
+     scores the LABELLED CROPS at the chosen grades with a pretrained DINOv2 + kNN — it
+     never reads a built gallery. So a run belongs to no model version (`feasibility_runs`
+     has no model id, by design), there is nothing to "re-validate", and a run is
+     identified by what it measured: grades + crop/cat counts. The UI said only "feasibility
+     probe, before promote", which read as "validates the last build".
+
+208. Model building is ordered Validate → Build → Promote, not Build → Validate → Promote.
+     Validate reads no gallery, so it is a gate on the DATA — "is this separable enough to
+     build from" — answered before a build is spent, not a check on one already made. The old
+     order was what made it read as "validates the last build". Validate is labelled optional:
+     a build recomputes the same threshold over the crops it actually enrols, so skipping it
+     costs nothing but the forecast.
+
+209. ARCHITECTURE's learning-loop section now matches the code: validation is its own step
+     BEFORE training (it scores the labelled data, reads no gallery, belongs to no version,
+     and is skippable), a built version carries its own threshold + separability from the
+     vectors it enrolled, and promotion covers delete + the one-active invariant.
+     It had claimed "a new version is validated, then promoted" — per-version validation,
+     which does not exist. Recorded as deliberately-not-done so it isn't read as a gap.
+
+210. The gallery-version list labels `n_vectors` as "Crops", in the runs table's
+     Grades · Crops · Cats order. The gallery holds exactly ONE vector per enrolled crop
+     (`build_gallery` returns the same integer for both), so "Vectors" was the artifact's
+     word for a number the operator already knows as crops — and the differing labels hid
+     that a version built at the grades a run scored covers (about) the same crops, which is
+     the only sense in which a validation run corresponds to a model. Presentation only: the
+     wire/DB name stays `n_vectors`, like the `yolo-serial` slug (entry 147).
+
+211. A validation run can be DELETED — `Store.delete_feasibility_run` + `DELETE
+     /api/training/feasibility/runs/{id}`, a Delete button per row. Only `prune_feasibility_
+     reports` existed, which frees the report DIRS but keeps every metrics row forever; this
+     discards one run entirely. No in-use guard is needed (unlike a model version): nothing
+     references a run, since validation scores the labelled data, not a gallery. Same
+     discipline as the version delete — row in one locked txn, dir after the commit and
+     outside the lock, and the resolved dir confirmed under `training_root` before the rmtree.
+
+212. The validation-run "report" link is now a BUTTON — an `<a class="qbtn">`, so it keeps a
+     link's affordances (middle-click, copy-link, no JS) while reading as the row's control.
+     A pruned report renders a DISABLED Report button, not a "pruned" note: verified to the
+     same 57x25 box as the link, so the column keeps one shape and the row still says what it
+     would have offered.

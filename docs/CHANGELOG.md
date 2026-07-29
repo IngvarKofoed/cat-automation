@@ -1226,3 +1226,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      uploading an avatar. Not incidental: the server's cv2 re-encode DROPS the EXIF tag, so a
      phone photo POSTed raw lands permanently sideways. Duplicated per the no-shared-JS
      convention — the two front doors must both carry it or they disagree on the same upload.
+
+196. Admin `#annotate` gained a Labelled mode: review decided visits newest-first, filter by label
+     (incl. `ignored`), re-label with the same 1-9/u/x keys, or `d` one back to the queue. Fixing a
+     mislabel no longer means the retired `/admin-old` — it closes P4's deferred relabel item.
+     A re-label now RE-SEEDS each crop's quality grade with the queue's own formula; passing the
+     stored grade through left a not-a-cat correction ungraded, so every gallery build skipped it.
+
+197. `Store.labeled_visits` moved to its own short-lived WAL read connection, and returns per-frame
+     `score` + per-visit `peak_area`/`peak_score` (the re-seed inputs above). Unbounded, it walks
+     every positive oracle verdict probing `dataset_items` per row — holding the shared write lock
+     for that is the collector starvation entries 102-105 removed, and the live admin now calls it.

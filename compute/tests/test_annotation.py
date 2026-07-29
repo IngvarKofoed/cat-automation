@@ -860,6 +860,29 @@ def test_labeled_visits_returns_decided_visits_with_identity(tmp_path):
     assert {fr["id"] for fr in v["frames"]} == {f1, f2}
 
 
+def test_labeled_visits_carry_the_queues_quality_seed_inputs(tmp_path):
+    # A re-label re-seeds each crop's quality grade with the SAME formula the queue
+    # used, which needs the per-frame score and the visit's peak box area. Without
+    # them a not_cat -> cat correction could only pass the stored (NULL) grade
+    # through, minting ungraded crops a quality-filtered gallery build then skips.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    f1 = store.add(_frame(frame_id=1), recv_ts_ms=base)
+    f2 = store.add(_frame(frame_id=2), recv_ts_ms=base + 500)
+    store.write_analysis(f1, "yolo-serial", True, 0.5, _boxes_detail([[0, 0, 10, 10, 0.5]]))
+    store.write_analysis(f2, "yolo-serial", True, 0.9, _boxes_detail([[0, 0, 30, 30, 0.9]]))
+    # A not_cat row stores neither bbox nor quality — the case the seed inputs exist for.
+    store.add_dataset_items(
+        [{"frame_id": f, "label_kind": "not_cat", "cat_id": None,
+          "quality": None, "bbox": None, "crop_path": None} for f in (f1, f2)]
+    )
+    v = store.labeled_visits("yolo-serial")[0]
+    assert v["peak_score"] == 0.9
+    assert v["peak_area"] == 900.0  # the rep box, 30x30
+    assert {fr["id"]: fr["score"] for fr in v["frames"]} == {f1: 0.5, f2: 0.9}
+    assert all(fr["quality"] is None for fr in v["frames"])
+
+
 def test_labeled_visits_excludes_undecided_and_queue_excludes_decided(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000

@@ -4633,9 +4633,16 @@ class Store:
         bbox is NULL). Returned newest-labelled first (max ``labeled_ts`` per
         cluster, DESC) so the most recent mistake is on top. Per visit::
 
-            {frames: [{id, recv_ts, bbox, quality, crop_path, url}, ...],
-             rep_frame_id, span: [lo_ts, hi_ts], label_kind, cat_id, cat_name,
-             mixed, labeled_ts}
+            {frames: [{id, recv_ts, bbox, score, quality, crop_path, url}, ...],
+             rep_frame_id, peak_area, peak_score, span: [lo_ts, hi_ts],
+             label_kind, cat_id, cat_name, mixed, labeled_ts}
+
+        ``score`` / ``peak_area`` / ``peak_score`` mirror ``annotation_visits`` so a
+        re-label can re-seed each crop's quality grade with the SAME formula the queue
+        used. Without them a re-label could only pass the STORED ``quality`` through —
+        which is NULL on a ``not_cat``/``ignored`` row, so correcting one of those to a
+        cat would mint ungraded crops that every quality-filtered gallery build then
+        silently skips.
 
         ``since_id`` / ``until_id`` are the same inclusive id-range scope every
         windowed read shares. Like ``annotation_visits`` it is unpaginated (a known
@@ -4643,8 +4650,16 @@ class Store:
         """
         frags, params = _range_bounds("f.id", since_id, until_id)
         and_sql = "".join(" AND " + frag for frag in frags)
-        with self._lock:
-            rows = self._conn.execute(
+        # Its OWN short-lived WAL read connection, NOT the shared write-locked one — the
+        # move ``tuning_calendar`` / ``lighting_histogram`` make, for the same reason.
+        # Unbounded by default, the query walks every positive ``oracle`` verdict in the
+        # store probing ``dataset_items`` per row, and it is now reachable from the live
+        # admin's Annotation page; holding the write lock for that is the collector
+        # starvation entries 102-105 removed.
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            rows = conn.execute(
                 "SELECT f.id, f.recv_ts, o.detail, d.cat_id, d.label_kind, d.quality,"
                 " d.crop_path, d.labeled_ts, c.name"
                 " FROM frames f"
@@ -4655,18 +4670,21 @@ class Store:
                 " ORDER BY f.recv_ts ASC, f.id ASC",
                 [oracle] + params,
             ).fetchall()
+        finally:
+            conn.close()
         # Box-parse + assemble outside the lock (pure Python over fetched rows).
         decided: "list[dict]" = []
         for row_id, recv_ts, detail, cat_id, label_kind, quality, crop_path, labeled_ts, cat_name in rows:
             box = self._best_box(detail)
             if box is None:
                 continue  # defensive: a decided frame should still parse a box
-            bbox, _score = box
+            bbox, score = box
             decided.append(
                 {
                     "id": int(row_id),
                     "recv_ts": recv_ts,
                     "bbox": bbox,
+                    "score": score,
                     "quality": quality,
                     "crop_path": crop_path,
                     "cat_id": cat_id,
@@ -4682,6 +4700,7 @@ class Store:
                     "id": fr["id"],
                     "recv_ts": fr["recv_ts"],
                     "bbox": fr["bbox"],
+                    "score": fr["score"],
                     "quality": fr["quality"],
                     "crop_path": fr["crop_path"],
                     "url": f"/media/{fr['id']}",
@@ -4694,6 +4713,8 @@ class Store:
                 {
                     "frames": out_frames,
                     "rep_frame_id": rep["id"],
+                    "peak_area": self._bbox_area(rep["bbox"]),
+                    "peak_score": max(fr["score"] for fr in cluster),
                     "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
                     "label_kind": rep["label_kind"],
                     "cat_id": rep["cat_id"],

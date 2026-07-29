@@ -137,6 +137,10 @@
   select:hover { border-color: var(--muted); }
   select:focus { outline: none; border-color: var(--accent); }
   label.fld { display: inline-flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  /* Caption beside the field, not above it — for a field sharing a control bar with
+     same-height controls (a .seg, a button), where the stacked caption is what makes
+     the bar render two lines tall. */
+  label.fld.inline { flex-direction: row; align-items: center; gap: 7px; }
 
   /* Stat grid */
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
@@ -408,6 +412,21 @@
   .astage-full { max-width: 420px; flex: 1; min-width: 220px; }
   .astage-full img { width: 100%; height: auto; display: block; border-radius: var(--radius); }
   .acat { font-size: 13px; }
+  /* Labelled review: every crop the visit contributed, carrying the quality grade a
+     gallery build filters on — the one thing a decided visit holds that the queue's
+     rep-crop view never shows. Read-only: grades are auto-seeded, and a re-label
+     re-seeds them, so there is nothing here to edit in place. */
+  .afilm { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+    gap: 6px; margin-top: 12px; }
+  .afilm .at { position: relative; border: 1px solid var(--border); border-radius: 4px;
+    overflow: hidden; background: var(--bg); }
+  .afilm .at.rep { border-color: var(--accent); }
+  .afilm img { width: 100%; height: 72px; object-fit: cover; display: block; }
+  .afilm .aq { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; text-align: center;
+    text-transform: uppercase; letter-spacing: .3px; background: rgba(0,0,0,.62); color: var(--muted); }
+  .afilm .aq[data-q=gallery] { color: var(--tl-green); }
+  .afilm .aq[data-q=ok]      { color: var(--tl-amber); }
+  .afilm .aq[data-q=poor]    { color: var(--tl-red); }
 
   /* Cats roster — reuses .qtable's cell styling with its own colgroup geometry. */
   /* Every other column is fixed, so the slack all goes to Notes — the one free-text
@@ -1979,11 +1998,19 @@
   function mountAnnotate(view) {
     view.innerHTML = `
       <div class="card">
-        <div class="row"><span id="aStatus" class="note grow">Loading queue…</span><button id="aReload">Reload queue</button></div>
+        <div class="row">
+          <div class="seg" id="aMode">
+            <button data-m="queue" class="sel">Queue</button>
+            <button data-m="labelled">Labelled</button>
+          </div>
+          <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
+          <span id="aStatus" class="note grow">Loading queue…</span>
+          <button id="aReload">Reload</button>
+        </div>
       </div>
       <div class="card">
         <div id="aStage"><span class="note">Loading…</span></div>
-        <p class="hint">Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last</p>
+        <p class="hint" id="aHint"></p>
       </div>
       <div class="card">
         <h3>Roster</h3>
@@ -1995,6 +2022,11 @@
 
     let alive = true;
     let visits = [], idx = 0, cats = [], hasModel = false, truncated = false, lastAction = null;
+    // Labelled review: the decided mirror of the queue. `labAll` is what the server
+    // returned, `lab` the subset the "Show label" filter shows — kept apart so a
+    // requeue can drop the visit from BOTH (dropping it only from the filtered view
+    // resurrects it the moment the filter is re-derived).
+    let mode = 'queue', busy = false, labAll = [], lab = [], labIdx = 0;
 
     const bboxArea = (b) => (b ? Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]) : 0);
     function seedQuality(f, v) {
@@ -2008,9 +2040,16 @@
     const flash = (m) => { $('#aStatus', view).textContent = m; };
 
     function renderStatus() {
-      $('#aStatus', view).textContent = visits.length
-        ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}`
-        : 'Queue empty';
+      const el = $('#aStatus', view);
+      if (mode === 'queue') {
+        el.textContent = visits.length
+          ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}`
+          : 'Queue empty';
+      } else {
+        el.textContent = lab.length
+          ? `Visit ${labIdx + 1} / ${lab.length} · newest-labelled first`
+          : (labAll.length ? 'No visits carry that label' : 'Nothing labelled yet');
+      }
     }
     function renderVisit() {
       renderStatus();
@@ -2041,23 +2080,35 @@
       renderVisit();
     }
     async function commitLabel(decision, cat_id) {
-      const v = current(); if (!v) return;
+      const v = current(); if (!v || busy) return;
+      busy = true;
       const withCrop = decision !== 'not_cat';
       const frames = v.frames.map((f) => withCrop ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) } : { frame_id: f.id });
       try { await api('POST', '/api/label', { decision, cat_id: cat_id ?? null, frames }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); }
       catch (e) { flash('label failed: ' + e.message); }
+      finally { busy = false; }
     }
     async function ignoreVisit() {
-      const v = current(); if (!v) return;
+      const v = current(); if (!v || busy) return;
+      busy = true;
       try { await api('POST', '/api/label/ignore', { frame_ids: v.frames.map((f) => f.id) }); lastAction = v.frames.map((f) => f.id); advanceAfterDecision(); }
       catch (e) { flash('ignore failed: ' + e.message); }
+      finally { busy = false; }
     }
     async function undoLast() {
-      if (!lastAction) { flash('nothing to undo'); return; }
+      if (!lastAction || busy) { if (!lastAction) flash('nothing to undo'); return; }
+      busy = true;
       try { await api('POST', '/api/label/delete', { frame_ids: lastAction }); lastAction = null; loadQueue(); }
       catch (e) { flash('undo failed: ' + e.message); }
+      finally { busy = false; }
     }
-    function skip(delta) { if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); } }
+    function skip(delta) {
+      if (mode === 'queue') {
+        if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); }
+      } else if (lab.length) {
+        labIdx = (labIdx + delta + lab.length) % lab.length; renderLabelled();
+      }
+    }
 
     async function loadQueue() {
       const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading queue…</span>';
@@ -2065,12 +2116,192 @@
       catch (e) { stage.innerHTML = `<span class="note bad">${e.message}</span>`; }
     }
 
+    // ---- Labelled review: fix a mislabel without SQL ----------------------
+    // The decided mirror of the queue, newest-labelled first — so the most recent
+    // mistake is the first thing on screen. Every action routes through the same
+    // two endpoints the queue uses, on the same rows, so a correction made here IS
+    // the correction; there is no second copy of the labels.
+    const LABEL_TEXT = { unknown_cat: 'unknown cat', not_cat: 'not a cat', ignored: 'ignored' };
+    const labelKey = (v) => (v.label_kind === 'identified' ? `cat:${v.cat_id}` : v.label_kind);
+    const labelText = (v) => (v.label_kind === 'identified'
+      ? (v.cat_name || `cat #${v.cat_id}`)
+      : (LABEL_TEXT[v.label_kind] || v.label_kind || '—'));
+    // The identity chip, in the palette the rest of the console reads: a resident is
+    // green and a foreign cat red (via the roster's is_resident — labeled_visits
+    // carries the name but not the residency), an unknown cat amber. not_cat /
+    // ignored are not identities at all, so they take the muted chip.
+    function labelChip(v) {
+      if (v.label_kind === 'identified') {
+        const c = cats.find((x) => x.id === v.cat_id);
+        return identityChip({ cat_id: v.cat_id, cat_name: v.cat_name || (c && c.name), is_resident: !!(c && c.is_resident) });
+      }
+      if (v.label_kind === 'unknown_cat') return identityChip({ cat_id: null });
+      return `<span class="tchip motion">${esc(labelText(v))}</span>`;
+    }
+    // A re-label re-seeds each crop's grade with the queue's own formula, so the two
+    // paths can't grade the same crop differently — and correcting a not-a-cat (whose
+    // stored grade is NULL) to a real cat yields graded crops a gallery build can use.
+    // A compute build predating the per-frame `score` / `peak_area` fields can't seed,
+    // so it falls back to passing the stored grade through (the old console's behaviour)
+    // rather than seeding everything 'poor' off a missing peak area.
+    const canSeed = (v) => v && v.peak_area != null;
+    const qualityFor = (f, v) => (canSeed(v) && f.score != null ? seedQuality(f, v) : (f.quality || null));
+
+    function renderLabelled() {
+      renderStatus();
+      const stage = $('#aStage', view), v = lab[labIdx];
+      if (!v) {
+        stage.innerHTML = `<span class="note">${labAll.length
+          ? 'No visits carry that label — pick another under “Show label”.'
+          : 'Nothing labelled yet — decide some visits in the Queue.'}</span>`;
+        return;
+      }
+      const frames = v.frames.slice().sort((a, b) => a.recv_ts - b.recv_ts);
+      const rep = frames.find((f) => f.id === v.rep_frame_id) || frames[0];
+      const t0 = frames[0].recv_ts, t1 = frames[frames.length - 1].recv_ts;
+      const meta = [
+        fmtTs(t0), `${frames.length} frames`, `span ${fmtDuration((t1 - t0) / 1000)}`,
+        `rep ${detPct(rep.score)}`, `peak ${detPct(v.peak_score)}`,
+        v.relabelled ? 'labelled just now' : `labelled ${fmtTs(v.labeled_ts)}`,
+      ].join(' · ');
+      stage.innerHTML = `
+        <div class="row" style="margin-bottom:10px">
+          ${labelChip(v)}
+          ${v.mixed ? '<span class="mv-tag" title="Two labelling gestures fell into one visit cluster — re-labelling rewrites both as one.">mixed</span>' : ''}
+        </div>
+        <div class="astage-imgs">
+          <div class="astage-crop"><img src="${cropUrl(rep)}" alt="crop"></div>
+          <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
+        </div>
+        <div class="note" style="margin-top:8px">${meta}</div>
+        ${canSeed(v) ? '' : '<div class="note warn" style="margin-top:6px">This compute build predates the per-crop scores a re-label re-seeds from, so each crop keeps its stored grade — a not-a-cat correction stays ungraded and a quality-filtered gallery build will skip it. Pull + restart the compute PC.</div>'}
+        <div class="row" style="margin-top:12px">
+          <button id="aRelUnknown">Unknown cat (u)</button>
+          <button id="aRelNotCat">Not a cat (x)</button>
+          <button id="aRequeue" class="danger">Send back to queue (d)</button>
+        </div>
+        <div class="afilm">${frames.map((f) => `
+          <div class="at${f.id === v.rep_frame_id ? ' rep' : ''}">
+            <img src="${cropUrl(f)}" loading="lazy" alt="crop">
+            ${f.quality ? `<span class="aq" data-q="${esc(f.quality)}">${esc(f.quality)}</span>` : ''}
+          </div>`).join('')}</div>
+      `;
+      placeBoxes(stage);
+      $('#aRelUnknown', view).addEventListener('click', () => relabel('unknown_cat', null));
+      $('#aRelNotCat', view).addEventListener('click', () => relabel('not_cat', null));
+      $('#aRequeue', view).addEventListener('click', requeue);
+    }
+
+    // Re-label: the server drops this visit's rows + crop files, then re-commits under
+    // the new identity. The visit deliberately STAYS in view (rather than advancing) so
+    // the correction is visible — this is the mode you came to in order to check one.
+    async function relabel(decision, cat_id) {
+      const v = lab[labIdx]; if (!v || busy) return;
+      busy = true;
+      const withCrop = decision !== 'not_cat';
+      const payload = v.frames.map((f) => withCrop
+        ? { frame_id: f.id, bbox: f.bbox, quality: qualityFor(f, v) }
+        : { frame_id: f.id });
+      try {
+        const res = await api('POST', '/api/label/relabel', { decision, cat_id: cat_id ?? null, frames: payload });
+        v.label_kind = decision;
+        v.cat_id = decision === 'identified' ? cat_id : null;
+        v.cat_name = decision === 'identified' ? ((cats.find((c) => c.id === cat_id) || {}).name || null) : null;
+        v.mixed = false;
+        v.relabelled = true;
+        v.frames.forEach((f, i) => { f.quality = payload[i].quality || null; });
+        // The "Show label" counts are NOT re-derived here: doing so would drop the visit
+        // out of a filtered view the instant it was corrected, yanking it off screen.
+        // They refresh on the next Reload — a cosmetic lag, deliberately chosen.
+        renderLabelled();
+        // A re-label DELETES the old rows first, so frames evicted since the visit was
+        // labelled come back written to fewer rows than were sent — and at zero the
+        // visit silently leaves the labelled feed on the next reload. Say so, rather
+        // than let the freshly-drawn chip claim a label that did not persist.
+        // (After renderLabelled, which repaints the status line this writes to.)
+        const kept = res && res.inserted != null ? res.inserted : payload.length;
+        if (kept < payload.length) flash(`re-labelled ${kept} of ${payload.length} frames — the rest are no longer in the store`);
+      } catch (e) { flash('re-label failed: ' + e.message); }
+      finally { busy = false; }
+    }
+
+    // Undo: delete the rows + crop files so the frames re-enter the annotation queue.
+    async function requeue() {
+      const v = lab[labIdx]; if (!v || busy) return;
+      busy = true;
+      try {
+        await api('POST', '/api/label/delete', { frame_ids: v.frames.map((f) => f.id) });
+        lab.splice(labIdx, 1);
+        const gi = labAll.indexOf(v); if (gi >= 0) labAll.splice(gi, 1);
+        if (labIdx >= lab.length) labIdx = Math.max(0, lab.length - 1);
+        // Unlike a re-label, the visit is GONE from both sets, so re-deriving the filter
+        // can't resurrect it — and leaving the counts stale would advertise "not a cat (1)"
+        // over an empty view. Only re-derive the shown subset when the selected label
+        // emptied out (the option vanishes and the select falls back to All); otherwise
+        // hold position, so a review pass isn't thrown back to the top of the list.
+        const before = $('#aFilter', view).value;
+        rebuildFilter();
+        if ($('#aFilter', view).value !== before) applyFilter(); else renderLabelled();
+      } catch (e) { flash('send back failed: ' + e.message); }
+      finally { busy = false; }
+    }
+
+    // Options are built from the labels actually PRESENT, with counts, so the filter
+    // never offers a label with nothing behind it. Keeps the current selection when it
+    // still exists; falls back to All when it doesn't.
+    function rebuildFilter() {
+      const sel = $('#aFilter', view), prev = sel.value || 'all';
+      const counts = new Map();
+      for (const v of labAll) {
+        const k = labelKey(v), e = counts.get(k) || { text: labelText(v), n: 0 };
+        e.n += 1; counts.set(k, e);
+      }
+      const rank = (k) => (k.startsWith('cat:') ? 0 : k === 'unknown_cat' ? 1 : k === 'not_cat' ? 2 : 3);
+      const entries = [...counts.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[1].text.localeCompare(b[1].text));
+      sel.innerHTML = [`<option value="all">All labels (${labAll.length})</option>`]
+        .concat(entries.map(([k, e]) => `<option value="${esc(k)}">${esc(e.text)} (${e.n})</option>`)).join('');
+      sel.value = [...sel.options].some((o) => o.value === prev) ? prev : 'all';
+    }
+    function applyFilter() {
+      const k = $('#aFilter', view).value || 'all';
+      lab = k === 'all' ? labAll.slice() : labAll.filter((v) => labelKey(v) === k);
+      labIdx = 0;
+      renderLabelled();
+    }
+    async function loadLabelled() {
+      const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading labelled visits…</span>';
+      try {
+        const r = await api('GET', '/api/label/labeled');
+        if (!alive) return;
+        labAll = r.visits || [];
+        rebuildFilter();
+        applyFilter();
+      } catch (e) {
+        labAll = []; lab = [];
+        stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+      }
+    }
+
+    function setMode(m) {
+      mode = m;
+      view.querySelectorAll('#aMode button').forEach((b) => b.classList.toggle('sel', b.dataset.m === m));
+      $('#aFilterWrap', view).style.display = m === 'labelled' ? '' : 'none';
+      $('#aHint', view).innerHTML = m === 'queue'
+        ? 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last'
+        : 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>n</b>/→ next · <b>p</b>/← back';
+      if (m === 'queue') loadQueue(); else loadLabelled();
+    }
+
     // Retired cats are not labellable, so the digit binding runs over the ACTIVE roster
     // only — the same derivation the Cats page shows in its Key column. Retiring a cat
     // therefore shifts the digits after it; deliberate, and rare enough to prefer over a
     // departed cat holding key 2 forever.
     const pickable = () => cats.filter((c) => c.active);
-    function labelCat(i) { const c = pickable()[i]; if (c) commitLabel('identified', c.id); }
+    function labelCat(i) { const c = pickable()[i]; if (c) decide('identified', c.id); }
+    // The decision keys and the roster buttons mean "label" in the queue and "re-label"
+    // in Labelled review — one dispatch point, so the two modes can never diverge on
+    // which endpoint a digit hits.
+    const decide = (d, cat_id) => (mode === 'queue' ? commitLabel(d, cat_id ?? null) : relabel(d, cat_id ?? null));
     function renderRoster() {
       const el = $('#aRoster', view), usable = pickable();
       // Three states, not two: an empty roster and an all-retired one both leave no
@@ -2085,20 +2316,30 @@
     async function loadCats() { try { const r = await api('GET', '/api/cats'); if (alive) { cats = r.cats || []; renderRoster(); } } catch (_) {} }
 
     function onKey(e) {
-      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+      // SELECT is in the ignore list because Labelled review has a focusable filter:
+      // without it, typing over the dropdown would re-label the visit behind it.
+      if (e.target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
       const k = e.key;
       if (k >= '1' && k <= '9') { labelCat(parseInt(k, 10) - 1); e.preventDefault(); }
-      else if (k === 'u') commitLabel('unknown_cat', null);
-      else if (k === 'x') commitLabel('not_cat', null);
-      else if (k === 'g') ignoreVisit();
+      else if (k === 'u') decide('unknown_cat');
+      else if (k === 'x') decide('not_cat');
+      else if (k === 'g') { if (mode === 'queue') ignoreVisit(); }
       else if (k === 'n' || k === 'ArrowRight' || k === ' ') { skip(1); e.preventDefault(); }
       else if (k === 'p' || k === 'ArrowLeft') skip(-1);
-      else if (k === 'z') undoLast();
+      else if (k === 'z') { if (mode === 'queue') undoLast(); }
+      // In Labelled review the undo IS the requeue, so it takes the destructive keys
+      // rather than z (which undoes the queue's LAST action, a different gesture).
+      else if (k === 'd' || k === 'Backspace') { if (mode === 'labelled') { requeue(); e.preventDefault(); } }
     }
     document.addEventListener('keydown', onKey);
-    $('#aReload', view).addEventListener('click', () => { loadCats(); loadQueue(); });
+    $('#aReload', view).addEventListener('click', () => { loadCats(); if (mode === 'queue') loadQueue(); else loadLabelled(); });
+    $('#aMode', view).addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-m]');
+      if (b && b.dataset.m !== mode) setMode(b.dataset.m);
+    });
+    $('#aFilter', view).addEventListener('change', applyFilter);
 
-    loadCats(); loadQueue();
+    loadCats(); setMode('queue');
     return () => { alive = false; document.removeEventListener('keydown', onKey); };
   }
 

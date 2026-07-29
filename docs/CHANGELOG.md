@@ -1237,3 +1237,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `score` + per-visit `peak_area`/`peak_score` (the re-seed inputs above). Unbounded, it walks
      every positive oracle verdict probing `dataset_items` per row — holding the shared write lock
      for that is the collector starvation entries 102-105 removed, and the live admin now calls it.
+
+198. New `compute/tools/ir_lamp_timeline.py` plots a night's mean luma + colourfulness with sun
+     events, and spectrally tests the luma series for a RIPPLE: thermal shutdown cycles over
+     minutes, foldback settles flat, and in a dark scene the two look identical by eye.
+     Periods are capped to those the window holds 4+ cycles of — else leftover trend reads as a
+     confident ripple. Reads on its OWN connection, never the write-locked `Store` one.
+
+199. Diagnosed (not yet fixed): the IR illuminator collapses to a few percent output at civil
+     dusk and holds there till dawn, so EVERY night captured so far is near-dark from ~22:15.
+     Do not tune night MOG2 params, calibrate the lighting cutoff, or build night IR crops from
+     that data — a bad night scorecard reflects a broken lamp, not the gate. Leading cause is
+     thermal (3 W emitter, half-enclosed back). Separately, `catpi` runs permanently under-volted.

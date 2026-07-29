@@ -1340,3 +1340,17 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      A pruned report renders a DISABLED Report button, not a "pruned" note: verified to the
      same 57x25 box as the link, so the column keeps one shape and the row still says what it
      would have offered.
+
+213. Admin action buttons now right-align on ONE rule: a row's action goes right, while toggles,
+     segmented controls and pickers stay left. Moved to the right rail: Location Save, the lighting
+     cutoff Save/Clear, Frame review Load, Add cat, Validate, Build, Scorecards Compare, and
+     Activity's Reload (which sat left while Annotation's and Cats' identical Reload sat right).
+     Deliberately still left: the collector toggles, Reset to edge baseline, the roster digit picker.
+
+214. That right rail is held by `grow` on the ADJACENT STATUS NOTE, never a bare spacer: flex
+     line-breaking uses each item's BASE size, so a full-width note bumps the button onto a second
+     line where it left-aligns, while a `grow` note has base size 0 and shrinks instead.
+     Consequence for future edits: such a note's tone class must be toggled via classList —
+     `className = 'note ok'` drops the `grow` and moves the button (hit and fixed in addCat).
+     Location instead uses margin-left:auto, so its bottom-aligned note+button group (entry 134)
+     stays right-aligned on the narrow widths where it wraps to its own line.

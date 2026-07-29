@@ -873,9 +873,14 @@
         <div class="row">
           <label class="fld">Latitude<input id="locLat" type="number" step="any" min="-90" max="90" /></label>
           <label class="fld">Longitude<input id="locLon" type="number" step="any" min="-180" max="180" /></label>
-          <div class="row" style="align-self:flex-end">
-            <button id="locSave" class="primary">Save</button>
+          <!-- Right-aligned via margin-left:auto rather than a .grow spacer: a long note can
+               push this group onto its own wrapped line, where a spacer left behind on the
+               previous line would stop right-aligning it. The note keeps its bottom-aligned
+               pairing with the button (entry 134) and sits LEFT of it, so the button holds the
+               same right edge as every other card's action. -->
+          <div class="row" style="align-self:flex-end;margin-left:auto">
             <span id="locNote" class="note"></span>
+            <button id="locSave" class="primary">Save</button>
           </div>
         </div>
       </div>
@@ -1156,9 +1161,9 @@
         <div id="litHist" class="lithist"></div>
         <div class="row" style="margin-top:12px">
           <label class="fld">Night below<input id="litThresh" type="number" step="any" min="0" style="width:110px"></label>
+          <span id="litState" class="note grow"></span>
           <button id="litSave">Save</button>
           <button id="litClear">Clear</button>
-          <span id="litState" class="note grow"></span>
         </div>
         <p class="hint">Colourfulness per frame — 0 is monochrome. Sweep a day, look for TWO
           separated humps (colour day vs IR night), and set the cutoff where they part.
@@ -1183,13 +1188,13 @@
       <div class="card">
         <h3>Scorecards</h3>
         <div class="row">
-          <button id="compareBtn" class="primary">Compare</button>
           <div id="regimeSel" class="seg">
             <button class="sel" data-regime="">All</button>
             <button data-regime="day">Day</button>
             <button data-regime="night">Night</button>
           </div>
-          <span id="splitNote" class="note"></span>
+          <span id="splitNote" class="note grow"></span>
+          <button id="compareBtn" class="primary">Compare</button>
         </div>
         <div id="scorecards" class="stats sccards" style="margin-top:12px"></div>
         <div id="missedPanel"></div>
@@ -1842,8 +1847,8 @@
         <div class="row">
           <label class="fld">Start<input id="fStart" type="datetime-local" step="60"></label>
           <label class="fld">Timespan<select id="fSpan">${SPANS.map((m) => `<option value="${m}"${m === 5 ? ' selected' : ''}>${m} min</option>`).join('')}</select></label>
+          <span id="fScope" class="note grow"></span>
           <button id="fLoad" class="primary" style="align-self:flex-end">Load</button>
-          <span id="fScope" class="note"></span>
         </div>
         <div class="row" style="margin-top:12px">
           <div class="seg" id="fFilters">
@@ -2395,8 +2400,13 @@
         <div class="row">
           <input id="kNewCat" type="text" placeholder="new cat name" style="width:180px">
           <label class="note"><input id="kResident" type="checkbox" checked> resident</label>
+          <!-- "grow" (base size 0) rather than a plain spacer + fixed-width note: flex line
+               breaking uses each item's BASE size, so a long error message would push the
+               button onto a second line — where it left-aligns and the right rail breaks.
+               addCat() must therefore add its ok/bad class with classList, never by
+               reassigning className, or this class goes with it. -->
+          <span id="kAddNote" class="note grow"></span>
           <button id="kAdd" class="primary">Add cat</button>
-          <span id="kAddNote" class="note"></span>
         </div>
         <p class="hint">A cat you name but leave un-resident is a known neighbour — identified by
           name, but never counted as one of ours.</p>
@@ -2618,13 +2628,16 @@
       const field = $('#kNewCat', view), note = $('#kAddNote', view);
       const name = field.value.trim();
       if (!name) return;
+      // Toggle only the tone class — the note also carries the `grow` that keeps the Add
+      // button pinned to the card's right edge, and reassigning className would drop it.
+      const tone = (t, msg) => { note.classList.remove('ok', 'bad'); note.classList.add(t); note.textContent = msg; };
       try {
         await api('POST', '/api/cats', { name, is_resident: $('#kResident', view).checked });
         if (!alive) return;
         field.value = '';
-        note.className = 'note ok'; note.textContent = 'Added ' + name + '.';
+        tone('ok', 'Added ' + name + '.');
         load();
-      } catch (e) { note.className = 'note bad'; note.textContent = e.message; }
+      } catch (e) { tone('bad', e.message); }
     }
 
     $('#kAdd', view).addEventListener('click', addCat);
@@ -2655,7 +2668,7 @@
       </div>
       <div class="card">
         <h3>1 · Validate <span class="note">(optional)</span></h3>
-        <div class="row">${qChecks('v')}<button id="mValidate">Validate</button><span id="mValNote" class="note"></span></div>
+        <div class="row">${qChecks('v')}<span id="mValNote" class="note grow"></span><button id="mValidate">Validate</button></div>
         <p class="hint">Scores the LABELLED CROPS at those grades — how separable the cats are,
           measured with a pretrained DINOv2 + kNN. It reads no gallery, so it comes FIRST: it
           answers "is this data separable enough to build from", and a run belongs to no
@@ -2665,7 +2678,7 @@
       </div>
       <div class="card">
         <h3>2 · Build gallery</h3>
-        <div class="row">${qChecks('b')}<button id="mBuild" class="primary">Build</button><span id="mBuildNote" class="note"></span></div>
+        <div class="row">${qChecks('b')}<span id="mBuildNote" class="note grow"></span><button id="mBuild" class="primary">Build</button></div>
         <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.
           Build embeds the SAME crop set a Validate run at the same grades scored, so those
           numbers forecast this gallery — mismatch the grades and they describe something else.</p>
@@ -2926,9 +2939,9 @@
     view.innerHTML = `
       <div class="card">
         <div class="row">
-          <button id="acReload">Reload</button>
           <label class="note"><input type="checkbox" id="acHide"> Hide our cats</label>
           <span class="grow"></span>
+          <button id="acReload">Reload</button>
           <button id="acAnalyze" title="Re-detect the loaded events' motion frames (person/bird/cat subjects)">Analyze</button>
           <button id="acIdentify" title="Name historical visits against the active gallery">Identify</button>
         </div>

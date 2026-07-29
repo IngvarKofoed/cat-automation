@@ -410,7 +410,12 @@
   .acat { font-size: 13px; }
 
   /* Cats roster — reuses .qtable's cell styling with its own colgroup geometry. */
-  .qtable.ctable { min-width: 760px; }
+  /* Every other column is fixed, so the slack all goes to Notes — the one free-text
+     field, and the one that reads worst truncated. The min-width is the SCROLL floor for
+     a narrow window, deliberately under the ~822px admin column: set above it and the
+     table overflows at every viewport (the column is capped, so a wider screen never
+     helps) and Last seen sits permanently off-screen behind a scroll. */
+  .qtable.ctable { min-width: 780px; }
   .ctable td.cedit { white-space: normal; }
   .ctable input[type=text] { width: 100%; padding: 3px 6px; font-size: 12px; }
   .ctable td.ckey { color: var(--muted); font-size: 11px; }
@@ -418,6 +423,31 @@
   .ctable tr.retired td { opacity: .5; }
   .ctable tr.cerr td { border-bottom: 0; padding: 0 8px 6px; color: var(--bad);
     font-size: 12px; white-space: normal; }
+  /* Photo cell: a thumb + a visible SET/CHANGE caption, both inside the <label> that
+     holds the hidden file input, so a click on either opens the picker. The caption is
+     not decoration — a bare clickable circle does not READ as a control on a dense
+     table, and the first build (thumb + tooltip) was reported as having no upload.
+     The remove badge sits OUTSIDE the label (so it can't open the picker) and only for
+     an uploaded override, never for the auto labelled-crop fallback. */
+  .cphoto { position: relative; display: inline-flex; flex-direction: column;
+    align-items: center; gap: 3px; }
+  .cphoto label { display: flex; flex-direction: column; align-items: center; gap: 3px;
+    cursor: pointer; }
+  .cphoto .cthumb { width: 34px; height: 34px; border-radius: 50%; overflow: hidden;
+    border: 1px solid var(--border); background: var(--bg); }
+  .cphoto label:hover .cthumb { border-color: var(--accent); }
+  .cphoto label:hover .ccap { color: var(--accent); }
+  .cphoto .ccap { font-size: 10px; text-transform: uppercase; letter-spacing: .3px;
+    color: var(--muted); line-height: 1; }
+  .cphoto img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cphoto input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .cphoto .cinitial { display: flex; align-items: center; justify-content: center;
+    width: 100%; height: 100%; color: var(--muted); font-size: 13px; font-weight: 600; }
+  .cphoto.busy label { opacity: .5; }
+  .cphoto .cx { position: absolute; top: -4px; right: -4px; width: 15px; height: 15px;
+    border-radius: 50%; border: 1px solid var(--border); background: var(--surface);
+    color: var(--muted); font-size: 10px; line-height: 1; padding: 0; cursor: pointer; }
+  .cphoto .cx:hover { color: var(--bad); border-color: var(--bad); }
 </style>
 
 <header class="appbar">
@@ -2127,7 +2157,22 @@
         const cv = cov[c.id] || {};
         const dn = covAvail ? `${fmtInt(cv.day || 0)} / ${fmtInt(cv.night || 0)}` : '—';
         const err = errors[c.id];
+        // Version-stamped URL: an unchanged avatar keeps ONE cacheable URL, a replaced
+        // one gets a fresh URL that auto-busts (the scheme entry 85 established).
+        const photo = c.has_avatar
+          ? `<img src="/api/cats/${c.id}/avatar?v=${c.avatar_version}" alt="">`
+          : `<span class="cinitial">${esc((c.name || '?').trim().charAt(0).toUpperCase())}</span>`;
         return `<tr class="crow${c.active ? '' : ' retired'}" data-id="${c.id}">
+            <td>
+              <div class="cphoto">
+                <label title="Upload a photo for this cat">
+                  <span class="cthumb">${photo}</span>
+                  <span class="ccap">${c.has_avatar ? 'Change' : 'Set'}</span>
+                  <input class="cfile" type="file" accept="image/*" aria-label="upload a photo">
+                </label>
+                ${c.avatar_uploaded ? '<button class="cx" title="Remove the uploaded photo">✕</button>' : ''}
+              </div>
+            </td>
             <td class="num ckey">${keyOf[c.id] || ''}</td>
             <td class="cedit"><input class="cname" type="text" value="${esc(c.name)}" aria-label="name"></td>
             <td><input class="cres" type="checkbox"${c.is_resident ? ' checked' : ''} aria-label="resident"></td>
@@ -2136,15 +2181,15 @@
             <td class="num">${fmtInt(cv.total || 0)}</td>
             <td class="num">${dn}</td>
             <td class="num">${fmtTs(c.last_seen_ts)}</td>
-          </tr>` + (err ? `<tr class="cerr"><td colspan="8">${esc(err)}</td></tr>` : '');
+          </tr>` + (err ? `<tr class="cerr"><td colspan="9">${esc(err)}</td></tr>` : '');
       }).join('');
       wrap.innerHTML = '<table class="qtable ctable">'
-        + '<colgroup><col style="width:44px"><col style="width:23%"><col style="width:76px">'
-        + '<col style="width:62px"><col><col style="width:66px"><col style="width:94px">'
-        + '<col style="width:130px"></colgroup>'
-        + '<thead><tr><th>Key</th><th>Name</th><th>Resident</th><th>Active</th><th>Notes</th>'
-        + '<th class="num">Crops</th><th class="num">Day / night</th><th class="num">Last seen</th>'
-        + '</tr></thead><tbody>' + body + '</tbody></table>';
+        + '<colgroup><col style="width:62px"><col style="width:40px"><col style="width:150px">'
+        + '<col style="width:76px"><col style="width:62px"><col><col style="width:62px">'
+        + '<col style="width:90px"><col style="width:128px"></colgroup>'
+        + '<thead><tr><th>Photo</th><th>Key</th><th>Name</th><th>Resident</th><th>Active</th>'
+        + '<th>Notes</th><th class="num">Crops</th><th class="num">Day / night</th>'
+        + '<th class="num">Last seen</th></tr></thead><tbody>' + body + '</tbody></table>';
       wire();
     }
 
@@ -2176,9 +2221,86 @@
       withFocus(render);
     }
 
+    // EXIF orientation is normalised CLIENT-side because the server's cv2 re-encode drops
+    // the EXIF tag — a phone photo POSTed raw would land permanently sideways. Downscale
+    // + JPEG here too, so the upload is small. Duplicated from the user dashboard on
+    // purpose: the two front doors share no JS (entry 80), so they drift independently.
+    async function normalizeImage(file) {
+      const MAX_DIM = 1024;
+      let src, w, h;
+      try {
+        src = await createImageBitmap(file, { imageOrientation: 'from-image' });
+        w = src.width; h = src.height;
+      } catch {
+        src = await new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(file), im = new Image();
+          im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+          im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('not an image we can read')); };
+          im.src = url;
+        });
+        w = src.naturalWidth; h = src.naturalHeight;
+      }
+      if (!w || !h) throw new Error('not an image we can read');
+      const scale = Math.min(1, MAX_DIM / Math.max(w, h));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      canvas.getContext('2d').drawImage(src, 0, 0, canvas.width, canvas.height);
+      if (src.close) src.close();
+      return await new Promise((resolve, reject) => {
+        canvas.toBlob((b) => b ? resolve(b) : reject(new Error('could not encode the image')), 'image/jpeg', 0.9);
+      });
+    }
+
+    async function uploadAvatar(id, file, cell) {
+      cell.classList.add('busy');
+      try {
+        const blob = await normalizeImage(file);
+        const res = await fetch(`/api/cats/${id}/avatar`, {
+          method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob,
+        });
+        if (!res.ok) {
+          let detail = '';
+          try { detail = (await res.json()).detail || ''; } catch (_) {}
+          throw new Error(`${res.status}${detail ? ' ' + detail : ''}`);
+        }
+        if (!alive) return;
+        delete errors[id];
+        // Refetch rather than patch in place: the new avatar_version is what stamps a
+        // fresh URL, so without it the <img> would keep serving the cached old photo.
+        await load();
+      } catch (e) {
+        if (!alive) return;
+        errors[id] = 'photo: ' + e.message;
+        cell.classList.remove('busy');
+        render();
+      }
+    }
+
+    async function removeAvatar(id) {
+      try {
+        await api('DELETE', `/api/cats/${id}/avatar`);
+        if (!alive) return;
+        delete errors[id];
+        await load();
+      } catch (e) {
+        if (!alive) return;
+        errors[id] = 'photo: ' + e.message;
+        render();
+      }
+    }
+
     function wire() {
       for (const row of view.querySelectorAll('.crow')) {
         const id = Number(row.dataset.id);
+        const cell = $('.cphoto', row), fileEl = $('.cfile', row);
+        fileEl.addEventListener('change', () => {
+          const f = fileEl.files && fileEl.files[0];
+          fileEl.value = '';               // let the same file be re-picked after a failure
+          if (f) uploadAvatar(id, f, cell);
+        });
+        const rm = $('.cx', row);
+        if (rm) rm.addEventListener('click', () => removeAvatar(id));
         const name = $('.cname', row), notes = $('.cnotes', row);
         const cat = cats.find((c) => c.id === id) || {};
         // Blur is the single commit point; Enter just blurs, so one edit is one request.

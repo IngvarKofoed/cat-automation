@@ -245,6 +245,18 @@ def test_api_overview_has_avatar_from_crop_and_upload(api):
     )
     assert cats[bare_cat["id"]]["avatar_version"] is None
 
+    # avatar_uploaded splits the two sources has_avatar collapses: only an UPLOADED
+    # override can be deleted, so the roster page needs this to decide whether to offer
+    # a remove control. A crop-derived avatar is auto and has nothing to remove.
+    assert cats[crop_cat["id"]]["avatar_uploaded"] is False
+    assert cats[upload_cat["id"]]["avatar_uploaded"] is True
+    assert cats[bare_cat["id"]]["avatar_uploaded"] is False
+
+    # Deleting the override reverts the flag (and the cat falls back to its crop).
+    client.delete(f"/api/cats/{upload_cat['id']}/avatar")
+    after = {c["id"]: c for c in client.get("/api/cats/overview").json()["cats"]}
+    assert after[upload_cat["id"]]["avatar_uploaded"] is False
+
 
 # --- POST /api/cats/{id}/avatar ---------------------------------------------
 

@@ -1209,3 +1209,20 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      The join is a LEFT JOIN, so a catless kind (`unknown_cat`) has a NULL `c.active`; a bare
      `c.active = 1` would silently drop every catless crop, which is not a retired cat's crop.
      Default stays `False`, so the two opt-in callers are explicit and greppable.
+
+193. Roster rows set a cat's photo — a Photo column with a round thumb (falling back to the
+     name's initial) over a visible SET / CHANGE caption, both opening the file picker.
+     The caption is load-bearing, not decoration: a bare clickable circle on a dense table
+     does not read as a control, and the first build (thumb + tooltip only) was reported as
+     having no upload at all. Reverses the spec's "no avatar management here" non-goal —
+     when renaming and retiring rows, the photo is how you tell which cat a row is.
+
+194. `/api/cats/overview` gained `avatar_uploaded`, distinct from `has_avatar` (true for the
+     AUTO labelled-crop fallback too). Only an uploaded override can be deleted, so a remove
+     control needs to know which of the two it is showing — otherwise it offers to remove a
+     crop-derived photo and silently does nothing.
+
+195. The roster duplicates the user dashboard's client-side EXIF normalisation before
+     uploading an avatar. Not incidental: the server's cv2 re-encode DROPS the EXIF tag, so a
+     phone photo POSTed raw lands permanently sideways. Duplicated per the no-shared-JS
+     convention — the two front doors must both carry it or they disagree on the same upload.

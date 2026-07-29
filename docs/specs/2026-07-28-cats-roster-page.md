@@ -48,8 +48,12 @@ frontend, plus giving `active` real consumers so "retire" means something.
 ## Non-goals
 
 - Deleting a cat. Retire is the exit; `dataset_items.cat_id` must keep resolving.
-- Avatar management of any kind — no upload, no thumbnail column. It lives on
-  the user dashboard, and a photo earns little on a management table.
+- ~~Avatar management of any kind — no upload, no thumbnail column.~~
+  **Reversed after the first build, at the user's request.** The roster now has a
+  Photo column that sets, replaces, and removes a cat's avatar, reusing the
+  existing avatar endpoints. The original reasoning ("a photo earns little on a
+  management table") was wrong: when you are renaming and retiring rows, the photo
+  is how you tell which cat a row *is*.
 - Merging two cats, or bulk-reassigning one cat's labels to another.
 - Changing what the user dashboard's Cats view *looks* like.
 

@@ -2057,7 +2057,8 @@ def create_app(
         for row in rows:
             ver = None
             uploaded = store.avatar_path(row["id"])
-            if os.path.isfile(uploaded):
+            is_uploaded = os.path.isfile(uploaded)
+            if is_uploaded:
                 ver = int(os.path.getmtime(uploaded) * 1000)
             elif row["has_crop"]:
                 crop = store.cat_avatar_crop_path(row["id"])
@@ -2065,6 +2066,10 @@ def create_app(
                     ver = int(os.path.getmtime(crop) * 1000)
             row["avatar_version"] = ver
             row["has_avatar"] = ver is not None
+            # Distinct from has_avatar, which is also true for the AUTO labelled-crop
+            # fallback. Only an uploaded override can be removed, so a UI needs to know
+            # which of the two it is showing before offering a delete.
+            row["avatar_uploaded"] = is_uploaded
         model = store.active_model()
         return {
             "cats": rows,

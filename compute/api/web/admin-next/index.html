@@ -1160,7 +1160,10 @@
         </div>
         <div id="litHist" class="lithist"></div>
         <div class="row" style="margin-top:12px">
-          <label class="fld">Night below<input id="litThresh" type="number" step="any" min="0" style="width:110px"></label>
+          <!-- "inline" caption (beside the input, not stacked above it): this field shares a
+               control bar with same-height buttons, and the stacked caption is what made the
+               bar two lines tall — so the field read as its own row above Save/Clear. -->
+          <label class="fld inline">Night below<input id="litThresh" type="number" step="any" min="0" style="width:110px"></label>
           <span id="litState" class="note grow"></span>
           <button id="litSave">Save</button>
           <button id="litClear">Clear</button>
@@ -1847,8 +1850,17 @@
         <div class="row">
           <label class="fld">Start<input id="fStart" type="datetime-local" step="60"></label>
           <label class="fld">Timespan<select id="fSpan">${SPANS.map((m) => `<option value="${m}"${m === 5 ? ' selected' : ''}>${m} min</option>`).join('')}</select></label>
-          <span id="fScope" class="note grow"></span>
-          <button id="fLoad" class="primary" style="align-self:flex-end">Load</button>
+          <!-- The note + Load share a BOTTOM-ALIGNED group, the Location card's idiom (entry
+               134). The two fields beside them stack a caption above their control, making the
+               bar two lines tall, so the row's own align-items:center floated the note above
+               the inputs; inside this group it centres on the button instead, and the group's
+               flex-end puts both level with the fields' controls.
+               The group grows (rather than margin-left:auto) and the note shrinks inside it, so
+               a long readout can never force Load onto a second line. -->
+          <div class="row grow" style="align-self:flex-end">
+            <span id="fScope" class="note grow"></span>
+            <button id="fLoad" class="primary">Load</button>
+          </div>
         </div>
         <div class="row" style="margin-top:12px">
           <div class="seg" id="fFilters">

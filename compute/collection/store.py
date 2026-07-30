@@ -34,7 +34,6 @@ from typing import Callable
 
 from compute.analysis import ANALYZER_NAMES  # import-light registry (no ML); single source of oracle ids
 from compute.analysis.yolo import (  # import-light COCO class-id constants (yolo.py holds no ML at module scope)
-    _COCO_BIRD_CLASS_ID,
     _COCO_CAT_CLASS_ID,
     _COCO_PERSON_CLASS_ID,
 )
@@ -1841,7 +1840,7 @@ class Store:
         that analyzer's stored per-frame detection over just the sampled ids and
         adds four keys per frame — ``analyzed`` (a verdict row exists, i.e. the
         frame was swept), ``score``/``box``/``cls`` (the highest-confidence
-        {cat, person, bird} box, or ``None`` when the row holds no such box).
+        {cat, person} box, or ``None`` when the row holds no such box).
 
         ``identify`` (a flag) OPTIONALLY attaches an ``identity`` key per frame: the
         ACTIVE gallery's nearest match, resolved through the SAME threshold/fail-safe
@@ -3773,10 +3772,10 @@ class Store:
         classification (event-subject-classification spec) from the span's
         ``yolo-serial`` boxes plus a motion floor::
 
-            {kind: 'cat'|'person'|'bird'|'corrupted'|'unrecognized'|'motion_only', ...}
+            {kind: 'cat'|'person'|'corrupted'|'unrecognized'|'motion_only', ...}
 
         A positive cat detection always wins (``kind='cat'``; ``identity`` then
-        carries resident/neighbour/unknown-cat). Otherwise person/bird if YOLO named
+        carries resident/neighbour/unknown-cat). Otherwise ``person`` if YOLO named
         one; else ``corrupted`` when YOLO saw NOTHING and any frame in the visit carries
         a ``corruption`` verdict (glitch-explained, deprioritised-not-hidden); else the
         motion floor splits substantial-but-unnamed motion (``unrecognized``) from
@@ -3785,7 +3784,7 @@ class Store:
 
         ``detection`` records per-visit ``yolo-serial`` detection aggregates over the
         visit's MOTION frames — ``{ratio, conf_max, conf_mean}`` — combining the
-        cat/person/bird classes into one detection-density signal, RAW (no
+        cat/person classes into one detection-density signal, RAW (no
         ``_ANNOTATE_MIN_CONF`` floor, unlike the subject ladder). ``ratio`` = (motion
         frames with >=1 such box) / ``n_frames``; ``conf_max``/``conf_mean`` are over
         those per-frame max confidences, ``null`` when the visit has none. ``ratio`` is
@@ -3879,7 +3878,7 @@ class Store:
         # --- Read-time subject classification (event-subject-classification spec).
         # Annotate each RETURNED event with a `subject` — YOLO's "what is it" — from
         # the span's `yolo-serial` analysis rows plus a motion floor. Read regardless
-        # of verdict: a person/bird box rides a verdict=0 row (verdict stays cat-only),
+        # of verdict: a person box rides a verdict=0 row (verdict stays cat-only),
         # so the classifier must see those rows the identify path ignores. The floor
         # is resolved ONCE from the same active model's `metrics.subject_floor` (learned
         # at gallery-build), falling back to a conservative hardcoded default so the
@@ -3923,15 +3922,15 @@ class Store:
             ).fetchall()
         subj_fids = [r[0] for r in subj_rows]
         corrupt_fids = [r[0] for r in corrupt_rows]
-        # The three detection classes the aggregates combine into one density signal.
-        _det_classes = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID)
+        # The detection classes the aggregates combine into one density signal.
+        _det_classes = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID)
         for event in events:
             e_lo, e_hi = event["start_id"], event["end_id"]
             lo_i = bisect.bisect_left(subj_fids, e_lo)
             hi_i = bisect.bisect_right(subj_fids, e_hi)
             # Merge each frame's per-class max confidence into a span-wide max (subject
             # ladder), AND collect the per-MOTION-frame max detection confidence over
-            # {cat, person, bird} — RAW, no _ANNOTATE_MIN_CONF floor (record the full
+            # {cat, person} — RAW, no _ANNOTATE_MIN_CONF floor (record the full
             # distribution for the future eval feature; the ladder keeps its own floor).
             class_conf: "dict[int, float]" = {}
             det_frame_confs: "list[float]" = []  # per motion frame with >=1 detection
@@ -4164,14 +4163,17 @@ class Store:
 
             1. cat         → {kind: 'cat'}                         # identity carries who
             2. person      → {kind: 'person', conf}
-            3. bird        → {kind: 'bird', conf}
-            4. corrupted   → {kind: 'corrupted'}                   # NO cat/person/bird box AND corruption_present
-            5. peak_area >= floor.min_area OR n_frames >= floor.min_frames
+            3. corrupted   → {kind: 'corrupted'}                   # NO cat/person box AND corruption_present
+            4. peak_area >= floor.min_area OR n_frames >= floor.min_frames
                            → {kind: 'unrecognized', peak_area, n_frames}
-            6. else        → {kind: 'motion_only', peak_area, n_frames}
+            5. else        → {kind: 'motion_only', peak_area, n_frames}
+
+        There is deliberately no ``bird`` rung: the detector no longer detects the class
+        (see ``compute/analysis/yolo.py``), so bird motion — and a legacy stored bird box
+        — files as ``unrecognized``/``motion_only``, which is the honest label for it.
 
         A positive cat box (step 1) always wins over the size floor, so a cat is never
-        second-guessed by geometry — and because ``corrupted`` (step 4) fires only when
+        second-guessed by geometry — and because ``corrupted`` (step 3) fires only when
         YOLO detected NOTHING, a cat that shares a frame with a glitch still resolves to
         ``cat`` (the corruption fail-safe). ``corrupted`` is deprioritised-not-hidden:
         it marks glitch-explained motion as low-interest so ``unrecognized`` sharpens to
@@ -4179,17 +4181,15 @@ class Store:
         that masks a real cat stays reachable in the feed. One rung sits OUTSIDE this
         method: a confident NAMED gallery match can promote a non-cat verdict (including
         ``corrupted``) to ``cat`` — that needs the identity join, so ``events()`` applies
-        it after calling this (see the promotion note there). Steps 4–6 are the only
+        it after calling this (see the promotion note there). Steps 3–5 are the only
         reachable ones when the span has no ``yolo-serial`` rows (no class info), so an
         un-swept or pre-model event still gets an honest label rather than a blank card;
-        with no ``corruption`` verdicts either, step 4 simply can't fire.
+        with no ``corruption`` verdicts either, step 3 simply can't fire.
         """
         if class_conf.get(_COCO_CAT_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
             return {"kind": "cat"}
         if class_conf.get(_COCO_PERSON_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
             return {"kind": "person", "conf": class_conf[_COCO_PERSON_CLASS_ID]}
-        if class_conf.get(_COCO_BIRD_CLASS_ID, 0.0) >= _ANNOTATE_MIN_CONF:
-            return {"kind": "bird", "conf": class_conf[_COCO_BIRD_CLASS_ID]}
         if corruption_present:
             return {"kind": "corrupted"}
         if peak_area >= floor["min_area"] or n_frames >= floor["min_frames"]:
@@ -4257,7 +4257,7 @@ class Store:
         5-element cat-only box). Returns ``([x1,y1,x2,y2], conf)`` for the cat box with
         the max ``conf``, or ``None`` when the detail is missing, malformed, or holds
         no cat box — so identify + annotation stay behaviour-preserving (they only ever
-        wanted the cat crop), and a person/bird-only frame yields ``None`` here.
+        wanted the cat crop), and a person-only frame yields ``None`` here.
         """
         usable = [b for b in Store._detail_boxes(detail_text) if Store._box_class(b) == _COCO_CAT_CLASS_ID]
         if not usable:
@@ -4267,7 +4267,7 @@ class Store:
 
     @staticmethod
     def _best_detection_box(detail_text: "str | None") -> "tuple[list[float], float, int] | None":
-        """Highest-confidence {cat, person, bird} box in a ``detail`` JSON, or ``None``.
+        """Highest-confidence {cat, person} box in a ``detail`` JSON, or ``None``.
 
         Unlike cat-only ``_best_box``, this shows what the (broadened) serial YOLO
         persona actually detected in the frame — over the same class set the event
@@ -4276,9 +4276,10 @@ class Store:
         ``([x1,y1,x2,y2], conf, cls)`` for the max-``conf`` box over that class set,
         sharing ``_detail_boxes`` + ``_box_class`` so the parse and the legacy
         5-element rule stay single-sourced. ``None`` when the detail is missing,
-        malformed, or holds no such box.
+        malformed, or holds no such box — which now includes a frame whose only box is
+        a LEGACY bird one, swept before the class was dropped from the detector.
         """
-        allowed = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID)
+        allowed = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID)
         usable = [
             (b, Store._box_class(b)) for b in Store._detail_boxes(detail_text)
         ]
@@ -4300,7 +4301,9 @@ class Store:
         with ``_best_box`` so the parse and the legacy-5-element rule live in one place.
         Each box contributes its class id → the running max ``conf`` for that class.
         This is the signal the event-subject classification ladder reads to decide
-        whether a span holds a cat / person / bird when no cat was detected.
+        whether a span holds a cat / person when no cat was detected. It stays
+        class-agnostic on purpose (a legacy bird box still lands in the map); the
+        ladder and the aggregates name the classes they act on.
         """
         by_class: "dict[int, float]" = {}
         for b in Store._detail_boxes(detail_text):

@@ -47,7 +47,6 @@
     --unknown:   #e6b25a;  --unknown-bg:   #33260f;
     --unident:   #9a8a78;  --unident-bg:   #241c12;
     --person:    #7fb0e8;  --person-bg:    #16283d;
-    --bird:      #4fd0bb;  --bird-bg:      #103029;
     --unrec:     #b79ae8;  --unrec-bg:     #2a2038;
   }
   * { box-sizing: border-box; }
@@ -395,7 +394,6 @@
   .tchip.unknown      { background: var(--unknown-bg);   color: var(--unknown); }
   .tchip.unident      { background: var(--unident-bg);   color: var(--unident); }
   .tchip.person       { background: var(--person-bg);    color: var(--person); }
-  .tchip.bird         { background: var(--bird-bg);      color: var(--bird); }
   .tchip.unrecognized { background: var(--unrec-bg);     color: var(--unrec); }
   .tchip.motion       { background: var(--unident-bg);   color: var(--unident); }
   /* Lighting is a SCENE property, not a verdict about a cat, so it deliberately takes
@@ -595,7 +593,7 @@
   // Thresholds and palette mirror the USER dashboard's playback overlay; by the
   // entry-80 convention the two files share no CSS/JS, so this is a deliberate
   // duplicate. Change them together.
-  const CLS_LABEL = { 0: 'person', 14: 'bird', 15: 'cat' };
+  const CLS_LABEL = { 0: 'person', 15: 'cat' };
   const clsLabel = (c) => CLS_LABEL[c] || (c == null ? 'object' : 'cls ' + c);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   // Raw, uncalibrated YOLO confidence → traffic-light band: red < 40% · amber < 65% · green.
@@ -682,9 +680,11 @@
   // surface "YOLO saw a cat, no model named it" is a state worth seeing, not a blank.
   // A subject kind maps to a fixed label + CSS class, so an unrecognized kind from a
   // newer backend degrades to the muted styling instead of putting an unknown token in
-  // the class attribute. `corrupted` borrows the violet, as it does on the old /admin.
-  const SUBJECT_LABEL = { person: 'person', bird: 'bird', corrupted: 'corrupted', unrecognized: 'unrecognized', motion_only: 'motion only' };
-  const SUBJECT_CLASS = { person: 'person', bird: 'bird', corrupted: 'unrecognized', unrecognized: 'unrecognized', motion_only: 'motion' };
+  // the class attribute. `corrupted` borrows the violet. `bird` is deliberately absent
+  // (the class was dropped from the detector) — a backend still emitting it therefore
+  // falls through to that same muted chip rather than being silently relabelled.
+  const SUBJECT_LABEL = { person: 'person', corrupted: 'corrupted', unrecognized: 'unrecognized', motion_only: 'motion only' };
+  const SUBJECT_CLASS = { person: 'person', corrupted: 'unrecognized', unrecognized: 'unrecognized', motion_only: 'motion' };
   function eventChip(ev, pos) {
     const kind = ev.subject && ev.subject.kind;
     if (!kind || kind === 'cat') {
@@ -3459,7 +3459,7 @@
           <label class="note"><input type="checkbox" id="acHide"> Hide our cats</label>
           <span class="grow"></span>
           <button id="acReload">Reload</button>
-          <button id="acAnalyze" title="Re-detect the loaded events' motion frames (person/bird/cat subjects)">Analyze</button>
+          <button id="acAnalyze" title="Re-detect the loaded events' motion frames (person/cat subjects)">Analyze</button>
           <button id="acIdentify" title="Name historical visits against the active gallery">Identify</button>
         </div>
         <div id="acNote" class="note" style="margin-top:6px"></div>

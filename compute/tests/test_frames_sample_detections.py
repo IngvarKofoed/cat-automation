@@ -4,7 +4,7 @@ and ``Store.sample_frames`` (compute/api/app.py, compute/collection/store.py).
 See docs/specs/2026-07-24-playback-yolo-boxes.md. The players fetch the exact
 frames they show via ``/api/frames/sample``; when they pass
 ``detections=yolo-serial`` the store attaches each sampled frame's stored
-highest-confidence {cat, person, bird} box + score + class so the tile can be
+highest-confidence {cat, person} box + score + class so the tile can be
 colored and the box drawn — no re-detection.
 
 Pure-sqlite: NO torch/ultralytics/GPU. ``yolo-serial`` verdicts are inserted
@@ -22,7 +22,10 @@ from shared.wire import StreamFrameMeta
 
 _JPEG_BODY = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body" + b"\xff\xd9"
 
-_CAT, _PERSON, _BIRD = 15, 0, 14
+_CAT, _PERSON = 15, 0
+# COCO `bird`, DROPPED from the detector's class set — the stand-in for a class the
+# read path must IGNORE in rows swept before the drop.
+_BIRD = 14
 
 
 def _frame(frame_id: int = 1, ts: int = 1_000, motion: bool = False) -> StreamFrame:
@@ -114,7 +117,7 @@ def test_sample_frames_detections_person_box_wins_when_highest_conf(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000
     f = store.add(_frame(frame_id=1), recv_ts_ms=base)
-    # Person is the highest-confidence {cat, person, bird} box -> it is returned,
+    # Person is the highest-confidence {cat, person} box -> it is returned,
     # honest about the frame regardless of any visit-level cat chip.
     store.write_analysis(
         f, "yolo-serial", False, 0.0,
@@ -124,6 +127,22 @@ def test_sample_frames_detections_person_box_wins_when_highest_conf(tmp_path):
     assert r["cls"] == _PERSON
     assert r["score"] == 0.95
     assert r["box"] == [1.0, 1.0, 9.0, 9.0]
+
+
+def test_sample_frames_detections_ignores_legacy_bird_box(tmp_path):
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    f = store.add(_frame(frame_id=1), recv_ts_ms=base)
+    # A row swept before `bird` was dropped: its bird box must not be drawn, even at a
+    # higher confidence than the cat box beside it. The frame still reads as ANALYZED.
+    store.write_analysis(
+        f, "yolo-serial", True, 0.4,
+        _boxes_detail([[0, 0, 4, 4, 0.4, _CAT], [1, 1, 9, 9, 0.99, _BIRD]]),
+    )
+    (r,) = store.sample_frames(None, None, 100, detections="yolo-serial")
+    assert r["analyzed"] is True
+    assert r["cls"] == _CAT
+    assert r["score"] == 0.4
 
 
 # --- GET /api/frames/sample -----------------------------------------------

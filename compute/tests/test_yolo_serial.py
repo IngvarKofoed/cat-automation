@@ -97,6 +97,16 @@ def test_serial_and_default_share_inference_params():
     assert (serial._imgsz, serial._conf, serial._half) == (default._imgsz, default._conf, default._half)
 
 
+def test_detected_class_sets_per_persona():
+    # The serial persona detects person + cat; the batched oracle stays cat-only so its
+    # verdict/score are unchanged. `bird` (14) is DELIBERATELY absent from both: from the
+    # top-down door view a COCO bird box was almost never a bird, and it earned its own
+    # subject chip in the feed. Guard against re-adding it by reflex.
+    serial = set(YoloAnalyzer(serial=True)._predict_kwargs()["classes"])
+    assert serial == {0, 15}
+    assert set(YoloAnalyzer()._predict_kwargs()["classes"]) == {15}
+
+
 def test_fp32_passes_no_precision_arg_at_all():
     # Regression guard: ultralytics >= 8.4 warns ONCE PER predict call whenever a `half`
     # key is present at any value — at yolo-serial's one call per frame that is a log

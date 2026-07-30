@@ -42,12 +42,16 @@ logger = logging.getLogger(__name__)
 # bird, 15 cat, 16 dog, ... This is what we filter every detection against;
 # every other one of the model's 80 classes is noise for this oracle's purpose.
 _COCO_CAT_CLASS_ID = 15
-# The serial persona additionally detects 'person' (0) and 'bird' (14) so the
-# event-subject classifier can tell a human / bird apart from an unrecognized
-# blob. These NEVER affect the verdict/score (both stay cat-only — see
-# ``_result_from``); they only ride along in ``detail['boxes']``.
+# The serial persona additionally detects 'person' (0) so the event-subject
+# classifier can tell a human apart from an unrecognized blob. It NEVER affects
+# the verdict/score (both stay cat-only — see ``_result_from``); it only rides
+# along in ``detail['boxes']``.
+#
+# DELIBERATELY NOT bird (14), which this persona used to detect too: from the
+# top-down door view a COCO `bird` box was almost never a bird, and its own chip
+# in the feed dressed that noise up as a named subject. Such motion now files as
+# `unrecognized`, which is what it is. Re-adding the class means re-arguing that.
 _COCO_PERSON_CLASS_ID = 0
-_COCO_BIRD_CLASS_ID = 14
 
 # Env overrides, per the spec — each read once in __init__ and cached, so a
 # sweep's per-frame `analyze()` never touches the environment. Defaults favor
@@ -222,10 +226,9 @@ class YoloAnalyzer:
 
         The class set is PER-PERSONA: the batched ``yolo`` oracle stays cat-only
         (``[15]``) so its verdict/score are byte-identical to today (no scorecard
-        risk); the serial ``yolo-serial`` persona also detects person (0) and bird
-        (14) to feed the event-subject classifier. Verdict/score remain cat-only
-        for BOTH (see ``_result_from``) — the extra classes only populate
-        ``detail['boxes']``.
+        risk); the serial ``yolo-serial`` persona also detects person (0) to feed
+        the event-subject classifier. Verdict/score remain cat-only for BOTH (see
+        ``_result_from``) — the extra class only populates ``detail['boxes']``.
 
         PRECISION is passed only when FP16 is actually on. FP32 is the default in
         every ultralytics version, so omitting the arg is behaviourally identical to
@@ -236,7 +239,7 @@ class YoloAnalyzer:
         the inference regime is unchanged across both spellings.
         """
         if self._serial:
-            classes = [_COCO_PERSON_CLASS_ID, _COCO_BIRD_CLASS_ID, _COCO_CAT_CLASS_ID]
+            classes = [_COCO_PERSON_CLASS_ID, _COCO_CAT_CLASS_ID]
         else:
             classes = [_COCO_CAT_CLASS_ID]
         precision: dict = {}
@@ -278,7 +281,7 @@ class YoloAnalyzer:
         Keeps every surviving box (ultralytics already applied ``conf``
         internally), each recorded as ``[x1, y1, x2, y2, conf, cls]`` — the 6th
         element is the COCO class id, so ``detail['boxes']`` now carries ALL
-        detected classes (cat, plus person/bird for the serial persona). Zero
+        detected classes (cat, plus person for the serial persona). Zero
         detections is the common, expected case (most frames have no cat) — it
         falls straight through to an empty ``boxes`` list, ``verdict=False``,
         ``score=0.0``, no special-casing.
@@ -287,7 +290,7 @@ class YoloAnalyzer:
         ALONE, so "verdict=1 ⇒ a cat is present" and "score = max cat confidence"
         are UNCHANGED for both personas. For the batched ``yolo`` oracle every box
         is class 15 already, so its verdict/score are identical to today by
-        construction; for ``yolo-serial`` a person/bird-only frame yields
+        construction; for ``yolo-serial`` a person-only frame yields
         ``verdict=False`` while still recording its box in ``detail`` for the
         subject classifier.
         """

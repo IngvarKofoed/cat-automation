@@ -1503,3 +1503,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 237. `/code-review` is no longer what the nudge suggests: it needs a PR to exist, only posts a
      comment, and on this repo it spent ~743k tokens to report `findings: []` (entry 230).
      Its workflow-script tiering note stays — the user can still run it deliberately.
+
+238. COCO `bird` (14) is DROPPED from `yolo-serial`'s class set, reverting half of entry 89:
+     from the top-down door view a bird box was almost never a bird, and its own subject chip
+     dressed that noise up as a named subject. `person` (0) stays; verdict/score were always
+     cat-only, so no scorecard moves. Such motion now files as `unrecognized`/`motion_only`.
+
+239. Every read path that ACTS on a class dropped bird with it — the subject ladder, the
+     per-visit detection aggregates, and `_best_detection_box` (playback/grid overlays) — so a
+     LEGACY stored bird box is ignored rather than half-honoured. `_subject_classes` stays
+     class-agnostic (it still reports the box); the consumers name what they act on.
+     Consequence: a swept bird-only visit now reads as a measured detection MISS (ratio 0.0).

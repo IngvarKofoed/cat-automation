@@ -9,7 +9,7 @@ suite's other conventions (test_events.py / test_identification_store.py): a
 factory opens a Store under ``tmp_path``.
 
 Covers:
-- events()'s subject ladder (cat / person / bird / unrecognized / motion_only),
+- events()'s subject ladder (cat / person / unrecognized / motion_only),
   including cat-always-wins precedence and identity staying intact alongside it.
 - The preserved box-reading contract: a person-only detail has NO cat box
   (_best_box -> None, verdict/score would be cat-only), a coexisting cat+person
@@ -37,7 +37,11 @@ from shared.wire import StreamFrameMeta
 
 _JPEG_BODY = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body" + b"\xff\xd9"
 
-_CAT, _PERSON, _BIRD = 15, 0, 14
+_CAT, _PERSON = 15, 0
+# COCO `bird`, DROPPED from the detector's class set (and from every read path that
+# acts on a class). Kept here as the stand-in for a class the store must IGNORE —
+# stored rows swept before the drop still carry such boxes.
+_BIRD = 14
 
 
 def _frame(frame_id: int = 1, ts: int = 1_000, motion: bool = False, area: float = 0.0, bbox=None) -> StreamFrame:
@@ -187,14 +191,29 @@ def test_subject_person_only(tmp_path):
     assert ev["identity"] is None
 
 
-def test_subject_bird_only(tmp_path):
+def test_subject_legacy_bird_box_is_not_a_subject(tmp_path):
+    # `bird` was dropped from the detector, so a LEGACY stored bird box earns no chip of
+    # its own: it falls through the ladder like any un-named class. Here the visit sits
+    # below the motion floor, so it lands on motion_only.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    (f1,) = _one_event_ids(store, base, 1, area=_SUBJECT_FLOOR_DEFAULT["min_area"] / 10)
+    store.write_analysis(f1, "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 5, 5, 0.5, _BIRD]]))
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "motion_only"
+
+
+def test_legacy_bird_box_does_not_count_toward_detection_aggregates(tmp_path):
+    # The per-visit detection density combines {cat, person} only, so a swept visit whose
+    # sole box is a legacy bird one reads as a measured MISS (ratio 0.0, not null) rather
+    # than inflating the recall proxy with a class we no longer detect.
     store = _store(tmp_path)
     base = 1_700_000_000_000
     (f1,) = _one_event_ids(store, base, 1)
-    store.write_analysis(f1, "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 5, 5, 0.5, _BIRD]]))
+    store.write_analysis(f1, "yolo-serial", False, 0.0, _boxes_detail([[0, 0, 5, 5, 0.9, _BIRD]]))
     ev = store.events(None, None)["events"][0]
-    assert ev["subject"]["kind"] == "bird"
-    assert ev["subject"]["conf"] == pytest.approx(0.5)
+    assert ev["detection"]["ratio"] == pytest.approx(0.0)
+    assert ev["detection"]["conf_max"] is None
 
 
 def test_subject_no_yolo_rows_above_floor_is_unrecognized(tmp_path):
@@ -248,7 +267,7 @@ def test_subject_merges_max_confidence_across_span_frames(tmp_path):
 def test_subject_corrupted_when_no_detection_and_corruption_present(tmp_path):
     # A visit that would be 'unrecognized' (area above floor) with NO YOLO detection but
     # a corruption verdict on one of its frames files as 'corrupted' — the new rung
-    # between bird and unrecognized.
+    # between person and unrecognized.
     store = _store(tmp_path)
     base = 1_700_000_000_000
     ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)

@@ -4515,6 +4515,7 @@ class Store:
         *,
         limit: int = _ANNOTATE_PAGE_DEFAULT,
         scan_frames: int = _ANNOTATE_SCAN_FRAMES,
+        uncertain_only: bool = False,
     ) -> dict:
         """Bounded annotation queue: newest undecided visits, capped and optionally distance-sorted.
 
@@ -4526,7 +4527,20 @@ class Store:
         neither the SQL result nor the Python work grows with the store (entries
         102–104). Returns::
 
-            {visits: [...], truncated: bool, ordered_by: 'distance'|'recent', has_model: bool}
+            {visits: [...], truncated: bool, ordered_by: 'distance'|'recent', has_model: bool,
+             hidden_confident: int}
+
+        ``uncertain_only`` drops the visits the active model already matched CONFIDENTLY
+        to a resident, leaving the ones it found hard — what ARCHITECTURE calls the
+        active-learning set. This is the difference between "undecided" (the queue's
+        membership rule: no ``dataset_items`` row) and "uncertain" (the model's own
+        verdict): a good model does not shrink the queue at all, because every new visit
+        is undecided until a human says otherwise, so without this filter weeks of
+        correctly-identified visits bury the few that need attention. Filtered BEFORE the
+        ``limit`` cap, which is the whole point — applied after, confident visits would
+        still consume the page's slots. ``hidden_confident`` counts what it removed, so a
+        short page never reads as an empty queue. A NO-OP without an active model (nothing
+        has been identified, so nothing is confident) rather than an empty queue.
 
         Each visit carries the same shape ``annotation_visits`` returns
         (``frames``/``rep_frame_id``/``peak_area``/``peak_score``/``span``) plus
@@ -4651,6 +4665,16 @@ class Store:
         else:
             visits.sort(key=lambda v: (v["span"][0], v["start_id"]), reverse=True)
 
+        # Drop the confidently-matched visits BEFORE the limit cap (see the docstring):
+        # applied after, they would still eat the page's slots and the filter would appear
+        # to do nothing on a busy store. Without a model every `uncertain` is None, so the
+        # filter is skipped entirely rather than emptying the queue.
+        hidden_confident = 0
+        if uncertain_only and model is not None:
+            kept = [v for v in visits if v["uncertain"]]
+            hidden_confident = len(visits) - len(kept)
+            visits = kept
+
         if len(visits) > limit:
             truncated = True
             visits = visits[:limit]
@@ -4660,6 +4684,7 @@ class Store:
             "truncated": truncated,
             "ordered_by": ordered_by,
             "has_model": model is not None,
+            "hidden_confident": hidden_confident,
         }
 
     def _attach_queue_distances(self, visits: "list[dict]", model: dict) -> None:

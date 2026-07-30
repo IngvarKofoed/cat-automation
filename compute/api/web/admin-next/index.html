@@ -2048,6 +2048,7 @@
             <button data-m="flagged" id="aFlaggedBtn">Flagged</button>
             <button data-m="labelled">Labelled</button>
           </div>
+          <label class="note" id="aUncertainWrap" title="Show only the visits the active model found hard — it matched the rest confidently to a resident."><input type="checkbox" id="aUncertain"> Hide confident matches</label>
           <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
           <span id="aSaving" class="status" hidden><span class="dot"></span><span></span></span>
           <span id="aStatus" class="note grow">Loading queue…</span>
@@ -2074,6 +2075,15 @@
     // requeue can drop the visit from BOTH (dropping it only from the filtered view
     // resurrects it the moment the filter is re-derived).
     let mode = 'queue', busy = false, labAll = [], lab = [], labIdx = 0;
+    // "Hide confident matches": the queue's membership rule is UNDECIDED (no dataset_items
+    // row), not uncertain, so a good model doesn't shrink it — weeks of correctly-named
+    // visits bury the few that need attention. This filters to what the model found hard.
+    let uncertainOnly = false, hiddenConfident = 0;
+    // Sequence guard for loadQueue: two can be in flight at once (mount's initial load, the
+    // Reload button, a toggle, the reload after a decision empties the page), and without
+    // this the LAST RESPONSE wins rather than the last REQUEST — so a slow earlier fetch
+    // silently overwrites a newer filtered one, and the toggle appears not to work.
+    let queueSeq = 0;
     // Flagged review: the visits the household user marked from the user dashboard
     // (user-flag-for-labelling spec). Distinct from both other modes — a flagged span
     // may be undecided OR already labelled, so every decision here goes through
@@ -2133,9 +2143,14 @@
         // The decision just taken is echoed here — with the advance now instant, it is
         // the only trace of what a keypress did, and what `z` would undo.
         const last = lastDecision ? ` · last: ${lastDecision}` : '';
+        // What the filter removed is stated, never implied: with it on, an empty or short
+        // queue means "nothing hard left", NOT "nothing left to label".
+        const hid = hiddenConfident ? ` · ${hiddenConfident} confident hidden` : '';
         el.textContent = visits.length
-          ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}${last}`
-          : `Queue empty${last}`;
+          ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}${hid}${last}`
+          : (uncertainOnly && hiddenConfident
+            ? `Nothing uncertain left · ${hiddenConfident} confident match(es) hidden${last}`
+            : `Queue empty${last}`);
       } else if (mode === 'flagged') {
         el.textContent = flg.length
           ? `Flagged ${flgIdx + 1} / ${flg.length} · newest-flagged first`
@@ -2155,7 +2170,14 @@
       // showing one mode's visit while the keys dispatch to the other's is a destructive
       // mislabel (the digit would re-label the visit you can't see).
       if (mode !== 'queue') return;
-      if (!v) { stage.innerHTML = '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>'; return; }
+      // The empty state must not claim a clear queue when a filter is doing the emptying.
+      if (!v) {
+        stage.innerHTML = (uncertainOnly && hiddenConfident)
+          ? `<span class="note">Nothing the model found hard — ${hiddenConfident} confidently-matched `
+            + 'visit(s) are hidden. Untick “Hide confident matches” to work them too.</span>'
+          : '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>';
+        return;
+      }
       const rep = repOf(v);
       const dist = (hasModel && v.distance != null) ? ` · nearest d=${v.distance.toFixed(3)}${v.uncertain ? ' (uncertain)' : ''}` : '';
       stage.innerHTML = `
@@ -2258,6 +2280,20 @@
         )
         .then(() => { pendingWrites -= 1; renderPending(); });
     }
+    // Only meaningful with a promoted model: without one nothing has been identified, so
+    // there are no confident matches to hide (the backend treats the flag as a no-op). Say
+    // that on the control rather than offering a switch that does nothing.
+    function renderUncertainToggle() {
+      const wrap = $('#aUncertainWrap', view), box = $('#aUncertain', view);
+      if (!wrap || !box) return;
+      wrap.hidden = mode !== 'queue';
+      box.disabled = !hasModel;
+      box.checked = uncertainOnly && hasModel;
+      wrap.classList.toggle('dim', !hasModel);
+      wrap.title = hasModel
+        ? 'Show only the visits the active model found hard — it matched the rest confidently to a resident.'
+        : 'Needs a promoted model: with none, nothing has been identified, so no match is confident.';
+    }
     function skip(delta) {
       if (mode === 'queue') {
         if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); }
@@ -2270,10 +2306,14 @@
 
     async function loadQueue() {
       if (!alive || mode !== 'queue') return;
+      const seq = ++queueSeq;
       const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading queue…</span>';
       try {
-        const q = await api('GET', '/api/label/queue');
-        if (!alive || mode !== 'queue') return;
+        // `uncertain_only` filters SERVER-side, before the page cap — client-side filtering
+        // would leave whatever few of the capped 100 happen to be uncertain.
+        const q = await api('GET', '/api/label/queue' + (uncertainOnly ? '?uncertain_only=true' : ''));
+        if (!alive || mode !== 'queue' || seq !== queueSeq) return;   // a newer load won
+        hiddenConfident = q.hidden_confident || 0;
         // Drop the frames already decided locally: a decision's write may still be in the
         // chain, so the server can legitimately still call them undecided, and offering
         // them again would label the same crop twice. Filtered PER FRAME, not per visit —
@@ -2287,11 +2327,17 @@
           if (frames.length) keep.push({ ...v, frames });
           return keep;
         }, []);
-        hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0; renderVisit();
+        hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0;
+        renderUncertainToggle();
+        renderVisit();
       }
       // Guarded like the success path above — a failed load must not paint over another
       // mode's visit while the keys still dispatch to it.
-      catch (e) { if (alive && mode === 'queue') stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`; }
+      catch (e) {
+        if (alive && mode === 'queue' && seq === queueSeq) {
+          stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+        }
+      }
     }
 
     // ---- Labelled review: fix a mislabel without SQL ----------------------
@@ -2712,6 +2758,7 @@
       showErr('');
       view.querySelectorAll('#aMode button').forEach((b) => b.classList.toggle('sel', b.dataset.m === m));
       $('#aFilterWrap', view).style.display = m === 'labelled' ? '' : 'none';
+      renderUncertainToggle();   // queue-only control
       const HINTS = {
         queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
         labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>n</b>/→ next · <b>p</b>/← back',
@@ -2795,6 +2842,19 @@
       if (b && b.dataset.m !== mode) setMode(b.dataset.m);
     });
     $('#aFilter', view).addEventListener('change', applyFilter);
+    // Re-fetches rather than filtering what is already loaded: the filter runs before the
+    // server's page cap, so a reload is what actually fills the page with hard cases.
+    $('#aUncertain', view).addEventListener('change', (e) => {
+      uncertainOnly = e.target.checked;
+      hiddenConfident = 0;
+      // BLUR after toggling: `onKey` ignores every keystroke whose target is an input, so
+      // leaving focus on this checkbox silently swallows the operator's next label — the
+      // dropped-key failure entries 216/218 are about, and this page is keyboard-first.
+      // (Blur rather than exempting checkboxes from that guard: Space is bound to skip AND
+      // toggles a focused checkbox, so keeping focus would fire both.)
+      e.target.blur();
+      if (mode === 'queue') loadQueue();
+    });
 
     loadCats(); loadFlagCount(); setMode('queue');
     return () => {
@@ -3106,10 +3166,18 @@
       </div>
       <div class="card">
         <h3>2 · Build gallery</h3>
-        <div class="row">${qChecks('b')}<span id="mBuildNote" class="note grow"></span><button id="mBuild" class="primary">Build</button></div>
+        <div class="row">${qChecks('b')}<label class="fld inline">Max per cat<input id="mCap" type="number" min="1" step="1" placeholder="none"></label><span id="mBuildNote" class="note grow"></span><button id="mBuild" class="primary">Build</button></div>
         <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.
           Build embeds the SAME crop set a Validate run at the same grades scored, so those
           numbers forecast this gallery — mismatch the grades and they describe something else.</p>
+        <p class="hint"><b>Max per cat</b> (blank = every crop) balances enrolment when the
+          dataset is skewed — the cats that visit most produce far more crops, and a 1-NN
+          gallery then leans toward them: their vectors blanket more of the embedding space,
+          and the suggested threshold is calibrated mostly on their pairs. It enrols the
+          best-graded crops per cat, spread over time rather than taken from one visit, and
+          discards no labels — a later build may enrol different ones. Check the per-cat
+          counts on <a href="#cats">Cats</a> to pick a number; a cap near your rarest cat's
+          count is what actually balances the gallery.</p>
       </div>
       <div class="card">
         <h3>3 · Promote</h3>
@@ -3131,10 +3199,18 @@
       return q.length ? q : null; // empty selection ⇒ null ⇒ all grades (backend contract)
     };
 
+    // Blank / 0 / a non-number all mean "no cap" — the backend takes null, and `ge=1`
+    // would 422 on a 0 typed into the field.
+    const getCap = () => {
+      const n = parseInt($('#mCap', view).value, 10);
+      return Number.isFinite(n) && n >= 1 ? n : null;
+    };
+
     async function build() {
       $('#mBuildNote', view).textContent = 'starting…';
       try {
-        const r = await api('POST', '/api/training/gallery/build', { qualities: getQualities('b') });
+        const r = await api('POST', '/api/training/gallery/build',
+          { qualities: getQualities('b'), max_per_cat: getCap() });
         $('#mBuildNote', view).textContent = r.enough === false ? r.message : 'build enqueued';
         if (r.enough !== false) pollJob();
       } catch (e) { $('#mBuildNote', view).textContent = e.message; }
@@ -3159,6 +3235,16 @@
     // The version list, in the queue table's geometry: one row per gallery build, newest
     // first. `threshold` stays a WORD when NULL — an uncalibrated model resolves every event
     // to "unknown cat" (entry 70), so "uncalibrated" is the reading, not a missing number.
+    // "≤N/cat" when the build was capped, with what it left out. A version built before
+    // the cap existed carries no `max_per_cat` key, which reads the same as uncapped —
+    // correct, since that is exactly what it was.
+    function capNote(m) {
+      const mx = m.metrics && m.metrics.max_per_cat;
+      if (!mx) return '';
+      const out = m.metrics.n_capped_out;
+      const tip = out ? `capped at ${mx} crops per cat — ${out} labelled crop(s) not enrolled` : `capped at ${mx} crops per cat`;
+      return ` <span class="note" title="${esc(tip)}">≤${mx}/cat</span>`;
+    }
     function modelsTable(models) {
       if (!models.length) return '<span class="note">No gallery versions yet — build one above.</span>';
       const chip = (s) => (s === 'active' ? '<span class="pill ok">active</span>'
@@ -3179,8 +3265,11 @@
         // Grades · Crops · Cats in the SAME order as the validation-runs table above, so the
         // two can be read down the page: a version built at the grades a run scored covers
         // (about) the same crops, which is the only sense in which a run "belongs" to it.
+        // The per-cat cap rides in the Grades cell, because it is the other half of
+        // "which crops went in" — and `n_vectors` alone can't distinguish a gallery capped
+        // at 40 from one whose cats only ever had 40 crops.
         + models.map((m) => `<tr><td>${chip(m.status)}</td><td class="num">v${m.id}</td>`
-          + `<td class="qname">${esc(m.quality || 'all')}</td>`
+          + `<td class="qname">${esc(m.quality || 'all')}${capNote(m)}</td>`
           + `<td class="num">${fmtInt(m.n_vectors)}</td><td class="num">${fmtInt(m.n_cats)}</td>`
           + `<td class="num">${m.threshold == null ? '<span class="note warn">uncalibrated</span>' : f3(m.threshold)}</td>`
           + `<td class="num">${fmtTs(m.created_ts)}</td><td class="num">${action(m)}</td></tr>`).join('')

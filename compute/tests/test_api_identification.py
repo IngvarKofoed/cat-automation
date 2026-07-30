@@ -111,7 +111,7 @@ class FakeTrainingManager:
         self.gallery_build_calls: "list[dict]" = []
         self.identify_calls: "list[dict]" = []
 
-    def enqueue_gallery_build(self, store, qualities) -> dict:
+    def enqueue_gallery_build(self, store, qualities, max_per_cat=None) -> dict:
         self.gallery_build_calls.append({"store": store, "qualities": qualities})
         return {"position": 0, "deduped": False}
 

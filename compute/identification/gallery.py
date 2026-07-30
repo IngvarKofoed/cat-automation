@@ -45,10 +45,82 @@ if TYPE_CHECKING:
 Gallery = namedtuple("Gallery", ["vectors", "cat_ids", "backbone", "imgsz"])
 
 
+# Grade preference when a per-cat cap forces a choice: a clean representative crop beats
+# a hard one for ENROLMENT (compute/CLAUDE.md's protect-the-gallery rule). An ungraded crop
+# sorts last — it is not evidence of quality, just of an older labelling path.
+_GRADE_RANK = {"gallery": 0, "ok": 1, "poor": 2}
+
+
+def cap_per_cat(labels: "list[dict]", max_per_cat: "int | None") -> "list[dict]":
+    """Keep at most ``max_per_cat`` crops per cat: best grades first, spread over time.
+
+    Why a cap exists at all: the door produces wildly unequal crop counts — a resident
+    crosses many times a day while a neighbour visits occasionally — so an uncapped
+    gallery enrols hundreds of vectors for one cat and a handful for another. Matching is
+    1-NN, so imbalance is milder than for a classifier, but it still biases two ways: the
+    dominant cat's vectors blanket more of the embedding space (an ambiguous crop is
+    likelier to land nearest one of them), and the suggested threshold is calibrated from a
+    same/different distance distribution those cats' pairs dominate. Capping fixes both
+    without discarding a single label — the crops stay on disk and a later build may enrol
+    different ones.
+
+    Selection, per cat: sort by grade (``gallery`` → ``ok`` → ``poor`` → ungraded), then
+    take whole tiers while they fit. The tier that OVERFLOWS the remaining budget is
+    sampled EVENLY ACROSS TIME rather than taken from the front — a contiguous run of crops
+    is one visit in one light, which is the least useful thing to fill a gallery with,
+    while a spread approximates pose/lighting variety. Time order is ``src_frame_id``
+    order: frame ids are assigned in receive order, the same equivalence
+    ``resolve_ts_range`` relies on, so no extra column is needed.
+
+    ``max_per_cat`` of ``None`` (or < 1) returns ``labels`` unchanged. Deterministic: ties
+    break on ``src_frame_id``, so the same labels always produce the same gallery. Pure —
+    no store, no torch — so the policy is unit-testable on plain dicts.
+    """
+    if not max_per_cat or max_per_cat < 1:
+        return labels
+    by_cat: "dict[int, list[dict]]" = {}
+    for row in labels:
+        by_cat.setdefault(row["cat_id"], []).append(row)
+    out: "list[dict]" = []
+    for cat_id in sorted(by_cat):
+        rows = by_cat[cat_id]
+        if len(rows) <= max_per_cat:
+            out.extend(rows)
+            continue
+        budget = max_per_cat
+        kept: "list[dict]" = []
+        # Group into grade tiers, best first, and spend the budget tier by tier.
+        for _rank, tier in sorted(_tier_by_grade(rows).items()):
+            if budget <= 0:
+                break
+            tier.sort(key=lambda r: r["src_frame_id"])
+            if len(tier) <= budget:
+                kept.extend(tier)
+                budget -= len(tier)
+                continue
+            # Even stride across the tier's time order: indices spread from first to last.
+            step = len(tier) / float(budget)
+            kept.extend(tier[min(int(i * step), len(tier) - 1)] for i in range(budget))
+            budget = 0
+        kept.sort(key=lambda r: r["src_frame_id"])
+        out.extend(kept)
+    return out
+
+
+def _tier_by_grade(rows: "list[dict]") -> "dict[int, list[dict]]":
+    """Bucket ``rows`` by ``_GRADE_RANK`` (ungraded → last tier)."""
+    tiers: "dict[int, list[dict]]" = {}
+    for row in rows:
+        rank = _GRADE_RANK.get(row.get("quality"), len(_GRADE_RANK))
+        tiers.setdefault(rank, []).append(row)
+    return tiers
+
+
 def build_gallery(
     store,
     out_dir: str,
     qualities: "tuple[str, ...] | None" = None,
+    max_per_cat: "int | None" = None,
     progress: "Callable[[int, int], bool] | None" = None,
 ) -> dict:
     """Embed the labelled ``identified`` crops into a versioned gallery under ``out_dir``.
@@ -78,6 +150,13 @@ def build_gallery(
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
     labels = store.labeled_crops(("identified",), qualities, active_only=True)
+    # Cap BEFORE the cold-start guard and before embedding: the guard should describe what
+    # will actually be enrolled, and the dropped crops cost nothing to embed. Capping can
+    # never reduce the number of distinct cats (each keeps at least one), so it cannot turn
+    # a buildable set into `insufficient_labels` on the cat count.
+    n_labelled = len(labels)
+    labels = cap_per_cat(labels, max_per_cat)
+    n_capped_out = n_labelled - len(labels)
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:
@@ -136,6 +215,12 @@ def build_gallery(
     ]
     metrics = {
         "per_cat": per_cat,
+        # What the cap did, recorded on the version so a later reader can tell a balanced
+        # gallery from an uncapped one — `per_cat` alone can't distinguish "capped at 40"
+        # from "only ever had 40 crops of that cat".
+        "max_per_cat": max_per_cat,
+        "n_labelled": n_labelled,
+        "n_capped_out": n_capped_out,
         "backbone": embedder.backbone,
         "imgsz": embedder.imgsz,
         "threshold_balanced_acc": bal_acc,

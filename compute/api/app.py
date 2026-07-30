@@ -498,9 +498,24 @@ class GalleryBuildRequest(BaseModel):
     widen the selection per run. A grade outside ``_QUALITIES`` is a client mistake
     (400). Both ``null`` and ``[]`` collapse to ``None`` (no filter) at the
     store/manager boundary, mirroring ``FeasibilityRunRequest``.
+
+    ``max_per_cat`` (``null`` = uncapped) enrols at most that many crops per cat, best
+    grades first and spread over time — see ``cap_per_cat``. It exists because the door
+    produces wildly unequal crop counts per cat, which biases a 1-NN gallery toward the
+    cats that visit most and calibrates the threshold mostly on their pairs. ``ge=1``, and
+    booleans are rejected (pydantic treats ``bool`` as an int subtype, so ``true`` would
+    otherwise mean "one crop per cat").
     """
 
     qualities: "list[str] | None" = None
+    max_per_cat: "int | None" = Field(default=None, ge=1)
+
+    @field_validator("max_per_cat", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a crop count, not a boolean")
+        return v
 
 
 class IdentifyRunRequest(BaseModel):
@@ -2161,6 +2176,7 @@ def create_app(
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
         limit: int = Query(default=_ANNOTATE_PAGE_DEFAULT),
+        uncertain_only: bool = Query(default=False),
     ):
         # The BOUNDED annotation queue (admin-next P4): the newest undecided visits,
         # capped and — once a model is active — distance-sorted worst-first (the
@@ -2173,8 +2189,13 @@ def create_app(
                 status_code=400,
                 detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
             )
+        # `uncertain_only` hides the visits the active model matched confidently, leaving
+        # the active-learning set. Additive: default off answers exactly as before, plus a
+        # `hidden_confident: 0`.
         _validate_bounds(since_id, until_id)
-        return store.annotation_queue_page(oracle, since_id, until_id, limit=limit)
+        return store.annotation_queue_page(
+            oracle, since_id, until_id, limit=limit, uncertain_only=uncertain_only
+        )
 
     @app.get("/api/label/regime-coverage")
     def api_label_regime_coverage():
@@ -2631,8 +2652,13 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(exc))
 
         # Enough to run: enqueue on the training queue (same dedup-running-only
-        # semantics as the other training enqueues — see TrainingManager).
-        return {**training_manager.enqueue_gallery_build(store, qualities), "enough": True}
+        # semantics as the other training enqueues — see TrainingManager). The cap is NOT
+        # pre-checked against the counts above: it can only reduce crops per cat, never the
+        # number of cats, so it cannot turn a passing set into an unbuildable one.
+        return {
+            **training_manager.enqueue_gallery_build(store, qualities, req.max_per_cat),
+            "enough": True,
+        }
 
     @app.get("/api/training/models")
     def api_training_models():

@@ -511,11 +511,16 @@ an explicit, human-in-the-loop loop driven from the dashboard. It has two runtim
   isn't trusted yet), which also makes this the **cold-start** mode — the very
   first setup runs here, door in its safe default, until a first model exists.
 - **Run.** Normal autonomous operation (detect → identify → decide → actuate →
-  record → notify). Identifications below the confidence threshold have their
-  crops **auto-added to the annotation queue** — active learning on exactly the
-  cases the model finds hard. Only uncertain samples are enqueued, and at most a
-  few crops per track (not one per frame), so a cat loitering at the door doesn't
-  flood the queue.
+  record → notify). The annotation queue's membership rule is **undecided** — a
+  detected visit with no label — *not* "uncertain", so a good model does not shrink
+  it: every new visit joins until a human decides it. Active learning is therefore
+  a **view** over that queue rather than a separate feeder: with a promoted model the
+  queue sorts worst-first by gallery distance, and an opt-in *hide confident matches*
+  filter drops the visits the model already matched confidently, leaving exactly the
+  cases it found hard. The filter is applied before the page cap, and reports how many
+  it hid, so a short queue never reads as an empty one. (A confidently *wrong*
+  identification is invisible to this ordering by construction — that is what the
+  user-app flag is for.)
 
 The loop is **Collect → Annotate → Train → Run**, with Run continuously feeding
 the queue back into Annotate:
@@ -551,6 +556,14 @@ the queue back into Annotate:
   extreme-angle hard cases are useful for tuning the threshold and for validation,
   but folding them into the gallery would blur the embedding space (a stranger's
   blurry crop could then match a resident).
+  A build also takes an optional **per-cat cap**, because the door produces wildly
+  unequal crop counts — a resident crosses many times a day, a neighbour visits
+  occasionally — and that skew biases a 1-NN gallery two ways: the dominant cat's
+  vectors blanket more of the embedding space, and the suggested threshold is
+  calibrated from a distance distribution its pairs dominate. The cap enrols the
+  best-graded crops per cat, **spread over time** rather than taken from one visit
+  (a contiguous run is one visit in one light), and discards no labels — a later
+  build may enrol different ones.
 - **Promotion.** A built version is promoted to the active model that Run uses —
   exactly one is active at a time. Versions are retained in the model store so a bad
   one can be rolled back (by promoting the retired one). A version that is not active

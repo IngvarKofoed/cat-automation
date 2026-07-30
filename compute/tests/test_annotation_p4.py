@@ -159,7 +159,10 @@ def test_queue_page_excludes_decided(tmp_path):
 def test_queue_page_empty_when_no_present_frames(tmp_path):
     store = _store(tmp_path)
     page = store.annotation_queue_page("yolo-serial")
-    assert page == {"visits": [], "truncated": False, "ordered_by": "recent", "has_model": False}
+    assert page == {
+        "visits": [], "truncated": False, "ordered_by": "recent", "has_model": False,
+        "hidden_confident": 0,
+    }
 
 
 # --- 4. DISTANCE-SORT (needs an active model) ----------------------------------

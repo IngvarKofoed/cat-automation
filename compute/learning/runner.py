@@ -200,7 +200,9 @@ class TrainingManager:
         job = _Job(kind="feasibility", params=params, label=label)
         return self._enqueue(store, job)
 
-    def enqueue_gallery_build(self, store: "Store", qualities: "list | None") -> dict:
+    def enqueue_gallery_build(
+        self, store: "Store", qualities: "list | None", max_per_cat: "int | None" = None
+    ) -> dict:
         """Enqueue a gallery build over the ``identified`` crops of ``qualities``.
 
         ``qualities`` is the crop-grade selection from the Build panel's checkboxes —
@@ -209,9 +211,22 @@ class TrainingManager:
         ``enqueue_feasibility`` the heavy deps + labelled-crop pre-check are the *endpoint's*
         concern; this just builds the job and dedups+appends under the lock (see
         ``_enqueue``). Same ``{**status(), "position", "deduped"}`` return.
+
+        ``max_per_cat`` (``None`` = uncapped) balances the gallery across cats — see
+        ``cap_per_cat``. Unlike ``feasibility``, gallery-build's ``params`` is therefore a
+        PAIR — ``(qualities_or_None, max_per_cat_or_None)`` — so it lands in the dedup key:
+        changing only the cap and pressing Build again is genuinely different work, and with
+        the cap outside the key the double-click guard would silently drop it.
         """
-        params = tuple(qualities) if qualities else None
-        label = "gallery-build" if params is None else f"gallery-build ({_quality_slug(params)})"
+        quals = tuple(qualities) if qualities else None
+        cap = int(max_per_cat) if max_per_cat else None
+        params = (quals, cap)
+        label = "gallery-build" + (
+            "" if quals is None and cap is None
+            else " (" + ", ".join(
+                ([_quality_slug(quals)] if quals else []) + ([f"max {cap}/cat"] if cap else [])
+            ) + ")"
+        )
         job = _Job(kind="gallery-build", params=params, label=label)
         return self._enqueue(store, job)
 
@@ -513,8 +528,13 @@ class TrainingManager:
         insert fails (WAL/locked/full) before re-raising, so a failed insert never leaves a dir
         without its row. Returns the summary stashed into ``status().result``.
         """
+        # gallery-build params are always the (qualities, max_per_cat) pair built by
+        # `enqueue_gallery_build` — unpacked here rather than treated as a bare grades tuple.
+        quals, cap = job.params
         ts = int(time.time() * 1000)
-        slug = "all" if job.params is None else _quality_slug(job.params)
+        slug = "all" if quals is None else _quality_slug(quals)
+        if cap:
+            slug += f"-max{cap}"   # the cap is part of the artifact's identity, like the grades
         out_dir = os.path.join(store.models_root, f"{ts}-{slug}")
 
         def progress(done: int, total: int) -> bool:
@@ -524,7 +544,8 @@ class TrainingManager:
         result = self._gallery_builder(
             store,
             out_dir,
-            qualities=(list(job.params) if job.params else None),
+            qualities=(list(quals) if quals else None),
+            max_per_cat=cap,
             progress=progress,
         )
 

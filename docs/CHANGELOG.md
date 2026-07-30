@@ -1457,3 +1457,39 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      hit the weekly limit before ANY finder returned — and reported `findings: []`, which
      reads as "clean" rather than "never ran". Tier the verify fan-out by hand; note the
      script is a per-run copy, and re-tiering a COMPLETED agent voids its resume cache.
+
+231. Gallery build takes an optional PER-CAT CAP (`max_per_cat`, blank = uncapped), because
+     the door makes the dataset permanently skewed — a resident crosses many times a day,
+     a neighbour visits occasionally — and no amount of further collection fixes a ratio the
+     door itself sets. 1-NN matching makes imbalance milder than for a classifier but not
+     harmless: the dominant cat's vectors blanket more of the embedding space, and the
+     suggested threshold is calibrated from a distribution its pairs dominate.
+
+232. `cap_per_cat` picks best-grade-first (gallery → ok → poor → ungraded) and, where a tier
+     overflows the budget, samples it EVENLY OVER TIME rather than from the front: a
+     contiguous run of crops is one visit in one light, the least useful thing to fill a
+     gallery with. Time order is `src_frame_id` order (ids are assigned on receive), so no
+     extra column is needed. It discards no labels — a later build may enrol different crops
+     — and can never drop a cat, which is why it runs before the cold-start guard.
+
+233. The annotation queue gained "Hide confident matches" (`uncertain_only`), the filter
+     ARCHITECTURE always described but the code never had. Queue membership is UNDECIDED
+     (no `dataset_items` row), NOT uncertain — so a good model does not shrink the queue at
+     all, and weeks of correctly-named visits bury the few worth attention. `uncertain` was
+     already computed per visit and merely PRINTED; it is now a filter, applied server-side
+     BEFORE the page cap (after it, confident visits would still eat the 100 slots).
+     `hidden_confident` is reported, so a short or empty queue never reads as "nothing left".
+
+234. Gallery-build's job `params` is now the `(qualities, max_per_cat)` PAIR, so the cap is in
+     the dedup key: changing only the cap and pressing Build again is genuinely different
+     work, and with the cap outside the key the double-click guard silently dropped it.
+     The cap also lands in the artifact dir name and on the version row's metrics — with
+     `n_vectors` alone, a gallery capped at 40 is indistinguishable from one whose cats only
+     ever had 40 crops.
+
+235. Two bugs the browser test caught, both in the new toggle's own wiring: `loadQueue` had no
+     sequence guard, so a slow earlier fetch overwrote a newer filtered one and the toggle
+     appeared not to work (mount's own load raced it); and leaving focus on the checkbox made
+     `onKey` swallow the operator's next label silently, since it ignores keystrokes from
+     inputs — so the control now blurs itself. Rather than exempt checkboxes from that guard:
+     Space is bound to skip AND toggles a focused checkbox, so it would fire both.

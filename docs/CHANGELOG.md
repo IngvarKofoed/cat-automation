@@ -1361,3 +1361,33 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      Frame review's `store: … → …` note joins Load in a bottom-aligned group so it centres on the
      button: that row IS two lines tall (the Start/Timespan captions stack), and the row's
      `align-items:center` centred the note against the full height, floating it above the inputs.
+
+216. Annotation labelling no longer waits on its own write: a keypress advances to the next visit
+     at once and the POST settles behind it. A label crops one JPEG per visit frame — tens of
+     frames, seconds under store-lock contention — and awaiting that read as a dropped key, so
+     it got pressed twice. Writes stay STRICTLY SERIAL on one chain: a fast labeller must not
+     pile parallel crop-writing threads onto the shared lock, and undo must follow its label.
+
+217. The next two visits' rep crop + frame now PREFETCH, so the advance paints from cache instead
+     of a blank stage waiting on a fresh server-side decode. `/api/label/crop` therefore answers
+     with a short `Cache-Control` (it carries no validator of its own, unlike `/media`, so the
+     browser would refetch and the prefetch would buy nothing). Deliberately not `immutable`:
+     `frames.id` is reused after a `clear()`, so a (frame_id, box) URL is only stable per session.
+
+218. Rails the optimistic advance needs. A failed write re-queues its visit at the END (never its
+     old index — that would move `current()` under the visit on screen) and reports it on a
+     persistent error line, since the status is rewritten by the next keypress; `inserted 0` names
+     "already labelled" and points at Labelled review. Auto-repeat no longer labels a whole queue,
+     and closing the tab mid-save asks first (losing a queued write is fail-safe but silent).
+
+219. Queue renders are MODE-GUARDED. A write settles long after its keypress now, so a chained
+     callback could paint the queue over Labelled review — leaving the stage showing one mode's
+     visit while the keys dispatch to the other's, which re-labels a visit the operator cannot
+     see. `loadQueue` also filters locally-decided frames PER FRAME, not per visit: a returned
+     cluster can mix decided frames with fresh ones, which dropping it whole would hide.
+
+220. `POST /api/label` resolves a visit's frames in ONE batched read (`Store.frame_sources`)
+     instead of a `frame_recv_ts` + `path_for` pair each: those take the shared write lock, so a
+     40-frame visit took it 80 times, every acquisition queueing behind the collector's inserts
+     (the contention class entries 102-105 removed). It also closes a small race — the old pair
+     could see a frame evicted between the two reads.

@@ -809,6 +809,22 @@ def test_api_label_crop_returns_jpeg_bytes(make_app):
     assert img.shape[:2] == (30, 30)
 
 
+@_requires_cv
+def test_api_label_crop_is_cacheable_so_the_ui_prefetch_is_reused(make_app):
+    # The annotation queue PREFETCHES the next visits' crops; without an explicit lifetime
+    # (this Response carries no validator, unlike /media's FileResponse) the browser
+    # refetches and the prefetch buys nothing. Short-lived on purpose: frames.id is reused
+    # after a clear(), so a (frame_id, box) URL is only immutable within a session.
+    client, store = make_app()
+    fid = store.add(_frame(frame_id=1, body=_jpeg_gray(180, size=64)), recv_ts_ms=1_700_000_000_000)
+
+    resp = client.get(f"/api/label/crop/{fid}", params={"box": "0,0,30,30"})
+    assert resp.status_code == 200
+    cache = resp.headers["cache-control"]
+    assert "max-age=" in cache
+    assert 0 < int(cache.split("max-age=")[1].split(",")[0]) <= 600
+
+
 def test_api_label_crop_malformed_box_is_400(make_app):
     client, store = make_app()
     fid = store.add(_frame(frame_id=1, body=_JPEG_BODY), recv_ts_ms=1_700_000_000_000)

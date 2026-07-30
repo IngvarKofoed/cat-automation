@@ -494,6 +494,54 @@ def test_path_for_unknown_id_returns_none(tmp_path):
     assert store.path_for(999) is None
 
 
+# --- Store: frame_sources() ----------------------------------------------------
+#
+# The batched (recv_ts, path) read the label commit uses instead of one
+# frame_recv_ts + one path_for per visit frame.
+
+
+def test_frame_sources_matches_the_two_single_id_reads(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i * 100) for i in range(3)]
+
+    sources = store.frame_sources(ids)
+    assert set(sources) == set(ids)
+    for fid in ids:
+        assert sources[fid] == (store.frame_recv_ts(fid), store.path_for(fid))
+
+
+def test_frame_sources_omits_unknown_ids_and_handles_empty(tmp_path):
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=10_000_000)
+    live = store.add(_frame(frame_id=1), recv_ts_ms=1_700_000_000_000)
+
+    # An id with no row is ABSENT, not a None entry — the caller skips it exactly as it
+    # skipped a None from path_for.
+    assert set(store.frame_sources([live, 999])) == {live}
+    assert store.frame_sources([]) == {}
+
+
+def test_frame_sources_chunks_past_the_sqlite_parameter_limit(tmp_path, monkeypatch):
+    from compute.collection import store as store_mod
+
+    store = Store(db_path=str(tmp_path / "index.db"), media_root=str(tmp_path / "media"), max_bytes=50_000_000)
+    ids = [store.add(_frame(frame_id=i), recv_ts_ms=1_700_000_000_000 + i) for i in range(30)]
+
+    # More ids than one chunk holds: a long visit must not exceed SQLite's host-parameter
+    # limit. Assert the SPLIT happened (30 ids / 7 = 5 queries), not just that the union is
+    # complete — a single un-chunked IN(30) would satisfy the ids assertion on its own and
+    # leave the property the chunk loop exists for unpinned.
+    monkeypatch.setattr(store_mod, "_ID_PARAM_CHUNK", 7)
+    statements: "list[str]" = []
+    store._conn.set_trace_callback(statements.append)
+    try:
+        sources = store.frame_sources(ids)
+    finally:
+        store._conn.set_trace_callback(None)
+
+    assert set(sources) == set(ids)
+    assert sum(1 for sql in statements if "FROM frames WHERE id IN" in sql) == 5
+
+
 # --- Store: frame-range groups (create/list/delete) ----------------------------
 #
 # A group is a named, contiguous [start_id, end_id] bookmark (see the

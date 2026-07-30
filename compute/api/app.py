@@ -2230,6 +2230,14 @@ def create_app(
         subdir = f"cat_{cat_id}" if decision == "identified" else "cat_unknown_cat"
         rows: "list[dict]" = []
         crops_written = 0
+        # One batched frames read for the whole visit (recv_ts + path per frame) instead
+        # of two locked single-id reads each: a visit is tens of frames, and every
+        # acquisition queues behind the collector's inserts. Skipped entirely for
+        # 'not_cat', which writes no crops and so needs neither field.
+        sources = (
+            {} if decision == "not_cat"
+            else store.frame_sources([fr.frame_id for fr in frames])
+        )
         for fr in frames:
             row: dict = {
                 "frame_id": fr.frame_id,
@@ -2246,10 +2254,12 @@ def create_app(
                 row["crop_path"] = None
                 rows.append(row)
                 continue
-            recv_ts = store.frame_recv_ts(fr.frame_id)
-            src_path = store.path_for(fr.frame_id)
-            if recv_ts is None or src_path is None or not os.path.isfile(src_path):
+            src = sources.get(fr.frame_id)
+            if src is None:
                 continue  # frame no longer live — skipped here AND by the store
+            recv_ts, src_path = src
+            if not os.path.isfile(src_path):
+                continue  # row still live but its JPEG is gone from disk
             rel_path = os.path.join(subdir, f"{fr.frame_id}_{recv_ts}.jpg")
             dest_abs = os.path.join(dataset_root, rel_path)
             if not crops.materialize(src_path, fr.bbox, dest_abs, root=dataset_root):
@@ -2358,7 +2368,18 @@ def create_app(
             data = crops.crop_bytes(path, coords)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return Response(content=data, media_type="image/jpeg")
+        # Cacheable for a short while: the annotation UI PREFETCHES the next visits'
+        # crops so a keypress paints from cache instead of waiting on a fresh decode,
+        # and this response carries no validator of its own (unlike /media's
+        # FileResponse), so without an explicit lifetime the browser refetches it and
+        # the prefetch buys nothing. Deliberately short, not immutable: `frames.id` is
+        # REUSED after a clear() (entry 143), so a (frame_id, box) URL is only
+        # immutable within a session, not forever.
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=120"},
+        )
 
     # --- Training page: feasibility validation (learning-loop Train stage) ----------
     #

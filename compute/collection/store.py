@@ -231,6 +231,10 @@ _ANNOTATE_PAGE_DEFAULT = 100
 _ANNOTATE_PAGE_MAX = 500
 _ANNOTATE_SCAN_FRAMES = 50_000
 
+# Ids per ``... WHERE id IN (?, ?, ...)`` chunk, well under SQLite's default 999-host-
+# parameter limit, so a batched read over an arbitrarily long id list can't raise.
+_ID_PARAM_CHUNK = 500
+
 # Pre-calibration default for the event-subject motion floor (see ``events()`` and
 # ``labeled_cat_motion_floor``). ``min_area`` is a FRACTION of the downscaled MOG2
 # ROI — the exact axis ``frames.area`` stores (largest-blob px / downscaled total,
@@ -870,6 +874,35 @@ class Store:
         if row is None:
             return None
         return os.path.join(self._media_root, row[0])
+
+    def frame_sources(self, frame_ids: "list[int]") -> "dict[int, tuple[int, str]]":
+        """``{frame_id: (recv_ts, absolute_jpeg_path)}`` for the ids that are LIVE rows.
+
+        The batched form of ``frame_recv_ts`` + ``path_for``, which the label commit
+        needs for EVERY frame of a visit — tens of frames, so the per-frame pair of
+        calls took the shared write lock 2N times, each acquisition queueing behind
+        the collector's continuous inserts (the contention class entries 102–105
+        removed). One lock hold, one indexed read.
+
+        An id with no row is simply ABSENT from the map, which the caller skips exactly
+        as it skipped a ``None`` from the two single-id reads; whether the file is still
+        on disk stays the caller's check, as with ``path_for``.
+        """
+        ids = [int(f) for f in frame_ids]
+        out: "dict[int, tuple[int, str]]" = {}
+        if not ids:
+            return out
+        with self._lock:
+            # Chunked: a long visit can carry more ids than SQLite's host-parameter limit.
+            for start in range(0, len(ids), _ID_PARAM_CHUNK):
+                chunk = ids[start:start + _ID_PARAM_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                for fid, recv_ts, path in self._conn.execute(
+                    "SELECT id, recv_ts, path FROM frames WHERE id IN (" + placeholders + ")",
+                    chunk,
+                ).fetchall():
+                    out[int(fid)] = (int(recv_ts), os.path.join(self._media_root, path))
+        return out
 
     @property
     def dataset_root(self) -> str:

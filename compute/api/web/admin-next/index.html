@@ -2045,6 +2045,7 @@
         <div class="row">
           <div class="seg" id="aMode">
             <button data-m="queue" class="sel">Queue</button>
+            <button data-m="flagged" id="aFlaggedBtn">Flagged</button>
             <button data-m="labelled">Labelled</button>
           </div>
           <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
@@ -2073,6 +2074,13 @@
     // requeue can drop the visit from BOTH (dropping it only from the filtered view
     // resurrects it the moment the filter is re-derived).
     let mode = 'queue', busy = false, labAll = [], lab = [], labIdx = 0;
+    // Flagged review: the visits the household user marked from the user dashboard
+    // (user-flag-for-labelling spec). Distinct from both other modes — a flagged span
+    // may be undecided OR already labelled, so every decision here goes through
+    // /api/label/relabel (delete-then-commit, a superset of /api/label) and then
+    // resolves the flag. `flgCount` comes from the CHEAP /api/label/flags so the mode
+    // button can show work waiting without resolving anything.
+    let flg = [], flgIdx = 0, flgCount = null;
     // Queue-mode writes are OPTIMISTIC: a decision advances the stage immediately and
     // its POST settles behind the operator (a label decodes + crops + writes one JPEG
     // per visit frame — tens of frames, seconds under store-lock contention — and
@@ -2128,6 +2136,10 @@
         el.textContent = visits.length
           ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}${last}`
           : `Queue empty${last}`;
+      } else if (mode === 'flagged') {
+        el.textContent = flg.length
+          ? `Flagged ${flgIdx + 1} / ${flg.length} · newest-flagged first`
+          : 'Nothing flagged — the household marks visits from the user app';
       } else {
         el.textContent = lab.length
           ? `Visit ${labIdx + 1} / ${lab.length} · newest-labelled first`
@@ -2249,6 +2261,8 @@
     function skip(delta) {
       if (mode === 'queue') {
         if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); }
+      } else if (mode === 'flagged') {
+        if (flg.length) { flgIdx = (flgIdx + delta + flg.length) % flg.length; renderFlagged(); }
       } else if (lab.length) {
         labIdx = (labIdx + delta + lab.length) % lab.length; renderLabelled();
       }
@@ -2275,7 +2289,9 @@
         }, []);
         hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0; renderVisit();
       }
-      catch (e) { stage.innerHTML = `<span class="note bad">${e.message}</span>`; }
+      // Guarded like the success path above — a failed load must not paint over another
+      // mode's visit while the keys still dispatch to it.
+      catch (e) { if (alive && mode === 'queue') stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`; }
     }
 
     // ---- Labelled review: fix a mislabel without SQL ----------------------
@@ -2444,9 +2460,251 @@
         rebuildFilter();
         applyFilter();
       } catch (e) {
+        if (!alive || mode !== 'labelled') return;   // same guard as the success path
         labAll = []; lab = [];
         stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
       }
+    }
+
+    // ---- Flagged review: the visits the household user marked --------------
+    //
+    // The user taps "Mark for labelling" in the user app's playback modal; each tap is
+    // one label_flags row keyed by that EVENT's frame span. Two things make this mode
+    // different from the queue, both deliberate (see the spec):
+    //   * the flagged SPAN is the unit — no `_gap_split` re-clustering, so what is
+    //     labelled here is exactly what the user was looking at; and
+    //   * it is UNFLOORED, so a faint sub-0.3 cat box the bulk queue hides is labellable
+    //     here. A faint crop still grades `poor`, so it stays out of a gallery build.
+    // The state says why a visit isn't labellable yet, derived from COVERAGE — never
+    // from the mere existence of a verdict, or an unswept span would read as a measured
+    // "no detection".
+    // The state is a SCENE/coverage fact, not a verdict about a cat, so it takes the
+    // muted chip rather than a verdict or identity colour (upholding entry 43's
+    // "color = verdict"); the word carries the meaning, and flagWhyNote carries the tone.
+    const FLAG_STATE = {
+      labellable:   'labellable',
+      partial:      'partly analysed',
+      no_detection: 'no detection',
+      unswept:      'not analysed',
+      gone:         'frames gone',
+    };
+    const flgCurrent = () => flg[flgIdx];
+    function renderFlagCount() {
+      const b = $('#aFlaggedBtn', view);
+      if (b) b.textContent = flgCount ? `Flagged (${flgCount})` : 'Flagged';
+    }
+    function renderFlagged() {
+      renderStatus();
+      const stage = $('#aStage', view), v = flgCurrent();
+      if (!stage || mode !== 'flagged') return;   // the mirror of renderVisit's guard
+      if (!v) {
+        stage.innerHTML = '<span class="note">Nothing flagged. Visits arrive here when the '
+          + 'household taps “Mark for labelling” in the user app.</span>';
+        return;
+      }
+      const stWord = FLAG_STATE[v.state] || v.state;
+      const cov = v.coverage || {};
+      const frames = v.frames || [];
+      const rep = repOf(v);
+      const label = v.current_label;
+      const meta = [
+        fmtTs(v.span && v.span[0]),
+        `${cov.n_live != null ? cov.n_live : '?'} frames in store`,
+        `${cov.n_swept != null ? cov.n_swept : '?'} analysed`,
+        `${frames.length} labellable`,
+        `flagged ${fmtTs(v.created_ts)}`,
+      ].join(' · ');
+      // A span can hold frames from two labelling gestures (an event span is a MOTION
+      // cluster, so a detection hole splits it into two annotation visits) — one keypress
+      // here rewrites them all as one identity, so `mixed` has to be visible. So does a
+      // label that covers only PART of the span: a confident chip over 3 labelled frames
+      // of 40 would read as "this visit is named" while a decision rewrites all 40.
+      const partial = label && label.n_frames != null && label.n_frames < frames.length
+        ? `<span class="note">on ${label.n_frames} of ${frames.length} frames</span>` : '';
+      stage.innerHTML = `
+        <div class="row" style="margin-bottom:10px">
+          <span class="tchip lit" title="What can be done with this flagged visit, from how much of its span is analysed.">${esc(stWord)}</span>
+          ${label ? labelChip(label) : '<span class="note">not labelled yet</span>'}
+          ${label && label.mixed ? '<span class="mv-tag" title="Two labelling gestures fall inside this flagged span — one decision here rewrites both as one.">mixed</span>' : ''}
+          ${partial}
+        </div>
+        ${rep ? `
+        <div class="astage-imgs">
+          <div class="astage-crop"><img src="${cropUrl(rep)}" alt="crop"></div>
+          <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
+        </div>
+        <div class="note" style="margin-top:8px">${meta} · rep ${detPct(rep.score)} · peak ${detPct(v.peak_score)}</div>
+        ` : `<div class="note">${meta}</div>`}
+        ${flagWhyNote(v)}
+        <div class="row" style="margin-top:12px">
+          <button id="aFlgUnknown"${rep ? '' : ' disabled'}>Unknown cat (u)</button>
+          <button id="aFlgNotCat"${rep ? '' : ' disabled'}>Not a cat (x)</button>
+          ${v.state === 'unswept' || v.state === 'partial' ? '<button id="aFlgAnalyse">Analyse</button>' : ''}
+          <button id="aFlgDismiss" class="danger">Dismiss (d)</button>
+        </div>
+        ${frames.length ? `<div class="afilm">${frames.map((f) => {
+          // The grade a decision here WOULD write (seedQuality is the same formula the
+          // queue uses), not the stored one — a flagged span is often unlabelled, and
+          // showing the seeded grade is what makes an unfloored faint crop's `poor`
+          // visible before it is committed.
+          const q = seedQuality(f, v);
+          return `<div class="at${f.id === v.rep_frame_id ? ' rep' : ''}">
+            <img src="${cropUrl(f)}" loading="lazy" alt="crop">
+            <span class="aq" data-q="${q}" title="detection ${detPct(f.score)} → grade ${q}">${q}</span>
+          </div>`;
+        }).join('')}</div>` : ''}
+      `;
+      placeBoxes(stage);
+      if (rep) {
+        $('#aFlgUnknown', view).addEventListener('click', () => flagLabel('unknown_cat', null));
+        $('#aFlgNotCat', view).addEventListener('click', () => flagLabel('not_cat', null));
+      }
+      const an = $('#aFlgAnalyse', view);
+      if (an) an.addEventListener('click', () => analyseFlagged(v));
+      $('#aFlgDismiss', view).addEventListener('click', dismissFlag);
+    }
+    // Why a flagged visit isn't (fully) labellable, and what — if anything — fixes it.
+    // The cases are NOT interchangeable: only an incomplete sweep is worth re-running.
+    // Shown for `partial` even when there ARE crops to label, because incomplete coverage
+    // is precisely what the operator needs to know before deciding on the frames it has.
+    function flagWhyNote(v) {
+      if (v.state === 'labellable') return '';
+      if (v.state === 'gone') {
+        return '<div class="note warn" style="margin-top:6px">These frames have aged out of the '
+          + 'rolling store, so there is no crop left to cut. Dismiss it.</div>';
+      }
+      if (v.state === 'no_detection') {
+        return '<div class="note warn" style="margin-top:6px">Every frame here has been analysed '
+          + 'and the detector found no cat, so there is nothing to crop. Re-running it would '
+          + 'return the same answer — dismiss it.</div>';
+      }
+      return '<div class="note warn" style="margin-top:6px">Not every frame here has been analysed '
+        + 'yet, so there may be a cat the detector hasn’t looked for. Run Analyse, then reload.</div>';
+    }
+    // Label a flagged visit: /api/label/relabel, which DELETES any rows on these frames
+    // and re-commits — so it is correct whether the span was already labelled or not
+    // (the queue's plain /api/label would be a no-op on an already-labelled frame).
+    // Grades re-seed with the queue's own formula, so a flagged decision can't grade the
+    // same crop differently. Synchronous + busy-guarded like Labelled review, not
+    // optimistic like the queue: this is a handful of visits worked deliberately, and
+    // "flag gone" has to mean the write landed.
+    async function flagLabel(decision, cat_id) {
+      const v = flgCurrent(); if (!v || busy) return;
+      const frames = v.frames || [];
+      if (!frames.length) { flash('nothing to label in this visit'); return; }
+      busy = true;
+      const withCrop = decision !== 'not_cat';
+      const payload = frames.map((f) => withCrop
+        ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) }
+        : { frame_id: f.id });
+      const what = decision === 'identified'
+        ? ((cats.find((c) => c.id === cat_id) || {}).name || `cat #${cat_id}`)
+        : (LABEL_TEXT[decision] || decision);
+      // ON the queue's serial writeChain, not beside it. A relabel is delete-then-insert
+      // over the same rows a pending Queue write may be inserting, and a flagged span
+      // (a motion cluster) overlaps a queue visit (a detected-frame cluster) by
+      // construction — off-chain, the two interleave and one decision is silently lost
+      // to `INSERT OR IGNORE`, leaving an orphan crop file nothing reclaims.
+      //   Awaited, unlike a queue decision: this mode is deliberate, low-volume work, and
+      // "flag gone" has to mean the write landed.
+      flash(`saving ${what}…`);
+      pendingWrites += 1; renderPending();
+      const work = writeChain.then(async () => {
+        const res = await api('POST', '/api/label/relabel', { decision, cat_id: cat_id ?? null, frames: payload });
+        const kept = res && res.inserted != null ? res.inserted : payload.length;
+        // NOTHING recorded is a failure, not a partial success: /api/label/relabel answers
+        // 200 with inserted:0 when every frame has evicted since the resolve — the routine
+        // aging path here, since flags are never auto-pruned. Deleting the flag then would
+        // discard both the household's mark AND the operator's decision, silently.
+        if (kept === 0) {
+          showErr(`${what}: nothing recorded — these frames are no longer in the store. The flag is still here.`);
+          return;
+        }
+        await api('DELETE', `/api/label/flags/${v.flag_id}`);
+        frames.forEach((f) => decided.delete(f.id));   // labelled here, so not queue-pending
+        if (alive && mode === 'flagged') dropFlagged(v);
+        flash(kept < payload.length
+          ? `${what}: recorded ${kept} of ${payload.length} frames — the rest are no longer in the store`
+          : `${what} · flag cleared`);
+      });
+      writeChain = work.catch(() => {});   // one failure must not poison the chain
+      try { await work; }
+      catch (e) { showErr(`${what} failed: ${e.message} — the visit is still flagged.`); }
+      finally { pendingWrites -= 1; renderPending(); busy = false; }
+    }
+    // Dismiss: drop the flag and leave any label on its frames exactly as it was. The
+    // distinct action, because a visit can be flagged AFTER it was labelled (or labelled
+    // from the ordinary queue while flagged) — there the right answer is "seen, nothing
+    // to change", not a rewrite.
+    async function dismissFlag() {
+      const v = flgCurrent(); if (!v || busy) return;
+      busy = true;
+      try {
+        await api('DELETE', `/api/label/flags/${v.flag_id}`);
+        if (alive && mode === 'flagged') dropFlagged(v);
+        flash('flag dismissed');
+      } catch (e) { flash('dismiss failed: ' + e.message); }
+      finally { busy = false; }
+    }
+    function dropFlagged(v) {
+      const i = flg.indexOf(v);
+      if (i >= 0) flg.splice(i, 1);
+      if (flgCount != null) flgCount = Math.max(0, flgCount - 1);
+      // Removing a visit BELOW the cursor shifts everything down, so hold position rather
+      // than let the stage skip one — reachable because `n`/`p` are not busy-guarded and
+      // a write is now awaited.
+      if (i >= 0 && i < flgIdx) flgIdx -= 1;
+      if (flgIdx >= flg.length) flgIdx = Math.max(0, flg.length - 1);
+      renderFlagCount();
+      renderFlagged();
+    }
+    // Fill the span's MISSING verdicts: not `reanalyze` (redoing existing ones would
+    // return the same answer), and deliberately NOT `motion_only` — unlike the Activity
+    // page's breadth button. Coverage here is measured against EVERY live frame in the
+    // span, and an event span is min..max of a MOTION cluster, so on a keep-all store it
+    // holds non-motion frames too: a motion-only sweep could never clear `partial`, and
+    // the operator would loop on an Analyse button that never goes away. A cat sitting in
+    // a non-motion frame (a gate miss) is also exactly what this should surface.
+    //   The first YOLO enqueue blocks seconds on the synchronous dep import, so say so.
+    async function analyseFlagged(v) {
+      if (busy) return;
+      busy = true;
+      flash('Enqueuing Analyse…');
+      try {
+        await api('POST', '/api/analysis/run', {
+          analyzer: 'yolo-serial', reanalyze: false,
+          since_id: v.start_id, until_id: v.end_id,
+        });
+        flash('Analyse enqueued — progress on Motion tuning. Reload when it finishes.');
+      } catch (e) { flash('Analyse: ' + e.message); }
+      finally { busy = false; }
+    }
+    async function loadFlagged() {
+      const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading flagged visits…</span>';
+      try {
+        const r = await api('GET', '/api/label/flagged');
+        if (!alive || mode !== 'flagged') return;
+        flg = r.visits || []; flgIdx = 0; flgCount = flg.length;
+        renderFlagCount();
+        renderFlagged();
+      } catch (e) {
+        // Guarded like the success path: this is the EXPENSIVE per-span resolve, so it is
+        // the read most likely to be slow or fail — and painting its error over Queue mode
+        // would leave the stage showing one thing while the keys label another.
+        if (!alive || mode !== 'flagged') return;
+        flg = [];
+        stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+      }
+    }
+    // The count alone, from the tiny table — so mounting in Queue mode never pays for a
+    // resolve nobody is looking at.
+    async function loadFlagCount() {
+      try {
+        const r = await api('GET', '/api/label/flags');
+        if (!alive) return;
+        flgCount = r.total || 0;
+        renderFlagCount();
+      } catch (_) { /* the button just stays unnumbered */ }
     }
 
     function setMode(m) {
@@ -2454,10 +2712,17 @@
       showErr('');
       view.querySelectorAll('#aMode button').forEach((b) => b.classList.toggle('sel', b.dataset.m === m));
       $('#aFilterWrap', view).style.display = m === 'labelled' ? '' : 'none';
-      $('#aHint', view).innerHTML = m === 'queue'
-        ? 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last'
-        : 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>n</b>/→ next · <b>p</b>/← back';
-      if (m === 'queue') loadQueue(); else loadLabelled();
+      const HINTS = {
+        queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
+        labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>n</b>/→ next · <b>p</b>/← back',
+        // No `g` here: ignore is the queue's "skip without judging", and in Flagged
+        // review dismiss already plays that role — without rewriting the labels.
+        flagged: 'Keys: <b>1–9</b> label as a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> dismiss the flag · <b>n</b>/→ next · <b>p</b>/← back',
+      };
+      $('#aHint', view).innerHTML = HINTS[m] || '';
+      if (m === 'queue') loadQueue();
+      else if (m === 'flagged') loadFlagged();
+      else loadLabelled();
     }
 
     // Retired cats are not labellable, so the digit binding runs over the ACTIVE roster
@@ -2469,7 +2734,10 @@
     // The decision keys and the roster buttons mean "label" in the queue and "re-label"
     // in Labelled review — one dispatch point, so the two modes can never diverge on
     // which endpoint a digit hits.
-    const decide = (d, cat_id) => (mode === 'queue' ? commitLabel(d, cat_id ?? null) : relabel(d, cat_id ?? null));
+    const decide = (d, cat_id) => (
+      mode === 'queue' ? commitLabel(d, cat_id ?? null)
+        : mode === 'flagged' ? flagLabel(d, cat_id ?? null)
+          : relabel(d, cat_id ?? null));
     function renderRoster() {
       const el = $('#aRoster', view), usable = pickable();
       // Three states, not two: an empty roster and an all-retired one both leave no
@@ -2500,7 +2768,12 @@
       else if (k === 'z') { if (mode === 'queue') undoLast(); }
       // In Labelled review the undo IS the requeue, so it takes the destructive keys
       // rather than z (which undoes the queue's LAST action, a different gesture).
-      else if (k === 'd' || k === 'Backspace') { if (mode === 'labelled') { requeue(); e.preventDefault(); } }
+      // `d` is the destructive key in both review modes, and means the mode's own undo:
+      // send a labelled visit back to the queue, or drop a flag (leaving its label).
+      else if (k === 'd' || k === 'Backspace') {
+        if (mode === 'labelled') { requeue(); e.preventDefault(); }
+        else if (mode === 'flagged') { dismissFlag(); e.preventDefault(); }
+      }
     }
     document.addEventListener('keydown', onKey);
     // Advancing before the write lands means a queued label can still be in flight when the
@@ -2509,14 +2782,21 @@
     // but it is silent, so ask. Removed on teardown: this belongs to the annotation page only.
     function onUnload(e) { if (pendingWrites > 0) { e.preventDefault(); e.returnValue = ''; } }
     window.addEventListener('beforeunload', onUnload);
-    $('#aReload', view).addEventListener('click', () => { showErr(''); loadCats(); if (mode === 'queue') loadQueue(); else loadLabelled(); });
+    $('#aReload', view).addEventListener('click', () => {
+      // The count refreshes in EVERY mode (loadFlagged overwrites it harmlessly) — a stale
+      // "Flagged (3)" while reviewing Labelled is exactly when it goes unnoticed.
+      showErr(''); loadCats(); loadFlagCount();
+      if (mode === 'queue') loadQueue();
+      else if (mode === 'flagged') loadFlagged();
+      else loadLabelled();
+    });
     $('#aMode', view).addEventListener('click', (e) => {
       const b = e.target.closest('button[data-m]');
       if (b && b.dataset.m !== mode) setMode(b.dataset.m);
     });
     $('#aFilter', view).addEventListener('change', applyFilter);
 
-    loadCats(); setMode('queue');
+    loadCats(); loadFlagCount(); setMode('queue');
     return () => {
       alive = false;
       document.removeEventListener('keydown', onKey);

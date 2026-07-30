@@ -1401,3 +1401,52 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      sweep is still curl-able — but it has no UI, which matters if the NoIR module carries the
      IMX708 artifacts over. Rebuild the page from docs/specs/2026-07-23-corruption-review-page.md
      if it does.
+
+222. The household can now MARK a visit for labelling from the user app's playback modal
+     (⚑ on the card); admin `#annotate` gained a Flagged mode to work the marked set.
+     New `label_flags` table keyed by the EVENT's frame span — span-keyed is what makes a
+     `motion_only`/`unrecognized` visit flaggable at all, since with no YOLO box it can
+     never enter the annotation queue. Spec: docs/specs/2026-07-30-user-flag-for-labelling.md.
+
+223. A flag is a work item, not output: resolving one deletes its row (no history), and
+     `clear()` drops the table since frame ids restart at 1. Eviction does NOT cascade —
+     a flag whose frames aged out reads `gone` and waits to be dismissed, because a mark
+     that silently disappears hides that the work was lost to retention.
+
+224. Flag identity is span OVERLAP on both sides — the client draws the ⚑ for any flag
+     overlapping an event, and `add_label_flag` dedups the same way. An event's motion
+     cluster GROWS as later frames arrive, so an exact `(start_id, end_id)` key would mint
+     a second flag on a re-tap and leave un-mark with no target. So un-mark takes the SPAN
+     (`POST /api/label/flags/unmark`) and clears every overlapping flag.
+
+225. Flagged spans are UNFLOORED, diverging from the queue's `_ANNOTATE_MIN_CONF` (0.3):
+     YOLO runs recall-first at 0.15, so a faint 0.2 cat box is a real crop the queue hides.
+     The floor keeps phantom empty-scene detections out of the BULK queue (entry 73) — a
+     human pointing at one visit is not that case, and a faint crop still grades `poor`,
+     so a quality-filtered gallery build skips it anyway.
+
+226. A flagged visit's state is derived from COVERAGE (`n_swept` vs `n_live`), never from a
+     verdict merely existing — partial sweeps are the norm (entries 76, 142, 149), and
+     calling one `no_detection` would claim the detector rejected frames it never saw.
+     Analyse is offered only where coverage is incomplete, and sweeps the span WITHOUT
+     `motion_only`: coverage counts every live frame, so a motion-only sweep could never
+     clear `partial` on a keep-all store.
+
+227. A flagged decision runs on the annotation page's existing serial `writeChain` and
+     clears the flag ONLY when the write recorded ≥1 row. `/api/label/relabel` answers 200
+     with `inserted: 0` once a span's frames have evicted — the routine aging path, since
+     flags are never pruned — so deleting unconditionally would discard both the mark and
+     the decision silently. `d` dismisses the flag ALONE, leaving any label untouched.
+
+228. The user app's flag toggle reports onto the modal readout ONLY while its own event is
+     still on screen, and re-enables the button for whatever IS. Prev/Next repoints that
+     shared button at another event, so a settling write repainted a lie there — "Marked ✓"
+     over an unflagged visit, whose next tap then ADDED a mark the user meant to remove.
+     A failed write also restores the flag delta, not a whole snapshot that could undo a
+     flag made elsewhere meanwhile.
+
+229. `_resolve_flag` hints `+analyzer` to de-index that term. With no ANALYZE stats SQLite
+     preferred `idx_analysis_analyzer_verdict` over the `frame_id` range and scanned every
+     verdict for the oracle — O(analysis) PER FLAG, the opposite of the per-span read the
+     design chose. Measured at 1.5M verdicts: 65 ms → 0.4 ms, flat in store size.
+     The same query shape elsewhere (e.g. `events()`) still carries the mis-plan.

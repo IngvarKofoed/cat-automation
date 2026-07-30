@@ -523,7 +523,13 @@ the queue back into Annotate:
 - **Annotation.** In the dashboard the owner labels queued crops — assign a
   resident identity, or mark stranger / not-a-cat. Three feeders reach the queue:
   collection-mode captures, run-mode uncertain samples, and corrections of wrong
-  identifications.
+  identifications. A fourth, human-initiated path sits beside the queue rather than
+  in it: from the **user** app the household can *mark a visit for labelling* — a
+  flag on that visit's frame span, worked as its own list in the admin workbench.
+  It is deliberately not queue-ordered: the queue is the model's own
+  active-learning order, and a person pointing at one visit is a different signal.
+  Because it is span-keyed it also reaches visits the queue cannot represent at all
+  (no detection, so no crop to label yet).
 - **Validation.** Before building, the owner can score the **labelled data itself**:
   embed the crops of the selected quality grades and measure how separable the cats
   are (leave-one-out kNN accuracy, a same-vs-different distance AUC, and a suggested

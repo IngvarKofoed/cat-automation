@@ -674,6 +674,32 @@
             font-size: .85rem;
         }
 
+        /* ================= "mark for labelling" ================= */
+        /* The household user's one-tap flag (user-flag-for-labelling spec): a ⚑ beside
+           the pill on a flagged card, and the toggle in the playback modal's footer.
+           Deliberately the porch accent, NOT an identity or verdict colour — a flag is
+           a note-to-self about the visit, not a statement about what the cat is. */
+        .flag-mark {
+            flex: none;
+            color: var(--porch);
+            font-size: .8rem;
+            line-height: 1;
+        }
+        .player-actions {
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+            flex-wrap: wrap;
+            padding: .75rem 1rem 1rem;
+            border-top: 1px solid var(--hairline);
+        }
+        .player-actions .msg { color: var(--muted); font-size: .85rem; }
+        .player-actions .msg.bad { color: var(--neighbour); }
+        /* Marked state: the accent moves to the border + text, so the button reads as
+           "already on" rather than as the primary thing to press. */
+        .btn.marked { background: var(--porch-soft); color: var(--porch); border-color: var(--porch); }
+        .btn.marked:hover { filter: none; background: var(--porch-soft); }
+
         @media (max-width: 480px) {
             .porthole { width: 60px; }
             .event-time { font-size: 1.05rem; }
@@ -784,6 +810,12 @@
             </div>
             <div class="filmstrip" id="playerFilmstrip"></div>
             <div class="player-stats hidden" id="playerStats"></div>
+            <div class="player-actions">
+                <button class="btn ghost" id="playerFlag">Mark for labelling</button>
+                <!-- a live region: this is where a failed flag write is reported, and the
+                     button's own label doesn't carry the reason -->
+                <span class="msg" id="playerFlagMsg" aria-live="polite"></span>
+            </div>
         </div>
     </div>
 
@@ -804,6 +836,13 @@
         let catHasAvatar = {};   // cat_id -> has a photo (from /api/cats/overview); gates avatar requests
         let catAvatarVer = {};   // cat_id -> avatar_version (mtime); stamped on the URL so it caches yet busts on change
         let activitySeq = 0, activitySelectedIndex = -1;
+        // "Mark for labelling" flags (user-flag-for-labelling spec): the bare spans from
+        // /api/label/flags, fetched beside the feed. A visit is flagged when any flag
+        // OVERLAPS its id span — not an equality test, because an event's motion cluster
+        // grows as later frames land within the visit gap, so the span a flag was made
+        // against is routinely a subset of the same event's span later.
+        let activityFlags = [];
+        let flagBusy = false;   // one in-flight flag write at a time (the button's own guard)
         let strangersOnly = false;
         // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
         // motion and motion-only noise — leaving named cats, persons and birds.
@@ -833,6 +872,7 @@
         const playerScrubEl = $('playerScrub'), playerCountEl = $('playerCount');
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
+        const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
         const playerFrameEl = $('playerFrame'), playerBboxEl = $('playerBbox'), playerBboxCapEl = $('playerBboxCap');
 
         // ================= helpers =================
@@ -1021,6 +1061,123 @@
             return dot;
         }
 
+        // ================= "mark for labelling" =================
+        // A visit is flagged when any flag's id span OVERLAPS its own — the same rule the
+        // server dedups by, so the two can never disagree about which visit is marked.
+        function isFlagged(ev) {
+            return activityFlags.some(f => f.end_id >= ev.start_id && f.start_id <= ev.end_id);
+        }
+        function flagMark() {
+            const el = document.createElement('span');
+            el.className = 'flag-mark';
+            el.textContent = '⚑';
+            el.title = 'Marked for labelling';
+            el.setAttribute('aria-hidden', 'true');   // the row's aria-label already says it
+            return el;
+        }
+        // Local mirror of the server's overlap rules, so the button and the ⚑ update
+        // together without refetching the whole feed after a tap.
+        function dropOverlappingFlags(ev) {
+            activityFlags = activityFlags.filter(f => !(f.end_id >= ev.start_id && f.start_id <= ev.end_id));
+        }
+        function renderFlagButton(ev) {
+            const on = isFlagged(ev);
+            playerFlagBtn.textContent = on ? 'Marked for labelling ✓' : 'Mark for labelling';
+            playerFlagBtn.classList.toggle('marked', on);
+            playerFlagBtn.title = on
+                ? 'This visit is on the labelling list — tap to remove it'
+                : 'Put this visit on the labelling list to name it later';
+            playerFlagBtn.disabled = flagBusy;
+        }
+        function setFlagMsg(text, bad) {
+            playerFlagMsgEl.textContent = text || '';
+            playerFlagMsgEl.classList.toggle('bad', !!bad);
+        }
+        // Optimistic: the label flips at once (the write takes the store lock and can
+        // queue behind the collector), and reverts with a message if the call fails.
+        async function toggleFlag() {
+            const ev = activityVisible[activitySelectedIndex];
+            if (!ev || flagBusy) return;
+            const wasOn = isFlagged(ev);
+            const span = { start_id: ev.start_id, end_id: ev.end_id };
+            // Snapshot the DELTA, not the whole array: a feed reload can land while the
+            // write is in flight (a hash change escapes the "never refresh while playback
+            // is open" guard), and restoring a whole stale array would drop a flag some
+            // other client had just made.
+            const removed = wasOn ? activityFlags.filter(f => f.end_id >= ev.start_id && f.start_id <= ev.end_id) : null;
+            flagBusy = true;
+            setFlagMsg('');
+            if (wasOn) dropOverlappingFlags(ev);
+            // Placeholder id is deliberately unusable: NOTHING may key this array by id —
+            // both write routes are span-keyed, and every reader here uses start/end only.
+            else activityFlags = activityFlags.concat([{ id: -1, ...span, start_ts: ev.start_ts }]);
+            renderFlagButton(ev);
+            renderActivityRowFlag(ev);
+            // Only report onto the shared modal readout while THIS event is still the one on
+            // screen: openEvent (Prev/Next) repoints the button + message at another event,
+            // and a settling write that repainted them anyway would leave a lie there —
+            // "Marked ✓" over an unflagged visit, whose next tap then adds a mark the user
+            // meant to remove.
+            const stillOpen = () => activityVisible[activitySelectedIndex] === ev;
+            const report = (msg, bad) => { if (stillOpen()) setFlagMsg(msg, bad); };
+            try {
+                const url = wasOn ? '/api/label/flags/unmark' : '/api/label/flags';
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(span),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const body = await res.json();
+                if (wasOn) {
+                    // `deleted: 0` means the list this page held was stale (the flag fetch is
+                    // best-effort) — say what actually happened, not what was intended.
+                    report(body.deleted > 0 ? 'Removed from the labelling list.' : 'It was not on the labelling list.');
+                } else {
+                    // Replace the placeholder with the server's row (its real id, and the
+                    // span it actually stored, which an existing overlapping flag owns).
+                    dropOverlappingFlags(ev);
+                    activityFlags = activityFlags.concat([body]);
+                    report(body.created ? 'Added to the labelling list.' : 'Already on the labelling list.');
+                }
+            } catch (err) {
+                // Put the truth back — the write did not land. Re-applying the delta, so a
+                // flag added elsewhere while this was in flight survives.
+                if (wasOn) activityFlags = activityFlags.concat(removed);
+                else dropOverlappingFlags(ev);
+                report(err.message, true);
+            } finally {
+                flagBusy = false;
+                // Re-enable for whatever is on screen NOW (skipping this would leave the
+                // button stuck disabled until the next openEvent); the card marker is
+                // event-scoped, so it is always safe to repaint for the captured event.
+                const open = activityVisible[activitySelectedIndex];
+                if (open) renderFlagButton(open);
+                renderActivityRowFlag(ev);
+            }
+        }
+        // Repaint just this event's card marker, so a tap doesn't rebuild the rail (which
+        // would drop the reader's scroll position while the modal is open).
+        function renderActivityRowFlag(ev) {
+            const i = activityVisible.indexOf(ev);
+            if (i < 0) return;
+            const row = railEl.querySelector(`.event-row[data-index="${i}"]`);
+            if (!row) return;
+            setRowLabel(row, ev);   // the ⚑ is aria-hidden, so the label carries the state
+            let chipRow = row.querySelector('.chip-row');
+            if (!chipRow) {
+                // A card can have no chip row at all (no pill, no health dot). Make one
+                // rather than bail, or the ⚑ would only appear after a reload.
+                if (!isFlagged(ev)) return;
+                chipRow = document.createElement('div');
+                chipRow.className = 'chip-row';
+                row.querySelector('.event-meta').appendChild(chipRow);
+            }
+            const existing = chipRow.querySelector('.flag-mark');
+            if (isFlagged(ev)) { if (!existing) chipRow.appendChild(flagMark()); }
+            else if (existing) existing.remove();
+        }
+
         // ================= router =================
         function setRoute(r) {
             route = ROUTES.includes(r) ? r : 'activity';
@@ -1056,13 +1213,22 @@
                 // Events drive the feed; the cats overview (best-effort, in parallel) tells
                 // us which cats have a photo, so an identified event only requests an avatar
                 // that exists — a photoless cat shows its frame instead of firing a 404.
-                const [eres, cres] = await Promise.all([
+                // The flag list rides along (best-effort, like the overview): it is one
+                // tiny table read, and without it a card can't show whether it is
+                // already marked.
+                const [eres, cres, fres] = await Promise.all([
                     fetch('/api/events'),
                     fetch('/api/cats/overview'),
+                    fetch('/api/label/flags'),
                 ]);
                 if (!eres.ok) throw new Error(await errorFromResponse(eres));
                 const edata = await eres.json();
                 if (seq !== activitySeq) return;
+                if (fres.ok) {
+                    try {
+                        activityFlags = (await fres.json()).flags || [];
+                    } catch (_) { /* keep the previous list — worst case a ⚑ is stale */ }
+                }
                 if (cres.ok) {
                     try {
                         const cdata = await cres.json();
@@ -1135,6 +1301,19 @@
             });
         }
 
+        // The row's whole spoken description, re-applied whenever a fact in it changes.
+        // Folds in the visit-health verdict and the ⚑ so assistive tech gets what the
+        // colour dot and the glyph give everyone else — the glyph itself is aria-hidden,
+        // so this text is the ONLY signal that a visit is marked, and a live toggle has
+        // to update it or a screen-reader user is told the opposite of what is on screen.
+        function setRowLabel(row, ev) {
+            const health = visitHealth(ev.detection);
+            const healthText = health ? ` Detection ${TL_WORD[health]}.` : '';
+            const flagText = isFlagged(ev) ? ' Marked for labelling.' : '';
+            row.setAttribute('aria-label',
+                `${formatTime(ev.start_ts)}, ${subjectAriaText(ev)}.${healthText}${flagText} Open playback.`);
+        }
+
         function eventRow(ev, i) {
             const kind = subjectKind(ev);
             const row = document.createElement('div');
@@ -1142,11 +1321,7 @@
             row.dataset.index = String(i);
             row.tabIndex = 0;
             row.setAttribute('role', 'button');
-            // Fold the visit-health verdict into the label so assistive tech gets the
-            // signal the colour dot gives everyone else (omitted when unmeasured).
-            const health = visitHealth(ev.detection);
-            const healthText = health ? ` Detection ${TL_WORD[health]}.` : '';
-            row.setAttribute('aria-label', `${formatTime(ev.start_ts)}, ${subjectAriaText(ev)}.${healthText} Open playback.`);
+            setRowLabel(row, ev);
 
             const dot = document.createElement('div');
             dot.className = 'dot ' + subjectCssClass(kind);
@@ -1180,14 +1355,16 @@
             rel.className = 'event-rel';
             rel.textContent = relativeTime(ev.start_ts);
             meta.append(time, rel);
-            // The identity/subject pill and the visit-health dot share one line.
+            // The identity/subject pill, the visit-health dot and the ⚑ share one line.
             const chip = subjectChip(ev);
             const healthEl = healthDot(ev);
-            if (chip || healthEl) {
+            const flagEl = isFlagged(ev) ? flagMark() : null;
+            if (chip || healthEl || flagEl) {
                 const chipRow = document.createElement('div');
                 chipRow.className = 'chip-row';
                 if (chip) chipRow.appendChild(chip);
                 if (healthEl) chipRow.appendChild(healthEl);
+                if (flagEl) chipRow.appendChild(flagEl);
                 meta.appendChild(chipRow);
             }
 
@@ -1322,6 +1499,9 @@
             const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
             renderPlayerStats(ev.detection);
+            // The flag toggle reflects THIS event (openEvent is also the Prev/Next hop).
+            setFlagMsg('');
+            renderFlagButton(ev);
 
             // Reset to a loading state so a slow fetch never shows the previous event.
             playerFrames = []; playerImages = []; playerTiles = [];
@@ -1474,6 +1654,7 @@
         playerNextBtn.addEventListener('click', () => moveEvent(1));
         playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
         playerCloseBtn.addEventListener('click', closePlayer);
+        playerFlagBtn.addEventListener('click', toggleFlag);
 
         // Backdrop close: only when BOTH press and release land on the overlay itself
         // (never the dialog) — so a scrub/tile drag that releases over the backdrop

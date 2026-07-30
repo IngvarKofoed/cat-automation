@@ -136,6 +136,21 @@ _MAX_EVENTS = 500
 # events with ``truncated`` set (older ones need a narrower date range).
 _EVENT_SCAN_FRAMES = 200_000
 
+# Widest frame-id span a single "mark for labelling" flag may cover. A flag comes from a
+# client posting ONE activity event's [start_id, end_id], so any real value is tens to a
+# few hundred frames — but nothing else bounds it, and `_resolve_flag` materialises every
+# live frame in the span, so an absurd width (a fat-fingered or hostile id) would load the
+# whole `frames` table into one response. Sized at the event scan cap: generous against any
+# real visit at ~5 fps, and it also keeps such a flag from overlapping (and so ⚑-marking)
+# every event in the feed.
+_MAX_FLAG_SPAN = _EVENT_SCAN_FRAMES
+
+# Ceiling on one ``list_label_flags`` read (newest first). The household flags a handful of
+# visits, but nothing prunes them automatically and the user app fetches this list on every
+# feed load, so the read gets a bound instead of trusting the list to stay short. Reaching
+# it means the Flagged list has gone unworked for a very long time.
+_MAX_FLAGS_READ = 500
+
 # The visit-inbox error modes ``visits`` clusters and ranks (see the
 # motion-detection-workflow spec). "missed"/"false" judge the LIVE edge gate
 # (``frames.motion``) against one oracle; "conflict" compares the two oracles
@@ -609,6 +624,29 @@ class Store:
               end_id   INTEGER NOT NULL,   -- inclusive upper id actually purged
               at_ts    INTEGER NOT NULL    -- ms epoch the purge recorded this span
             );
+            -- `label_flags` is the household user's "mark this for labelling" gesture
+            -- from the user dashboard (see the user-flag-for-labelling spec): one row
+            -- per flagged ACTIVITY EVENT, keyed by that event's frame span rather than
+            -- per frame or per crop. Span-keyed is what makes a `motion_only` /
+            -- `unrecognized` event flaggable at all — it has no YOLO box, so it cannot
+            -- appear in the annotation queue, yet it is exactly what a user flags.
+            -- A flag is a WORK ITEM, not precious output: resolving one deletes its row
+            -- (no `resolved_ts` history), and being frame-id keyed it is dropped by
+            -- `clear` for the same rowid-reuse reason as `groups`/`mode_changes`/
+            -- `purge_spans`. NOT cascaded by eviction — a flag whose frames aged out
+            -- reads as `gone` and waits to be dismissed, because a mark that silently
+            -- disappears hides that the work was lost to retention.
+            --   The index is deliberately NOT unique: flag identity is span OVERLAP
+            -- (an event's cluster grows as later motion lands within _VISIT_GAP_MS),
+            -- which no column constraint expresses — `add_label_flag` probes for it.
+            CREATE TABLE IF NOT EXISTS label_flags (
+              id         INTEGER PRIMARY KEY,
+              start_id   INTEGER NOT NULL,   -- frames.id lower bound (inclusive) of the flagged event
+              end_id     INTEGER NOT NULL,   -- frames.id upper bound (inclusive)
+              start_ts   INTEGER NOT NULL,   -- recv_ts of the span's first live frame, at flag time
+              created_ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_label_flags_span ON label_flags(start_id, end_id);
             """
         )
         self._conn.commit()
@@ -992,6 +1030,12 @@ class Store:
             # 1, so a stale purge span would spuriously flag brand-new frames as
             # "misses unmeasurable". A cleared store has no purged history.
             self._conn.execute("DELETE FROM purge_spans")
+            # Drop the user's labelling flags for the SAME rowid-reuse reason: a flag is
+            # a [start_id, end_id] frame span, and a full clear restarts ids at 1, so a
+            # stale flag would point at brand-new unrelated frames. Unlike `cats` /
+            # `dataset_items`, a flag is a work item, not output — nothing is lost that
+            # a fresh look at the new frames can't re-flag.
+            self._conn.execute("DELETE FROM label_flags")
             self._conn.commit()
             self._total_bytes = 0
             self._count = 0
@@ -4758,6 +4802,333 @@ class Store:
             )
         visits.sort(key=lambda v: v["labeled_ts"], reverse=True)
         return visits
+
+    # --- "Mark for labelling" flags (the user dashboard's gesture) ----------
+    #
+    # A flag is ONE activity-event frame span the household user tapped on their
+    # phone, worked later in the admin Annotation page's Flagged mode. Identity is
+    # span OVERLAP on BOTH sides — the client draws the ⚑ for any flag overlapping an
+    # event, and `add_label_flag` dedups the same way — so the read and write rules
+    # can never disagree about which visit is flagged. See the user-flag-for-labelling
+    # spec, and the table comment in the schema for why it is span-keyed.
+
+    def add_label_flag(self, start_id: int, end_id: int) -> "dict | None":
+        """Flag an event's frame span for labelling; return the flag row, or ``None``.
+
+        Idempotent by span OVERLAP, not by an exact ``(start_id, end_id)`` pair: an
+        event's motion cluster GROWS as later frames land within ``_VISIT_GAP_MS``, so
+        the span a flag was made against is routinely a subset of the same event's span
+        an hour later. Probing for an overlapping flag and returning it UNCHANGED is
+        what makes a re-tap a no-op rather than a second row — and it leaves un-mark
+        with a single well-defined target.
+
+        Returns ``None`` when the span holds no live frame; the caller maps that to a
+        409. That doubles as the span-exists check (ids that never existed, or whose
+        frames have already evicted): with no frames there is no crop to ever cut, so
+        a flag there could only rot.
+
+        ``start_ts`` is captured now from the span's first live frame — first BY ID,
+        which is also the minimum ``recv_ts`` because frames are inserted in receive
+        order (the equivalence ``resolve_ts_range`` relies on, entry 103) — so the
+        admin list can still say WHEN a flag was for after its frames age out.
+        """
+        lo, hi = int(start_id), int(end_id)
+        if lo < 1 or hi < lo:
+            raise ValueError(f"bad span: start_id={lo}, end_id={hi}")
+        if hi - lo + 1 > _MAX_FLAG_SPAN:
+            raise ValueError(
+                f"span too wide: {hi - lo + 1} frames (max {_MAX_FLAG_SPAN}) — a flag "
+                "covers ONE visit"
+            )
+        now = int(time.time() * 1000)
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT recv_ts FROM frames WHERE id BETWEEN ? AND ? ORDER BY id ASC LIMIT 1",
+                    (lo, hi),
+                ).fetchone()
+                if row is None:
+                    return None
+                # Overlap, not equality: two spans overlap iff each starts at or before
+                # the other ends. Oldest match wins, so a re-tap keeps the flag's
+                # original created_ts rather than appearing to be new work.
+                existing = self._conn.execute(
+                    "SELECT id, start_id, end_id, start_ts, created_ts FROM label_flags"
+                    " WHERE end_id >= ? AND start_id <= ? ORDER BY id ASC LIMIT 1",
+                    (lo, hi),
+                ).fetchone()
+                if existing is not None:
+                    return {
+                        "id": int(existing[0]), "start_id": int(existing[1]),
+                        "end_id": int(existing[2]), "start_ts": existing[3],
+                        "created_ts": existing[4], "created": False,
+                    }
+                cur = self._conn.execute(
+                    "INSERT INTO label_flags (start_id, end_id, start_ts, created_ts)"
+                    " VALUES (?, ?, ?, ?)",
+                    (lo, hi, int(row[0]), now),
+                )
+                self._conn.commit()
+                # Built INSIDE the lock, like every other write here (`add`, `create_cat`,
+                # `create_group`): the returned id is read on the same cursor under the
+                # same lock as its insert, so it cannot be read against another writer.
+                created = {
+                    "id": int(cur.lastrowid), "start_id": lo, "end_id": hi,
+                    "start_ts": int(row[0]), "created_ts": now, "created": True,
+                }
+            except Exception:
+                self._conn.rollback()
+                raise
+        return created
+
+    def list_label_flags(self) -> "list[dict]":
+        """Every flag, newest first — ``[{id, start_id, end_id, start_ts, created_ts}, ...]``.
+
+        The cheap read: the phone fetches it beside the activity feed to decide which
+        cards carry the ⚑, and the admin mode button takes its count from here rather
+        than from ``flagged_visits`` — so mounting Annotation in Queue mode never pays
+        for a resolve nobody is looking at. The table holds one row per flagged visit,
+        so this stays a tiny scan.
+
+        ``LIMIT``ed all the same: this runs on the SHARED write connection and the phone
+        now fetches it on every feed load (the 60 s poll, every SSE nudge, every
+        foreground), while flags are never auto-pruned — so the one read that could grow
+        without bound gets a ceiling rather than relying on the operator to work the list.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, start_id, end_id, start_ts, created_ts FROM label_flags"
+                " ORDER BY created_ts DESC, id DESC LIMIT ?",
+                (_MAX_FLAGS_READ,),
+            ).fetchall()
+        return [
+            {"id": int(r[0]), "start_id": int(r[1]), "end_id": int(r[2]),
+             "start_ts": r[3], "created_ts": r[4]}
+            for r in rows
+        ]
+
+    def delete_label_flag(self, flag_id: int) -> bool:
+        """Delete one flag by id; return whether a row was removed (the admin's dismiss)."""
+        with self._lock:
+            try:
+                cur = self._conn.execute("DELETE FROM label_flags WHERE id = ?", (int(flag_id),))
+                self._conn.commit()
+                removed = cur.rowcount > 0   # read under the same lock as its DELETE
+            except Exception:
+                self._conn.rollback()
+                raise
+        return removed
+
+    def delete_label_flags_overlapping(self, start_id: int, end_id: int) -> int:
+        """Delete every flag overlapping ``[start_id, end_id]``; return the count.
+
+        The phone's un-mark. It takes the EVENT SPAN, not a flag id, because the
+        gesture means "this visit is not marked" — and two flags can overlap one event
+        (two separately-flagged events later merged into one cluster), where deleting
+        the one id the client happened to hold would leave the ⚑ lit with no way to
+        turn it off.
+
+        Width-bounded exactly like ``add_label_flag``: not for the memory reason (this one
+        materialises nothing) but because an id beyond SQLite's 64-bit INTEGER raises
+        ``OverflowError``, which is not a ``ValueError`` and so escapes the route's mapping
+        as a 500. Both span routes must reject the same inputs.
+        """
+        lo, hi = int(start_id), int(end_id)
+        if lo < 1 or hi < lo:
+            raise ValueError(f"bad span: start_id={lo}, end_id={hi}")
+        if hi - lo + 1 > _MAX_FLAG_SPAN:
+            raise ValueError(
+                f"span too wide: {hi - lo + 1} frames (max {_MAX_FLAG_SPAN}) — a flag "
+                "covers ONE visit"
+            )
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "DELETE FROM label_flags WHERE end_id >= ? AND start_id <= ?", (lo, hi)
+                )
+                self._conn.commit()
+                removed = cur.rowcount    # read under the same lock as its DELETE
+            except Exception:
+                self._conn.rollback()
+                raise
+        return removed
+
+    def flagged_visits(self, oracle: str = "yolo-serial") -> "list[dict]":
+        """Every flag resolved to a labellable visit record, newest-flagged first.
+
+        The admin Flagged mode's feed. Per flag::
+
+            {flag_id, created_ts,
+             frames: [{id, recv_ts, bbox, score, url}, ...],
+             rep_frame_id, peak_area, peak_score, span: [lo_ts, hi_ts],
+             start_id, end_id,
+             state: 'labellable'|'partial'|'no_detection'|'unswept'|'gone',
+             coverage: {n_live, n_swept, n_boxed},
+             current_label: {label_kind, cat_id, cat_name, n_frames, mixed} | None}
+
+        ``frames``/``rep_frame_id``/``peak_area``/``peak_score``/``span`` mirror
+        ``annotation_queue_page`` exactly, so the Annotation stage and the quality
+        re-seed formula render a flagged visit with no special case.
+
+        Two deliberate differences from the queue:
+
+        - **UNFLOORED.** The queue admits cat boxes only at or above
+          ``_ANNOTATE_MIN_CONF`` (0.3) while YOLO runs recall-first at 0.15, so a faint
+          0.2 cat box — a real crop — is invisible to it. Here every ``verdict = 1``
+          frame counts (``verdict`` IS "has a cat box"; see ``yolo.py``'s invariant).
+          The floor exists to keep phantom empty-scene detections out of the BULK
+          queue (entry 73); a human pointing at one visit is not that case, and a faint
+          crop still grades ``poor`` and so stays out of a quality-filtered build.
+        - **No re-clustering.** The flagged span IS the unit, so what the operator
+          labels is what the user tapped — even if the surrounding motion has since
+          grown into a wider cluster, and even where a detection hole would have split
+          it into two ``_gap_split`` visits.
+
+        ``state`` is derived from COVERAGE, never from the mere existence of an
+        ``analysis`` row: the live-identify worker writes verdicts only inside visit
+        spans (entry 76) and the oracle worker is forward-only (entries 142, 149), so a
+        partly-swept span is the normal case. Calling one ``no_detection`` would claim
+        the detector had rejected frames it never looked at.
+
+        Runs on its OWN short-lived WAL read connection, and resolves each flag with
+        three small id-range reads rather than one ``min..max`` pass over all spans:
+        flags are never auto-pruned, so a single old ``gone`` flag would otherwise pin
+        the range to the whole store and make every pass O(store).
+        """
+        flags = self.list_label_flags()
+        if not flags:
+            return []
+        # A fresh reader, deliberately OFF the shared write lock — the collector must
+        # not stall behind an operator-triggered resolve (entries 102-105).
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            return [self._resolve_flag(conn, flag, oracle) for flag in flags]
+        finally:
+            conn.close()
+
+    def _resolve_flag(self, conn, flag: dict, oracle: str) -> dict:
+        """One flag → its Flagged-mode record. See ``flagged_visits`` for the contract."""
+        lo, hi = flag["start_id"], flag["end_id"]
+        live = conn.execute(
+            "SELECT id, recv_ts FROM frames WHERE id BETWEEN ? AND ? ORDER BY id ASC", (lo, hi)
+        ).fetchall()
+        live_ts = {int(r[0]): r[1] for r in live}
+        # Every verdict for this oracle in the span. `analysis` is cascade-deleted with
+        # its frame, so these should all be live; intersect anyway so a stale row can
+        # never inflate coverage above the frames that actually exist.
+        #   `+analyzer` de-indexes that term ON PURPOSE. The table carries both
+        # PRIMARY KEY (frame_id, analyzer) and idx_analysis_analyzer_verdict, and with no
+        # ANALYZE stats SQLite costs a two-sided range above an equality — so it picks the
+        # analyzer index and scans EVERY row for this oracle, making the read O(analysis)
+        # per flag instead of O(span). Measured at 1.5M verdicts: 65 ms → 0.4 ms, and flat
+        # in store size rather than growing with it.
+        verdicts = conn.execute(
+            "SELECT frame_id, verdict, detail FROM analysis"
+            " WHERE +analyzer = ? AND frame_id BETWEEN ? AND ?",
+            (oracle, lo, hi),
+        ).fetchall()
+        n_swept = 0
+        boxed: "list[dict]" = []
+        for frame_id, verdict, detail in verdicts:
+            fid = int(frame_id)
+            if fid not in live_ts:
+                continue
+            n_swept += 1
+            if not verdict:
+                continue
+            box = self._best_box(detail)  # unfloored — see the docstring
+            if box is None:
+                continue
+            bbox, score = box
+            boxed.append({
+                "id": fid, "recv_ts": live_ts[fid], "bbox": bbox,
+                "score": score, "url": f"/media/{fid}",
+            })
+        boxed.sort(key=lambda fr: (fr["recv_ts"], fr["id"]))
+        # Labels already on this span, keyed on BOTH columns (the clear()-safe pair), so
+        # a stale pre-clear row for a reused id can't be read as this visit's label.
+        label_rows = conn.execute(
+            "SELECT d.src_frame_id, d.src_recv_ts, d.label_kind, d.cat_id, c.name"
+            " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
+            " WHERE d.src_frame_id BETWEEN ? AND ?",
+            (lo, hi),
+        ).fetchall()
+        decided = [
+            r for r in label_rows
+            if int(r[0]) in live_ts and r[1] == live_ts[int(r[0])]
+        ]
+
+        n_live = len(live_ts)
+        if n_live == 0:
+            state = "gone"
+        elif n_swept == 0:
+            state = "unswept"
+        elif n_swept < n_live:
+            state = "partial"
+        elif boxed:
+            state = "labellable"
+        else:
+            state = "no_detection"
+
+        if boxed:
+            rep = max(boxed, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            span = [boxed[0]["recv_ts"], boxed[-1]["recv_ts"]]
+            rep_id, peak_area = rep["id"], self._bbox_area(rep["bbox"])
+            peak_score = max(fr["score"] for fr in boxed)
+        else:
+            # Nothing to label: keep the record renderable anyway. The span falls back
+            # to the live frames, and to the flag's captured start_ts once they are gone
+            # — a `gone` row must still be able to say when it was for.
+            rep_id, peak_area, peak_score = None, 0.0, None
+            span = ([live[0][1], live[-1][1]] if live
+                    else [flag["start_ts"], flag["start_ts"]])
+        return {
+            "flag_id": flag["id"],
+            "created_ts": flag["created_ts"],
+            "frames": boxed,
+            "rep_frame_id": rep_id,
+            "peak_area": peak_area,
+            "peak_score": peak_score,
+            "span": span,
+            "start_id": lo,
+            "end_id": hi,
+            "state": state,
+            "coverage": {"n_live": n_live, "n_swept": n_swept, "n_boxed": len(boxed)},
+            "current_label": self._aggregate_flag_label(decided),
+        }
+
+    @staticmethod
+    def _aggregate_flag_label(decided: "list[tuple]") -> "dict | None":
+        """The span's existing label, or ``None`` — with ``mixed`` when it holds several.
+
+        An event span is a MOTION cluster, so ``_gap_split`` over detected frames can
+        have split it into two annotation visits carrying different labels (a detection
+        hole inside one motion run; or two cats at the door). One keypress in Flagged
+        mode rewrites them all as one identity, so the operator has to be told: the
+        reported identity is the MAJORITY ``(label_kind, cat_id)`` pair and ``mixed``
+        is the same test ``labeled_visits`` applies (see its ``mixed``), which the
+        Labelled stage already renders as a tag.
+        """
+        if not decided:
+            return None
+        counts: "dict[tuple, dict]" = {}
+        for _fid, _ts, label_kind, cat_id, cat_name in decided:
+            key = (label_kind, cat_id)
+            entry = counts.setdefault(
+                key, {"label_kind": label_kind, "cat_id": cat_id, "cat_name": cat_name, "n": 0}
+            )
+            entry["n"] += 1
+        # Majority wins; ties broken deterministically by kind then cat id, so the same
+        # rows always report the same identity.
+        best = max(counts.values(), key=lambda e: (e["n"], e["label_kind"], -1 if e["cat_id"] is None else e["cat_id"]))
+        return {
+            "label_kind": best["label_kind"],
+            "cat_id": best["cat_id"],
+            "cat_name": best["cat_name"],
+            "n_frames": len(decided),
+            "mixed": len(counts) > 1,
+        }
 
     def add_dataset_items(self, rows: "list[dict]") -> int:
         """Bulk-insert one ``dataset_items`` row per labelled crop; return the count.

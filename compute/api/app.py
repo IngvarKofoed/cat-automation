@@ -449,6 +449,32 @@ class IgnoreRequest(BaseModel):
     frame_ids: "list[int]" = []
 
 
+class FlagSpanRequest(BaseModel):
+    """Body of ``POST /api/label/flags`` and ``/api/label/flags/unmark``: an event span.
+
+    ``start_id``/``end_id`` are the inclusive frame-id bounds of one activity event —
+    exactly what ``GET /api/events`` returns for it, which the client round-trips. The
+    span, not a flag id, is the unit on BOTH calls: flag identity is span overlap (an
+    event's motion cluster grows as later frames arrive), so "unmark this visit" must
+    clear every flag overlapping it rather than one id the client happens to hold.
+
+    ``ge=1`` rejects a zero/negative id at the pydantic boundary, and the ``bool`` guard
+    mirrors ``LocationRequest``: pydantic treats ``bool`` as an int subtype, so without
+    it ``true`` would coerce to frame id 1 and silently flag whatever visit sits at the
+    start of the store. The store still range-checks ``start_id <= end_id``.
+    """
+
+    start_id: int = Field(ge=1)
+    end_id: int = Field(ge=1)
+
+    @field_validator("start_id", "end_id", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a frame id, not a boolean")
+        return v
+
+
 class FeasibilityRunRequest(BaseModel):
     """Body of ``POST /api/training/feasibility/run``: which crop grades to embed.
 
@@ -2337,6 +2363,62 @@ def create_app(
         rows = [{"frame_id": int(fid), "label_kind": "ignored"} for fid in req.frame_ids]
         inserted = store.add_dataset_items(rows)
         return {"ignored": inserted}
+
+    # --- "Mark for labelling" flags ----------------------------------------
+    #
+    # The household user's one-tap gesture from the user dashboard's playback modal,
+    # worked later in the admin Annotation page's Flagged mode (see the
+    # user-flag-for-labelling spec). Four routes: flag a span, list the bare spans
+    # (what the phone needs to draw the ⚑ — cheap enough to fetch beside the feed),
+    # un-mark by span, dismiss one by id; plus the admin's resolve, below.
+
+    @app.post("/api/label/flags")
+    def api_label_flag(req: FlagSpanRequest):
+        # Idempotent by span OVERLAP (the store probes), so a double-tap returns the
+        # existing flag rather than minting a second. A span with no live frames is a
+        # 409, not a 404: the ids were legitimate, the frames have simply aged out —
+        # and with no frames there is never a crop to label.
+        try:
+            flag = store.add_label_flag(req.start_id, req.end_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if flag is None:
+            raise HTTPException(
+                status_code=409, detail="those frames have aged out — nothing left to label"
+            )
+        return flag
+
+    @app.get("/api/label/flags")
+    def api_label_flags():
+        flags = store.list_label_flags()
+        return {"flags": flags, "total": len(flags)}
+
+    @app.post("/api/label/flags/unmark")
+    def api_label_unmark(req: FlagSpanRequest):
+        # The phone's un-mark: clears EVERY flag overlapping the event span. Idempotent
+        # — un-marking something already unmarked is `{deleted: 0}`, not an error.
+        try:
+            deleted = store.delete_label_flags_overlapping(req.start_id, req.end_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"deleted": deleted}
+
+    @app.delete("/api/label/flags/{flag_id}")
+    def api_label_flag_delete(flag_id: int):
+        # The admin's dismiss: one flag by id, leaving any label on its frames alone.
+        return {"deleted": store.delete_label_flag(flag_id)}
+
+    @app.get("/api/label/flagged")
+    def api_label_flagged(oracle: str = Query(default=_LABEL_DEFAULT_ORACLE)):
+        # The admin Flagged feed: each flag resolved to a labellable visit + its
+        # coverage-derived state. Same oracle gate as every other oracle-taking route.
+        if oracle not in ANALYZER_NAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+            )
+        visits = store.flagged_visits(oracle)
+        return {"visits": visits, "total": len(visits)}
 
     @app.get("/api/label/crop/{frame_id}")
     def api_label_crop(frame_id: int, box: str = Query(...)):

@@ -1493,3 +1493,13 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `onKey` swallow the operator's next label silently, since it ignores keystrokes from
      inputs — so the control now blurs itself. Rather than exempt checkboxes from that guard:
      Space is bound to skip AND toggles a focused checkbox, so it would fire both.
+
+236. The after-edits review now PREFERS `/fix-code --fix` — it rates findings 1-5, has a verifier
+     refute each before repairing, and is undoable — keeping the inline self-run pass as fallback:
+     a missing skill changes who reviews, never whether. New pre-commit gate: a commit request
+     over changes no `--fix` run has seen asks once first, delegated `/git commit` included.
+     The end-of-turn nudge now points at a user-run `/fix-code`; it buys DISTANCE, not another tool.
+
+237. `/code-review` is no longer what the nudge suggests: it needs a PR to exist, only posts a
+     comment, and on this repo it spent ~743k tokens to report `findings: []` (entry 230).
+     Its workflow-script tiering note stays — the user can still run it deliberately.

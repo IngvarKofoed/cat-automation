@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local frontend dev proxy — edit the web/ HTML on your dev box, see it against the
-# REAL compute PC's data. Serves compute/api/web/{user,admin}/index.html locally
+# REAL compute PC's data. Serves compute/api/web/{user,admin-next}/index.html locally
 # (no-store, so a refresh shows edits) and reverse-proxies /api + /media to the real
 # backend. Frontend-only; no backend changes. See compute/tools/frontend_dev_proxy.py.
 #
@@ -9,7 +9,7 @@
 #   CAT_COMPUTE_URL=http://host:8001 ./frontend-dev.sh
 #   CAT_DEV_PORT=9090 ./frontend-dev.sh              # different local port (default 8080)
 #
-# Then open http://localhost:8080/ (user), /admin (console), /admin-old (retired console).
+# Then open http://localhost:8080/ (user) or /admin (console).
 set -euo pipefail
 cd "$(dirname "$0")"
 

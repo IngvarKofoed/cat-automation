@@ -4,9 +4,9 @@ Iterate on ``compute/api/web/*/index.html`` on your dev box against the REAL
 backend's data (cats, events, media, models) with a plain browser reload — no
 backend changes, no data copy, no CORS. Because the frontend uses same-origin
 absolute paths (``/api/...``, ``/media/...``), a same-origin reverse proxy is all it
-takes: this server answers ``/``, ``/admin`` (+ its ``/admin-next`` alias), and
-``/admin-old`` from your local files (served no-store, so an edit shows on refresh)
-and forwards every other request to ``CAT_COMPUTE_URL`` unchanged.
+takes: this server answers ``/`` and ``/admin`` (+ its ``/admin-next`` alias) from
+your local files (served no-store, so an edit shows on refresh) and forwards every
+other request to ``CAT_COMPUTE_URL`` unchanged.
 
 **Fully async + streaming**, and that is load-bearing, not incidental. The user
 dashboard opens a long-lived **SSE** stream (``/api/events/stream``, a keepalive every
@@ -27,7 +27,7 @@ Usage (from the repo root, after ``./compute.sh`` has built ``.venv-compute`` on
     ./frontend-dev.sh http://<compute-pc-ip>:8001      # backend as an arg
     CAT_COMPUTE_URL=http://<compute-pc-ip>:8001 .venv-compute/bin/python compute/tools/frontend_dev_proxy.py
 
-Then open http://localhost:8080/ (user), /admin (console), or /admin-old (retired console).
+Then open http://localhost:8080/ (user) or /admin (console).
 
 Env:
     CAT_COMPUTE_URL   real compute backend base URL (default http://localhost:8001)
@@ -47,9 +47,8 @@ from starlette.background import BackgroundTask
 _WEB = Path(__file__).resolve().parents[1] / "api" / "web"
 _USER_HTML = _WEB / "user" / "index.html"
 # Same mapping the real app uses after the flip (NEW_ADMIN_PLAN.md P8): the
-# admin-next rebuild IS `/admin`; the console it replaced answers `/admin-old`.
+# admin-next rebuild IS `/admin`; the console it replaced is deleted.
 _ADMIN_HTML = _WEB / "admin-next" / "index.html"
-_ADMIN_OLD_HTML = _WEB / "admin" / "index.html"
 
 _BACKEND = os.environ.get("CAT_COMPUTE_URL", "http://localhost:8001").rstrip("/")
 _PORT = int(os.environ.get("CAT_DEV_PORT", "8080"))
@@ -106,11 +105,6 @@ def admin_index() -> Response:
     return _serve_local(_ADMIN_HTML, "admin page")
 
 
-@app.get("/admin-old")
-def admin_old_index() -> Response:
-    return _serve_local(_ADMIN_OLD_HTML, "old admin page")
-
-
 @app.api_route(
     "/{full_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
@@ -158,7 +152,7 @@ async def proxy(full_path: str, request: Request) -> Response:
 if __name__ == "__main__":
     import uvicorn
 
-    print(f"[frontend-dev] serving local web/ at http://localhost:{_PORT}  (/ user, /admin workbench, /admin-next rebuild)")
+    print(f"[frontend-dev] serving local web/ at http://localhost:{_PORT}  (/ user, /admin console)")
     print(f"[frontend-dev] proxying everything else -> {_BACKEND}")
     # timeout_graceful_shutdown bounds how long Ctrl-C waits for in-flight requests.
     # Without it (uvicorn's default is wait-forever), the proxied SSE stream — which

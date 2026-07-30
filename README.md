@@ -105,5 +105,4 @@ sudo systemctl restart systemd-journald
 
 Bootstraps `.venv-compute`, resolves the edge URL (`CAT_PI_URL`, default
 `localhost:8000`), and serves the admin console on `:8001` (`/admin`) with the user
-dashboard at `/`. The workbench the console replaced stays at `/admin-old` until it
-is retired. See [`compute/CLAUDE.md`](compute/CLAUDE.md) for the details.
+dashboard at `/`. See [`compute/CLAUDE.md`](compute/CLAUDE.md) for the details.

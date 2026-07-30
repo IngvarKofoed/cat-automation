@@ -66,14 +66,11 @@ _WEB_DIR = Path(__file__).resolve().parent / "web"
 # own inline <style>) are what keep their CSS isolated — see
 # docs/specs/2026-07-22-admin-user-area-split.md.
 _USER_HTML = _WEB_DIR / "user" / "index.html"
-# The admin-next rebuild is now THE admin (NEW_ADMIN_PLAN.md P8 — the flip): it
-# serves `/admin`, and the workbench it replaced moved to `/admin-old`, kept until
-# the new one is trusted (see docs/specs/2026-07-25-admin-next-redesign.md). The
-# directories keep their build-time names — renaming them would churn the dev proxy
-# and every spec reference for no gain, and `admin/` is deleted outright once the
-# old console is retired.
+# The admin-next rebuild is THE admin (NEW_ADMIN_PLAN.md P8 — the flip), and the
+# workbench it replaced is now DELETED: no `/admin-old`, no `web/admin/`. The
+# directory keeps its build-time name — renaming it would churn the dev proxy and
+# every spec reference for no gain.
 _ADMIN_HTML = _WEB_DIR / "admin-next" / "index.html"
-_ADMIN_OLD_HTML = _WEB_DIR / "admin" / "index.html"
 # Home-screen icon for the pinned user app (served at the root paths iOS probes).
 _APPLE_TOUCH_ICON = _WEB_DIR / "user" / "apple-touch-icon.png"
 
@@ -960,16 +957,6 @@ def create_app(
         if not _ADMIN_HTML.is_file():
             raise HTTPException(status_code=404, detail="admin UI not built")
         return FileResponse(_ADMIN_HTML, media_type="text/html", headers=_SHELL_HEADERS)
-
-    @app.get("/admin-old")
-    def admin_old():
-        # The workbench the rebuild replaced (Buckets/Sweeps/Corruption/Training…),
-        # kept reachable until the new console is trusted, then deleted. Some views
-        # here have no admin-next equivalent yet (buckets, corruption review), so this
-        # is a working fallback, not only a rollback.
-        if not _ADMIN_OLD_HTML.is_file():
-            raise HTTPException(status_code=404, detail="old admin UI not built")
-        return FileResponse(_ADMIN_OLD_HTML, media_type="text/html", headers=_SHELL_HEADERS)
 
     @app.get("/apple-touch-icon.png")
     @app.get("/apple-touch-icon-precomposed.png")

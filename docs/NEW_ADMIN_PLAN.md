@@ -103,11 +103,19 @@ slices all touch one file.
 - **Verify:** purge never touches durable crops/labels/models; counts stay exact;
   purged window warns "misses unmeasurable"; lock released between batches.
 
-### P8 — The flip
-- **Work:** point `/admin` at `admin-next/index.html`; move old file to
-  `/admin-old`; delete later once trusted.
-- **Depends on:** all prior phases done + trusted. **Verify:** `/admin` serves
-  the new UI; `/admin-old` still serves the old one.
+### P8 — The flip — **DONE**
+- **Planned work (historical):** point `/admin` at `admin-next/index.html`; move
+  the old file to `/admin-old`; delete later once trusted. Verified at the time by
+  `/admin` serving the new UI and `/admin-old` the old one.
+- **Depends on:** all prior phases done + trusted.
+- **Outcome — both halves are now done.** The flip landed, then the old console was
+  **deleted**: no `/admin-old` route, no `web/admin/`, no appbar link to it, and so
+  no rollback target. Buckets and corruption review went with it BY DECISION, not
+  oversight — buckets is superseded by the tuning calendar, and corruption review is
+  simply dropped. Their `/api` endpoints remain, so a corruption sweep is still
+  curl-able; rebuild the page from
+  `docs/specs/2026-07-23-corruption-review-page.md` if the NoIR module brings the
+  IMX708 artifacts with it.
 
 ## Which phases can be fanned out (ultracode)
 

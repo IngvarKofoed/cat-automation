@@ -1,16 +1,17 @@
 <!DOCTYPE html>
 <!--
   The compute admin console — served at /admin (and /admin-next, the route it was
-  built under). The workbench it replaced is at /admin-old until it is retired.
+  built under). The workbench it replaced has been deleted.
 
-  Self-contained single file (own CSS + JS, no sharing with /admin-old or / — the
-  entry-80 convention). Dark, deliberately minimal styling; the reskin comes
+  Self-contained single file (own CSS + JS, no sharing with / — the entry-80
+  convention). Dark, deliberately minimal styling; the reskin comes
   later. Pages are hash-routed; each page is a mount(view) -> teardown function
   so a live page can poll and clean up its timers on navigation. Built per phase
   (see docs/NEW_ADMIN_PLAN.md).
 
-  Pages: Start · Motion tuning · Frame review · Annotation · Model building ·
-  Activity. Not carried over from the old console: buckets, corruption review.
+  Pages: Start · Motion tuning · Frame review · Annotation · Cats · Model
+  building · Activity. Deliberately dropped with the old console: buckets and
+  corruption review — their /api endpoints survive for curl.
 -->
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -74,7 +75,6 @@
   .status .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
   .status.ok .dot { background: var(--ok); }
   .status.bad .dot { background: var(--bad); }
-  .oldlink { font-size: 13px; color: var(--muted); }
 
   /* Nav */
   nav.tabs { display: flex; gap: 2px; flex-wrap: wrap; padding: 0 12px;
@@ -488,7 +488,6 @@
   <span class="wordmark">Admin</span>
   <span class="spacer"></span>
   <span id="apiStatus" class="status"><span class="dot"></span><span class="label">checking…</span></span>
-  <a class="oldlink" href="/admin-old">old admin ↗</a>
 </header>
 
 <nav class="tabs" id="tabs"></nav>

@@ -1569,3 +1569,42 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      historical window is now only a Motion-tuning sweep, which is also where its progress always
      showed; Identify stays as Activity's one backfill. `/api/analysis/run`'s `reanalyze` +
      `motion_only` are untouched (the tuning sweeps use both), so this dropped a caller, not a path.
+
+250. User playback steps VISIT to visit: the Prev/Next pair moved out of the frame-controls row
+     into the footer beside the flag, as `‹ Newer` / `Older ›` around a `12 / 40` position readout.
+     They already hopped visits — sitting among Play/scrub/count they READ as frame stepping, and
+     they squeezed the scrub slider to ~40px on a phone (measured 158px after). Below 480px the nav
+     takes its own full-width line, arrows at the screen edges.
+     Spec: docs/specs/2026-07-31-user-visit-swipe-nav.md.
+
+251. A horizontal swipe on the played frame does the same hop, with the frame tracking the finger
+     — so the gesture is self-teaching rather than a silent jump. Swipe left = older, matching the
+     newest-first feed. Damped to a third at either end.
+     The ease-back is the "that didn't take" cue, so it plays ONLY when the visit doesn't change
+     (short drag, refusal at an end, cancel); a committed hop drops the transform instantly, since
+     animating it back would read as the gesture bouncing off the swipe that worked.
+
+252. Two rails the swipe needs. A second finger DISARMS the gesture: merely ignoring its
+     `touchstart` left the first armed, so a pinch ended with a large `dx` and hopped visits.
+     And there is deliberately NO `touch-action` on the stage — `pan-y` would kill pinch-zoom on
+     the one image worth zooming; the axis latch calls `preventDefault` only once a drag has
+     committed to horizontal, which claims the axis without taking the browser's own gestures.
+
+253. `.stage` gained `min-height: 0` so it is the dialog column's shrinking item. A flex item's
+     default `min-height: auto` won't shrink below its aspect-ratio height, so the new footer line
+     overflowed `max-height: 94vh` and `overflow: hidden` CLIPPED the nav — the one control that
+     must stay reachable. Not a `vh` cap: any value low enough to save a 568px phone also shrinks
+     the frame on a tall desktop.
+
+254. The visit-position readout never asserts an absolute it can't support, and there are TWO ways
+     it couldn't. It carries `/api/events`' `truncated` flag (the user page dropped it) → `40+` and
+     "oldest loaded"; and it hedges to "newest/oldest SHOWN" whenever a toggle is hiding events —
+     the common case, since `showAll` defaults off and nav walks the FILTERED list, so a bare
+     "newest" is a lie on the default view. "shown" subsumes a capped feed, so it wins over "loaded".
+
+255. The playback dialog's `aria-label` carries the same health + flag sentences the feed rows do,
+     via one shared `visitAriaExtras` so the two can't claim different things about one visit. The
+     flag fragment is elsewhere called the ONLY signal a visit is marked for a screen reader, and
+     the dialog is where it gets toggled.
+     Known limit: a hop is still silent to a screen reader — re-labelling an already-open
+     `aria-modal` dialog isn't reliably announced and focus stays on the pressed button.

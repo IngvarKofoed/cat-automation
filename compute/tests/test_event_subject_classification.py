@@ -572,3 +572,34 @@ def test_events_partial_stamped_floor_fills_missing_key_from_default(tmp_path):
     (f1,) = _one_event_ids(store, base, 1, area=0.1)  # < 0.5 stamped min_area; 1 < default min_frames
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "motion_only"
+
+
+def test_verdicts_on_frames_between_events_never_reach_a_subject(tmp_path):
+    """A detection on a frame that lies BETWEEN two events belongs to neither.
+
+    Each annotation read is scoped to one event's own id span, so a row on a
+    non-motion frame in the gap is never even fetched. Under continuous capture
+    those gap frames are the great majority — the whole point of the per-span
+    read — and a cat box there must not label the visits on either side.
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    e1 = _one_event_ids(store, base, 2)
+    # Non-motion frames in the gap: id-wise between the two events, in no span.
+    gap = [_add(store, base + 300 + 50 * i, motion=False) for i in range(3)]
+    e2 = _one_event_ids(store, base + 10 * _VISIT_GAP_MS, 2)
+    assert gap[0] == e1[-1] + 1 and e2[0] == gap[-1] + 1
+
+    # A confident cat box AND a corruption verdict, both only on gap frames.
+    for fid in gap:
+        store.write_analysis(fid, "yolo-serial", 1, 0.9, _boxes_detail([[0, 0, 1, 1, 0.9, _CAT]]))
+        store.write_analysis(fid, _CORRUPTION_ANALYZER, 1, 1.0, None)
+
+    events = store.events(None, None)["events"]
+    assert len(events) == 2
+    for ev in events:
+        # Neither the cat box nor the corruption flag leaked in from the gap.
+        assert ev["subject"]["kind"] not in ("cat", "corrupted")
+        # And the gap rows did not count as this visit's coverage: no motion frame
+        # of either span was swept, so the ratio is "not measured".
+        assert ev["detection"]["ratio"] is None

@@ -736,3 +736,56 @@ def test_events_identity_ignores_identifications_outside_event_spans(tmp_path):
     events = store.events(None, None)["events"]
     assert len(events) == 2
     assert all(ev["identity"] is None for ev in events)
+
+
+def test_events_with_subject_false_omits_subject_but_keeps_identical_identity(tmp_path):
+    """The identity-only path ``cats_overview`` takes must not change the identity.
+
+    That reuse exists so Cats and Activity can never name the same moment
+    differently, so skipping the subject annotation has to leave `identity`
+    byte-identical — only `subject`/`detection` may disappear.
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 3)
+    vid = _add_version(store, threshold=0.5)
+    store.promote_model(vid)
+    cat = store.create_cat("A", is_resident=True)["id"]
+    store.write_identifications_batch([(fid, vid, cat, 0.2, [0, 0, 1, 1]) for fid in ids])
+
+    annotated = store.events(None, None)["events"]
+    identity_only = store.events(None, None, with_subject=False)["events"]
+
+    assert len(annotated) == len(identity_only) == 1
+    # subject/detection are ABSENT (not None) — nothing computed them.
+    assert "subject" not in identity_only[0] and "detection" not in identity_only[0]
+    assert "subject" in annotated[0] and "detection" in annotated[0]
+    # Everything else, identity included, is unchanged.
+    for key, value in annotated[0].items():
+        if key in ("subject", "detection"):
+            continue
+        assert identity_only[0][key] == value
+    assert identity_only[0]["identity"]["cat_id"] == cat
+
+
+def test_events_with_subject_false_skips_the_subject_promotion(tmp_path):
+    """A named match promotes the subject to 'cat' — but only when there IS a subject.
+
+    With no yolo-serial rows the span's subject would be motion-only, which a
+    confident named identity promotes to 'cat'. The identity-only path must skip
+    that promotion rather than KeyError on the subject it never built.
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2)
+    vid = _add_version(store, threshold=0.5)
+    store.promote_model(vid)
+    cat = store.create_cat("A", is_resident=True)["id"]
+    store.write_identifications_batch([(fid, vid, cat, 0.1, [0, 0, 1, 1]) for fid in ids])
+
+    # With the annotation on, the named match promotes the subject.
+    assert store.events(None, None)["events"][0]["subject"]["kind"] == "cat"
+    # With it off, the call still succeeds and still names the cat.
+    ev = store.events(None, None, with_subject=False)["events"][0]
+    assert "subject" not in ev
+    assert ev["identity"]["cat_name"] == "A"

@@ -277,6 +277,16 @@
         .empty .big { font-family: var(--font-display); font-size: 1.15rem; color: var(--ink); margin-bottom: .25rem; }
         .empty.hidden { display: none; }
 
+        /* The paged feed's foot: "loading older…" / the end-stop. Empty text collapses
+           it, so a feed with more to load reserves no gap. */
+        .feed-foot {
+            text-align: center;
+            color: var(--muted);
+            font-size: .85rem;
+            padding: 0 1rem;
+        }
+        .feed-foot:not(:empty) { padding: 1.25rem 1rem 1.75rem; }
+
         /* ================= identity chip ================= */
         .chip {
             display: inline-flex;
@@ -782,6 +792,11 @@
             <div class="empty hidden" id="activityEmpty"></div>
 
             <div id="activityRail"></div>
+            <!-- The infinite-scroll sentinel: scrolling it into view asks for the next
+                 older page. It sits BELOW the foot text so the text is already on screen
+                 when the fetch starts. -->
+            <div class="feed-foot" id="feedFoot"></div>
+            <div id="feedSentinel" aria-hidden="true"></div>
         </section>
 
         <!-- ============ CATS ============ -->
@@ -869,15 +884,31 @@
         const MAX_PLAY_FRAMES = 240;           // cap sampled/played frames per event
         const PLAYER_FPS_MS = 200;             // ~5 fps, matches the ~5 fps capture
         const PRELOAD_AHEAD = 16;              // frames preloaded ahead of the current one
+        const EVENTS_PAGE = 100;               // visits per feed page; older pages load on scroll
+        // The nav readout's note while an edge hop's page is in flight. Named because the
+        // landing page has to recognise its own note to clear it.
+        const NAV_LOADING_NOTE = 'loading older…';
+        // How early (px before the sentinel reaches the viewport) the next page is
+        // fetched, so scrolling stays continuous instead of stopping at each page edge.
+        // ONE constant for the observer's rootMargin and the still-in-view re-check, so
+        // the two can't disagree about where the trigger window is.
+        const FEED_PREFETCH_PX = 600;
 
         // ================= state =================
         let route = 'activity';
 
         let activityEvents = [], activityVisible = [];
-        // /api/events caps its scan, so the feed may not reach the oldest visit. Carried
-        // (the page used to drop it) because the visit-position readout would otherwise
-        // assert a total the backend already told us is incomplete.
+        // Older visits exist beyond what is loaded — the LAST page's `truncated`. Two
+        // consumers: the visit-position readout, which must not assert a total the
+        // backend already told us is incomplete, and the infinite scroll, for which it
+        // IS the "another page exists" test. One flag, because it answers one question.
         let activityTruncated = false;
+        // Infinite scroll (the feed is paged; see EVENTS_PAGE). One in-flight page at a
+        // time — appends are strictly sequential, so a busy flag is the whole guard.
+        let activityPaging = false;
+        // Day-group cursor, kept across appends so an appended page continues the last
+        // day's rail instead of restarting the grouping.
+        let railLastDay = null, railCurrent = null;
         let catHasAvatar = {};   // cat_id -> has a photo (from /api/cats/overview); gates avatar requests
         let catAvatarVer = {};   // cat_id -> avatar_version (mtime); stamped on the URL so it caches yet busts on change
         let activitySeq = 0, activitySelectedIndex = -1;
@@ -919,6 +950,7 @@
         const showAllEl = $('showAll');
         const activityErrorEl = $('activityError');
         const activityEmptyEl = $('activityEmpty'), railEl = $('activityRail');
+        const feedFootEl = $('feedFoot'), feedSentinelEl = $('feedSentinel');
         const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
         const modalEl = $('playerModal'), dialogEl = $('playerDialog');
         const playerImgEl = $('playerImg'), playerWhenEl = $('playerWhen'), playerChipSlotEl = $('playerChipSlot');
@@ -1251,11 +1283,105 @@
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
 
         // ================= ACTIVITY view =================
-        // No date picker — just the recent visits, newest first. /api/events returns the
-        // newest events (clustered motion, capped server-side); the client renders them
-        // newest-first. Reloaded each time the view is entered so it stays fresh.
+        // No date picker — just the recent visits, newest first, one EVENTS_PAGE at a
+        // time with older pages loading as you scroll. Reloaded each time the view is
+        // entered so it stays fresh.
         async function enterActivity() {
             loadRecentActivity();
+        }
+
+        // Fetch the page of visits OLDER than everything loaded and append it.
+        // Keyset, not offset: `until_id` is one below the oldest loaded event's
+        // start_id, so a page can neither overlap nor skip, and costs the same as
+        // page 1 no matter how deep we are.
+        async function loadOlderActivity() {
+            if (activityPaging || !activityTruncated || !activityEvents.length) return;
+            // reduce, not Math.min(...spread): paging makes this array unbounded, and a
+            // spread of enough arguments throws RangeError — here, before the try block,
+            // so it would surface as an unhandled rejection with no visible error at all.
+            const untilId = activityEvents.reduce((m, ev) => Math.min(m, ev.start_id), Infinity) - 1;
+            // Past the store's first frame — there is nothing older to ask for.
+            if (untilId < 1) { activityTruncated = false; updateFeedFoot(); return; }
+            activityPaging = true;
+            const seq = activitySeq;
+            updateFeedFoot();
+            try {
+                const res = await fetch(`/api/events?limit=${EVENTS_PAGE}&until_id=${untilId}`);
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const data = await res.json();
+                // A page-1 reload landed while this was in flight; its events replaced
+                // ours, so appending this page would splice a stale window into the feed.
+                if (seq !== activitySeq) return;
+                const older = data.events || [];
+                activityEvents = activityEvents.concat(older);
+                // An empty page means we ran past the oldest retained visit, whatever
+                // the flag says.
+                activityTruncated = older.length ? !!data.truncated : false;
+                appendActivityRows(older);
+                // The player may be open on the last loaded visit: its Older button was
+                // disabled at the end of the list and this page just extended it. Drop
+                // the "loading older…" note with it — the hop it refused now works, so
+                // leaving it up would explain a button that is no longer blocked.
+                if (playerOpen()) {
+                    if (navEndNote === NAV_LOADING_NOTE) navEndNote = '';
+                    updatePlayerNav();
+                }
+            } catch (err) {
+                if (seq === activitySeq) {
+                    showNote(activityErrorEl, `Couldn't load older visits: ${err.message}`);
+                    // That note lives on the page BEHIND the playback modal, so a reader who
+                    // triggered this from the player's Older never sees it — and the readout
+                    // would keep promising "loading older…" for a fetch that already failed.
+                    // Say so where they are actually looking.
+                    if (playerOpen() && navEndNote === NAV_LOADING_NOTE) {
+                        navEndNote = 'older visits failed';
+                        updatePlayerNav();
+                    }
+                }
+            } finally {
+                // Both cleared UNCONDITIONALLY. The flag is global, not per-sequence, so
+                // skipping it when a page-1 reload superseded us would leave it stuck true
+                // and block every later page for the rest of the session. And the foot must
+                // be repainted even then: the superseding render ran while the flag was
+                // still true, so it painted "Loading older visits…" — and if only the
+                // winner repaints, that lie stays on screen until some later append.
+                activityPaging = false;
+                updateFeedFoot();
+                if (seq === activitySeq) maybeContinuePaging();
+            }
+        }
+
+        // IntersectionObserver fires on a CROSSING, not on "still visible", so any render
+        // that leaves the sentinel already in view gets no callback and the chain stalls
+        // with nothing coming. Both renders can do that:
+        //   - an appended page that failed to push the sentinel back off screen (every
+        //     visit on it filtered out, so the feed grew by nothing; or a short page), and
+        //   - a page-1 reload landing while the reader sits at the bottom, which is the
+        //     foreground-resume path: it rebuilds to one page, scroll clamps to the new
+        //     (shorter) bottom, and the reader is parked ON the sentinel — dead-ended until
+        //     they scroll up and back down to manufacture a crossing.
+        // So re-check by geometry after either. Deferred, not recursive, so a long chain
+        // doesn't nest; terminates when the sentinel moves off screen or nothing is left.
+        function maybeContinuePaging() {
+            if (route === 'activity' && activityTruncated && sentinelInView()) {
+                setTimeout(loadOlderActivity, 0);
+            }
+        }
+
+        // Is the paging sentinel within the observer's own trigger window?
+        function sentinelInView() {
+            const r = feedSentinelEl.getBoundingClientRect();
+            return r.top <= window.innerHeight + FEED_PREFETCH_PX && r.bottom >= -FEED_PREFETCH_PX;
+        }
+
+        // The feed's foot: "loading older…" while a page is in flight, and the end-stop
+        // once there is nothing older. A silent end would leave a reader scrolling at a
+        // list that simply stops, unable to tell "that's all" from "still loading".
+        function updateFeedFoot() {
+            if (activityPaging) { feedFootEl.textContent = 'Loading older visits…'; return; }
+            // Only claim the end once something is actually shown — the empty-state
+            // panel already speaks for a feed with nothing in it.
+            feedFootEl.textContent = (!activityTruncated && activityVisible.length) ? 'That’s all we kept.' : '';
         }
 
         async function loadRecentActivity() {
@@ -1270,7 +1396,7 @@
                 // tiny table read, and without it a card can't show whether it is
                 // already marked.
                 const [eres, cres, fres] = await Promise.all([
-                    fetch('/api/events'),
+                    fetch(`/api/events?limit=${EVENTS_PAGE}`),
                     fetch('/api/cats/overview'),
                     fetch('/api/label/flags'),
                 ]);
@@ -1295,6 +1421,7 @@
                 activityEvents = edata.events || [];
                 activityTruncated = !!edata.truncated;
                 renderActivity();
+                maybeContinuePaging();
             } catch (err) {
                 if (seq === activitySeq) showNote(activityErrorEl, `Couldn't load activity: ${err.message}`);
             }
@@ -1302,6 +1429,13 @@
 
         function renderActivity() {
             railEl.innerHTML = '';
+            // Reset the day cursor HERE, beside the clear it belongs to — never in the
+            // non-empty path below, which the empty branch returns before reaching. A
+            // cursor left pointing at a rail node that `innerHTML = ''` just detached
+            // makes a later appended page invisible: its rows are added to the orphaned
+            // node yet still counted in activityVisible, so the position readout and the
+            // player's nav address rows that are not on screen.
+            railLastDay = null; railCurrent = null;
             activitySelectedIndex = -1;
             activityVisible = activityEvents.filter(passesActivityFilters);
 
@@ -1331,15 +1465,46 @@
                 const p = document.createElement('div'); p.textContent = line;
                 activityEmptyEl.append(b, p);
                 closePlayer();
+                // The panel above says everything; a foot under it would only repeat it.
+                updateFeedFoot();
                 return;
             }
 
             // Build the time-rail: one day-group per calendar day, events newest-first.
-            let lastDay = null, currentRail = null;
-            activityVisible.forEach((ev, i) => {
+            appendRailRows(activityVisible, 0);
+            updateFeedFoot();
+        }
+
+        // Append one freshly-fetched page's rows, leaving everything already rendered
+        // (and the open player's selection) alone. Safe because appended events are
+        // strictly OLDER: they land at the end of `activityVisible`, so every existing
+        // row's index — which is what `data-index` and `activitySelectedIndex` mean —
+        // still points at the same visit.
+        function appendActivityRows(newEvents) {
+            const startIndex = activityVisible.length;
+            const shown = newEvents.filter(passesActivityFilters);
+            if (!shown.length) { updateFeedFoot(); return; }
+            // The empty-state panel is showing whenever the previous render found nothing
+            // to show — which is the case this append most often resolves (page 1 all
+            // filtered out, a later page holding the visit worth seeing). Only
+            // renderActivity toggles it, and it is not running here, so without this the
+            // panel keeps claiming "nothing to show" above the row we just added.
+            activityEmptyEl.classList.add('hidden');
+            // A page whose every visit is filtered out leaves the sentinel on screen, so
+            // the observer simply asks for the next page — the feed keeps filling until
+            // it has something to show or runs out.
+            activityVisible = activityVisible.concat(shown);
+            appendRailRows(shown, startIndex);
+            updateFeedFoot();
+        }
+
+        // The shared row-emitting loop, continuing the day grouping from wherever the
+        // last call left it (`railLastDay`/`railCurrent`).
+        function appendRailRows(events, startIndex) {
+            events.forEach((ev, n) => {
                 const dk = startOfDay(ev.start_ts);
-                if (dk !== lastDay) {
-                    lastDay = dk;
+                if (dk !== railLastDay) {
+                    railLastDay = dk;
                     const group = document.createElement('div');
                     group.className = 'day-group';
                     const h = document.createElement('div');
@@ -1349,9 +1514,9 @@
                     rail.className = 'rail';
                     group.append(h, rail);
                     railEl.appendChild(group);
-                    currentRail = rail;
+                    railCurrent = rail;
                 }
-                currentRail.appendChild(eventRow(ev, i));
+                railCurrent.appendChild(eventRow(ev, startIndex + n));
             });
         }
 
@@ -1734,8 +1899,18 @@
                 return;
             }
             if (next >= activityVisible.length) {
-                // "shown" already covers a capped feed, so it wins over "loaded".
-                navEndNote = filtered ? 'oldest shown' : (activityTruncated ? 'oldest loaded' : 'oldest');
+                // At the end of the LOADED pages, not necessarily of the feed. Kick off
+                // the next page and refuse THIS hop rather than awaiting it: the swipe's
+                // ease-back is the "that didn't take" cue, and holding the frame still
+                // mid-gesture while a fetch runs would read as a freeze. The page lands
+                // in a moment and re-enables the button, so the next hop goes through.
+                if (activityTruncated) {
+                    loadOlderActivity();
+                    navEndNote = NAV_LOADING_NOTE;
+                } else {
+                    // "shown" already covers a capped feed, so it wins over "loaded".
+                    navEndNote = filtered ? 'oldest shown' : 'oldest';
+                }
                 updatePlayerNav();
                 return;
             }
@@ -2091,6 +2266,19 @@
             es.addEventListener('error', () => { if (es && es.readyState === EventSource.CLOSED) es = null; });
         }
         function disconnectLive() { if (es) { es.close(); es = null; } }
+
+        // Infinite scroll: the sentinel under the feed asks for the next older page when
+        // it comes into view. `rootMargin` starts the fetch a screen early, so scrolling
+        // stays continuous instead of stopping at the end of each page.
+        // Appending is safe even with playback open (unlike the poll's full reload, which
+        // is guarded off): it only extends the list, never re-renders a row or moves the
+        // selection, so it can't yank frames or scroll position out from under a reader.
+        if ('IntersectionObserver' in window) {
+            new IntersectionObserver((entries) => {
+                if (route !== 'activity') return;
+                if (entries.some(e => e.isIntersecting)) loadOlderActivity();
+            }, { rootMargin: `${FEED_PREFETCH_PX}px 0px` }).observe(feedSentinelEl);
+        }
 
         // Resume-from-background is the main case: visibilitychange fires when iOS brings
         // the frozen WebView back on screen — pull fresh data immediately, then resume

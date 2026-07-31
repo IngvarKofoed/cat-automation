@@ -79,6 +79,16 @@ _APPLE_TOUCH_ICON = _WEB_DIR / "user" / "apple-touch-icon.png"
 _SSE_POLL_SECONDS = 3.0
 _SSE_HEARTBEAT_TICKS = 7
 
+# One page of the activity feed. Deliberately far below the store's `_MAX_EVENTS`
+# (500) hard cap: cost scales with the page, so a page of 100 measured ~18 ms vs
+# ~49 ms for 500 at 1.5M frames, and both dashboards page older on demand rather
+# than paying for visits nobody scrolled to. Below ~50 the gain flattens against
+# the feed's fixed floor (the motion-frame scan + clustering), so 100 is the knee.
+# NOT used by `Store.events`'s own default, which `cats_overview` relies on staying
+# wide — it walks the feed for the newest event naming each cat, so a 100-event
+# window would shorten every "last seen" it can report.
+_EVENTS_PAGE = 100
+
 # Config via environment variables (the edge's style; the compute tier has no
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
 _ENV_DIR = "CAT_COLLECT_DIR"
@@ -1354,6 +1364,7 @@ def create_app(
         since_id: "int | None" = Query(default=None),
         until_id: "int | None" = Query(default=None),
         min_frames: int = Query(default=1),
+        limit: int = Query(default=_EVENTS_PAGE),
     ):
         # The user-facing, oracle-free activity feed: motion frames clustered into
         # "what happened at the door" events, newest-first (see the activity-page
@@ -1363,10 +1374,16 @@ def create_app(
         # caveat: this page WANTS motion frames, so motion-only capture doesn't
         # degrade it. The date filter is resolved to since_id/until_id client-side
         # via /api/frames/resolve, the same scope every windowed read takes.
+        #
+        # `limit` is ONE PAGE of the feed. Paging is keyset, not offset: a client walks
+        # older by re-requesting with `until_id` = (oldest loaded event's start_id - 1),
+        # so page N costs the same as page 1 — measured equal at 1.5M frames — and pages
+        # can never overlap or skip an event. `truncated` says whether older events exist
+        # beyond the page, which is what tells a client there is another page to fetch.
         _validate_bounds(since_id, until_id)
-        # min_frames is clamped to >= 1 inside Store.events (the single source of
-        # truth for the clamp), so the route passes it straight through.
-        return store.events(since_id, until_id, min_frames=min_frames)
+        # min_frames and limit are both clamped inside Store.events (the single source of
+        # truth for those clamps), so the route passes them straight through.
+        return store.events(since_id, until_id, min_frames=min_frames, limit=limit)
 
     @app.get("/api/events/stream")
     async def api_events_stream(request: Request):

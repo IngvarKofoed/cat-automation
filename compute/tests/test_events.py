@@ -253,3 +253,70 @@ def test_api_events_min_frames_clamps_to_at_least_one(api_client):
     body = resp.json()
     assert len(body["events"]) == 1
     assert body["events"][0]["n_frames"] == 1
+
+
+# --- paging: `limit` + the until_id keyset --------------------------------
+
+
+def _distinct_events(store, n: int, base: int = 1_700_000_000_000) -> "list[int]":
+    """Add ``n`` one-frame events, each past the visit gap → their store ids, oldest first."""
+    return [
+        store.add(_frame(frame_id=i + 1, motion=True, area=0.2), recv_ts_ms=base + i * 10 * _VISIT_GAP_MS)
+        for i in range(n)
+    ]
+
+
+def test_api_events_limit_caps_the_page_and_reports_more_exist(api_client):
+    client, store = api_client
+    _distinct_events(store, 5)
+
+    body = client.get("/api/events", params={"limit": 2}).json()
+    assert len(body["events"]) == 2
+    # Newest-first, and `truncated` is what tells a client another page exists.
+    assert body["events"][0]["start_ts"] > body["events"][1]["start_ts"]
+    assert body["truncated"] is True
+
+
+def test_api_events_paging_walks_older_without_overlap_or_gap(api_client):
+    client, store = api_client
+    ids = _distinct_events(store, 5)  # oldest → newest
+
+    seen = []
+    until_id = None
+    for _ in range(3):  # 5 events over pages of 2 → 3 requests
+        params = {"limit": 2}
+        if until_id is not None:
+            params["until_id"] = until_id
+        body = client.get("/api/events", params=params).json()
+        page = body["events"]
+        seen.extend(page)
+        if not body["truncated"] or not page:
+            break
+        # The keyset the dashboards use: one below the oldest event on the page.
+        until_id = min(ev["start_id"] for ev in page) - 1
+
+    # Every event exactly once, newest-first, no duplicate and none skipped.
+    assert [ev["start_id"] for ev in seen] == list(reversed(ids))
+
+
+def test_api_events_last_page_reports_nothing_older(api_client):
+    client, store = api_client
+    ids = _distinct_events(store, 3)
+
+    # Scoped below the second-oldest event → only the oldest remains, so the feed has
+    # reached the end and must NOT claim more exist (the paging stop condition).
+    body = client.get("/api/events", params={"limit": 2, "until_id": ids[1] - 1}).json()
+    assert [ev["start_id"] for ev in body["events"]] == [ids[0]]
+    assert body["truncated"] is False
+
+
+def test_api_events_limit_is_clamped_not_rejected(api_client):
+    client, store = api_client
+    _distinct_events(store, 3)
+
+    # Non-positive clamps up to 1 (like min_frames), absurdly large clamps down to the
+    # store's own _MAX_EVENTS cap — neither is an error.
+    assert len(client.get("/api/events", params={"limit": 0}).json()["events"]) == 1
+    body = client.get("/api/events", params={"limit": 10_000}).json()
+    assert len(body["events"]) == 3
+    assert body["truncated"] is False

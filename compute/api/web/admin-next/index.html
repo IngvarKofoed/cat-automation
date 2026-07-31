@@ -526,6 +526,9 @@
     return ct.includes('json') ? res.json() : res.text();
   }
   const $ = (sel, root = document) => root.querySelector(sel);
+  // One page of the Activity feed. Cost scales with the page (~18 ms vs ~49 ms for 500
+  // at 1.5M frames), so the feed loads a page and walks older on demand.
+  const EVENTS_PAGE = 100;
   function fmtBytes(n) {
     if (n == null) return '—';
     const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, v = n;
@@ -3626,11 +3629,20 @@
       <div class="card">
         <h3>Recent visits <span class="note">(click to play)</span></h3>
         <div id="acGrid" class="fgrid"><span class="note">Loading…</span></div>
+        <div class="row" style="margin-top:8px">
+          <span id="acCount" class="note grow"></span>
+          <button id="acOlder" hidden>Show older</button>
+        </div>
       </div>
     `;
 
     let alive = true;
     let events = [];
+    // Older visits exist beyond the loaded pages (the last page's `truncated`), and one
+    // page fetch at a time. The feed is paged: EVENTS_PAGE visits per request, walked
+    // older by keyset (`until_id`), so a deep page costs what page 1 costs.
+    // `feedSeq` makes Reload win over an older-page fetch still in flight.
+    let more = false, paging = false, feedSeq = 0;
     let modal = null, playerTimer = null;
     // Serializes overlapping openPlayer() calls. It fetches its frames BEFORE building
     // the modal, so two clicks during that fetch would each build one — the first left
@@ -3639,16 +3651,39 @@
     // opens a visit.
     let playerSeq = 0;
 
+    // reduce, not Math.min(...spread): paging makes `events` unbounded, and a spread of
+    // enough arguments throws RangeError — from here that lands before identifyPass's try,
+    // i.e. an unhandled rejection with nothing shown to the operator.
     const span = () => {
       if (!events.length) return null;
-      return { since_id: Math.min(...events.map((e) => e.start_id)), until_id: Math.max(...events.map((e) => e.end_id)) };
+      return {
+        since_id: events.reduce((m, e) => Math.min(m, e.start_id), Infinity),
+        until_id: events.reduce((m, e) => Math.max(m, e.end_id), -Infinity),
+      };
     };
     const flash = (m) => { $('#acNote', view).textContent = m; };
+
+    // The paging foot. Runs BEFORE renderGrid's early returns, because the state it
+    // shows is about the LOADED SET, not about what the filter left visible — a grid
+    // reading "all hidden by the filter" is exactly when the operator wants to pull
+    // older visits in, so freezing the button there would strand them.
+    function renderFoot() {
+      // Say how many are loaded and whether that is all of them — a grid that just
+      // stops looks the same as one showing everything there is.
+      $('#acCount', view).textContent = events.length
+        ? `${fmtInt(events.length)} visit${events.length === 1 ? '' : 's'} loaded${more ? '' : ' · that is all'}`
+        : '';
+      const btn = $('#acOlder', view);
+      btn.hidden = !more;
+      btn.disabled = paging;
+      btn.textContent = paging ? 'Loading…' : 'Show older';
+    }
 
     function renderGrid() {
       const grid = $('#acGrid', view);
       const hide = $('#acHide', view).checked;
       const shown = events.map((e, i) => [e, i]).filter(([e]) => !(hide && identityKind(e.identity) === 'resident'));
+      renderFoot();
       if (!events.length) { grid.innerHTML = '<span class="note">No visits yet.</span>'; return; }
       if (!shown.length) { grid.innerHTML = '<span class="note">All hidden by the filter.</span>'; return; }
       const p = (x) => String(x).padStart(2, '0');
@@ -3664,8 +3699,46 @@
     }
     async function loadEvents() {
       const grid = $('#acGrid', view); grid.innerHTML = '<span class="note">Loading…</span>';
-      try { const d = await api('GET', '/api/events'); if (!alive) return; events = Array.isArray(d) ? d : (d.events || []); renderGrid(); }
-      catch (e) { grid.innerHTML = `<span class="note bad">${e.message}</span>`; }
+      const seq = ++feedSeq;   // supersedes any older-page fetch still in flight
+      try {
+        const d = await api('GET', `/api/events?limit=${EVENTS_PAGE}`);
+        if (!alive || seq !== feedSeq) return;
+        events = Array.isArray(d) ? d : (d.events || []);
+        more = !Array.isArray(d) && !!d.truncated;
+        renderGrid();
+      } catch (e) { grid.innerHTML = `<span class="note bad">${e.message}</span>`; }
+    }
+    // Append the page of visits OLDER than everything loaded. Keyset off the oldest
+    // loaded start_id, so pages can neither overlap nor skip a visit. Indices only ever
+    // grow at the end, so an open player's `idx` keeps pointing at the same visit.
+    async function loadOlderEvents() {
+      if (paging || !more || !events.length) return;
+      const untilId = events.reduce((m, e) => Math.min(m, e.start_id), Infinity) - 1;
+      if (untilId < 1) { more = false; renderGrid(); return; }
+      paging = true; renderGrid();
+      const seq = feedSeq;
+      try {
+        const d = await api('GET', `/api/events?limit=${EVENTS_PAGE}&until_id=${untilId}`);
+        // Reload replaced the loaded set while this was in flight: its keyset was
+        // computed against the OLD set, so appending it now could duplicate a visit or
+        // leave a hole — and the indices the grid's click handlers carry would no longer
+        // address the visits they were built from.
+        if (!alive || seq !== feedSeq) return;
+        const older = d.events || [];
+        events = events.concat(older);
+        // An empty page means there is nothing older left, whatever the flag says.
+        more = older.length ? !!d.truncated : false;
+      } catch (e) { flash('Older visits: ' + e.message); }
+      // `paging` and the foot are BOTH refreshed unconditionally. The flag is a global
+      // in-flight marker, so leaving it set after a superseded page would block every
+      // later page; and Reload's own render ran while it was still true, painting the
+      // button disabled/'Loading…' — if only the winner repaints, the button stays stuck
+      // that way until some unrelated re-render. Only the GRID stays sequence-gated.
+      finally {
+        paging = false;
+        if (alive) renderFoot();
+        if (alive && seq === feedSeq) renderGrid();
+      }
     }
 
     function closeModal() { if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } if (modal) { modal.remove(); modal = null; } }
@@ -3737,12 +3810,20 @@
 
     async function identifyPass() {
       const s = span(); if (!s) return;
-      try { await api('POST', '/api/identify/run', s); flash('Identify enqueued — progress on Model building.'); }
-      catch (e) { flash('Identify: ' + e.message); }
+      try {
+        await api('POST', '/api/identify/run', s);
+        // NAME the scope. The span is the LOADED visits' id range, which paging made a
+        // page of 100 rather than the ~500 an unpaged feed used to hand it — so the same
+        // click now backfills a narrower window, and the only honest cue is to say which.
+        // "Show older" first to widen it.
+        flash(`Identify enqueued over the ${fmtInt(events.length)} loaded visit${events.length === 1 ? '' : 's'}`
+              + `${more ? ' (Show older first to cover more)' : ''} — progress on Model building.`);
+      } catch (e) { flash('Identify: ' + e.message); }
     }
     $('#acReload', view).addEventListener('click', loadEvents);
     $('#acHide', view).addEventListener('change', renderGrid);
     $('#acIdentify', view).addEventListener('click', identifyPass);
+    $('#acOlder', view).addEventListener('click', loadOlderEvents);
 
     loadEvents();
     return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };

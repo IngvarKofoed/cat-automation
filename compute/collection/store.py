@@ -3726,6 +3726,7 @@ class Store:
         *,
         min_frames: int = 1,
         limit: int = _MAX_EVENTS,
+        with_subject: bool = True,
     ) -> dict:
         """The user-facing activity feed: motion frames clustered into events, newest-first.
 
@@ -3798,6 +3799,12 @@ class Store:
         ``truncated`` is True when the ``limit`` cap dropped events OR the frame-scan
         cap was hit (older events exist beyond the read window) — either way the UI
         prompts for a narrower date range.
+
+        ``with_subject=False`` skips the ``subject``/``detection`` annotation (and the
+        per-span ``analysis`` reads that feed it), returning records WITHOUT those two
+        keys. For identity-only callers — ``cats_overview`` reuses this feed purely for
+        "which cat, when", and computing a subject it never reads is the single most
+        expensive part of the call.
         """
         limit = max(1, min(int(limit), _MAX_EVENTS))
         min_frames = max(1, int(min_frames))
@@ -3872,8 +3879,18 @@ class Store:
         # motion floor (next): fetched once, lock free (clustering released it), and
         # `active_model()` re-acquires the lock per the single-lock discipline.
         model = self.active_model()
-        lo = min(e["start_id"] for e in events)
-        hi = max(e["end_id"] for e in events)
+        # Every annotation read below is scoped to each event's OWN id span, one
+        # indexed range read per event, NOT one read over the events' overall
+        # [min start_id, max end_id] envelope. The envelope is the wrong unit: the
+        # returned events are the newest `limit` clusters, so it stretches across
+        # every frame between the oldest and newest of them — and under continuous
+        # capture the ~95% of those frames that fall BETWEEN visits carry rows that
+        # match no event and are discarded after being materialised. Measured at 1.5M
+        # frames with a full yolo-serial sweep: 530 ms for 1.5M envelope rows vs 9 ms
+        # for the 20k that actually lie inside a span, all of it under the shared write
+        # lock (so the envelope read also stalled the collector). Per-span keeps the
+        # cost proportional to what the feed shows, flat in store size.
+        spans = [(e["start_id"], e["end_id"]) for e in events]
 
         # --- Read-time subject classification (event-subject-classification spec).
         # Annotate each RETURNED event with a `subject` — YOLO's "what is it" — from
@@ -3888,84 +3905,101 @@ class Store:
         # min_frames — no model, metrics None, no subject_floor key, a too-few-visits None,
         # or even a floor dict lacking a key all fall back per-key. _classify_subject indexes
         # both, so a partial floor must never KeyError the whole feed.
-        _metrics = (model or {}).get("metrics") or {}
-        _stamped_floor = _metrics.get("subject_floor")
-        floor = {**_SUBJECT_FLOOR_DEFAULT, **(_stamped_floor if isinstance(_stamped_floor, dict) else {})}
-        with self._lock:
-            # frame_id-ORDERED so each event's span is a contiguous slice found by
-            # bisect (like the identity join), and ALL verdicts (no verdict filter).
-            # JOIN frames.motion so the per-visit detection aggregates can count only
-            # the visit's MOTION frames (a yolo-serial row can ride a non-motion frame
-            # whose id falls inside the span under continuous capture — that must NOT
-            # count toward the ratio; the subject ladder's class_conf still merges over
-            # all rows, unchanged).
-            subj_rows = self._conn.execute(
-                "SELECT a.frame_id, a.detail, f.motion FROM analysis a"
-                " JOIN frames f ON f.id = a.frame_id"
-                " WHERE a.analyzer = 'yolo-serial' AND a.frame_id BETWEEN ? AND ?"
-                " ORDER BY a.frame_id ASC",
-                (int(lo), int(hi)),
-            ).fetchall()
-            # Corruption presence: ANY frame in the visit's id span [start_id, end_id] with a
-            # corruption verdict=1 — motion or not; a glitch anywhere in the visit's window is
-            # enough — sliced per event by bisect like subj_rows. No-detection + this →
-            # `corrupted`. Deliberately NOT motion-filtered: a corruption-adjacent missed cat
-            # landing in `corrupted` is an accepted loss — YOLO misses on corruption-FREE
-            # visits (plain `unrecognized`) are plentiful and cleaner to learn from, a miss
-            # co-occurring with corruption is confounded anyway, and `corrupted` stays
-            # reachable. Read-time — no such frames → can't fire, stays `unrecognized`.
-            corrupt_rows = self._conn.execute(
-                "SELECT frame_id FROM analysis"
-                " WHERE analyzer = ? AND verdict = 1 AND frame_id BETWEEN ? AND ?"
-                " ORDER BY frame_id ASC",
-                (_CORRUPTION_ANALYZER, int(lo), int(hi)),
-            ).fetchall()
-        subj_fids = [r[0] for r in subj_rows]
-        corrupt_fids = [r[0] for r in corrupt_rows]
-        # The detection classes the aggregates combine into one density signal.
-        _det_classes = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID)
-        for event in events:
-            e_lo, e_hi = event["start_id"], event["end_id"]
-            lo_i = bisect.bisect_left(subj_fids, e_lo)
-            hi_i = bisect.bisect_right(subj_fids, e_hi)
-            # Merge each frame's per-class max confidence into a span-wide max (subject
-            # ladder), AND collect the per-MOTION-frame max detection confidence over
-            # {cat, person} — RAW, no _ANNOTATE_MIN_CONF floor (record the full
-            # distribution for the future eval feature; the ladder keeps its own floor).
-            class_conf: "dict[int, float]" = {}
-            det_frame_confs: "list[float]" = []  # per motion frame with >=1 detection
-            n_swept_motion = 0  # the visit's motion frames that carry a yolo-serial row
-            for _fid, detail, motion in subj_rows[lo_i:hi_i]:
-                classes = self._subject_classes(detail)
-                for cls, conf in classes.items():
-                    if conf > class_conf.get(cls, 0.0):
-                        class_conf[cls] = conf
-                if motion:
-                    n_swept_motion += 1
-                    frame_confs = [classes[c] for c in _det_classes if c in classes]
-                    if frame_confs:
-                        det_frame_confs.append(max(frame_confs))
-            # ratio DISTINGUISHES "not measured" from "measured miss": null (UI '-') when
-            # NONE of the visit's motion frames were swept (coverage unknown), vs 0.0 (a
-            # real YOLO miss) when swept but nothing detected — so a future recall stat can
-            # tell the two apart. Denominator is the visit's motion-frame count (n_frames);
-            # a PARTIALLY-swept visit therefore deflates ratio (accepted edge case — the
-            # live-identify worker sweeps whole visits). conf_max/conf_mean are over the
-            # per-motion-frame max detection confidences, null when there are none.
-            n_motion = event["n_frames"]
-            event["detection"] = {
-                "ratio": None if n_swept_motion == 0 else (len(det_frame_confs) / n_motion),
-                "conf_max": max(det_frame_confs) if det_frame_confs else None,
-                "conf_mean": (sum(det_frame_confs) / len(det_frame_confs)) if det_frame_confs else None,
-            }
-            # Corruption present iff any corruption verdict=1 frame falls in this span.
-            c_lo = bisect.bisect_left(corrupt_fids, e_lo)
-            c_hi = bisect.bisect_right(corrupt_fids, e_hi)
-            corruption_present = c_hi > c_lo
-            event["subject"] = self._classify_subject(
-                class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor,
-                corruption_present,
-            )
+        # Skipped wholesale for an identity-only caller (`with_subject=False`), which is
+        # what makes `cats_overview`'s reuse of this feed cheap — these two reads plus
+        # their per-row JSON parse are the bulk of the call.
+        if with_subject:
+            _metrics = (model or {}).get("metrics") or {}
+            _stamped_floor = _metrics.get("subject_floor")
+            floor = {**_SUBJECT_FLOOR_DEFAULT, **(_stamped_floor if isinstance(_stamped_floor, dict) else {})}
+            with self._lock:
+                # One read PER EVENT SPAN (see `spans` above), each an indexed range seek,
+                # and ALL verdicts (no verdict filter).
+                # JOIN frames.motion so the per-visit detection aggregates can count only
+                # the visit's MOTION frames (a yolo-serial row can ride a non-motion frame
+                # whose id falls inside the span under continuous capture — that must NOT
+                # count toward the ratio; the subject ladder's class_conf still merges over
+                # all rows, unchanged).
+                # `+a.analyzer` DE-INDEXES that term, exactly as `_resolve_flag` does
+                # (changelog 229, which warned this query shape here still carried the
+                # mis-plan). The store runs no ANALYZE, so with no `sqlite_stat1` SQLite
+                # prefers `idx_analysis_analyzer_verdict` on the equality and scans the
+                # WHOLE yolo-serial partition — once PER SPAN, which the always-on oracle's
+                # full coverage makes as big as the store. Measured at 1.5M frames over one
+                # 100-event page: 19.5 s as an indexed equality vs 4.8 ms seeking the
+                # frame_id range (the old envelope query was 538 ms), so without the hint
+                # the per-span read is a 36x REGRESSION on the very path it speeds up.
+                # `+` removes the term from index selection only — results are identical.
+                subj_by_event = [
+                    self._conn.execute(
+                        "SELECT a.detail, f.motion FROM analysis a"
+                        " JOIN frames f ON f.id = a.frame_id"
+                        " WHERE +a.analyzer = 'yolo-serial' AND a.frame_id BETWEEN ? AND ?",
+                        (int(e_lo), int(e_hi)),
+                    ).fetchall()
+                    for e_lo, e_hi in spans
+                ]
+                # Corruption presence: ANY frame in the visit's id span [start_id, end_id] with a
+                # corruption verdict=1 — motion or not; a glitch anywhere in the visit's window is
+                # enough. No-detection + this →
+                # `corrupted`. Deliberately NOT motion-filtered: a corruption-adjacent missed cat
+                # landing in `corrupted` is an accepted loss — YOLO misses on corruption-FREE
+                # visits (plain `unrecognized`) are plentiful and cleaner to learn from, a miss
+                # co-occurring with corruption is confounded anyway, and `corrupted` stays
+                # reachable. Read-time — no such frames → can't fire, stays `unrecognized`.
+                # Only PRESENCE is needed, so this stops at the span's first hit rather than
+                # materialising every corrupt frame id in it.
+                # `+analyzer` for the same reason as above. This one looks free TODAY only
+                # because no corruption verdict=1 rows exist to walk: the (analyzer, verdict)
+                # index seek lands on an empty range. Once a corruption sweep flags any real
+                # fraction of the store, the indexed form walks every corrupt frame per span
+                # while the frame_id seek stays proportional to the span.
+                corrupt_by_event = [
+                    self._conn.execute(
+                        "SELECT 1 FROM analysis"
+                        " WHERE +analyzer = ? AND verdict = 1 AND frame_id BETWEEN ? AND ?"
+                        " LIMIT 1",
+                        (_CORRUPTION_ANALYZER, int(e_lo), int(e_hi)),
+                    ).fetchone() is not None
+                    for e_lo, e_hi in spans
+                ]
+            # The detection classes the aggregates combine into one density signal.
+            _det_classes = (_COCO_CAT_CLASS_ID, _COCO_PERSON_CLASS_ID)
+            for i, event in enumerate(events):
+                # Merge each frame's per-class max confidence into a span-wide max (subject
+                # ladder), AND collect the per-MOTION-frame max detection confidence over
+                # {cat, person} — RAW, no _ANNOTATE_MIN_CONF floor (record the full
+                # distribution for the future eval feature; the ladder keeps its own floor).
+                class_conf: "dict[int, float]" = {}
+                det_frame_confs: "list[float]" = []  # per motion frame with >=1 detection
+                n_swept_motion = 0  # the visit's motion frames that carry a yolo-serial row
+                for detail, motion in subj_by_event[i]:
+                    classes = self._subject_classes(detail)
+                    for cls, conf in classes.items():
+                        if conf > class_conf.get(cls, 0.0):
+                            class_conf[cls] = conf
+                    if motion:
+                        n_swept_motion += 1
+                        frame_confs = [classes[c] for c in _det_classes if c in classes]
+                        if frame_confs:
+                            det_frame_confs.append(max(frame_confs))
+                # ratio DISTINGUISHES "not measured" from "measured miss": null (UI '-') when
+                # NONE of the visit's motion frames were swept (coverage unknown), vs 0.0 (a
+                # real YOLO miss) when swept but nothing detected — so a future recall stat can
+                # tell the two apart. Denominator is the visit's motion-frame count (n_frames);
+                # a PARTIALLY-swept visit therefore deflates ratio (accepted edge case — the
+                # live-identify worker sweeps whole visits). conf_max/conf_mean are over the
+                # per-motion-frame max detection confidences, null when there are none.
+                n_motion = event["n_frames"]
+                event["detection"] = {
+                    "ratio": None if n_swept_motion == 0 else (len(det_frame_confs) / n_motion),
+                    "conf_max": max(det_frame_confs) if det_frame_confs else None,
+                    "conf_mean": (sum(det_frame_confs) / len(det_frame_confs)) if det_frame_confs else None,
+                }
+                event["subject"] = self._classify_subject(
+                    class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor,
+                    corrupt_by_event[i],
+                )
 
         # --- Active-model identity join (identification-gallery-activity spec).
         # Annotate each RETURNED event with the active gallery's aggregated identity
@@ -3977,22 +4011,23 @@ class Store:
                 event["identity"] = None
             return {"events": events, "truncated": truncated}
 
-        # One indexed read of the active model's identifications across the returned
-        # events' overall id span (`lo`/`hi` computed above), plus one cats lookup —
-        # then aggregate per event in pure Python (no numpy). Idents in the gaps
-        # between events match no event's [start_id, end_id] and are simply ignored.
+        # One indexed read of the active model's identifications PER EVENT SPAN (see
+        # `spans` above — never the events' overall envelope, whose between-visit
+        # identifications match no event and would be materialised only to be
+        # discarded), plus one cats lookup — then aggregate per event in pure Python
+        # (no numpy).
         with self._lock:
-            # frame_id-ORDERED so each event's span is a contiguous slice found by
-            # bisect (below) — O(events·log N) instead of a full re-scan per event.
             # `cat_id IS NOT NULL` drops the "processed but un-embeddable" marker rows
             # (see write_identifications_batch): they mark a frame done so the identify
             # pass doesn't re-attempt it, but they carry no identity to aggregate.
-            ident_rows = self._conn.execute(
-                "SELECT frame_id, cat_id, distance FROM identifications"
-                " WHERE model_version_id = ? AND frame_id BETWEEN ? AND ? AND cat_id IS NOT NULL"
-                " ORDER BY frame_id ASC",
-                (int(model["id"]), int(lo), int(hi)),
-            ).fetchall()
+            ident_by_event = [
+                self._conn.execute(
+                    "SELECT cat_id, distance FROM identifications"
+                    " WHERE model_version_id = ? AND frame_id BETWEEN ? AND ? AND cat_id IS NOT NULL",
+                    (int(model["id"]), int(e_lo), int(e_hi)),
+                ).fetchall()
+                for e_lo, e_hi in spans
+            ]
             # Name AND resident flag per cat: the activity feed distinguishes a
             # resident match (our cat — a "known" chip) from a named foreign/neighbour
             # match (a stranger — flagged distinctly) via `is_resident`.
@@ -4001,14 +4036,8 @@ class Store:
             cat_residents = {cid: bool(res) for cid, _name, res in cat_rows}
 
         threshold = model["threshold"]
-        ident_fids = [r[0] for r in ident_rows]
-        for event in events:
-            e_lo, e_hi = event["start_id"], event["end_id"]
-            # Contiguous slice of idents whose frame_id ∈ [e_lo, e_hi]; events are
-            # disjoint motion clusters, so slices never overlap.
-            lo_i = bisect.bisect_left(ident_fids, e_lo)
-            hi_i = bisect.bisect_right(ident_fids, e_hi)
-            span = [(int(cid), float(dist)) for _fid, cid, dist in ident_rows[lo_i:hi_i]]
+        for i, event in enumerate(events):
+            span = [(int(cid), float(dist)) for cid, dist in ident_by_event[i]]
             event["identity"] = self._aggregate_identity(span, threshold, cat_names, cat_residents)
             # A confident NAMED gallery match (resident/neighbour, cat_id set) is a
             # stronger "is a cat" signal than the yolo-serial box confidence the subject
@@ -4021,8 +4050,14 @@ class Store:
             # positive cat detection always wins". An UNKNOWN-cat identity (cat_id None, a
             # far match) is NOT promoted: at low box confidence it may be an empty-scene
             # phantom, so it stays phantom-safe (unrecognized/motion_only).
+            # No `subject` to promote when the caller skipped the classification.
             ident = event["identity"]
-            if ident is not None and ident.get("cat_id") is not None and event["subject"]["kind"] != "cat":
+            if (
+                with_subject
+                and ident is not None
+                and ident.get("cat_id") is not None
+                and event["subject"]["kind"] != "cat"
+            ):
                 event["subject"] = {"kind": "cat"}
         return {"events": events, "truncated": truncated}
 
@@ -6262,8 +6297,12 @@ class Store:
         # Reuse the whole activity feed (newest-first, identity-joined). Walk it once
         # and record the newest matching event per cat — the first hit wins because
         # events() is already sorted newest-first.
+        # `with_subject=False`: only `identity` is read here, and computing the subject
+        # (what the thing IS) is the feed's most expensive annotation. The invariant
+        # this reuse exists for is untouched — identity still comes from the same code
+        # path Activity renders, so the two views can't name a moment differently.
         last_seen: "dict[int, dict]" = {}
-        for event in self.events(None, None)["events"]:
+        for event in self.events(None, None, with_subject=False)["events"]:
             identity = event.get("identity")
             if identity is None:
                 continue

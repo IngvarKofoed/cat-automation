@@ -1608,3 +1608,100 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      the dialog is where it gets toggled.
      Known limit: a hop is still silent to a screen reader — re-labelling an already-open
      `aria-modal` dialog isn't reliably announced and focus stays on the pressed button.
+
+256. `events()` reads its annotations PER EVENT SPAN, not over the events' overall
+     [min start_id, max end_id] envelope. That envelope stretches across every frame between
+     the newest and oldest event, so under continuous capture ~95% of the rows it fetched
+     belonged to no event — materialised, then discarded, all under the shared write lock.
+     Measured at 1.5M frames with a full YOLO sweep, on a store with NO `ANALYZE` stats
+     (what the real one is): `Store.events` 1415 ms → 54 ms for the same 500 events.
+
+257. `cats_overview` takes a new `with_subject=False` path: it reads only `identity`, and the
+     subject/detection annotation it never looked at was the call's most expensive part
+     (964 ms → 17 ms). The reuse-the-feed invariant is intact — identity still comes from the
+     same code Activity renders, so the two views cannot name a moment differently.
+
+258. Remaining headroom on that feed, deliberately not taken: it still fetches the newest
+     `_EVENT_SCAN_FRAMES` (200k) motion frames and clusters them all, to keep only the newest
+     500. Costs ~90 ms once a store's motion tail exceeds the cap (~165 ms/call measured at
+     540k motion frames); an early-stop after `limit` clusters would fix it, at the price of
+     reworking the `truncated`/partial-oldest-cluster semantics.
+
+259. The Activity feed is PAGED, 100 visits per page (`/api/events` gained `limit`), on both
+     dashboards. Cost scales with the page, so page 1 went ~54 ms → ~20 ms; 500 was never a
+     chosen page size, just the store's `_MAX_EVENTS` cap. Below ~50 the gain flattens against
+     the feed's fixed floor, so 100 is the knee.
+     `Store.events`'s own default stays wide — `cats_overview` walks the feed for the newest
+     event naming each cat, so a 100-event window would shorten every "last seen" it reports.
+
+260. Paging is KEYSET, not offset: a page asks for `until_id` = (oldest loaded start_id − 1),
+     so page N costs what page 1 costs (measured equal at 1.5M frames) and pages can neither
+     overlap nor skip a visit. `truncated` is the "another page exists" test. The user feed
+     auto-loads on scroll, admin has a "Show older" button; both report the loaded count and
+     an end-stop, because a list that simply stops looks like one showing everything.
+
+261. Appending a page never disturbs what is already on screen: appended visits are strictly
+     OLDER, so they land at the end and every existing index — what a row's `data-index` and
+     the player's selection mean — still addresses the same visit. That is why a page may be
+     appended with playback OPEN, unlike the poll's full reload, which stays guarded off.
+
+262. Rails the paging needed, each a real failure found in a browser. `IntersectionObserver`
+     fires on a CROSSING, so a page that didn't push the sentinel off screen (every visit
+     filtered out, or a short page) stalled the chain — it now re-checks by geometry and
+     continues. The in-flight flag is cleared UNCONDITIONALLY: skipping it when a page-1
+     reload superseded the fetch left it stuck true and blocked paging for the session.
+     A superseded older page is DISCARDED (its keyset was computed against the old set).
+
+263. Admin's loaded-count + Show-older state renders BEFORE `renderGrid`'s early returns.
+     It describes the LOADED SET, not what the filter left visible — and a grid reading
+     "all hidden by the filter" is exactly when an operator wants to pull older visits in,
+     so freezing the button there stranded them.
+
+264. The player's Older at the last loaded visit now fetches the next page instead of
+     refusing outright, so deep swiping still reaches back. It refuses THIS hop rather than
+     awaiting the page: the ease-back is the "that didn't take" cue, and holding the frame
+     still mid-gesture would read as a freeze. The note clears itself when the page lands,
+     since the hop it explained now works.
+
+265. The per-span reads carry `+analyzer`, DE-INDEXING that term as `_resolve_flag` does.
+     Without it entry 256 was a 36x REGRESSION, not a fix: the store runs no `ANALYZE`, so
+     with no `sqlite_stat1` SQLite prefers `idx_analysis_analyzer_verdict` on the equality
+     and scans the whole yolo-serial partition — once PER SPAN. One 100-event page at 1.5M
+     frames: 19.5 s unhinted vs 4.8 ms hinted (the old envelope query was 538 ms).
+     Entry 229 predicted exactly this and named `events()` as still carrying it.
+
+266. Measure query-plan work on a store with NO `ANALYZE` stats. A bench that runs `ANALYZE`
+     gets a plan the real store never gets, which is how entry 256's numbers came out both
+     too optimistic and measured against the wrong plan — the mis-plan above was invisible
+     until the same queries were re-timed without stats.
+
+267. Paging rails the browser pass missed, all in the append path. The day-group cursor is
+     reset beside `railEl.innerHTML = ''`, not in the non-empty branch the empty path returns
+     before reaching — a cursor pointing at a detached rail made an appended page's rows
+     invisible while still counted in `activityVisible`, so the position readout and the
+     player's nav addressed rows not on screen. Appending also clears the empty-state panel,
+     which otherwise kept claiming "nothing to show" above the row just added.
+
+268. A superseded page repaints the foot/button UNCONDITIONALLY, on both dashboards. The
+     winning render ran while the in-flight flag was still true, so it painted "Loading
+     older…" — and with only the winner repainting, that lie stayed until an unrelated
+     re-render. The flag itself was already cleared unconditionally; the paint was not.
+
+269. Two smaller paging repairs: a FAILED page fetch triggered from the player now says
+     "older visits failed" in the readout (its error note lives on the page BEHIND the modal,
+     so the reader saw only a promise that never resolved); and the keyset bound uses `reduce`
+     rather than `Math.min(...spread)`, since paging made those arrays unbounded and a large
+     enough spread throws RangeError before the try block, as an invisible unhandled rejection.
+
+270. Admin's Identify NAMES the span it enqueues ("over the N loaded visits"), because paging
+     silently narrowed that backfill from ~500 visits to one page of 100. The scope follows the
+     loaded set by design — "Show older" widens it — but nothing said so at the point of the click.
+
+271. Known limits of the paged feed, deliberately left. An empty page carrying `truncated:true`
+     (reachable when a scan-capped window's sole cluster is popped) stops paging: trusting the
+     flag instead would re-request the same `until_id` forever, since no new events move the
+     keyset — a real fix needs the backend to expose the scanned window's floor.
+     Infinite scroll also turns entry 258's fixed floor into one 200k-frame scan per page, on
+     the shared write connection; a short-lived WAL read connection (as `tuning_calendar` and
+     `labeled_visits` use) is the fix if it bites. And user-page paging exists only where
+     `IntersectionObserver` does, with no button fallback.

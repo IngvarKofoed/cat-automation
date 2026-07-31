@@ -425,10 +425,13 @@
   .astage-full { max-width: 420px; flex: 1; min-width: 220px; }
   .astage-full img { width: 100%; height: auto; display: block; border-radius: var(--radius); }
   .acat { font-size: 13px; }
-  /* Labelled review: every crop the visit contributed, carrying the quality grade a
-     gallery build filters on — the one thing a decided visit holds that the queue's
-     rep-crop view never shows. Read-only: grades are auto-seeded, and a re-label
-     re-seeds them, so there is nothing here to edit in place. */
+  /* FLAGGED review's crop strip: every crop the span would contribute, with the grade the
+     queue's formula seeds it — a flagged span is often undecided and unswept, so seeing
+     what it actually holds is the point before deciding it. Read-only (grades are seeded,
+     and a re-label re-seeds them).
+     Labelled review deliberately has NO strip: it showed up to ~100 crops of one visit,
+     which buried the review it exists for, and no reading is made per crop — the grade
+     TALLY on the meta line carries what a gallery build would keep. */
   .afilm { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
     gap: 6px; margin-top: 12px; }
   .afilm .at { position: relative; border: 1px solid var(--border); border-radius: 4px;
@@ -440,6 +443,22 @@
   .afilm .aq[data-q=gallery] { color: var(--tl-green); }
   .afilm .aq[data-q=ok]      { color: var(--tl-amber); }
   .afilm .aq[data-q=poor]    { color: var(--tl-red); }
+  /* Labelled review's EVENT overview: one tile per decided visit, so a wrong cat is found
+     by SCANNING the labelled set instead of stepping through it a visit at a time — the
+     mode's only surface used to be that stepper, over a per-crop strip, so it read as a
+     frame list. Reuses the shared .fgrid/.ftile chrome with two departures:
+       - the image is the visit's rep CROP, not its full frame — from the top-down door
+         view a cat covers a few percent of the ROI and is unreadable at tile size, and
+         reading the coat IS how a label gets checked;
+       - `contain`, not the filmstrip's `cover`: a crop is already tight on the cat, so
+         cropping it again at tile size could hide the marking being judged.
+     Height-capped and scrolled internally so the detail stage stays on screen as the
+     labelled set grows (labeled_visits is unpaginated). */
+  .aovgrid { max-height: 430px; overflow-y: auto; }
+  .aovgrid .fimg img { height: 104px; object-fit: contain; background: var(--bg); }
+  /* Selection takes the inset-ring treatment .ftile.f-motion uses — no border growth, so
+     picking a tile can't reflow the grid. The two never appear on the same page. */
+  .ftile.asel { border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--accent); }
 
   /* Cats roster — reuses .qtable's cell styling with its own colgroup geometry. */
   /* Every other column is fixed, so the slack all goes to Notes — the one free-text
@@ -2055,6 +2074,10 @@
           <button id="aReload">Reload</button>
         </div>
       </div>
+      <div class="card" id="aOverview" hidden>
+        <h3>Labelled visits <span class="note" id="aOvNote"></span></h3>
+        <div id="aOvGrid" class="fgrid aovgrid"></div>
+      </div>
       <div class="card">
         <div id="aStage"><span class="note">Loading…</span></div>
         <p class="note bad" id="aErr" hidden></p>
@@ -2371,6 +2394,80 @@
     const canSeed = (v) => v && v.peak_area != null;
     const qualityFor = (f, v) => (canSeed(v) && f.score != null ? seedQuality(f, v) : (f.quality || null));
 
+    // The event-level overview: one tile per labelled visit in the filtered set. This is
+    // the surface for FINDING a mislabel — the stage below shows a single visit's crops,
+    // which is the wrong altitude for "which of these carries the wrong cat".
+    //   Rebuilt only when the SET changes (load / filter / requeue), never on navigation:
+    // a rebuild re-creates every <img> and flickers the whole grid, and stepping between
+    // visits is the frequent gesture. Selection is a class toggle (syncLabelledSel).
+    function renderLabelledGrid() {
+      const grid = $('#aOvGrid', view), note = $('#aOvNote', view);
+      if (!grid) return;
+      // The filter's own count is on its <option>; this says what the GRID holds, so a
+      // filtered view never reads as the whole labelled set. The "click one" hint rides
+      // along rather than sitting statically in the heading — with an empty grid there is
+      // nothing to click, and inviting it anyway reads as a broken control.
+      if (note) {
+        note.textContent = !lab.length ? ''
+          : `· ${lab.length === labAll.length ? lab.length : `${lab.length} of ${labAll.length}`}`
+            + ' labelled · click one to review';
+      }
+      if (!lab.length) {
+        grid.innerHTML = `<span class="note">${labAll.length
+          ? 'No visits carry that label.' : 'Nothing labelled yet.'}</span>`;
+        return;
+      }
+      const p = (x) => String(x).padStart(2, '0');
+      grid.innerHTML = lab.map((v, i) => {
+        const rep = repOf(v);
+        const t = new Date(v.span ? v.span[0] : rep.recv_ts);
+        return `<div class="ftile" data-i="${i}" title="labelled ${esc(fmtTs(v.labeled_ts))}">
+          <div class="fimg"><img loading="lazy" src="${cropUrl(rep)}" alt="crop">
+            <div class="tchips">${labelChip(v)}</div></div>
+          <div class="fmeta"><span>${p(t.getDate())}/${p(t.getMonth() + 1)} ${p(t.getHours())}:${p(t.getMinutes())}</span><span>${v.frames.length}f</span></div>
+        </div>`;
+      }).join('');
+      grid.querySelectorAll('.ftile').forEach((el) => el.addEventListener('click', () => {
+        labIdx = Number(el.dataset.i);
+        renderLabelled();
+      }));
+    }
+    // Repaint ONE visit's tile chip, addressed by identity. Keyed to the visit rather than
+    // to `labIdx` because a re-label settles asynchronously: if the operator navigated away
+    // while the POST was in flight, the corrected visit is no longer the selected one, and
+    // refreshing "the selected tile" would leave the tile they just fixed showing its old
+    // cat until something forced a full rebuild — in the grid whose whole job is showing
+    // labels at a glance. Cheap and idempotent, so callers need not know whether it moved.
+    function refreshTileChip(v) {
+      const grid = $('#aOvGrid', view);
+      const i = v ? lab.indexOf(v) : -1;
+      if (!grid || i < 0) return;
+      const chips = grid.querySelector(`.ftile[data-i="${i}"] .tchips`);
+      if (chips) chips.innerHTML = labelChip(v);
+    }
+    // Mark the selected tile and refresh its chip — the two things that change without the
+    // set changing, so navigation never rebuilds (and never flickers) the grid.
+    //   The tile is scrolled into view by clamping the GRID's own scrollTop, never with
+    // `scrollIntoView`: that walks every scrollable ancestor including the document, so
+    // once the operator has scrolled down to work the detail stage (putting the grid above
+    // the viewport) each Prev/Next hop scrolled the PAGE back up to reveal the tile —
+    // measured at 84px per hop, yanking away the very thing they were reading. Rect maths
+    // rather than offsetTop because `.ftile` is unpositioned, so its offsetParent is not
+    // the grid. This is "nearest" semantics confined to one container.
+    function syncLabelledSel() {
+      const grid = $('#aOvGrid', view);
+      if (!grid) return;
+      grid.querySelectorAll('.ftile').forEach((el) => {
+        const on = Number(el.dataset.i) === labIdx;
+        el.classList.toggle('asel', on);
+        if (!on) return;
+        const g = grid.getBoundingClientRect(), t = el.getBoundingClientRect();
+        if (t.top < g.top) grid.scrollTop -= g.top - t.top;
+        else if (t.bottom > g.bottom) grid.scrollTop += t.bottom - g.bottom;
+      });
+      refreshTileChip(lab[labIdx]);
+    }
+
     function renderLabelled() {
       renderStatus();
       const stage = $('#aStage', view), v = lab[labIdx];
@@ -2384,9 +2481,26 @@
       const frames = v.frames.slice().sort((a, b) => a.recv_ts - b.recv_ts);
       const rep = frames.find((f) => f.id === v.rep_frame_id) || frames[0];
       const t0 = frames[0].recv_ts, t1 = frames[frames.length - 1].recv_ts;
+      // The per-crop grades as COUNTS, not as a tile each. The strip that showed them was
+      // up to ~100 crops of one visit — the bulk of the page, for a reading nobody makes
+      // per crop; what a reviewer wants from grades is what this visit would contribute to
+      // a quality-filtered gallery build, which is exactly the tally. Ungraded crops ARE
+      // counted (a build skips them, so they matter — see the canSeed note).
+      //   Suppressed entirely for the crop-less kinds: `not_cat` is committed with
+      // quality/bbox/crop_path all NULL, and an `ignored` row carries no crop either, so a
+      // tally there would read "N ungraded" about crops that were never written — a
+      // gallery-contribution claim for a visit that contributes nothing by construction.
+      // Keyed on the LABEL KIND, not on "every grade is null": for a real cat labelled
+      // before grading existed, "N ungraded" is true and worth showing.
+      const CROPLESS = v.label_kind === 'not_cat' || v.label_kind === 'ignored';
+      const grades = frames.reduce((m, f) => m.set(f.quality || 'ungraded',
+        (m.get(f.quality || 'ungraded') || 0) + 1), new Map());
+      const gradeText = CROPLESS ? '' : ['gallery', 'ok', 'poor', 'ungraded']
+        .filter((g) => grades.get(g)).map((g) => `${grades.get(g)} ${g}`).join(' / ');
       const meta = [
         fmtTs(t0), `${frames.length} frames`, `span ${fmtDuration((t1 - t0) / 1000)}`,
         `rep ${detPct(rep.score)}`, `peak ${detPct(v.peak_score)}`,
+        ...(gradeText ? [gradeText] : []),
         v.relabelled ? 'labelled just now' : `labelled ${fmtTs(v.labeled_ts)}`,
       ].join(' · ');
       stage.innerHTML = `
@@ -2401,20 +2515,24 @@
         <div class="note" style="margin-top:8px">${meta}</div>
         ${canSeed(v) ? '' : '<div class="note warn" style="margin-top:6px">This compute build predates the per-crop scores a re-label re-seeds from, so each crop keeps its stored grade — a not-a-cat correction stays ungraded and a quality-filtered gallery build will skip it. Pull + restart the compute PC.</div>'}
         <div class="row" style="margin-top:12px">
+          <button id="aPrev" title="Previous visit (p / ←)"${lab.length < 2 ? ' disabled' : ''}>← Prev</button>
+          <button id="aNext" title="Next visit (n / →)"${lab.length < 2 ? ' disabled' : ''}>Next →</button>
+          <span class="grow"></span>
           <button id="aRelUnknown">Unknown cat (u)</button>
           <button id="aRelNotCat">Not a cat (x)</button>
           <button id="aRequeue" class="danger">Send back to queue (d)</button>
         </div>
-        <div class="afilm">${frames.map((f) => `
-          <div class="at${f.id === v.rep_frame_id ? ' rep' : ''}">
-            <img src="${cropUrl(f)}" loading="lazy" alt="crop">
-            ${f.quality ? `<span class="aq" data-q="${esc(f.quality)}">${esc(f.quality)}</span>` : ''}
-          </div>`).join('')}</div>
       `;
       placeBoxes(stage);
+      // Prev/Next are the same gesture as n/p, made visible: the keys were listed only in
+      // the hint line, so the mode read as having no navigation at all — the more so once
+      // focus sat on the "Show label" dropdown, where onKey drops every keystroke.
+      $('#aPrev', view).addEventListener('click', () => skip(-1));
+      $('#aNext', view).addEventListener('click', () => skip(1));
       $('#aRelUnknown', view).addEventListener('click', () => relabel('unknown_cat', null));
       $('#aRelNotCat', view).addEventListener('click', () => relabel('not_cat', null));
       $('#aRequeue', view).addEventListener('click', requeue);
+      syncLabelledSel();
     }
 
     // Re-label: the server drops this visit's rows + crop files, then re-commits under
@@ -2439,6 +2557,10 @@
         // out of a filtered view the instant it was corrected, yanking it off screen.
         // They refresh on the next Reload — a cosmetic lag, deliberately chosen.
         renderLabelled();
+        // Explicitly repaint THIS visit's tile, not just the selected one: renderLabelled
+        // above draws whatever is selected NOW, which after a mid-flight navigation is a
+        // different visit than the one just corrected.
+        refreshTileChip(v);
         // A re-label DELETES the old rows first, so frames evicted since the visit was
         // labelled come back written to fewer rows than were sent — and at zero the
         // visit silently leaves the labelled feed on the next reload. Say so, rather
@@ -2460,26 +2582,44 @@
         // a visit labelled earlier THIS session and sent back here would otherwise stay
         // filtered out of the queue it was just returned to, until a page reload.
         v.frames.forEach((f) => decided.delete(f.id));
-        lab.splice(labIdx, 1);
+        // Locate by IDENTITY, not the live `labIdx` — the same reason `labAll` below and
+        // `dropFlagged` already do. Navigation is NOT busy-guarded (n/p, Prev/Next, and now
+        // a grid-tile click), so `labIdx` can have moved while the delete was in flight;
+        // splicing at it drops a DIFFERENT, still-labelled visit from the list while the
+        // one actually deleted stays on screen as though it were fine.
+        const li = lab.indexOf(v);
+        if (li >= 0) lab.splice(li, 1);
         const gi = labAll.indexOf(v); if (gi >= 0) labAll.splice(gi, 1);
+        // Removing a visit ABOVE the cursor shifts everything down, so follow it — hold the
+        // operator on the visit they are looking at rather than letting the stage skip one.
+        if (li >= 0 && li < labIdx) labIdx -= 1;
         if (labIdx >= lab.length) labIdx = Math.max(0, lab.length - 1);
         // Unlike a re-label, the visit is GONE from both sets, so re-deriving the filter
         // can't resurrect it — and leaving the counts stale would advertise "not a cat (1)"
         // over an empty view. Only re-derive the shown subset when the selected label
-        // emptied out (the option vanishes and the select falls back to All); otherwise
-        // hold position, so a review pass isn't thrown back to the top of the list.
+        // emptied out (its option vanishes and the select falls back to the first label);
+        // otherwise hold position, so a review pass isn't thrown back to the top of the list.
         const before = $('#aFilter', view).value;
         rebuildFilter();
-        if ($('#aFilter', view).value !== before) applyFilter(); else renderLabelled();
+        // Either way the grid must REBUILD, not just re-sync: `lab` was spliced, so every
+        // tile's data-i past this one now points at a different visit.
+        if ($('#aFilter', view).value !== before) applyFilter();
+        else { renderLabelledGrid(); renderLabelled(); }
       } catch (e) { flash('send back failed: ' + e.message); }
       finally { busy = false; }
     }
 
-    // Options are built from the labels actually PRESENT, with counts, so the filter
-    // never offers a label with nothing behind it. Keeps the current selection when it
-    // still exists; falls back to All when it doesn't.
+    // Options are built from the labels actually PRESENT, with counts, so the filter never
+    // offers a label with nothing behind it.
+    //   There is deliberately NO "all" option, and the first cat is preselected: a
+    // HOMOGENEOUS grid is what makes a mislabel visible — a cat that isn't Mittens leaps out
+    // of the Mittens tiles, and would be just another face in a mixed set. So the view is
+    // always scoped to exactly one label. The set-wide total isn't lost; the grid's note
+    // still reads "N of M labelled".
+    //   Keeps the current selection while it still exists (a requeue can empty a label out
+    // entirely); otherwise falls back to the first option.
     function rebuildFilter() {
-      const sel = $('#aFilter', view), prev = sel.value || 'all';
+      const sel = $('#aFilter', view), prev = sel.value;
       const counts = new Map();
       for (const v of labAll) {
         const k = labelKey(v), e = counts.get(k) || { text: labelText(v), n: 0 };
@@ -2487,18 +2627,25 @@
       }
       const rank = (k) => (k.startsWith('cat:') ? 0 : k === 'unknown_cat' ? 1 : k === 'not_cat' ? 2 : 3);
       const entries = [...counts.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[1].text.localeCompare(b[1].text));
-      sel.innerHTML = [`<option value="all">All labels (${labAll.length})</option>`]
-        .concat(entries.map(([k, e]) => `<option value="${esc(k)}">${esc(e.text)} (${e.n})</option>`)).join('');
-      sel.value = [...sel.options].some((o) => o.value === prev) ? prev : 'all';
+      sel.innerHTML = entries
+        .map(([k, e]) => `<option value="${esc(k)}">${esc(e.text)} (${e.n})</option>`).join('');
+      // `entries` is ranked cats-first then by name, so option 0 IS the first cat.
+      sel.value = [...sel.options].some((o) => o.value === prev)
+        ? prev : (sel.options[0] ? sel.options[0].value : '');
     }
     function applyFilter() {
-      const k = $('#aFilter', view).value || 'all';
-      lab = k === 'all' ? labAll.slice() : labAll.filter((v) => labelKey(v) === k);
+      // Every option is exactly one label (see rebuildFilter), so there is no set-wide
+      // branch. With nothing labelled the select has no options and `k` is '', matching no
+      // visit — which is right: labAll is empty too, and the grid says so.
+      const k = $('#aFilter', view).value;
+      lab = labAll.filter((v) => labelKey(v) === k);
       labIdx = 0;
+      renderLabelledGrid();
       renderLabelled();
     }
     async function loadLabelled() {
       const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading labelled visits…</span>';
+      $('#aOvGrid', view).innerHTML = '<span class="note">Loading…</span>';
       try {
         const r = await api('GET', '/api/label/labeled');
         if (!alive || mode !== 'labelled') return;
@@ -2508,6 +2655,10 @@
       } catch (e) {
         if (!alive || mode !== 'labelled') return;   // same guard as the success path
         labAll = []; lab = [];
+        // Blanked, not left to renderLabelledGrid: its empty state says "Nothing labelled
+        // yet", which under a failed fetch would claim a fact the request never established.
+        $('#aOvGrid', view).innerHTML = '';
+        $('#aOvNote', view).textContent = '';
         stage.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
       }
     }
@@ -2758,6 +2909,11 @@
       showErr('');
       view.querySelectorAll('#aMode button').forEach((b) => b.classList.toggle('sel', b.dataset.m === m));
       $('#aFilterWrap', view).style.display = m === 'labelled' ? '' : 'none';
+      // The event overview belongs to Labelled review only. The Queue and Flagged modes are
+      // deliberately steppers over work still to be done, where there is nothing to scan
+      // FOR — every item needs a decision, and worst-first/newest-first is the order to
+      // take them in.
+      $('#aOverview', view).hidden = m !== 'labelled';
       renderUncertainToggle();   // queue-only control
       const HINTS = {
         queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
@@ -2841,7 +2997,11 @@
       const b = e.target.closest('button[data-m]');
       if (b && b.dataset.m !== mode) setMode(b.dataset.m);
     });
-    $('#aFilter', view).addEventListener('change', applyFilter);
+    // BLUR after choosing, for the reason entry 235's checkbox does: onKey drops every
+    // keystroke whose target is a SELECT, so focus left on this dropdown silently kills
+    // n/p AND every re-label key until the operator clicks elsewhere — which reads as the
+    // mode having no navigation at all. This is the mode's own control, so it gets used.
+    $('#aFilter', view).addEventListener('change', (e) => { e.target.blur(); applyFilter(); });
     // Re-fetches rather than filtering what is already loaded: the filter runs before the
     // server's page cap, so a reload is what actually fills the page with hard cases.
     $('#aUncertain', view).addEventListener('change', (e) => {

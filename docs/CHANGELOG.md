@@ -1520,3 +1520,47 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      turn's edits, judged from inside the context that wrote them; nothing read the accumulated
      diff as one change. Carve-out, load-bearing now that review waits: tests, build and each
      subtree's verification workflow still run PER CHANGE. A fan-out's diff is flagged AT the gate.
+
+241. Annotation's Labelled mode gained an EVENT overview above the single-visit stage — a grid of
+     the decided visits, each a rep CROP with its label chip. Finding a mislabel is a scanning
+     task, and the mode offered only a stepper over one visit's crops, so it read as a frame list.
+     The crop, not the frame: top-down a cat is a few percent of the ROI, unreadable at tile size.
+     Rebuilds only on a SET change; selection is a class toggle, so stepping never flickers tiles.
+
+242. The Labelled keys were reachable only until you touched the mode's own "Show label" dropdown:
+     `onKey` drops any keystroke targeting a SELECT, so focus left there killed n/p AND every
+     re-label key — the mode read as having no navigation at all. It now blurs on change (entry
+     235's fix, same cause), and Prev/Next are visible buttons rather than hint-line-only keys.
+
+243. Labelled review dropped its per-crop filmstrip — a visit can hold ~100 crops, so the strip
+     WAS the page, and no reading is made per crop. The grades it carried are now a meta-line
+     tally (`2 gallery / 3 ok / 3 poor`): what this visit contributes to a quality-filtered
+     build. Suppressed for `not_cat`/`ignored`, which write no crops to grade. Flagged review
+     KEEPS its strip — that span is often undecided and unswept, so seeing its crops is the point.
+
+244. Labelled review is always scoped to ONE label — the "all labels" option is gone and the
+     first cat is preselected. A homogeneous grid is what makes a mislabel visible: a cat that
+     isn't Mittens leaps out of the Mittens tiles and is just another face in a mixed set.
+     The set-wide total survives in the grid's "N of M labelled". A label emptied by a requeue
+     drops its option and falls back to the first, since there is no all to fall back to.
+
+245. `requeue` drops the visit it DELETED, located by identity, not whatever `labIdx` points at
+     after the await. Navigation was never busy-guarded, and the overview's clickable tiles made
+     the race easy: navigating mid-delete spliced a different, still-labelled visit out of the
+     list while the deleted one stayed on screen looking fine. `labAll` and `dropFlagged` already
+     located by identity — Labelled's `lab` was the one place left trusting a live index.
+
+246. A settling re-label repaints ITS OWN tile (`refreshTileChip(v)`), not the selected one. Same
+     root cause: the write lands long after the keypress, so if the operator has moved on, the
+     tile they just corrected kept its old cat until a full rebuild — in the grid whose whole
+     job is showing labels at a glance.
+
+247. The selected tile is scrolled into view by clamping the grid's own `scrollTop`, never by
+     `scrollIntoView`, which walks every scrollable ancestor: with the grid scrolled above the
+     viewport each Prev/Next hop scrolled the PAGE up by ~84px, yanking away the detail stage
+     being read. Measured, not theorised — the prior comment claimed the opposite.
+
+248. The grade tally is suppressed for `not_cat` and `ignored`, which are committed crop-less
+     (quality/bbox/crop_path NULL), so a tally there read "8 ungraded" about crops that were
+     never written. Keyed on the label KIND, not on "every grade is null": for a real cat
+     labelled before grading existed, "N ungraded" is true and worth showing.

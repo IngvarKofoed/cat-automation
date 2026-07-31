@@ -40,18 +40,40 @@ Each subtree has its own `CLAUDE.md` with scoped tool/skill rules:
 - `compute/CLAUDE.md` — NVIDIA PC "brain": detection, tracking, individual re-ID identification, the decision engine, event store, notifications, dashboard, and the learning loop.
 - `shared/CLAUDE.md` — the cross-tier **contracts** (data model, event/intent schemas, the Pi control-API shape, constants) *and* the cross-tier **logic** both tiers instantiate: the `MotionGate` core and the frame wire format.
 
-## After making changes
+## Reviewing changes
 
-After a non-trivial edit, **the change gets a review-grade review automatically, in the same turn** — nobody should have to ask for it. Never skip it, and never leave it for a later pass.
+**This repo has exactly one review point: the commit.** Do not review after every edit, and do not run an unrequested review pass mid-session. A pass per prompt costs more than it catches — it only ever sees its own turn's edits, reviews them from inside the context that just wrote them, and the next follow-up ("also add X", "now handle Y") re-opens what it just looked at. Nothing in that scheme ever reads the accumulated diff as one change.
 
-**Preferred: `/fix-code --fix`.** It resolves the diff scope itself, rates every finding 1–5 by consequence, has an independent verifier refute each one before repairing, takes a restore point first, and applies only the repairs that are both serious and unambiguous — revert the run with `/fix-code --undo`. Prefer it over an ad-hoc pass: it's better calibrated, and its edits are reversible. Two things it deliberately does *not* do: it leaves severity-1 and -2 findings unrepaired, and it treats style / naming / reuse as `/simplify`'s job and deep security work as `/security-review`'s. Run those separately when the change warrants them.
+What does *not* wait for the commit is verifying your own work: run the tests, the build, and whatever the subtree's `CLAUDE.md` mandates — the edge's on-device / fake-source checks, compute's pytest suite plus the Playwright MCP pass on a changed dashboard view — per change, as always. Deferred here is the *review*, not the checking. Never report a change complete on the grounds that its review comes later.
 
-**Fallback, if `fix-code` isn't available: run the same review yourself, inline.** A missing skill changes only *who* performs the review, never whether it happens. Do **not** try to invoke `/code-review` for this routine pass — it is user-invoke-only (`disable-model-invocation`), so the call just fails.
+The commit is the right moment because it's when the diff is sealed into history, and because it's the first point where the accumulated diff can be read as **one change** — which is what a review needs.
 
-Scale the fallback to the change:
+**So when the user asks you to commit (or commit and push) and the working tree holds non-trivial changes, ask before committing** — `AskUserQuestion`, two options:
 
-- **Small, contained edits** — read the diff yourself in one careful pass.
-- **Substantial or high-risk changes** (a broad diff, or security- / data-integrity-sensitive code) — **fan out across subagents with the Agent tool, one per at-risk dimension (~2–4), and verify each finding before acting on it**. This needs no ultracode opt-in; that gate is only for the Workflow tool. Finders run on the strong model; verification can drop a tier (see *Multi-agent workflows*).
+1. **Review first** — review the working diff, apply the repairs, then commit with them included.
+2. **Commit now** — skip the review and go straight to the commit.
+
+**Label option 1 with the path that will actually run**, so the choice is concrete rather than abstract: **"Run `/fix-code --fix`"** when that skill is installed, **"Review inline"** when it isn't. The two differ in cost and calibration — don't hide which one the user is about to get behind a generic label.
+
+**You** run the pass; the user is only choosing whether it happens. This is the one place the review flow stops to ask — there is no end-of-turn nudge to go run a review elsewhere.
+
+- Ask **once per commit request**, not per round or per file. If the user picks the review, run it, report as usual, then continue to the commit without asking again.
+- **Skip the question** when the diff is trivial — a typo, a version bump, a changelog line — or when a full review pass has already covered this working diff since the last edit. Asking there is noise.
+- **Any** commit request goes through the gate, including a delegated one (`/git commit`, `/git commitandpush`) — check it *before* handing off, not after. A skill or subagent that does the committing never sees this rule.
+- If the user declines, that's the answer — commit as asked, and don't re-offer or hedge about it afterwards.
+
+### Running the review pass
+
+**Preferred: `/fix-code --fix`, whenever that skill is installed.** It resolves the diff scope itself, rates every finding 1–5 by consequence, has an independent verifier refute each one before repairing, takes a restore point first, and applies only the repairs that are both serious and unambiguous — revert the run with `/fix-code --undo`. Prefer it over an ad-hoc pass: it's better calibrated, and its edits are reversible. Two things it deliberately does *not* do: it leaves severity-1 and -2 findings unrepaired, and it treats style / naming / reuse as `/simplify`'s job and deep security work as `/security-review`'s. Run those separately when the change warrants them.
+
+**Fallback, when `fix-code` isn't installed: run the same review yourself, inline over the working diff.** A missing skill changes only *who* performs the review, never whether it happens. Do **not** try to invoke `/code-review` for this pass — it is user-invoke-only (`disable-model-invocation`), so the call just fails.
+
+Scale the fallback to the diff:
+
+- **Small, contained diff** — read it yourself in one careful pass.
+- **Substantial or complex diff** (what an accumulated multi-round working tree usually is) — **fan out across subagents with the Agent tool, one per dimension actually at risk in this diff (~2–4), and verify each finding before acting on it**. This needs no ultracode opt-in; that gate is only for the Workflow tool. Finders run on the strong model; verification can drop a tier (see *Multi-agent workflows*).
+
+**The surfaces worth their own finder in this repo**, when the diff touches them: the store's counter / eviction / accounting paths and anything holding the shared SQLite write lock; schema changes, and anything that deletes or purges frames, crops, or labels; the `shared/` cross-tier logic (wire format, `MotionGate`) both tiers depend on; the durable learning-loop tables (`cats`, `dataset_items`, `model_versions`) that survive eviction; and — once it exists — actuation and its access-decision policy.
 
 The fallback checks, across the diff: **correctness, security & data-integrity, edge cases & tests, reuse / duplication, clarity, performance, and conformance to this repo's conventions** — then applies **every** fix to the working tree. (`/fix-code` applies its own narrower threshold instead, by design — that's the trade for its per-finding verification.)
 
@@ -61,45 +83,7 @@ Once the fallback's fixes are applied, report what changed (when `/fix-code` ran
 2. **Summarize each bucket in one line** so the user can see what was fixed without expanding every finding.
 3. Do not stop to ask which to fix — all findings are fixed by default. The user can review the diff and revert anything they disagree with.
 
-Say plainly when the change is one you **couldn't fully verify** — you guessed at intent, left a known gap, or nothing covers it (it only runs on the compute PC, or on the Pi). State it as a fact about the change, not as a recommendation to go run something.
-
-### Before committing: offer the fresh-eyes pass
-
-An earlier review never covers later edits — each round of non-trivial changes gets its own pass, above, and a follow-up request ("also add X", "now handle Y") is a new change, not a continuation of one already reviewed. What erodes across rounds is *distance*: by the second or third follow-up you're reviewing your own patch from inside the context that wrote it, with the same blind spots, and each pass only ever saw its own turn's edits. Nothing has read the accumulated diff as one change.
-
-A commit request is where that gets settled, because it's the moment the diff is sealed into history. So **when the user asks you to commit (or commit and push) and the working tree holds non-trivial changes no `/fix-code --fix` run has seen, ask before committing** — `AskUserQuestion`, two options:
-
-1. **Review first** — run `/fix-code --fix` over the working diff, then commit with its repairs included.
-2. **Commit now** — the per-round reviews stand; go straight to the commit.
-
-**You** run the pass either way; the user is only choosing whether it happens.
-
-- **Skip the question** when `/fix-code --fix` has already run over this working diff since the last edit (it saw the whole thing), or when the diff is trivial — a typo, a version bump, a changelog line. Asking there is noise.
-- Ask **once per commit request**, not per round or per file. If the user picks the review, run it, report as usual, then continue to the commit without asking again.
-- **Any** commit request goes through the gate, including a delegated one (`/git commit`, `/git commitandpush`) — check it *before* handing off, not after. A skill or subagent that does the committing never sees this rule.
-- Never let the offer stand in for the work: this round's diff still gets its own review and its fixes before you ask anything.
-
-### Suggesting a user-run `/fix-code` pass
-
-**Default: say nothing.** Most turns end with the review report and no suggestion — the review already happened, and a reflexive "you may also want to review this" on every diff is noise that trains the user to ignore it on the one change where it mattered. Suggest a pass only when you can **name the trigger that fired**. Can't name one? Don't suggest.
-
-What a user-run pass adds is **distance, not a different tool**: run fresh — ideally in a new session — `/fix-code` reads the same diff without the context that produced it, and its report-only default (no `--fix`) changes nothing, so it is a safe second look. Deliberately *not* `/code-review`: that skill needs a pull request to exist and only posts a comment, and on this repo's diffs it has been a bad trade (see *Multi-agent workflows* below).
-
-**Triggers — any one is enough:**
-
-- **Heavy review** — a genuine blocker was fixed (a real correctness, security, or data-integrity bug), or should-fix changes landed across most of the files touched. A handful of nits is not churn.
-- **High-consequence surface** — in this repo: the store's counter / eviction / accounting paths and anything holding the shared SQLite write lock; schema changes, or anything that deletes or purges frames, crops, or labels; the `shared/` contracts (wire format, `MotionGate`) that both tiers depend on; the durable learning-loop tables (`cats`, `dataset_items`, `model_versions`) that survive eviction; and — once it exists — actuation and its access-decision policy.
-- **Large and non-mechanical** — roughly >400 changed lines or >10 files of real logic. A rename, a formatting sweep, or a presentation-only reskin of the same size does not count.
-- **Multi-agent fan-out produced the diff** — no single agent ever saw the whole combined change.
-- **Genuine uncertainty** — you guessed at intent, left a known gap, or couldn't verify the change (nothing covers it, or it only runs on the compute PC / on the Pi).
-
-**No level to pick.** `/fix-code` triages its own scope and announces the tier it ran at, so suggest the plain pass and let it size itself — don't invent flags for it.
-
-**These do *not* trigger it:** docs- or changelog-only edits, formatting and lint fixes, dependency bumps, adding tests to existing code, a contained single-function change with tests passing, a presentation-only UI tweak, or a review that turned up only nits.
-
-When you do suggest: **one sentence** at the end of the turn — the code is already reviewed with fixes applied, a fresh pass would add assurance, and **which trigger fired**. Frame it as optional reassurance, not a warning that something is wrong. Only claim the code was already reviewed if you actually ran the review above.
-
-**If the user is heading for a commit, don't say it twice.** The *Before committing* gate already offers that pass and asks the question — when a commit request is in play, the gate replaces this sentence.
+Either path closes the same way: say plainly what you **couldn't fully verify** — you guessed at intent, left a known gap, or nothing covers it (it only runs on the compute PC, or on the Pi). State it as a fact about the change, not as a recommendation to go run something.
 
 ## Multi-agent workflows
 
@@ -113,7 +97,7 @@ The guardrail: the stage that *catches* problems (adversarial review) stays stro
 
 **Invoking a named workflow is not authoring one.** The tiers above are yours to set only when *you* write the `agent()` calls. A built-in or named workflow — e.g. `Workflow({ name: 'code-review' })` — runs its own stages on the session model; nothing tiers them for you, so a wide fan-out (the review's per-`(file,line)` verifiers most of all) silently bills every agent at the top tier. Before launching one at `high`+ effort or over a broad diff, check the `scriptPath` the run reports: if a large *checking* stage isn't tiered, edit that script to drop those agents to the mid model (leaving the finders and final synthesis strong) and re-invoke with `{ scriptPath }` instead. Keep them strong only when the diff is security-/data-integrity-critical. For `code-review` specifically (verified 2026-07-30): its script carries **no** `model:` overrides at all — scope, finders, per-`(file,line)` verifiers, sweep and synthesis every one inherit the session model, so the verify fan-out is exactly the stage to tier by hand. Two gotchas when you edit the snapshot: the script is a **per-run** copy, so a fresh `/code-review` starts untiered again (re-invoke with `{ scriptPath }`, or resume with `{ scriptPath, resumeFromRunId }`); and adding `model:` to an agent that already **completed** changes its `(prompt, opts)` cache key, so it re-runs on resume — leave finished stages alone.
 
-**When a workflow returns, the after-edits review applies to its aggregate diff.** No single subagent saw the whole combined change, so treat the workflow's landed edits as one change and run the *After making changes* review over the aggregate diff — give it the substantial-change treatment even when each agent's own slice looked small. (A review stage *inside* the workflow checks its own findings; it does not replace this pass over what landed.) Being a no-single-author change, it also fires the *multi-agent fan-out* trigger in **Suggesting a user-run `/fix-code` pass** above.
+**A workflow's aggregate diff is what the review gate is for.** A fan-out edits files across several subagents — often in separate worktrees — so no single agent ever saw the whole combined change, and any review stage *inside* the workflow checked its own findings, not the landed diff. This doesn't earn an extra pass on return; the commit is still the review point. But when the gate asks, say the diff came out of a fan-out — it's where *review first* earns its cost most clearly, and it gets the substantial-diff treatment above even when each agent's own slice looked small.
 
 This section is inert unless you actually run a multi-agent workflow.
 
@@ -123,7 +107,7 @@ This section is inert unless you actually run a multi-agent workflow.
 
 **This setting only chooses *where* commits go — not *when* to make them.** Commit only when the user asks; finishing a change is not a cue to commit it. When you do commit, each commit is one complete change including its `docs/CHANGELOG.md` entry — never leave the tree half-committed.
 
-A commit request first passes through *Before committing: offer the fresh-eyes pass* above — check that gate before staging anything, including when the commit is delegated to `/git`.
+A commit request first passes through the review gate in *Reviewing changes* above — check it before staging anything, including when the commit is delegated to `/git`.
 
 <!-- Add additional sections below as the project develops:
   - Project-specific forcing rules (e.g., a policy the agent must follow before touching actuation)

@@ -1564,3 +1564,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      (quality/bbox/crop_path NULL), so a tally there read "8 ungraded" about crops that were
      never written. Keyed on the label KIND, not on "every grade is null": for a real cat
      labelled before grading existed, "N ungraded" is true and worth showing.
+
+249. Admin Activity lost its Analyze button (entries 90/91) — removed as unused. Re-detecting a
+     historical window is now only a Motion-tuning sweep, which is also where its progress always
+     showed; Identify stays as Activity's one backfill. `/api/analysis/run`'s `reanalyze` +
+     `motion_only` are untouched (the tuning sweeps use both), so this dropped a caller, not a path.

@@ -3619,7 +3619,6 @@
           <label class="note"><input type="checkbox" id="acHide"> Hide our cats</label>
           <span class="grow"></span>
           <button id="acReload">Reload</button>
-          <button id="acAnalyze" title="Re-detect the loaded events' motion frames (person/cat subjects)">Analyze</button>
           <button id="acIdentify" title="Name historical visits against the active gallery">Identify</button>
         </div>
         <div id="acNote" class="note" style="margin-top:6px"></div>
@@ -3741,15 +3740,9 @@
       try { await api('POST', '/api/identify/run', s); flash('Identify enqueued — progress on Model building.'); }
       catch (e) { flash('Identify: ' + e.message); }
     }
-    async function analyzePass() {
-      const s = span(); if (!s) return;
-      try { await api('POST', '/api/analysis/run', { analyzer: 'yolo-serial', reanalyze: true, motion_only: true, ...s }); flash('Analyze enqueued — progress on Motion tuning.'); }
-      catch (e) { flash('Analyze: ' + e.message); }
-    }
     $('#acReload', view).addEventListener('click', loadEvents);
     $('#acHide', view).addEventListener('change', renderGrid);
     $('#acIdentify', view).addEventListener('click', identifyPass);
-    $('#acAnalyze', view).addEventListener('click', analyzePass);
 
     loadEvents();
     return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };

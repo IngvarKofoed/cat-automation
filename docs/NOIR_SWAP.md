@@ -1,8 +1,25 @@
 # NoIR camera swap — do these before re-tuning the motion gate
 
-**Status:** open. Written 2026-07-27, swap expected ~28–29 July.
+**Status:** **swap DONE** (~28–29 July 2026); item 1 done and verified; items 2–4 still open.
+Written 2026-07-27, status updated 2026-08-01.
 **Why this exists:** the NoIR module resets the motion-gate tuning baseline, and two of
 the four items below have to be done *before* tuning or the tuning is wasted work.
+
+**Verified 2026-08-01 against the live Pi:** `tuning_file: imx708_noir.json` and
+`awb_gains: [0.858, 1.609]` are both persisted and survived several reboots — item 1 is
+done, and does *not* need redoing. The gains suppress R and boost B, which is what a lock
+taken on a daylit NoIR scene converges to; under IR that same fixed transform renders the
+scene blue-purple. That is correct locked behaviour, not auto-AWB hunting — do not
+"re-lock" on the strength of how a night frame looks.
+
+**Day/night lighting calibration is CLOSED, unset, by decision.** The lamp runs on this
+file's own astronomical schedule (sunset−1min / sunrise+1min) from the same lat/lon the
+compute-side split uses, so `suntimes.py` is already accurate for its only two jobs —
+per-cat regime coverage and day/night scorecards — and the measured colourfulness flag
+adds nothing. It also cannot separate the regimes here (evening daylight reads at or
+below IR night). Full detail in `docs/specs/2026-07-27-lighting-flag.md`; changelog 272–274.
+Consequence for item 2 below: if the regimes *do* want different params, the switch has
+to be a live edge-side one keyed off the schedule this Pi already computes.
 
 Background on the camera choice itself is in `docs/CONCEPT.md` (day/night regimes) and
 `docs/ARCHITECTURE.md` (*Camera source → Day/night visual regime*).
@@ -52,8 +69,9 @@ Both survive a restart and a self-heal camera reopen. An unloadable tuning-file 
 back to the default tuning and logs (a typo must not take the door offline). Neither control
 appears on a camera without the capability.
 
-Only then tune motion or calibrate day/night lighting — both are measured against these
-colours, and doing it the other way round calibrates against a moving target.
+Only then tune motion — it is measured against these colours, and doing it the other way
+round calibrates against a moving target. (Done: see the status block above. The day/night
+lighting calibration this once also gated is closed and unset by decision.)
 
 ---
 

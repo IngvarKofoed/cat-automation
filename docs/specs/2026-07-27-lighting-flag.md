@@ -1,5 +1,35 @@
 # Day/night lighting flag
 
+> **Status (2026-08-01): built, calibrated once, and deliberately LEFT UNSET.**
+> Do not pick a threshold from this design without re-reading this block.
+>
+> **The motivating premise does not hold for this installation.** The spec assumes an
+> illuminator "with its own photocell" whose flip does not track sunrise/sunset. The lamp
+> is actually driven by the edge's astronomical night-light schedule at sunset−1min /
+> sunrise+1min, from the *same* lat/lon `suntimes.py` uses — so the measured flag and the
+> sun-times split agree by construction, and the flag has nothing to add. Measured on
+> 30 July: the luma flip falls between 21:27 and 21:58 against a 21:19 sunset.
+>
+> **And the statistic does not work at this door anyway.** Swept over 30 July (707,784
+> frames, full coverage), colourfulness is *not* bimodal by regime: evening daylight reads
+> 0.088–0.100, at or *below* IR night's 0.100–0.103. The scene is achromatic in daylight
+> too — grey tile, beige plaster, white frame — so the statistic tracks direct sun rather
+> than colour-vs-IR. AWB is genuinely locked (`awb_gains [0.858, 1.609]`, `tuning_file
+> imx708_noir.json`, both persisted), so the invariance argument in *The statistic* holds
+> and the overlap is real, not an artifact. Re-locking and re-sweeping will not fix it.
+>
+> **Mean luma separates cleanly** — night 45.6–47.8, day 83.4–98.6 — and is already stored
+> in `analysis.detail.luma` for every swept frame, so moving to that axis needs no
+> re-sweep and no new capture, only a read path. Caveat: the separation exists *because*
+> auto-exposure is railed at night, so a brighter emitter (or a locked exposure) would
+> erode or void it.
+>
+> **What the sweep is still worth:** lamp health. Night luma sitting flat at ~46 is a
+> one-number check that the IR emitter has not collapsed the way the pre-swap one did
+> (changelog 199) — a trend readout, not a classifier.
+>
+> See changelog 272–274.
+
 Record, per stored frame, a continuous **colourfulness statistic** that separates
 colour-daylight from IR-monochrome night, swept offline over stored frames and stored in the
 `analysis` table. The threshold that turns that statistic into a `day`/`night` label is

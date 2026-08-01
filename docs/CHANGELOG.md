@@ -1705,3 +1705,32 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      the shared write connection; a short-lived WAL read connection (as `tuning_calendar` and
      `labeled_visits` use) is the fix if it bites. And user-page paging exists only where
      `IntersectionObserver` does, with no button fallback.
+
+272. Day/night stays SUN-TIMES driven and the lighting cutoff is deliberately left unset.
+     The IR lamp runs on the edge's astronomical schedule (sunset−1min / sunrise+1min) from
+     the SAME lat/lon the compute split uses, so the two agree by construction — the spec's
+     premise, an illuminator whose photocell drifts from sun times, is not this wiring.
+     And were MOG2 params ever to diverge, the switch must happen LIVE ON THE EDGE, which an
+     offline read-time flag could not drive regardless of how accurate it got.
+
+273. Measured over 30 July (707,784 frames, full lighting coverage): colourfulness CANNOT
+     separate the regimes at this door. Evening daylight reads 0.088–0.100, at or below IR
+     night's 0.100–0.103 — the scene is achromatic in daylight too, so the statistic tracks
+     direct sun rather than colour-vs-IR. Mean luma does separate cleanly (night 45.6–47.8,
+     day 83.4–98.6) and is ALREADY stored in `analysis.detail`, so switching axis later
+     would need no re-sweep. The separation depends on the lamp staying dim: auto-exposure
+     is railed at night, so a brighter emitter would erode the gap.
+
+274. The replacement IR lamp holds output — night luma flat at ~46 all night, unlike the
+     emitter of entry 199 that collapsed at civil dusk. Night crops are readable (tabby
+     striping legible at 360×267 px, YOLO 0.95), so the IR-night regime is viable for the
+     gallery, not merely populated. Night luma is therefore also a usable lamp-health
+     signal, which is the one job the lighting sweep still earns.
+
+275. Edge `fps` is set to 15 but the Pi only grabs ~10.2; on 30 July it ran 7.7–9.4 with no
+     outage. Nothing is lost in transit (compute stored 10.24 against the Pi's 10.19), so the
+     Pi is the ceiling — though a stored-rate dip can equally be collector lock contention,
+     which frame-id continuity cannot distinguish (ids are assigned at insert, so a frame
+     dropped before insert leaves no gap). Matters for tuning: `persistence` counts FRAMES,
+     so 2 is a ~250 ms window here, not the ~400 ms it would be at the documented 5 fps.
+

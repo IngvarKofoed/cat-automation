@@ -3,9 +3,11 @@
 
 # Motion tuning
 - [x] Scorecards, The compare button should be right alligned, CHECK other buttons for right alignments
+- [ ] Run lightning button not disabled while its starting -> confusing. Same with YOLO?
 
 # Annotation
 - [x] I would like to see labeled events 
+- [ ] Flagged should not show all frames
 
 # General
 - [x] Drop bird for YOLO

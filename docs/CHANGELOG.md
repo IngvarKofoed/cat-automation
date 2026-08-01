@@ -1734,3 +1734,23 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      dropped before insert leaves no gap). Matters for tuning: `persistence` counts FRAMES,
      so 2 is a ~250 ms window here, not the ~400 ms it would be at the documented 5 fps.
 
+276. The Motion-tuning calendar ("Last 4 weeks") no longer joins `frames` per verdict, and
+     carries `+analyzer` — entries 229/265's mis-plan, third instance: with no ANALYZE stats
+     SQLite scanned each analyzer's WHOLE partition and fetched every row. Each day's
+     verdicts are now COUNTed over that day's own id span off the `(frame_id, analyzer)` PK,
+     a pure covering scan — equivalent because recv_ts is non-decreasing with id and
+     `analysis` cascade-deletes with its frame.
+
+277. Measured on a 2.5M-frame / 4.3M-verdict replica of the real store: that pass 2590 →
+     880 ms, the whole call 3.0 → 1.4 s (the live endpoint was 4.8 s). Known limit — it is
+     still O(store), walking every frame's recv_ts index entry (390 ms) plus every verdict
+     in the window on EVERY open, and the store sits at 30% of its 1 TiB cap. Structural
+     fixes are maintained per-day counters or a cache; the always-on oracle writes verdicts
+     continuously, so a whole-store epoch key would never hit.
+
+278. What entry 276 trades away: `recv_ts` monotonic with `id` is ASSUMED, not enforced —
+     the collector stamps the wall clock — so a backward step across a local midnight
+     overlaps two days' id spans and the earlier day counts the later one's verdicts.
+     It fails LOUDLY, one direction only: coverage reads above 100%, never a silent
+     under-report. Left unguarded because clamping to the next day's first id regresses
+     the OPPOSITE skew into a fully-swept day reading 0%; only the join is immune.

@@ -2422,16 +2422,16 @@ class Store:
         carrying a verdict for that analyzer (the sweep-coverage numerator; the
         denominator is ``frames``).
 
-        Cost + concurrency: each pass scans O(window) rows — the frame count/id-span
-        and event passes are index-served (``idx_frames_recv_ts`` /
-        ``idx_frames_motion_recv``, no heap access) and the coverage pass scans only the
-        analysis rows in the window's id span (bounded by how much is swept), but a
-        fully-swept 4-week window is still millions of rows. So this read runs on its OWN
-        short-lived connection, NOT ``self._conn`` under ``self._lock``: WAL lets it read
-        the committed snapshot concurrently with the collector's writes, so a big
-        calendar scan can't stall inserts (the collector-starvation class entries 102-105
-        removed for the polled paths). Meant for on-demand use (calendar load + post-sweep
-        refresh), not polling.
+        Cost + concurrency: every pass is served by a COVERING index and touches no table
+        row — the frame count/id-span and event passes off ``idx_frames_recv_ts`` /
+        ``idx_frames_motion_recv``, the coverage pass off ``analysis``'s
+        ``(frame_id, analyzer)`` PK (see the hint note below it). Each still scans
+        O(window) index entries, and a fully-swept 4-week window is millions of them, so
+        this read runs on its OWN short-lived connection, NOT ``self._conn`` under
+        ``self._lock``: WAL lets it read the committed snapshot concurrently with the
+        collector's writes, so a big calendar scan can't stall inserts (the
+        collector-starvation class entries 102-105 removed for the polled paths). Meant for
+        on-demand use (calendar load + post-sweep refresh), not polling.
         """
         off, s, u = int(tz_offset_ms), int(since_ts), int(until_ts)
         DAY = 86_400_000
@@ -2474,22 +2474,40 @@ class Store:
                 row = days.get(int(d))
                 if row is not None:
                     row["events"] = int(ev)
-            # Per-analyzer sweep coverage per local day, scanning only the analysis rows
-            # whose frame_id falls in the window's id span (bounded by what's swept).
+            # Per-analyzer sweep coverage, counted per day over that day's OWN id span
+            # (from the pass above) — NOT by joining `frames` for each verdict's recv_ts.
+            # Equivalent because `recv_ts` is non-decreasing with `id` (frames are added in
+            # receive order — the same invariant `resolve_ts_range` relies on), so a day's
+            # frames occupy one contiguous id block, and because `analysis` cascade-deletes
+            # with its frame, so no orphan verdict can be counted into a day.
+            #
+            # That invariant is ASSUMED, not enforced: the collector stamps `recv_ts` from
+            # the wall clock, so a backward step across a local midnight makes two days'
+            # spans overlap and the earlier day counts the later one's verdicts too. It
+            # fails LOUDLY and in one direction only — a day reads `analyzed > frames`, i.e.
+            # coverage above 100% — never as a silent under-report. Left unguarded
+            # deliberately: clamping to the next day's first id regresses the OPPOSITE skew
+            # into a fully-swept day reading 0%, and only the join this replaced is actually
+            # immune. See CHANGELOG 277.
+            #
+            # `+analyzer` DE-INDEXES that term, exactly as `_resolve_flag` and the
+            # per-span reads in `events()` do. Without it SQLite — which has no ANALYZE
+            # stats on this store — prefers `idx_analysis_analyzer_verdict` on the
+            # equality and scans each analyzer's WHOLE partition, then fetches every row.
+            # Hinted, this is a pure covering scan of the PK index (frame_id, analyzer):
+            # no table access and no frames lookup at all. Measured on a 2.5M-frame /
+            # 4.3M-verdict replica: 2590 ms joined (as it planned itself) → 880 ms.
             if analyzers:
-                win_min = min(r["since_id"] for r in days.values())
-                win_max = max(r["until_id"] for r in days.values())
                 ph = ",".join("?" * len(analyzers))
-                for d, name, cnt in conn.execute(
-                    "SELECT (f.recv_ts + ?) / ? AS d, a.analyzer, COUNT(*)"
-                    " FROM analysis a JOIN frames f ON f.id = a.frame_id"
-                    " WHERE a.frame_id BETWEEN ? AND ? AND a.analyzer IN (" + ph + ")"
-                    " GROUP BY d, a.analyzer",
-                    [off, DAY, win_min, win_max] + list(analyzers),
-                ).fetchall():
-                    row = days.get(int(d))
-                    if row is not None and name in row["analyzed"]:
-                        row["analyzed"][name] = int(cnt)
+                for row in days.values():
+                    for name, cnt in conn.execute(
+                        "SELECT analyzer, COUNT(*) FROM analysis"
+                        " WHERE frame_id BETWEEN ? AND ? AND +analyzer IN (" + ph + ")"
+                        " GROUP BY analyzer",
+                        [row["since_id"], row["until_id"]] + list(analyzers),
+                    ).fetchall():
+                        if name in row["analyzed"]:
+                            row["analyzed"][name] = int(cnt)
         finally:
             conn.close()
         return [days[k] for k in sorted(days)]

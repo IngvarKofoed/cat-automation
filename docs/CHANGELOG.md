@@ -1824,3 +1824,53 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 290. A job can succeed and still record nothing for its span (frames evicted mid-run), so
      admin only retires the analyse button once the visit actually left `unanalyzed` —
      otherwise the retry control vanished under the line "Analysed: not analysed."
+
+291. Annotation can PLAY the visit it is deciding — click either stage image, the new
+     "▶ Play frames" button, or `v`, in Queue, Flagged and Labelled alike. A cat is a few
+     percent of the top-down ROI, so the stage's single rep still can leave the coat
+     ambiguous; the player runs the whole visit through the same crop-beside-frame pair.
+     No fetch: it plays the visit record's OWN frames, i.e. exactly the crops a decision
+     labels — not Activity's sampled event span, which includes frames carrying no crop.
+
+292. With the player open the keyboard still labels: a bound key closes it and then does
+     its normal thing, so a decision always lands on the visit that was on screen (the
+     player only ever plays the staged visit, and nothing navigates without closing).
+     Space is the exception — play/pause, since skipping a visit because the operator
+     reached for pause is the worse surprise. Any stage repaint closes it, and so does a
+     mode SWITCH: that load is async and leaves the outgoing mode's list in place, so a
+     key pressed over the player would have re-labelled a stale, already-decided visit.
+
+293. The player transport is now module-level and shared with Activity, which supplies its
+     own stage (one full frame + box) and stats as before — so play/pause, scrub, position,
+     Escape and backdrop-close can't drift between the two. Each cell is FIXED size —
+     the frame cell takes the frame's own aspect ratio — since a crop's box changes shape
+     frame to frame and content-sized cells would resize 5× a second.
+
+294. The annotation saving indicator moved out of the control row to a pulsing amber pill
+     directly above the stage, in a permanently reserved slot (measured: 0px shift, so the
+     images never step under the reader). A label is written BEHIND the operator, so this
+     is the only thing saying one is still in flight — and it has to register from the
+     crop, where the eye is. Motion is what peripheral vision picks up, not a grey word.
+
+295. It NAMES what is in flight ("Saving Mittens · 11/07-2026 06:14…"), because the visit
+     left the screen the instant it was submitted — "saving 3…" cannot answer the question
+     the operator actually has, which is whether their Mittens went through. All of them
+     are listed in the tooltip, which also says the buttons staying enabled is fine: the
+     writes are a queue, not a race.
+
+296. A drained queue now CONFIRMS with a brief green "Saved" instead of the chip merely
+     vanishing, which looked identical to one that never appeared. Suppressed when the
+     batch held a failure or a short write, so it can never contradict the error line
+     those already print.
+
+297. Labelled review's re-label and send-back are on the same indicator. A re-label deletes
+     the visit's crop files and cuts them all again, making it the SLOWEST write on the
+     page — and being awaited rather than optimistic, it previously left the page looking
+     completely idle for seconds. Root cause of the wait, unchanged: `_commit_label`
+     decodes + crops + writes one JPEG per visit frame, synchronously in the request.
+
+298. The player's scrub is the page's THIRD focusable control to blur itself after use,
+     joining the entry-235/242 pair. `onKey` drops any keystroke targeting an INPUT, so
+     focus left on the slider swallowed the operator's next label — with the modal over
+     the stage to hide why. Blurs on `change` AND `pointerup`: a click landing on the
+     thumb's current position changes no value and fires neither.

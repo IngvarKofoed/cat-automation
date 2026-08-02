@@ -430,7 +430,43 @@
   .astage-crop img { max-height: 260px; max-width: 100%; border: 1px solid var(--border); border-radius: var(--radius); display: block; }
   .astage-full { max-width: 420px; flex: 1; min-width: 220px; }
   .astage-full img { width: 100%; height: auto; display: block; border-radius: var(--radius); }
+  .astage-imgs.clickable { cursor: pointer; }
   .acat { font-size: 13px; }
+  /* Saving indicator. A label is written BEHIND the operator (the stage advances at once
+     and the POST settles after), so this chip is the ONLY thing saying one is still in
+     flight — and it has to register from the crop, where the eye is. Hence a pulsing
+     amber pill directly above the stage: peripheral vision picks up motion, not a word.
+     Its slot is PERMANENTLY reserved, because it appears and goes on every keypress and
+     a collapsing banner there would jog the images under the reader on each one. */
+  /* FLEX, not a plain block: as an inline box the pill's line-height added a couple of
+     pixels the empty slot doesn't have, so the images still stepped down on every save. */
+  .asaving-slot { display: flex; align-items: center; min-height: 28px; margin-bottom: 6px; }
+  .asaving { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600;
+    padding: 3px 11px; border-radius: 999px; background: var(--surface-2);
+    border: 1px solid var(--warn); color: var(--warn); }
+  .asaving.done { border-color: var(--ok); color: var(--ok); }
+  .asaving .pulse { width: 9px; height: 9px; border-radius: 50%; background: currentColor;
+    flex: none; animation: asave-pulse 1s ease-in-out infinite; }
+  .asaving.done .pulse { animation: none; }
+  @keyframes asave-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .3; transform: scale(.6); } }
+  @media (prefers-reduced-motion: reduce) { .asaving .pulse { animation: none; } }
+  /* The annotation PLAYER's stage: the same crop-beside-frame pair the label stage shows,
+     animated through the visit — from the top-down view the cat is a few percent of the
+     ROI, so a full-frame-only player would play a scene with nothing readable in it. */
+  .aplay { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .aplay .cell { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+    overflow: hidden; position: relative; width: min(44vh, 42vw); }
+  /* The crop cell takes the FRAME's nominal shape too, so the two read as a pair. It
+     can't take the crop's own: a box's aspect changes frame to frame, which is exactly
+     the resizing the fixed cell exists to stop. */
+  .aplay .pcrop { aspect-ratio: 4 / 3; }
+  /* The full-frame cell takes the FRAME's own aspect ratio (stamped on first load, since
+     every stored frame shares the camera's post-transform size), so the image fills it
+     exactly — which is what lets the box sit at plain percentages of the cell. 4/3 until
+     then, and the box stays hidden while the dimensions are unknown. */
+  .aplay .pfull { aspect-ratio: 4 / 3; }
+  .fmodal.player .aplay img { width: 100%; height: 100%; max-width: 100%; max-height: 100%;
+    object-fit: contain; display: block; }
   /* FLAGGED review's crop strip: every crop the span would contribute, with the grade the
      queue's formula seeds it — a flagged span is often undecided and unswept, so seeing
      what it actually holds is the point before deciding it. Read-only (grades are seeded,
@@ -765,10 +801,84 @@
     m.addEventListener('click', (e) => { if (e.target === m) closeFrameModal(); });
     frameModal = m;
   }
-  // One Escape listener for the app, not one per mounted page: the modal itself is
-  // module-level now, so its key handling belongs here too. A page's own modal (the
-  // Activity player) keeps its own handler; this one is a no-op when nothing is open.
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFrameModal(); });
+  // The visit PLAYER modal, hoisted for the reason openFrameModal is: two pages open
+  // one (Activity on a visit card, Annotation on the visit being labelled), and the
+  // transport — play/pause, scrub, position, Escape, backdrop-close, the ~5 fps that
+  // matches capture — must behave identically wherever a visit is played.
+  //   What DIFFERS is the stage, so the caller owns it: Activity plays the sampled
+  // frames of an event's whole id span (one full frame + its box), Annotation the
+  // visit's own detected frames (crop AND full frame, the two-up its label stage
+  // already shows). The caller supplies `stageHtml` and a `paint(i, modal)` that
+  // draws frame i onto it.
+  const PLAYER_MS = 200;   // ~5 fps — the capture rate, so a visit plays at real speed
+  let visitPlayer = null, visitPlayerTimer = null, visitPlayerToggle = null;
+  const currentVisitPlayer = () => visitPlayer;
+  function closeVisitPlayer() {
+    if (visitPlayerTimer) { clearInterval(visitPlayerTimer); visitPlayerTimer = null; }
+    if (visitPlayer) { visitPlayer.remove(); visitPlayer = null; }
+    visitPlayerToggle = null;
+  }
+  function toggleVisitPlayer() { if (visitPlayerToggle) visitPlayerToggle(); }
+  function openVisitPlayer({ n, stageHtml, paint, belowHtml = '', onBuilt }) {
+    closeVisitPlayer();
+    const m = document.createElement('div');
+    m.className = 'fmodal player';
+    m.innerHTML = `<div class="inner" style="min-width:320px">
+      ${stageHtml}
+      <div class="row" style="margin-top:8px;align-items:center">
+        <button id="pPlay">Pause</button>
+        <input id="pScrub" type="range" min="0" max="${n - 1}" value="0" style="flex:1;min-width:0">
+        <span id="pIdx" class="note mono">1/${n}</span>
+      </div>
+      <div id="pCap" class="note" style="margin-top:6px"></div>
+      ${belowHtml}
+    </div>`;
+    document.body.appendChild(m);
+    visitPlayer = m;
+    // BEFORE the first paint: a caller that learns the frames' natural dimensions from
+    // an image `load` must have that listener attached before the first `src` is set.
+    if (onBuilt) onBuilt(m);
+    let i = 0;
+    function show(k) {
+      i = ((k % n) + n) % n;
+      $('#pScrub', m).value = i;
+      $('#pIdx', m).textContent = (i + 1) + '/' + n;
+      paint(i, m);
+    }
+    const play = () => {
+      $('#pPlay', m).textContent = 'Pause';
+      visitPlayerTimer = setInterval(() => show(i + 1), PLAYER_MS);
+    };
+    const pause = () => {
+      $('#pPlay', m).textContent = 'Play';
+      if (visitPlayerTimer) { clearInterval(visitPlayerTimer); visitPlayerTimer = null; }
+    };
+    visitPlayerToggle = () => (visitPlayerTimer ? pause() : play());
+    $('#pPlay', m).addEventListener('click', toggleVisitPlayer);
+    $('#pScrub', m).addEventListener('input', (e) => { pause(); show(Number(e.target.value)); });
+    // BLUR once the interaction settles, the treatment #aFilter and #aUncertain already
+    // get (entries 235, 242). Annotation's onKey drops every keystroke whose target is an
+    // INPUT, so focus left on the scrub silently swallows the operator's next label —
+    // and here the modal covers the stage, so nothing on screen hints why.
+    //   Not on `input`, which would end a drag mid-way. `change` covers the drag; but a
+    // click that lands on the thumb's current position changes no value and so fires
+    // NEITHER, which is why `pointerup` is here too — it fires on any release.
+    // Accepted cost: arrow-key scrubbing ends at the first click. On this page the arrows
+    // are already bound to prev/next visit, so they never scrubbed here anyway.
+    const blurScrub = (e) => e.target.blur();
+    $('#pScrub', m).addEventListener('change', blurScrub);
+    $('#pScrub', m).addEventListener('pointerup', blurScrub);
+    m.addEventListener('click', (e) => { if (e.target === m) closeVisitPlayer(); });
+    show(0); play();
+    return m;
+  }
+  // One Escape listener for the app, not one per mounted page: both modals are
+  // module-level, so their key handling belongs here too. A no-op when nothing is open.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeFrameModal();
+    closeVisitPlayer();
+  });
 
   // Per-visit aggregates block, same three rows (and same wording) as the user dashboard.
   function statsHtml(det) {
@@ -2082,7 +2192,6 @@
           </div>
           <label class="note" id="aUncertainWrap" title="Show only the visits the active model found hard — it matched the rest confidently to a resident."><input type="checkbox" id="aUncertain"> Hide confident matches</label>
           <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
-          <span id="aSaving" class="status" hidden><span class="dot"></span><span></span></span>
           <span id="aStatus" class="note grow">Loading queue…</span>
           <button id="aReload">Reload</button>
         </div>
@@ -2092,6 +2201,7 @@
         <div id="aOvGrid" class="fgrid aovgrid"></div>
       </div>
       <div class="card">
+        <div class="asaving-slot"><span id="aSaving" class="asaving" hidden><span class="pulse"></span><span class="txt"></span></span></div>
         <div id="aStage"><span class="note">Loading…</span></div>
         <p class="note bad" id="aErr" hidden></p>
         <p class="hint" id="aHint"></p>
@@ -2138,7 +2248,13 @@
     // race the insert it means to delete.
     //   `decided` is every frame id decided locally, so a re-fetch of the queue can't
     // hand back a visit whose write hasn't landed yet.
-    let writeChain = Promise.resolve(), pendingWrites = 0, lastDecision = null;
+    //   `pending` is what is currently in flight, in submit order — the labels themselves,
+    // not a count. The visit a write belongs to left the screen the moment it was
+    // submitted, so "saving 3…" cannot answer the question the operator actually has,
+    // which is "did my Mittens go through?".
+    let writeChain = Promise.resolve(), lastDecision = null;
+    const pending = [];
+    let savedTimer = null, batchFailed = false;
     const decided = new Set();
     let preloads = [];
 
@@ -2152,6 +2268,9 @@
     const cropUrl = (f) => `/api/label/crop/${f.id}?box=${f.bbox.map(Math.round).join(',')}`;
     const repOf = (v) => (v ? (v.frames.find((f) => f.id === v.rep_frame_id) || v.frames[0]) : null);
     const current = () => visits[idx];
+    // The visit currently on stage, whichever mode is showing — what the player plays and
+    // what a decision key applies to. One accessor so the two can never disagree.
+    const staged = () => (mode === 'queue' ? current() : mode === 'flagged' ? flgCurrent() : lab[labIdx]);
     const flash = (m) => { const el = $('#aStatus', view); if (el) el.textContent = m; };
     // A failed write is reported on its OWN line, not through flash(): the stage
     // re-renders (and rewrites the status) on every keypress, so a flashed error would be
@@ -2165,11 +2284,47 @@
       el.textContent = m || '';
       el.hidden = !m;
     }
-    function renderPending() {
+    // One write's lifetime. Every path that posts goes through this pair, so the
+    // indicator can never disagree with the chain about what is outstanding.
+    function beginWrite(label) {
+      if (!pending.length) batchFailed = false;   // a fresh batch of writes
+      const tok = { label };
+      pending.push(tok);
+      renderPending();
+      return tok;
+    }
+    function endWrite(tok, failed) {
+      const i = pending.indexOf(tok);
+      if (i >= 0) pending.splice(i, 1);
+      if (failed) batchFailed = true;
+      renderPending(true);
+    }
+    function renderPending(settled) {
       const el = $('#aSaving', view);
       if (!el) return;
-      el.hidden = pendingWrites === 0;
-      if (pendingWrites) el.lastElementChild.textContent = `saving ${pendingWrites}…`;
+      if (savedTimer) { clearTimeout(savedTimer); savedTimer = null; }
+      const txt = $('.txt', el);
+      if (pending.length) {
+        el.hidden = false;
+        el.classList.remove('done');
+        txt.textContent = pending.length === 1
+          ? `Saving ${pending[0].label}…` : `Saving ${pending.length} labels…`;
+        // Says the thing the enabled buttons otherwise imply wrongly: carrying on is
+        // fine, the writes are a queue, not a race.
+        el.title = 'Still writing to the store. You can keep labelling — writes are queued '
+          + 'and saved in order.\n\n' + pending.map((p) => '• ' + p.label).join('\n');
+        return;
+      }
+      // Drained. Confirm it briefly rather than just vanishing: a chip that disappears
+      // looks exactly like one that never appeared, which is the doubt this exists to
+      // settle. Suppressed when the batch held a failure or a short write — that has its
+      // own persistent line, and a green "Saved" over it would contradict it.
+      if (!settled || batchFailed) { el.hidden = true; return; }
+      el.hidden = false;
+      el.classList.add('done');
+      txt.textContent = 'Saved';
+      el.title = 'Every queued label has been written to the store.';
+      savedTimer = setTimeout(() => { savedTimer = null; el.hidden = true; }, 1800);
     }
 
     function renderStatus() {
@@ -2206,6 +2361,10 @@
       // showing one mode's visit while the keys dispatch to the other's is a destructive
       // mislabel (the digit would re-label the visit you can't see).
       if (mode !== 'queue') return;
+      // The player belongs to the visit that was on stage, so a repaint (a decision's
+      // advance, a skip, a reload) closes it — leaving it open would show one visit's
+      // frames over another's, the same mislabel hazard the mode guard above prevents.
+      closeVisitPlayer();
       // The empty state must not claim a clear queue when a filter is doing the emptying.
       if (!v) {
         stage.innerHTML = (uncertainOnly && hiddenConfident)
@@ -2222,6 +2381,7 @@
           <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
         </div>
         <div class="note" style="margin-top:8px">${v.frames.length} frames · rep ${detPct(rep.score)} · peak ${Math.round((v.peak_score || 0) * 100)}%${dist}</div>
+        <div class="row" style="margin-top:10px">${PLAY_BTN}</div>
       `;
       // Same box placement (and the same confidence traffic light) the two overviews use —
       // the local copy predated placeBoxes() being hoisted to module scope, and its `warn`
@@ -2231,6 +2391,7 @@
       // would be a number the operator can't see (and .fbox takes no pointer events, so a
       // title tooltip wouldn't reach it).
       placeBoxes(stage);
+      wireStagePlay(stage);
       prefetchAhead();
     }
     // Load the NEXT visits' images now, so the advance paints from cache instead of
@@ -2244,6 +2405,111 @@
       }
       preloads = urls.map((u) => { const im = new Image(); im.src = u; return im; });
     }
+
+    // ---- Play the staged visit's frames ------------------------------------
+    // The stage shows ONE frame of a visit (its rep); this runs the WHOLE visit through
+    // the same crop-beside-frame pair, so the cat is seen moving — the dorsal coat a
+    // single top-down still can leave ambiguous, and the angle that finally shows a tail
+    // or a flank. Available in all three modes: the reading is the same whether the
+    // decision is a first label, a correction, or a flagged span.
+    //   No fetch: the frames come from the visit record already in hand (each carries its
+    // own box and score), so the player opens instantly and plays EXACTLY the frames a
+    // decision here labels — not the event span's sampled frames the Activity player
+    // shows, which include frames that carry no crop at all.
+    function playStaged() {
+      const v = staged();
+      const frames = (v && v.frames) || [];
+      if (!frames.length) { flash('nothing to play — this visit has no detected frames'); return; }
+      let natW = null, natH = null, cur = 0;
+      let crop = null, full = null, cell = null, fb = null, cap = null, capEl = null;
+      // Warm a few frames AHEAD of the cursor rather than the whole visit at once: a
+      // visit runs to ~100 frames, and 200 parallel requests would queue the frames
+      // actually being played behind the ones that aren't. /api/label/crop decodes the
+      // stored JPEG per call, so an un-warmed loop stutters on the first pass.
+      //   Held in a rolling buffer rather than reassigned per frame: dropping the last
+      // reference to an Image whose request is still in flight can cancel it, which at
+      // 5 frames a second is most of them.
+      const warm = [], WARM_KEEP = 24, warmed = new Set();
+      function warmAhead(i) {
+        for (let k = i + 1; k <= i + 4 && k < frames.length; k++) {
+          if (warmed.has(k)) continue;
+          warmed.add(k);
+          for (const u of [cropUrl(frames[k]), `/media/${frames[k].id}`]) {
+            const im = new Image(); im.src = u; warm.push(im);
+          }
+        }
+        if (warm.length > WARM_KEEP) warm.splice(0, warm.length - WARM_KEEP);
+      }
+      function drawBox(f) {
+        if (!natW) { fb.hidden = true; return; }
+        const band = bandOf(f.score);
+        fb.className = 'fbox ' + band;
+        fb.style.cssText = 'position:absolute;box-sizing:border-box;' + boxStyle(f.bbox, natW, natH);
+        cap.className = 'boxcap ' + band;
+        cap.textContent = detPct(f.score);
+        fb.hidden = false;
+      }
+      // The grade this crop carries: SEEDED (what a decision would write) in the queue and
+      // in Flagged review, STORED in Labelled review — the same split the two modes already
+      // make elsewhere. Omitted where there is no crop to grade (a not_cat / ignored row),
+      // rather than reading "ungraded" about a crop that was never written (entry 248).
+      const gradeOf = (f) => (mode === 'labelled' ? (f.quality || null) : seedQuality(f, v));
+      function caption(f) {
+        const g = gradeOf(f);
+        return [
+          fmtClock(f.recv_ts), `frame ${f.id}`, `det ${detPct(f.score)}`,
+          ...(g ? [`grade ${g}`] : []),
+          ...(f.id === v.rep_frame_id ? ['rep'] : []),
+        ].join(' · ');
+      }
+      openVisitPlayer({
+        n: frames.length,
+        stageHtml: '<div class="aplay">'
+          + '<div class="cell pcrop"><img id="apCrop" alt="crop"></div>'
+          + '<div class="cell pfull" id="apFull"><img id="apFrame" alt="frame">'
+          + '<div class="fbox" hidden><span class="boxcap"></span></div></div>'
+          + '</div>',
+        onBuilt: (m) => {
+          crop = $('#apCrop', m); full = $('#apFrame', m); cell = $('#apFull', m);
+          fb = $('#apFull .fbox', m); cap = $('.boxcap', fb); capEl = $('#pCap', m);
+          // Learned ONCE, like the Activity player's: every stored frame shares the
+          // camera's post-transform size, so the box can then be drawn synchronously per
+          // frame instead of hidden and re-shown 5× a second. Stamping the cell with the
+          // frame's aspect ratio is what makes the image fill it exactly — and only then
+          // is a percentage box position correct.
+          full.addEventListener('load', () => {
+            if (natW == null && full.naturalWidth) {
+              natW = full.naturalWidth; natH = full.naturalHeight;
+              cell.style.aspectRatio = `${natW} / ${natH}`;
+              drawBox(frames[cur]);
+            }
+          });
+        },
+        paint: (i) => {
+          cur = i;
+          const f = frames[i];
+          crop.src = cropUrl(f);
+          full.src = `/media/${f.id}`;
+          capEl.textContent = caption(f);
+          drawBox(f);
+          warmAhead(i);
+        },
+      });
+    }
+    // The images ARE the control (click either to play), but a bare clickable image does
+    // not read as one — so every mode also carries a visible button, and `v` the key.
+    function wireStagePlay(stage) {
+      const imgs = stage.querySelector('.astage-imgs');
+      if (imgs) {
+        imgs.classList.add('clickable');
+        imgs.title = "Play this visit's frames (v)";
+        imgs.addEventListener('click', playStaged);
+      }
+      const btn = $('#aPlay', stage);
+      if (btn) btn.addEventListener('click', playStaged);
+    }
+    const PLAY_BTN = '<button id="aPlay" title="Play this visit\'s frames (v)">▶ Play frames</button>';
+
     function advanceAfterDecision() {
       visits.splice(idx, 1);
       if (visits.length === 0) { renderVisit(); loadQueue(); return; }
@@ -2261,7 +2527,12 @@
       lastDecision = what;
       const at = fmtTs(v.frames[0].recv_ts);
       advanceAfterDecision();
-      pendingWrites += 1; renderPending();
+      // The indicator names the decision AND the visit's time — the visit itself is
+      // already off screen, so nothing else identifies which write is still running.
+      const tok = beginWrite(`${what} · ${at}`);
+      // A short write is a failure for the indicator's purposes: it has its own line on
+      // screen, and a green "Saved" over that would contradict it.
+      let failed = false;
       writeChain = writeChain.then(send).then(
         (res) => {
           // The server skips a frame evicted since the queue was read, one already carrying
@@ -2272,19 +2543,22 @@
           // so the honest next step is Labelled review, not another attempt here.
           const n = res && res.inserted != null ? res.inserted : (res && res.ignored);
           if (n === 0 && ids.length) {
+            failed = true;
             showErr(`${what} (${at}): nothing recorded — these frames are already labelled, or no longer in the store. Check them under Labelled.`);
           } else if (n != null && n < ids.length) {
+            failed = true;
             showErr(`${what} (${at}): recorded ${n} of ${ids.length} frames — the rest were evicted, already labelled, or their crop couldn't be written.`);
           }
         },
         (e) => {
+          failed = true;
           ids.forEach((id) => decided.delete(id));
           if (lastAction === ids) { lastAction = null; lastDecision = null; }
           visits.push(v);
           if (alive) { if (visits.length === 1) { idx = 0; renderVisit(); } else renderStatus(); }
           showErr(`${what} (${at}) failed: ${e.message} — the visit is back at the end of the queue.`);
         },
-      ).then(() => { pendingWrites -= 1; renderPending(); });
+      ).then(() => endWrite(tok, failed));
     }
     function commitLabel(decision, cat_id) {
       const v = current(); if (!v) return;
@@ -2303,7 +2577,8 @@
       if (!lastAction) { flash('nothing to undo'); return; }
       const ids = lastAction;
       lastAction = null; lastDecision = null;
-      pendingWrites += 1; renderPending();
+      const tok = beginWrite('undo');
+      let failed = false;
       // On the same chain as the labels, so the delete can never overtake the insert it
       // is undoing (which would leave the label standing and the undo silently a no-op).
       writeChain = writeChain
@@ -2312,9 +2587,9 @@
           // The error line is NOT cleared on success: it reports a DIFFERENT visit that
           // failed or recorded short, and undoing this one doesn't resolve that.
           () => { ids.forEach((id) => decided.delete(id)); loadQueue(); },
-          (e) => showErr('undo failed: ' + e.message),
+          (e) => { failed = true; showErr('undo failed: ' + e.message); },
         )
-        .then(() => { pendingWrites -= 1; renderPending(); });
+        .then(() => endWrite(tok, failed));
     }
     // Only meaningful with a promoted model: without one nothing has been identified, so
     // there are no confident matches to hide (the backend treats the flag as a no-op). Say
@@ -2485,6 +2760,7 @@
       renderStatus();
       const stage = $('#aStage', view), v = lab[labIdx];
       if (!stage || mode !== 'labelled') return;  // the mirror of renderVisit's guard
+      closeVisitPlayer();                         // and of its player close
       if (!v) {
         stage.innerHTML = `<span class="note">${labAll.length
           ? 'No visits carry that label — pick another under “Show label”.'
@@ -2530,6 +2806,7 @@
         <div class="row" style="margin-top:12px">
           <button id="aPrev" title="Previous visit (p / ←)"${lab.length < 2 ? ' disabled' : ''}>← Prev</button>
           <button id="aNext" title="Next visit (n / →)"${lab.length < 2 ? ' disabled' : ''}>Next →</button>
+          ${PLAY_BTN}
           <span class="grow"></span>
           <button id="aRelUnknown">Unknown cat (u)</button>
           <button id="aRelNotCat">Not a cat (x)</button>
@@ -2537,6 +2814,7 @@
         </div>
       `;
       placeBoxes(stage);
+      wireStagePlay(stage);
       // Prev/Next are the same gesture as n/p, made visible: the keys were listed only in
       // the hint line, so the mode read as having no navigation at all — the more so once
       // focus sat on the "Show label" dropdown, where onKey drops every keystroke.
@@ -2551,6 +2829,10 @@
     // Re-label: the server drops this visit's rows + crop files, then re-commits under
     // the new identity. The visit deliberately STAYS in view (rather than advancing) so
     // the correction is visible — this is the mode you came to in order to check one.
+    //   It shows the saving pill for the same reason the queue does, and with more cause:
+    // a re-label deletes this visit's crop files and cuts them all again, so it is the
+    // SLOWEST write on the page — and being awaited rather than optimistic, without the
+    // pill the page simply sat there looking idle.
     async function relabel(decision, cat_id) {
       const v = lab[labIdx]; if (!v || busy) return;
       busy = true;
@@ -2558,6 +2840,11 @@
       const payload = v.frames.map((f) => withCrop
         ? { frame_id: f.id, bbox: f.bbox, quality: qualityFor(f, v) }
         : { frame_id: f.id });
+      const what = decision === 'identified'
+        ? ((cats.find((c) => c.id === cat_id) || {}).name || `cat #${cat_id}`)
+        : (LABEL_TEXT[decision] || decision);
+      const tok = beginWrite(`${what} · re-label`);
+      let failed = false;
       try {
         const res = await api('POST', '/api/label/relabel', { decision, cat_id: cat_id ?? null, frames: payload });
         v.label_kind = decision;
@@ -2580,15 +2867,20 @@
         // than let the freshly-drawn chip claim a label that did not persist.
         // (After renderLabelled, which repaints the status line this writes to.)
         const kept = res && res.inserted != null ? res.inserted : payload.length;
-        if (kept < payload.length) flash(`re-labelled ${kept} of ${payload.length} frames — the rest are no longer in the store`);
-      } catch (e) { flash('re-label failed: ' + e.message); }
-      finally { busy = false; }
+        if (kept < payload.length) {
+          failed = true;
+          flash(`re-labelled ${kept} of ${payload.length} frames — the rest are no longer in the store`);
+        }
+      } catch (e) { failed = true; flash('re-label failed: ' + e.message); }
+      finally { endWrite(tok, failed); busy = false; }
     }
 
     // Undo: delete the rows + crop files so the frames re-enter the annotation queue.
     async function requeue() {
       const v = lab[labIdx]; if (!v || busy) return;
       busy = true;
+      const tok = beginWrite('send back to queue');
+      let failed = false;
       try {
         await api('POST', '/api/label/delete', { frame_ids: v.frames.map((f) => f.id) });
         // These frames are undecided again, so drop them from the optimistic-advance set:
@@ -2618,8 +2910,8 @@
         // tile's data-i past this one now points at a different visit.
         if ($('#aFilter', view).value !== before) applyFilter();
         else { renderLabelledGrid(); renderLabelled(); }
-      } catch (e) { flash('send back failed: ' + e.message); }
-      finally { busy = false; }
+      } catch (e) { failed = true; flash('send back failed: ' + e.message); }
+      finally { endWrite(tok, failed); busy = false; }
     }
 
     // Options are built from the labels actually PRESENT, with counts, so the filter never
@@ -2707,6 +2999,7 @@
       renderStatus();
       const stage = $('#aStage', view), v = flgCurrent();
       if (!stage || mode !== 'flagged') return;   // the mirror of renderVisit's guard
+      closeVisitPlayer();                         // and of its player close
       if (!v) {
         stage.innerHTML = '<span class="note">Nothing flagged. Visits arrive here when the '
           + 'household taps “Mark for labelling” in the user app.</span>';
@@ -2747,6 +3040,7 @@
         ` : `<div class="note">${meta}</div>`}
         ${flagWhyNote(v)}
         <div class="row" style="margin-top:12px">
+          ${rep ? PLAY_BTN : ''}
           <button id="aFlgUnknown"${rep ? '' : ' disabled'}>Unknown cat (u)</button>
           <button id="aFlgNotCat"${rep ? '' : ' disabled'}>Not a cat (x)</button>
           ${v.state === 'unswept' || v.state === 'partial' ? '<button id="aFlgAnalyse">Analyse</button>' : ''}
@@ -2765,6 +3059,7 @@
         }).join('')}</div>` : ''}
       `;
       placeBoxes(stage);
+      wireStagePlay(stage);
       if (rep) {
         $('#aFlgUnknown', view).addEventListener('click', () => flagLabel('unknown_cat', null));
         $('#aFlgNotCat', view).addEventListener('click', () => flagLabel('not_cat', null));
@@ -2818,7 +3113,8 @@
       //   Awaited, unlike a queue decision: this mode is deliberate, low-volume work, and
       // "flag gone" has to mean the write landed.
       flash(`saving ${what}…`);
-      pendingWrites += 1; renderPending();
+      const tok = beginWrite(`${what} · flagged`);
+      let failed = false;
       const work = writeChain.then(async () => {
         const res = await api('POST', '/api/label/relabel', { decision, cat_id: cat_id ?? null, frames: payload });
         const kept = res && res.inserted != null ? res.inserted : payload.length;
@@ -2827,9 +3123,11 @@
         // aging path here, since flags are never auto-pruned. Deleting the flag then would
         // discard both the household's mark AND the operator's decision, silently.
         if (kept === 0) {
+          failed = true;
           showErr(`${what}: nothing recorded — these frames are no longer in the store. The flag is still here.`);
           return;
         }
+        if (kept < payload.length) failed = true;   // short write — its own line says so
         await api('DELETE', `/api/label/flags/${v.flag_id}`);
         frames.forEach((f) => decided.delete(f.id));   // labelled here, so not queue-pending
         if (alive && mode === 'flagged') dropFlagged(v);
@@ -2839,8 +3137,8 @@
       });
       writeChain = work.catch(() => {});   // one failure must not poison the chain
       try { await work; }
-      catch (e) { showErr(`${what} failed: ${e.message} — the visit is still flagged.`); }
-      finally { pendingWrites -= 1; renderPending(); busy = false; }
+      catch (e) { failed = true; showErr(`${what} failed: ${e.message} — the visit is still flagged.`); }
+      finally { endWrite(tok, failed); busy = false; }
     }
     // Dismiss: drop the flag and leave any label on its frames exactly as it was. The
     // distinct action, because a visit can be flagged AFTER it was labelled (or labelled
@@ -2918,6 +3216,13 @@
     }
 
     function setMode(m) {
+      // SYNCHRONOUSLY, before anything else. The load below is async and leaves the
+      // OUTGOING mode's array and index in place until it resolves, while the full-screen
+      // player hides that the stage has changed at all — so a decision key pressed in that
+      // window closes the player and then lands on a stale visit of the mode just left.
+      // In Labelled review that is a re-label: durable rows and crop files rewritten for a
+      // previously-decided visit, with nothing on screen to show it happened.
+      closeVisitPlayer();
       mode = m;
       showErr('');
       view.querySelectorAll('#aMode button').forEach((b) => b.classList.toggle('sel', b.dataset.m === m));
@@ -2929,11 +3234,11 @@
       $('#aOverview', view).hidden = m !== 'labelled';
       renderUncertainToggle();   // queue-only control
       const HINTS = {
-        queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
-        labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>n</b>/→ next · <b>p</b>/← back',
+        queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>v</b> play frames · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
+        labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>v</b> play frames · <b>n</b>/→ next · <b>p</b>/← back',
         // No `g` here: ignore is the queue's "skip without judging", and in Flagged
         // review dismiss already plays that role — without rewriting the labels.
-        flagged: 'Keys: <b>1–9</b> label as a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> dismiss the flag · <b>n</b>/→ next · <b>p</b>/← back',
+        flagged: 'Keys: <b>1–9</b> label as a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> dismiss the flag · <b>v</b> play frames · <b>n</b>/→ next · <b>p</b>/← back',
       };
       $('#aHint', view).innerHTML = HINTS[m] || '';
       if (m === 'queue') loadQueue();
@@ -2967,6 +3272,10 @@
     }
     async function loadCats() { try { const r = await api('GET', '/api/cats'); if (alive) { cats = r.cats || []; renderRoster(); } } catch (_) {} }
 
+    // The keys onKey below actually acts on — the set the player's guard consults, so an
+    // unbound keystroke can't dismiss it. Kept beside the handler; the two must agree.
+    const BOUND_KEYS = new Set(['u', 'x', 'g', 'n', 'p', 'z', 'd', 'Backspace', 'ArrowRight', 'ArrowLeft', ' ']);
+    const isBoundKey = (k) => BOUND_KEYS.has(k) || (k >= '1' && k <= '9');
     function onKey(e) {
       // SELECT is in the ignore list because Labelled review has a focusable filter:
       // without it, typing over the dropdown would re-label the visit behind it.
@@ -2975,6 +3284,19 @@
       // repeat, walking through the queue labelling every visit the same cat.
       if (e.repeat) return;
       const k = e.key;
+      // With the player open the keyboard means the player, not the label — except that a
+      // decision must not be swallowed either (a dropped key is what entries 216/218 are
+      // about). So a BOUND key closes it and then does its normal thing: the player only
+      // ever plays the staged visit, and nothing can navigate without closing first, so
+      // the visit a decision lands on is always the one that was on screen.
+      //   Space is the exception: it is the play/pause every player has, and skipping a
+      // visit because the operator reached for pause would be the worse surprise.
+      if (currentVisitPlayer()) {
+        if (k === ' ') { toggleVisitPlayer(); e.preventDefault(); return; }
+        if (k === 'v') { closeVisitPlayer(); return; }
+        if (!isBoundKey(k)) return;
+        closeVisitPlayer();
+      } else if (k === 'v') { playStaged(); return; }
       if (k >= '1' && k <= '9') { labelCat(parseInt(k, 10) - 1); e.preventDefault(); }
       else if (k === 'u') decide('unknown_cat');
       else if (k === 'x') decide('not_cat');
@@ -2996,7 +3318,7 @@
     // tab closes, and closing right after the last keypress is exactly when that happens.
     // Losing one is FAIL-SAFE (the server never saw it, so the visit stays in the queue) —
     // but it is silent, so ask. Removed on teardown: this belongs to the annotation page only.
-    function onUnload(e) { if (pendingWrites > 0) { e.preventDefault(); e.returnValue = ''; } }
+    function onUnload(e) { if (pending.length) { e.preventDefault(); e.returnValue = ''; } }
     window.addEventListener('beforeunload', onUnload);
     $('#aReload', view).addEventListener('click', () => {
       // The count refreshes in EVERY mode (loadFlagged overwrites it harmlessly) — a stale
@@ -3032,6 +3354,9 @@
     loadCats(); loadFlagCount(); setMode('queue');
     return () => {
       alive = false;
+      // The player lives on document.body, so it outlives the view unless closed here.
+      closeVisitPlayer();
+      if (savedTimer) { clearTimeout(savedTimer); savedTimer = null; }
       document.removeEventListener('keydown', onKey);
       window.removeEventListener('beforeunload', onUnload);
     };
@@ -3659,7 +3984,6 @@
     // older by keyset (`until_id`), so a deep page costs what page 1 costs.
     // `feedSeq` makes Reload win over an older-page fetch still in flight.
     let more = false, paging = false, feedSeq = 0;
-    let modal = null, playerTimer = null;
     // Serializes overlapping openPlayer() calls. It fetches its frames BEFORE building
     // the modal, so two clicks during that fetch would each build one — the first left
     // orphaned in the DOM with its playback interval still ticking. Now only the newest
@@ -3757,39 +4081,15 @@
       }
     }
 
-    function closeModal() { if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } if (modal) { modal.remove(); modal = null; } }
     async function openPlayer(idx) {
       const ev = events[idx]; if (!ev) return;
       const seq = ++playerSeq;
-      closeModal();
+      closeVisitPlayer();
       const q = new URLSearchParams({ count: 60, since_id: ev.start_id, until_id: ev.end_id, detections: 'yolo-serial' });
       let pf = [];
       try { const d = await api('GET', '/api/frames/sample?' + q); pf = Array.isArray(d) ? d : (d.frames || []); } catch (e) { flash('Playback: ' + e.message); return; }
       if (!alive || seq !== playerSeq) return;
       if (!pf.length) { flash('No frames left for that visit — they may have been evicted.'); return; }
-      closeModal();
-      modal = document.createElement('div'); modal.className = 'fmodal player';
-      modal.innerHTML = `<div class="inner" style="min-width:320px">
-        <div class="fimg" id="pStage"><img id="pImg"><div class="fbox" hidden><span class="boxcap"></span></div></div>
-        <div class="row" style="margin-top:8px;align-items:center">
-          <button id="pPlay">Pause</button>
-          <input id="pScrub" type="range" min="0" max="${pf.length - 1}" value="0" style="flex:1;min-width:0">
-          <span id="pIdx" class="note mono">1/${pf.length}</span>
-        </div>
-        <div id="pCap" class="note" style="margin-top:6px"></div>
-        <div id="pStats">${statsHtml(ev.detection)}</div>
-        ${ev.subject && ev.subject.kind === 'unanalyzed'
-          ? '<div class="row" style="margin-top:8px"><span class="note grow" id="pAnMsg">Nothing has looked at this visit yet.</span>'
-            + '<button id="pAnalyse">Analyse this visit</button></div>'
-          : ''}
-      </div>`;
-      document.body.appendChild(modal);
-      // Only rendered on an 'unanalyzed' visit — on an already-swept one the job fills no
-      // verdicts, and a button that does nothing is worse than no button.
-      const anBtn = $('#pAnalyse', modal);
-      if (anBtn) anBtn.addEventListener('click', () => analyseVisit(ev, modal));
-      const img = $('#pImg', modal), fb = $('#pStage .fbox', modal), cap = $('.boxcap', fb);
-      let i = 0;
       // Natural dimensions are learned ONCE from this visit's first frame and cached, so
       // drawBox runs SYNCHRONOUSLY on every frame change. Waiting for each frame's load
       // meant hiding the box and re-showing it 5× a second — the flicker. Safe because
@@ -3798,7 +4098,10 @@
       // It also makes a stale box impossible — the box is drawn from the frame being
       // shown, never from a closure the previous frame left behind on `onload`.
       let natW = null, natH = null;
-      const capEl = $('#pCap', modal);
+      let img = null, fb = null, cap = null, capEl = null;
+      // Which frame is on screen: the `load` handler draws its box, and it fires after
+      // paint() has already set the src for that frame.
+      let cur = 0;
       function drawBox(f) {
         const band = bandOf(f.score);
         const txt = detLabel(f);
@@ -3812,25 +4115,28 @@
         cap.textContent = txt;
         fb.hidden = false;
       }
-      img.addEventListener('load', () => {
-        if (natW == null && img.naturalWidth) { natW = img.naturalWidth; natH = img.naturalHeight; }
-        drawBox(pf[i]);   // the first frame's box, now that dimensions are known
+      const modal = openVisitPlayer({
+        n: pf.length,
+        stageHtml: '<div class="fimg" id="pStage"><img id="pImg"><div class="fbox" hidden><span class="boxcap"></span></div></div>',
+        belowHtml: `<div id="pStats">${statsHtml(ev.detection)}</div>`
+          + (ev.subject && ev.subject.kind === 'unanalyzed'
+            ? '<div class="row" style="margin-top:8px"><span class="note grow" id="pAnMsg">Nothing has looked at this visit yet.</span>'
+              + '<button id="pAnalyse">Analyse this visit</button></div>'
+            : ''),
+        onBuilt: (m) => {
+          img = $('#pImg', m); fb = $('#pStage .fbox', m); cap = $('.boxcap', fb); capEl = $('#pCap', m);
+          img.addEventListener('load', () => {
+            if (natW == null && img.naturalWidth) { natW = img.naturalWidth; natH = img.naturalHeight; }
+            drawBox(pf[cur]);   // the first frame's box, now that dimensions are known
+          });
+        },
+        paint: (i) => { cur = i; img.src = pf[i].url; drawBox(pf[i]); },
       });
-      function show(n) {
-        i = n; const f = pf[i];
-        img.src = f.url;
-        $('#pScrub', modal).value = i; $('#pIdx', modal).textContent = (i + 1) + '/' + pf.length;
-        drawBox(f);
-      }
-      const play = () => { $('#pPlay', modal).textContent = 'Pause'; playerTimer = setInterval(() => show((i + 1) % pf.length), 200); };
-      const pause = () => { $('#pPlay', modal).textContent = 'Play'; if (playerTimer) { clearInterval(playerTimer); playerTimer = null; } };
-      $('#pPlay', modal).addEventListener('click', () => (playerTimer ? pause() : play()));
-      $('#pScrub', modal).addEventListener('input', (e) => { pause(); show(Number(e.target.value)); });
-      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
-      show(0); play();
+      // Only rendered on an 'unanalyzed' visit — on an already-swept one the job fills no
+      // verdicts, and a button that does nothing is worse than no button.
+      const anBtn = $('#pAnalyse', modal);
+      if (anBtn) anBtn.addEventListener('click', () => analyseVisit(ev, modal));
     }
-    function onKey(e) { if (e.key === 'Escape') closeModal(); }
-    document.addEventListener('keydown', onKey);
 
     // --- Analyse ONE visit (the unanalysed-visits spec) --------------------------
     // Detect + identify over just this visit's span, as one server-side job, so the
@@ -3862,7 +4168,7 @@
       // The modal is rebuilt per open, so these elements belong to THIS visit — but it can
       // still be closed (or another opened) mid-job, so every write is guarded on the
       // modal still being the mounted one.
-      const open = () => alive && modal === ownModal;
+      const open = () => alive && currentVisitPlayer() === ownModal;
       const say = (t) => { if (open() && msg) msg.textContent = t; };
       if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
       try {
@@ -3925,6 +4231,8 @@
     $('#acOlder', view).addEventListener('click', loadOlderEvents);
 
     loadEvents();
-    return () => { alive = false; closeModal(); document.removeEventListener('keydown', onKey); };
+    // Escape is the app-level listener's job now (the player is module-level), so this
+    // page keeps no key handler of its own — only its modal must not outlive the view.
+    return () => { alive = false; closeVisitPlayer(); };
   }
 </script>

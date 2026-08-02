@@ -47,7 +47,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from compute.analysis import ANALYZER_NAMES
+from compute.analysis import ANALYZER_NAMES, get_analyzer
 from compute.analysis.corruption import CorruptionAnalyzer
 from compute.analysis.lighting import LIGHTING_ANALYZER, LightingAnalyzer
 from compute.analysis.mog2 import MogAnalyzer
@@ -538,6 +538,38 @@ class IdentifyRunRequest(BaseModel):
 
     since_id: "int | None" = None
     until_id: "int | None" = None
+
+
+# Widest span ``POST /api/identify/visit`` accepts, in frame ids. One visit is seconds
+# to minutes; at the ~10 fps this door actually runs (changelog 275) this clears any
+# real visit by a wide margin (~16 min of continuous capture) while refusing a
+# store-wide span. The cap exists because the endpoint is called by the household's
+# phone on a no-auth LAN: a stray or malformed span must not become a full sweep.
+_MAX_VISIT_SPAN = 10_000
+
+
+class VisitIdentifyRequest(BaseModel):
+    """Body of ``POST /api/identify/visit``: the ONE visit span to analyse + identify.
+
+    Both bounds are REQUIRED, unlike every other windowed run in this API where a
+    ``None`` side means "unbounded" — here an omitted bound would silently widen a
+    per-visit action into a whole-store sweep. Pydantic enforces presence; the endpoint
+    enforces the ordering and the width cap.
+
+    ``ge=1`` and the ``bool`` guard mirror ``FlagSpanRequest``, the other span-keyed body
+    on this API: pydantic treats ``bool`` as an int subtype, so without the guard ``true``
+    coerces to frame id 1 and enqueues a job over whatever sits at the start of the store.
+    """
+
+    start_id: int = Field(ge=1)
+    end_id: int = Field(ge=1)
+
+    @field_validator("start_id", "end_id", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a frame id, not a boolean")
+        return v
 
 
 def _parse_box(box: str) -> "list[float]":
@@ -2735,6 +2767,46 @@ def create_app(
         return {
             **training_manager.enqueue_identify(store, req.since_id, req.until_id),
             "enough": True,
+        }
+
+    @app.post("/api/identify/visit")
+    def api_identify_visit(req: VisitIdentifyRequest):
+        """Detect + identify ONE visit span — the per-visit button on both dashboards.
+
+        Where ``/api/identify/run`` assumes its window is already detected, this runs the
+        detect half too, which is what turns an ``unanalyzed`` event into a real subject.
+        """
+        _validate_bounds(req.start_id, req.end_id)
+        if req.end_id - req.start_id > _MAX_VISIT_SPAN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"span of {req.end_id - req.start_id} ids exceeds the per-visit cap "
+                    f"({_MAX_VISIT_SPAN}); use a Motion-tuning sweep for a range this wide"
+                ),
+            )
+
+        # The deps check follows the HALVES, not the endpoint. Detect always runs, so its
+        # analyzer's deps are always required; the embedder's are required only when a
+        # gallery exists to identify against. Gating on the embedder unconditionally (as
+        # /api/identify/run does) would 503 the detect-only job that the no-model case
+        # exists to allow — and pre-gallery is the normal state in Phase 1.
+        model = store.active_model()
+        try:
+            get_analyzer("yolo-serial").ensure_available()
+            if model is not None:
+                from compute.identification.embed import Embedder
+
+                Embedder().ensure_available()
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        return {
+            **training_manager.enqueue_visit_identify(store, req.start_id, req.end_id),
+            # Lets the UI say which halves will run BEFORE the job starts. Read here, so a
+            # promotion landing mid-job doesn't retroactively change what the caller was
+            # told; the run re-reads active_model() itself and is the authority.
+            "will_identify": model is not None,
         }
 
     return app

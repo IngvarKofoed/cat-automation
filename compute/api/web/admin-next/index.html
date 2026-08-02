@@ -48,6 +48,11 @@
     --unident:   #9a8a78;  --unident-bg:   #241c12;
     --person:    #7fb0e8;  --person-bg:    #16283d;
     --unrec:     #b79ae8;  --unrec-bg:     #2a2038;
+    /* never looked at — the absence of a reading, not a verdict. Slate: desaturated so
+       it recedes beside the measured kinds, and clear of violet (unrec) and steel
+       (person). Duplicated from the user dashboard's token (no shared CSS by
+       convention) — change the two together. */
+    --unanalyzed: #9aadbd; --unanalyzed-bg: #1d252c;
   }
   * { box-sizing: border-box; }
   /* The UA's [hidden] rule is just `display:none` at author-stylesheet-losing specificity, so ANY
@@ -396,6 +401,7 @@
   .tchip.person       { background: var(--person-bg);    color: var(--person); }
   .tchip.unrecognized { background: var(--unrec-bg);     color: var(--unrec); }
   .tchip.motion       { background: var(--unident-bg);   color: var(--unident); }
+  .tchip.unanalyzed   { background: var(--unanalyzed-bg); color: var(--unanalyzed); }
   /* Lighting is a SCENE property, not a verdict about a cat, so it deliberately takes
      no verdict colour (upholding changelog 43's "color = verdict"): a neutral surface
      chip, dimmed further when the label is assumed rather than measured. */
@@ -705,8 +711,12 @@
   // the class attribute. `corrupted` borrows the violet. `bird` is deliberately absent
   // (the class was dropped from the detector) — a backend still emitting it therefore
   // falls through to that same muted chip rather than being silently relabelled.
-  const SUBJECT_LABEL = { person: 'person', corrupted: 'corrupted', unrecognized: 'unrecognized', motion_only: 'motion only' };
-  const SUBJECT_CLASS = { person: 'person', corrupted: 'unrecognized', unrecognized: 'unrecognized', motion_only: 'motion' };
+  // `unanalyzed` (no yolo-serial row anywhere in the span) is the one kind that is NOT a
+  // measurement — it outranks `corrupted` for that reason, and reads "not analysed" in
+  // British like every other operator-facing word here, while the wire value stays
+  // American with the rest of the payload vocabulary.
+  const SUBJECT_LABEL = { person: 'person', unanalyzed: 'not analysed', corrupted: 'corrupted', unrecognized: 'unrecognized', motion_only: 'motion only' };
+  const SUBJECT_CLASS = { person: 'person', unanalyzed: 'unanalyzed', corrupted: 'unrecognized', unrecognized: 'unrecognized', motion_only: 'motion' };
   function eventChip(ev, pos) {
     const kind = ev.subject && ev.subject.kind;
     if (!kind || kind === 'cat') {
@@ -3531,13 +3541,19 @@
     // --- The job queue (the shared renderQueue, fed from the training status poll) ---
     // All three kinds land on the ONE TrainingManager FIFO, so they render as one table:
     // a build queued behind an identify really does wait for it.
-    const KIND_NAME = { 'gallery-build': 'Gallery build', feasibility: 'Validation', identify: 'Identify' };
+    const KIND_NAME = {
+      'gallery-build': 'Gallery build', feasibility: 'Validation', identify: 'Identify',
+      // The per-visit analyse+identify button on either dashboard. Named here or the
+      // row would print the raw kind.
+      'visit-identify': 'Visit',
+    };
     function jobName(kind, params) {
       const base = KIND_NAME[kind] || kind;
       if (!params || !params.length) return base;
       // identify's params are its [since_id, until_id] frame bounds (either may be null =
-      // open end); a build's / validation's are the crop grades it embeds.
-      if (kind === 'identify') {
+      // open end), and visit-identify's are the same pair for ONE visit's span; a build's
+      // / validation's are the crop grades it embeds.
+      if (kind === 'identify' || kind === 'visit-identify') {
         const a = params[0], b = params[1];
         if (a == null && b == null) return base;
         return `${base} · #${a == null ? '…' : a}–#${b == null ? '…' : b}`;
@@ -3761,9 +3777,17 @@
           <span id="pIdx" class="note mono">1/${pf.length}</span>
         </div>
         <div id="pCap" class="note" style="margin-top:6px"></div>
-        ${statsHtml(ev.detection)}
+        <div id="pStats">${statsHtml(ev.detection)}</div>
+        ${ev.subject && ev.subject.kind === 'unanalyzed'
+          ? '<div class="row" style="margin-top:8px"><span class="note grow" id="pAnMsg">Nothing has looked at this visit yet.</span>'
+            + '<button id="pAnalyse">Analyse this visit</button></div>'
+          : ''}
       </div>`;
       document.body.appendChild(modal);
+      // Only rendered on an 'unanalyzed' visit — on an already-swept one the job fills no
+      // verdicts, and a button that does nothing is worse than no button.
+      const anBtn = $('#pAnalyse', modal);
+      if (anBtn) anBtn.addEventListener('click', () => analyseVisit(ev, modal));
       const img = $('#pImg', modal), fb = $('#pStage .fbox', modal), cap = $('.boxcap', fb);
       let i = 0;
       // Natural dimensions are learned ONCE from this visit's first frame and cached, so
@@ -3807,6 +3831,81 @@
     }
     function onKey(e) { if (e.key === 'Escape') closeModal(); }
     document.addEventListener('keydown', onKey);
+
+    // --- Analyse ONE visit (the unanalysed-visits spec) --------------------------
+    // Detect + identify over just this visit's span, as one server-side job, so the
+    // household's tap and the operator's do exactly the same work. The job is durable;
+    // the watch below is only UI freshness — closing the modal loses the repaint, never
+    // the analysis.
+    const AN_POLL_MS = 1500, AN_POLL_TRIES = 80;   // ~2 min ceiling; it may queue behind an operator job
+    async function waitForVisitJob(startId, endId) {
+      const mine = (kind, params) => kind === 'visit-identify'
+        && Array.isArray(params) && params[0] === startId && params[1] === endId;
+      for (let i = 0; i < AN_POLL_TRIES; i++) {
+        await new Promise((r) => setTimeout(r, AN_POLL_MS));
+        if (!alive) return false;
+        let s;
+        try { s = await api('GET', '/api/training/status'); } catch (_) { continue; }
+        // Both halves of the check: matching on `running` alone would call the job done
+        // while it was still queued behind another (the FIFO drains one at a time).
+        if ((s.running && mine(s.kind, s.params)) || (s.queue || []).some((j) => mine(j.kind, j.params))) continue;
+        // Leaving the queue is not succeeding. The outcome lives on its OWN history record
+        // (newest-first, so the first match is this run) — NOT on status.error, one sticky
+        // field that a later promotion clears and a later failure overwrites.
+        const rec = (s.history || []).find((h) => mine(h.kind, h.params));
+        return { finished: true, state: rec ? rec.state : null, error: rec ? rec.error : null };
+      }
+      return { finished: false };
+    }
+    async function analyseVisit(ev, ownModal) {
+      const btn = $('#pAnalyse', ownModal), msg = $('#pAnMsg', ownModal);
+      // The modal is rebuilt per open, so these elements belong to THIS visit — but it can
+      // still be closed (or another opened) mid-job, so every write is guarded on the
+      // modal still being the mounted one.
+      const open = () => alive && modal === ownModal;
+      const say = (t) => { if (open() && msg) msg.textContent = t; };
+      if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
+      try {
+        const r = await api('POST', '/api/identify/visit', { start_id: ev.start_id, end_id: ev.end_id });
+        say(r.will_identify ? 'Detecting, then naming against the active gallery…'
+                            : 'Detecting… (no active model, so nothing will be named)');
+        const outcome = await waitForVisitJob(ev.start_id, ev.end_id);
+        if (!outcome.finished) { say('Still running — reload when it finishes.'); return; }
+        if (outcome.state && outcome.state !== 'done') {
+          // Failed or canceled wrote nothing, or only part of the span. Keep the button so
+          // it can be retried rather than reporting a result that was never produced.
+          say(outcome.error ? `Analyse ${outcome.state}: ${outcome.error}` : `Analyse ${outcome.state}.`);
+          return;
+        }
+        // Re-read JUST this visit's span rather than the whole feed, so the loaded page
+        // (and its keyset paging state) is untouched.
+        const d = await api('GET', `/api/events?since_id=${ev.start_id}&until_id=${ev.end_id}&limit=1`);
+        const fresh = (d.events || [])[0];
+        if (!fresh) { say('Analysed, but the frames are gone.'); return; }
+        // Patch IN PLACE: `events` entries are addressed by identity (the grid's
+        // data-index, the player's idx), so the object must not be replaced.
+        ev.subject = fresh.subject; ev.identity = fresh.identity; ev.detection = fresh.detection;
+        renderGrid();
+        if (open()) {
+          const stats = $('#pStats', ownModal);
+          if (stats) stats.innerHTML = statsHtml(ev.detection);
+          // The job can succeed and still record nothing for this span (its frames evicted
+          // mid-run, say). Only retire the button once the visit actually left 'unanalyzed'
+          // — otherwise the retry control is gone AND the line reads "Analysed: not analysed".
+          if (ev.subject && ev.subject.kind === 'unanalyzed') {
+            say('Nothing was recorded for it — try again.');
+          } else {
+            if (btn) btn.remove();
+            say('Analysed: ' + (SUBJECT_LABEL[ev.subject && ev.subject.kind] || 'cat') + '.');
+          }
+        }
+      } catch (e) {
+        say('Analyse failed: ' + e.message);
+        flash('Analyse: ' + e.message);
+      } finally {
+        if (open() && btn && btn.isConnected) { btn.disabled = false; btn.textContent = 'Analyse this visit'; }
+      }
+    }
 
     async function identifyPass() {
       const s = span(); if (!s) return;

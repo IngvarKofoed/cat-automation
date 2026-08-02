@@ -1754,3 +1754,73 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      It fails LOUDLY, one direction only: coverage reads above 100%, never a silent
      under-report. Left unguarded because clamping to the next day's first id regresses
      the OPPOSITE skew into a fully-swept day reading 0%; only the join is immune.
+
+279. New `unanalyzed` subject rung: a visit whose span carries NO `yolo-serial` row says so,
+     instead of `unrecognized` — which claims YOLO looked and found nothing nameable, the
+     opposite reading. It outranks `corrupted`, whose contract needs "YOLO detected NOTHING"
+     that an unswept span cannot support (entry 226's rule). `swept` is free — `events()`
+     already holds the rows — and BINARY: a partly-swept visit reads analysed, with
+     `detection.ratio` carrying the nuance. Spec: docs/specs/2026-08-01-unanalysed-visits-analyse-identify.md.
+
+280. `swept` counts rows over the WHOLE span, not its motion frames, matching what a
+     span-scoped sweep fills — so it can disagree with `ratio`'s motion-only denominator
+     (swept, yet "not measured"). Narrowing it to motion frames would call a span
+     unanalyzed that a sweep cannot add one verdict to.
+
+281. New `visit-identify` TrainingManager kind + `POST /api/identify/visit`: detect THEN
+     identify over ONE visit span, the pair `LiveIdentifyManager._tick` runs per closed
+     visit, on demand for a visit the always-on workers never covered. No "did YOLO find a
+     cat" branch — `iter_unidentified` yields only frames with a present verdict, so an
+     empty visit self-skips. A cancel mid-detect returns NO summary, which is what records
+     it `canceled` rather than `done`.
+
+282. That route diverges from `/api/identify/run` twice, both because DETECT is the half
+     that resolves `unanalyzed` and is useful with no gallery: no active model is a SUCCESS
+     (detect ran, `identified: false`), and the deps check follows the HALVES — the
+     analyzer's always, the embedder's only when a model exists. Both span bounds are
+     REQUIRED and width-capped (10k ids): elsewhere a missing bound means "whole store",
+     and the household's phone calls this route on a no-auth LAN.
+
+283. Both dashboards gained the per-visit "Analyse this visit" button (playback modal), shown
+     ONLY on an `unanalyzed` visit — elsewhere the job fills nothing, and a button that does
+     nothing is worse than none. `unanalyzed` is EXEMPT from the user feed's noise filter:
+     it is not a low-signal reading but the absence of one, and hiding the visits whose
+     button you want tapped defeats the feature.
+
+284. The button's completion watch reads `/api/training/status` for its OWN (kind, span)
+     across `running` AND `queue` — matching `running` alone calls a job done while it is
+     still queued behind another. It then re-reads JUST that visit's span from `/api/events`
+     and patches the event IN PLACE, since object identity is what the rail rows, the player
+     and the paging state address a visit by. Closing the tab loses the repaint, never the
+     analysis.
+
+285. `activity_signal` deliberately does NOT learn about `analysis`, so a visit analysed to a
+     NO-DETECTION result pushes nothing over SSE and updates on the next reload. Adding a
+     verdict counter would nudge every connected client every tick — the always-on oracle
+     writes continuously.
+
+286. A successful flag toggle is now SILENT — the modal footer gained the analyse button and
+     has no room to confirm in words what the button's own label already says. The readout
+     is kept for DIVERGENCE only ("Already on the labelling list", "It was not on…"), which
+     reports the write doing something other than the tap intended and is shown nowhere else.
+
+287. The user dashboard has NO bare `.hidden` rule — only per-element qualified ones
+     (`.note.hidden`, `.modal.hidden`, …) — so `classList.toggle('hidden')` on an element
+     without its own rule is a silent NO-OP. The analyse button therefore showed on every
+     visit, and clicking it on an already-analysed one enqueued a pointless GPU job.
+     Verify visibility by COMPUTED STYLE, never by `classList.contains` — the class was
+     present the whole time, which is what made the browser check read as passing.
+
+288. The per-visit analyse watch reads its job's OWN history record, not `status.error`:
+     that is one sticky field a later promotion clears and a later failure overwrites, so
+     it can report another job's failure as this one's. Leaving the queue is not succeeding
+     — a failed or canceled job now says so instead of reporting a result never produced.
+
+289. "Analysing…" is per VISIT, not a global flag. The watch runs up to two minutes and
+     Prev/Next stays live throughout, so one flag painted the busy label onto whatever
+     visit the reader hopped to. Several analyses may now be in flight; the server queue is
+     serial and dedups a repeat of the running span.
+
+290. A job can succeed and still record nothing for its span (frames evicted mid-run), so
+     admin only retires the analyse button once the visit actually left `unanalyzed` —
+     otherwise the retry control vanished under the line "Analysed: not analysed."

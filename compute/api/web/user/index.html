@@ -66,6 +66,11 @@
             --person-bg:     #dde8f5;
             --unrec:         #7d5bc4;   /* substantial motion, nothing YOLO could name — violet */
             --unrec-bg:      #ece4f8;
+            /* never looked at — NOT a reading. Slate: desaturated so it recedes beside
+               the measured verdicts, and clear of violet (unrec) and steel (person),
+               which it would otherwise be mistaken for. */
+            --unanalyzed:    #5b6b7a;
+            --unanalyzed-bg: #e3e9ee;
 
             /* visit detection "health" — a weakest-of-three traffic light on each
                Activity card. Canonical signal colours, kept a touch brighter/cooler
@@ -109,6 +114,8 @@
                 --person-bg:    #16283d;
                 --unrec:        #b79ae8;
                 --unrec-bg:     #2a2038;
+                --unanalyzed:    #9aadbd;
+                --unanalyzed-bg: #1d252c;
 
                 --tl-green:     #57c98a;
                 --tl-amber:     #f0be55;
@@ -315,6 +322,7 @@
         .chip.person       { background: var(--person-bg); color: var(--person); }
         .chip.unrecognized { background: var(--unrec-bg);  color: var(--unrec); }
         .chip.motion       { background: var(--unident-bg); color: var(--unident); }
+        .chip.unanalyzed   { background: var(--unanalyzed-bg); color: var(--unanalyzed); }
 
         /* ================= visit-health traffic light ================= */
         /* One circle beside the pill on each Activity card: the WEAKEST band of the
@@ -380,6 +388,7 @@
         .event-row .dot.person       { background: var(--person); }
         .event-row .dot.unrecognized { background: var(--unrec); }
         .event-row .dot.motion       { background: var(--unident); }
+        .event-row .dot.unanalyzed   { background: var(--unanalyzed); }
 
         .event-card {
             display: flex;
@@ -715,6 +724,10 @@
            flex-wrap line-breaking uses each item's BASE size, so a full-width spacer
            would bump the nav onto its own line and left-align it there; a growing item
            has base size 0 and shrinks instead. */
+        /* This file has NO bare `.hidden` rule — only per-element qualified ones
+           (.note.hidden, .modal.hidden, …) — so a class toggle on an element without
+           its own rule is a silent no-op. #playerAnalyse needs its own. */
+        #playerAnalyse.hidden { display: none; }
         .player-actions .msg { color: var(--muted); font-size: .85rem; flex: 1; min-width: 0; }
         .player-actions .msg.bad { color: var(--neighbour); }
 
@@ -859,8 +872,12 @@
             <div class="player-stats hidden" id="playerStats"></div>
             <div class="player-actions">
                 <button class="btn ghost" id="playerFlag">Mark for labelling</button>
-                <!-- a live region: this is where a failed flag write is reported, and the
-                     button's own label doesn't carry the reason -->
+                <!-- Shown only on a visit nothing has looked at yet (subject 'unanalyzed').
+                     On an already-analysed visit the job would fill no verdicts, and a
+                     button that does nothing is worse than no button. -->
+                <button class="btn ghost hidden" id="playerAnalyse">Analyse this visit</button>
+                <!-- a live region shared by both actions above: it is where a failed write
+                     is reported, and neither button's label carries the reason -->
                 <span class="msg" id="playerFlagMsg" aria-live="polite"></span>
                 <!-- Visit stepping (not frame stepping): moved here from .player-controls.
                      The glyphs are aria-hidden — unwrapped, a screen reader reads
@@ -882,6 +899,12 @@
         const ROUTES = ['activity', 'cats', 'home'];
         const DAY_MS = 86400000;
         const MAX_PLAY_FRAMES = 240;           // cap sampled/played frames per event
+        // "Analyse this visit" job watch. One visit is tens of frames — a couple of
+        // seconds of GPU — but it queues behind any operator job on the compute PC, so the
+        // ceiling is generous (~2 min) and giving up only stops the WATCH: the job runs on
+        // regardless, and the visit shows its result on the next natural reload.
+        const ANALYSE_POLL_MS = 1500;
+        const ANALYSE_POLL_TRIES = 80;
         const PLAYER_FPS_MS = 200;             // ~5 fps, matches the ~5 fps capture
         const PRELOAD_AHEAD = 16;              // frames preloaded ahead of the current one
         const EVENTS_PAGE = 100;               // visits per feed page; older pages load on scroll
@@ -919,6 +942,12 @@
         // against is routinely a subset of the same event's span later.
         let activityFlags = [];
         let flagBusy = false;   // one in-flight flag write at a time (the button's own guard)
+        // Visits with an "Analyse this visit" write in flight. A SET, not a boolean: the
+        // watch runs for up to two minutes and Prev/Next stays live throughout, so a single
+        // flag would paint "Analysing…" onto whatever OTHER visit the reader hopped to.
+        // Several may be in flight — the server's queue is serial and dedups a repeat of the
+        // running span, so a second visit is just another job in line.
+        const analysing = new Set();
         let strangersOnly = false;
         // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
         // motion and motion-only noise — leaving named cats and persons.
@@ -960,6 +989,7 @@
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
         const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
+        const playerAnalyseBtn = $('playerAnalyse');
         const playerFrameEl = $('playerFrame'), playerBboxEl = $('playerBbox'), playerBboxCapEl = $('playerBboxCap');
 
         // ================= helpers =================
@@ -1036,8 +1066,13 @@
         //   unidentified = no active model / nothing matched     -> no chip
         // Non-cat subjects get their own chip, kept clear of the identity palette:
         //   person        = a person was in frame                -> steel blue
+        //   unanalyzed    = never looked at (no YOLO row at all)  -> slate
         //   unrecognized  = substantial motion, nothing nameable  -> violet
         //   motion_only   = a little motion, likely noise         -> muted grey
+        // 'unanalyzed' is the one that is NOT a reading: the detector has never run on
+        // that span, so `unrecognized` ("it looked and found nothing nameable") would be
+        // the opposite claim. It is also the only kind that offers an action — the
+        // analyse button below.
         function identityKind(identity) {
             if (!identity) return 'unidentified';
             if (identity.cat_id == null) return 'unknown';
@@ -1048,7 +1083,7 @@
         function subjectKind(ev) {
             const subj = ev.subject;
             if (!subj || subj.kind === 'cat') return identityKind(ev.identity);
-            return subj.kind;   // 'person' | 'unrecognized' | 'motion_only'
+            return subj.kind;   // 'person' | 'unanalyzed' | 'unrecognized' | 'motion_only'
         }
         // Resident = a confident NAMED match to one of our cats (identity-derived, the
         // same definition the admin feed uses) — not subject-derived, so the "hide our
@@ -1060,6 +1095,11 @@
         // Low-signal subject kinds hidden unless "Show all" is on: cat-scale motion the
         // detector couldn't name, and below-floor motion-only noise. Any actual subject —
         // a cat (named or not) or a person — always shows.
+        //   'unanalyzed' is deliberately NOT in here. It is not a low-signal reading, it
+        // is the absence of one, and it is the only kind carrying an action — hiding the
+        // visits whose button you want tapped would defeat the feature. Accepted cost:
+        // with the admin's YOLO worker off, every new visit shows a slate chip until
+        // something sweeps it.
         const NOISE_KINDS = new Set(['unrecognized', 'motion_only']);
         // Whether an event survives the two activity toggles.
         function passesActivityFilters(ev) {
@@ -1081,6 +1121,10 @@
         // it, so they can't diverge: motion_only renders with the muted 'motion' styling
         // (there is deliberately no `.motion_only` rule).
         function subjectCssClass(kind) { return kind === 'motion_only' ? 'motion' : kind; }
+        // Chip wording for kinds whose wire value isn't what a person should read. The
+        // payload vocabulary is American ('analyzer', 'unrecognized'); the words on screen
+        // are British, as everywhere else in this app.
+        const SUBJECT_TEXT = { motion_only: 'motion only', unanalyzed: 'not analysed' };
         // Builds the chip for ANY event — a cat keeps the exact identityChip()
         // rendering above; every other subject kind gets its own chip.
         function subjectChip(ev) {
@@ -1091,7 +1135,7 @@
             if (kind === 'unidentified') return null;
             const chip = document.createElement('span');
             chip.className = 'chip ' + subjectCssClass(kind);
-            chip.textContent = kind === 'motion_only' ? 'motion only' : kind;
+            chip.textContent = SUBJECT_TEXT[kind] || kind;
             return chip;
         }
         // Screen-reader text describing the subject, for the row's aria-label.
@@ -1103,6 +1147,7 @@
                     return ev.identity.cat_name || `cat #${ev.identity.cat_id}`;
                 case 'unknown': return 'an unknown cat';
                 case 'person': return 'a person';
+                case 'unanalyzed': return 'not analysed yet';
                 case 'unrecognized': return 'unrecognized motion';
                 case 'motion_only': return 'motion only, likely noise';
                 default: return 'a cat';
@@ -1178,6 +1223,152 @@
             playerFlagMsgEl.textContent = text || '';
             playerFlagMsgEl.classList.toggle('bad', !!bad);
         }
+
+        // ================= analyse this visit =================
+        // The one action on an 'unanalyzed' visit: POST the span, then watch the training
+        // queue and refresh THIS visit when the job leaves it. The work is server-side and
+        // durable (see the unanalysed-visits spec), so the watch is pure UI freshness —
+        // closing the tab or locking the phone loses the repaint, never the analysis.
+        function renderAnalyseButton(ev) {
+            const show = subjectKind(ev) === 'unanalyzed';
+            playerAnalyseBtn.classList.toggle('hidden', !show);
+            // Busy state is per VISIT, not global — see `analysing`.
+            const busy = analysing.has(ev);
+            playerAnalyseBtn.disabled = busy;
+            playerAnalyseBtn.textContent = busy ? 'Analysing…' : 'Analyse this visit';
+            playerAnalyseBtn.title = 'Look for a cat in this visit and name it if we can';
+        }
+        // Poll the training queue until (kind, span) is neither running nor pending.
+        // Matching on `running` ALONE would call the job finished while it was still
+        // queued behind another — the queue is serial and drains one at a time.
+        async function waitForVisitJob(startId, endId) {
+            const mine = (kind, params) => kind === 'visit-identify'
+                && Array.isArray(params) && params[0] === startId && params[1] === endId;
+            for (let i = 0; i < ANALYSE_POLL_TRIES; i++) {
+                await new Promise(r => setTimeout(r, ANALYSE_POLL_MS));
+                let s;
+                try {
+                    const res = await fetch('/api/training/status');
+                    if (!res.ok) continue;             // transient — keep watching
+                    s = await res.json();
+                } catch (_) { continue; }
+                const running = s.running && mine(s.kind, s.params);
+                const queued = (s.queue || []).some(j => mine(j.kind, j.params));
+                if (running || queued) continue;
+                // It left the queue — but leaving is not succeeding. Read the outcome from
+                // its OWN history record (newest-first, so the first match is this run),
+                // NOT from status.error: that is one sticky field which a later job's
+                // promotion clears and a later failure overwrites, so it can report someone
+                // else's failure as ours, or stay silent about ours.
+                const rec = (s.history || []).find(h => mine(h.kind, h.params));
+                return { finished: true, state: rec ? rec.state : null, error: rec ? rec.error : null };
+            }
+            return { finished: false };   // still going: it refreshes on the next natural reload
+        }
+        // Re-read JUST this visit (its own span), so the modal and its card update without
+        // the feed reload that would close the player under the reader.
+        async function refreshOneVisit(ev) {
+            const res = await fetch(`/api/events?since_id=${ev.start_id}&until_id=${ev.end_id}&limit=1`);
+            if (!res.ok) return false;
+            const fresh = ((await res.json()).events || [])[0];
+            if (!fresh) return false;   // its frames aged out from under us
+            // Patch in place: the object identity is what the rail rows, the player and the
+            // Prev/Next nav all address this visit by, so it must not be replaced.
+            ev.subject = fresh.subject;
+            ev.identity = fresh.identity;
+            ev.detection = fresh.detection;
+            return true;
+        }
+        async function analyseVisit() {
+            const ev = activityVisible[activitySelectedIndex];
+            if (!ev || analysing.has(ev)) return;
+            analysing.add(ev);
+            renderAnalyseButton(ev);
+            setFlagMsg('');
+            // Same discipline as the flag toggle: only ever report onto the shared readout
+            // while THIS event is the one on screen, since Prev/Next repoints it.
+            const stillOpen = () => activityVisible[activitySelectedIndex] === ev;
+            const report = (msg, bad) => { if (stillOpen()) setFlagMsg(msg, bad); };
+            try {
+                const res = await fetch('/api/identify/visit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ start_id: ev.start_id, end_id: ev.end_id }),
+                });
+                if (!res.ok) throw new Error(await errorFromResponse(res));
+                const body = await res.json();
+                report(body.will_identify
+                    ? 'Looking for a cat, and naming it if we can…'
+                    : 'Looking for a cat… (no trained model yet, so it won’t be named)');
+                const outcome = await waitForVisitJob(ev.start_id, ev.end_id);
+                if (!outcome.finished) { report('Still working — check back in a moment.'); return; }
+                // A job that failed or was canceled wrote nothing (or only part of the span),
+                // so claiming a result here would be a lie dressed as one.
+                if (outcome.state && outcome.state !== 'done') {
+                    report(outcome.error ? `Couldn’t analyse it: ${outcome.error}`
+                                         : `Analysis ${outcome.state} before it finished.`,
+                           outcome.state === 'failed');
+                    return;
+                }
+                const fresh = await refreshOneVisit(ev);
+                if (!fresh) { report('Analysed, but this visit’s frames are no longer stored.'); return; }
+                if (stillOpen()) {
+                    playerChipSlotEl.innerHTML = '';
+                    const chip = subjectChip(ev);
+                    if (chip) playerChipSlotEl.appendChild(chip);
+                    renderPlayerStats(ev.detection);
+                    renderAnalyseButton(ev);
+                }
+                refreshActivityRow(ev);
+                const kind = subjectKind(ev);
+                report(kind === 'unanalyzed'
+                    ? 'Analysed, but nothing was recorded for it.'
+                    : `Analysed: ${subjectAriaText(ev)}.`);
+            } catch (err) {
+                report(err.message, true);
+            } finally {
+                analysing.delete(ev);
+                // Repaint for whatever is on screen NOW — skipping this would leave the
+                // button stuck disabled until the next openEvent (the flag toggle's lesson).
+                const open = activityVisible[activitySelectedIndex];
+                if (open) renderAnalyseButton(open);
+            }
+        }
+        // Repaint one card's rail dot, pill and health dot after its subject changed,
+        // without rebuilding the rail (which would drop the reader's scroll position —
+        // and the modal is open over it). Mirrors renderActivityRowFlag's shape; the ⚑ it
+        // owns is left alone, since analysing a visit never changes whether it is marked.
+        function refreshActivityRow(ev) {
+            const i = activityVisible.indexOf(ev);
+            if (i < 0) return;
+            const row = railEl.querySelector(`.event-row[data-index="${i}"]`);
+            if (!row) return;
+            setRowLabel(row, ev);
+            const railDot = row.querySelector('.dot');
+            if (railDot) railDot.className = 'dot ' + subjectCssClass(subjectKind(ev));
+            const chip = subjectChip(ev);
+            const health = healthDot(ev);      // takes the EVENT, not ev.detection
+            let chipRow = row.querySelector('.chip-row');
+            if (!chipRow) {
+                // An un-analysed card always had a pill, so this is defensive — but a card
+                // with no chip row at all is reachable (no pill, no health dot, no ⚑), and
+                // bailing would hide the very result the user asked for.
+                if (!chip && !health) return;
+                chipRow = document.createElement('div');
+                chipRow.className = 'chip-row';
+                row.querySelector('.event-meta').appendChild(chipRow);
+            }
+            // Order is pill, health dot, ⚑ (see the card builder), so a new pill goes
+            // first and a new health dot before any ⚑.
+            const oldChip = chipRow.querySelector('.chip');
+            if (oldChip && chip) chipRow.replaceChild(chip, oldChip);
+            else if (chip) chipRow.insertBefore(chip, chipRow.firstChild);
+            else if (oldChip) oldChip.remove();
+            const oldHealth = chipRow.querySelector('.health-dot');
+            if (oldHealth && health) chipRow.replaceChild(health, oldHealth);
+            else if (oldHealth) oldHealth.remove();
+            else if (health) chipRow.insertBefore(health, chipRow.querySelector('.flag-mark'));
+        }
         // Optimistic: the label flips at once (the write takes the store lock and can
         // queue behind the collector), and reverts with a message if the call fails.
         async function toggleFlag() {
@@ -1214,16 +1405,20 @@
                 });
                 if (!res.ok) throw new Error(await errorFromResponse(res));
                 const body = await res.json();
+                // A plain success is SILENT: the button's own label has already flipped to
+                // say it, and the footer no longer has room to say it twice. Only a
+                // DIVERGENCE earns the readout — the write did something other than what
+                // the tap intended, which nothing else on screen shows.
                 if (wasOn) {
                     // `deleted: 0` means the list this page held was stale (the flag fetch is
                     // best-effort) — say what actually happened, not what was intended.
-                    report(body.deleted > 0 ? 'Removed from the labelling list.' : 'It was not on the labelling list.');
+                    if (!body.deleted) report('It was not on the labelling list.');
                 } else {
                     // Replace the placeholder with the server's row (its real id, and the
                     // span it actually stored, which an existing overlapping flag owns).
                     dropOverlappingFlags(ev);
                     activityFlags = activityFlags.concat([body]);
-                    report(body.created ? 'Added to the labelling list.' : 'Already on the labelling list.');
+                    if (!body.created) report('Already on the labelling list.');
                 }
             } catch (err) {
                 // Put the truth back — the write did not land. Re-applying the delta, so a
@@ -1731,9 +1926,11 @@
             const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
             renderPlayerStats(ev.detection);
-            // The flag toggle reflects THIS event (openEvent is also the Prev/Next hop).
+            // The flag toggle + analyse button reflect THIS event (openEvent is also the
+            // Prev/Next hop, which repoints both at another visit).
             setFlagMsg('');
             renderFlagButton(ev);
+            renderAnalyseButton(ev);
 
             // Reset to a loading state so a slow fetch never shows the previous event.
             playerFrames = []; playerImages = []; playerTiles = [];
@@ -2002,6 +2199,7 @@
         playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
         playerCloseBtn.addEventListener('click', closePlayer);
         playerFlagBtn.addEventListener('click', toggleFlag);
+        playerAnalyseBtn.addEventListener('click', analyseVisit);
 
         // Backdrop close: only when BOTH press and release land on the overlay itself
         // (never the dialog) — so a scrub/tile drag that releases over the backdrop

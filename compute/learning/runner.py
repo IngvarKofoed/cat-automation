@@ -57,6 +57,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from compute.analysis import get_analyzer
+from compute.analysis.runner import DetectAdapter, run_analysis
 from compute.identification.embed import EmbedCancelled
 from compute.identification.gallery import build_gallery, run_identify
 from compute.identification.probe import _quality_slug, run_feasibility_probe
@@ -88,9 +90,10 @@ class _Job:
     ``status()`` needs to describe it, but NOT the counters (those live on the manager
     and belong to whatever job is currently running) nor the store (a single instance
     shared by every job, held on the manager). ``kind`` selects the run function
-    (``'feasibility'`` | ``'gallery-build'`` | ``'identify'``); ``params`` is the hashable
-    job payload — for ``'feasibility'`` / ``'gallery-build'`` the ``qualities`` tuple
-    (``None`` = all grades), for ``'identify'`` the ``(since_id, until_id)`` window bounds.
+    (``'feasibility'`` | ``'gallery-build'`` | ``'identify'`` | ``'visit-identify'``);
+    ``params`` is the hashable job payload — for ``'feasibility'`` / ``'gallery-build'``
+    the ``qualities`` tuple (``None`` = all grades), for ``'identify'`` and
+    ``'visit-identify'`` the ``(since_id, until_id)`` window bounds.
     The per-run timestamped output dir is assigned when the job *runs*, so it is
     deliberately NOT part of the job or its dedup key. ``label`` is a human-readable name
     for the logs only.
@@ -128,10 +131,14 @@ class TrainingManager:
     worker. ``cancel`` sets ``stop_event`` under the same lock, so it can never race the
     promotion's ``stop_event`` swap.
 
-    ``probe_runner`` / ``gallery_builder`` / ``identifier`` are the injection seams: they
-    default to the real ``run_feasibility_probe`` / ``build_gallery`` / ``run_identify`` but
-    a test passes fakes, so the queue/threading/lifecycle can be exercised with no torch,
-    no matplotlib, and no real model.
+    ``probe_runner`` / ``gallery_builder`` / ``identifier`` / ``detector`` /
+    ``analyzer_factory`` are the injection seams: they default to the real
+    ``run_feasibility_probe`` / ``build_gallery`` / ``run_identify`` / ``run_analysis`` /
+    ``get_analyzer("yolo-serial")`` but a test passes fakes, so the queue/threading/
+    lifecycle can be exercised with no torch, no matplotlib, and no real model. The
+    analyzer is a FACTORY (a lambda, not a resolved analyzer) for the same reason
+    ``LiveIdentifyManager`` uses one: ``get_analyzer`` must not run at import time, or
+    importing this module would stop being torch-free.
     """
 
     def __init__(
@@ -139,10 +146,18 @@ class TrainingManager:
         probe_runner=run_feasibility_probe,
         gallery_builder=build_gallery,
         identifier=run_identify,
+        detector=run_analysis,
+        analyzer_factory=(lambda: get_analyzer("yolo-serial")),
     ) -> None:
         self._probe_runner = probe_runner
         self._gallery_builder = gallery_builder
         self._identifier = identifier
+        self._detector = detector
+        self._analyzer_factory = analyzer_factory
+        # The yolo-serial analyzer a visit-identify job detects with, built on first use
+        # and reused (weights load once per process, and run_analysis.prepare() is
+        # idempotent). Touched only by the worker thread, so it needs no lock.
+        self._analyzer: "object | None" = None
         # One lock guards every field below; taken briefly for reads (status) and writes
         # (enqueue / cancel / clear / _set_progress / _run's finally), NEVER held across the
         # heavy probe run itself.
@@ -241,6 +256,25 @@ class TrainingManager:
         """
         params = (since_id, until_id)
         job = _Job(kind="identify", params=params, label="identify")
+        return self._enqueue(store, job)
+
+    def enqueue_visit_identify(self, store: "Store", start_id: int, end_id: int) -> dict:
+        """Enqueue a detect-then-identify pass over ONE visit's ``[start_id, end_id]`` span.
+
+        The per-visit button's job (see the unanalysed-visits spec). Where ``identify``
+        assumes the frames are already detected, this runs BOTH halves over one span —
+        the same pair ``LiveIdentifyManager._tick`` runs per closed visit, on demand for a
+        visit the always-on workers never covered.
+
+        Both bounds are REQUIRED (the endpoint enforces presence and a width cap): the
+        window is one visit, never the open-ended ``None`` that means "whole store"
+        elsewhere. Dedup is the usual running-only guard, so a double-tap on the visit
+        being processed collapses; a second tap while some *other* job runs enqueues a
+        duplicate, which is harmless — the re-run fills missing verdicts and finds none.
+        Same ``{**status(), "position", "deduped"}`` return.
+        """
+        params = (int(start_id), int(end_id))
+        job = _Job(kind="visit-identify", params=params, label=f"visit {start_id}-{end_id}")
         return self._enqueue(store, job)
 
     def _enqueue(self, store: "Store", job: "_Job") -> dict:
@@ -396,7 +430,9 @@ class TrainingManager:
                 result_summary = self._run_gallery_build(job, store)
             elif job.kind == "identify":
                 result_summary = self._run_identify(job, store)
-            else:  # pragma: no cover - defensive: enqueue only ever builds the three kinds above
+            elif job.kind == "visit-identify":
+                result_summary = self._run_visit_identify(job, store)
+            else:  # pragma: no cover - defensive: enqueue only ever builds the four kinds above
                 raise ValueError(f"unknown training job kind: {job.kind!r}")
         except EmbedCancelled:
             # The probe's embed loop aborted at a batch boundary because the progress callback
@@ -618,6 +654,74 @@ class TrainingManager:
             "n_identified": result["n_identified"],
             "since_id": since_id,
             "until_id": until_id,
+        }
+
+    def _run_visit_identify(self, job: "_Job", store: "Store") -> "dict | None":
+        """Detect, then identify, ONE visit span — the per-visit button's job.
+
+        The same pair ``LiveIdentifyManager._tick`` runs per closed visit:
+
+        1. ``run_analysis`` over ``[start_id, end_id]`` with the ``yolo-serial`` analyzer,
+           filling MISSING verdicts (``reanalyze=False``) and deliberately NOT
+           ``motion_only`` — a cat often pauses at the flap, and those calm ``motion=0``
+           frames identify best. This is the half that resolves the visit's ``unanalyzed``
+           subject, and it is useful with no gallery at all.
+        2. ``run_identify`` against the ACTIVE gallery, when there is one.
+
+        With **no active model** this returns after step 1 with ``identified=False`` — a
+        SUCCESS, not the ``RuntimeError`` ``_run_identify`` raises. The whole-store identify
+        pass is meaningless without a gallery, but detecting one visit is not, and through
+        Phase 1 "no promoted model" is the normal state.
+
+        There is deliberately no "did YOLO find a cat" branch between the two: the
+        identifier walks ``store.iter_unidentified``, which yields only frames carrying a
+        present ``yolo-serial`` verdict, so an empty visit visits zero frames on its own.
+        A hand-written check here would be a second copy of that rule, free to drift.
+
+        Detect reports no progress (``DetectAdapter``'s hooks are no-ops), so the Jobs row
+        counts only the identify half — accepted: a visit span is tens of frames. Both
+        halves honour ``self.stop_event``, so Cancel interrupts either, and both are
+        resumable — a cancel leaves partial verdicts the next run fills.
+        """
+        start_id, end_id = job.params
+        if self._analyzer is None:
+            self._analyzer = self._analyzer_factory()
+        self._detector(
+            store,
+            self._analyzer,
+            DetectAdapter(self.stop_event),
+            since_id=start_id,
+            until_id=end_id,
+        )
+        # A stop during detect returns NORMALLY (run_analysis breaks between batches), so
+        # the span may be only partly detected. Identifying it now would name a fraction of
+        # the visit and report a count for the whole; bail instead — the re-run resumes.
+        # Returning None (not a summary) is what makes ``_run``'s finally record this
+        # 'canceled' rather than 'done': it checks ``result_summary is not None`` FIRST, so
+        # any summary here — even one flagged canceled — would report the job as completed.
+        if self.stop_event.is_set():
+            return None
+
+        model = store.active_model()
+        if model is None:
+            return {
+                "kind": "visit-identify", "n_identified": 0, "identified": False,
+                "since_id": start_id, "until_id": end_id,
+            }
+
+        def progress(done: int, total: int) -> bool:
+            self._set_progress(done, total)
+            return not self.stop_event.is_set()
+
+        result = self._identifier(
+            store, model, model["gallery_path"], start_id, end_id, progress
+        )
+        return {
+            "kind": "visit-identify",
+            "n_identified": result["n_identified"],
+            "identified": True,
+            "since_id": start_id,
+            "until_id": end_id,
         }
 
     # --- Progress hook (called by the probe via the run's callback) ----------------------

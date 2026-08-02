@@ -9,8 +9,10 @@ suite's other conventions (test_events.py / test_identification_store.py): a
 factory opens a Store under ``tmp_path``.
 
 Covers:
-- events()'s subject ladder (cat / person / unrecognized / motion_only),
-  including cat-always-wins precedence and identity staying intact alongside it.
+- events()'s subject ladder (cat / person / unanalyzed / corrupted / unrecognized /
+  motion_only), including cat-always-wins precedence and identity staying intact
+  alongside it. Note the ``_swept`` helper: every rung BELOW ``unanalyzed`` is a
+  measurement, so a test of one must give its span a ``yolo-serial`` row first.
 - The preserved box-reading contract: a person-only detail has NO cat box
   (_best_box -> None, verdict/score would be cat-only), a coexisting cat+person
   detail still yields the cat box, and a legacy 5-element box is still a cat.
@@ -70,6 +72,19 @@ def _one_event_ids(store: Store, base: int, n: int, area: float = 0.1) -> "list[
 def _boxes_detail(boxes: "list[list[float]]") -> dict:
     """A yolo-serial-shaped analysis.detail: ``{"boxes": [[x1,y1,x2,y2,conf,cls], ...]}``."""
     return {"boxes": boxes}
+
+
+def _swept(store: Store, *frame_ids: int) -> None:
+    """Mark ``frame_ids`` as LOOKED AT by yolo-serial, with nothing found.
+
+    The difference the ``unanalyzed`` rung turns on: a span with no ``yolo-serial`` row
+    at all is un-measured (``unanalyzed``), while one carrying an empty-box verdict is a
+    measured MISS and falls through to the corruption/floor rungs below. Every test of
+    those lower rungs must sweep first, or it stops at ``unanalyzed`` and never exercises
+    what it is named for.
+    """
+    for fid in frame_ids:
+        store.write_analysis(fid, "yolo-serial", False, 0.0, _boxes_detail([]))
 
 
 def _write_gallery_file(store: Store, gallery_dir: str) -> str:
@@ -216,15 +231,63 @@ def test_legacy_bird_box_does_not_count_toward_detection_aggregates(tmp_path):
     assert ev["detection"]["conf_max"] is None
 
 
-def test_subject_no_yolo_rows_above_floor_is_unrecognized(tmp_path):
+def test_subject_no_yolo_rows_is_unanalyzed(tmp_path):
+    # No yolo-serial row anywhere in the span: the detector has never looked, so the
+    # ladder must NOT reach the floor rungs — they are measurements, and there is no
+    # measurement here. Area is comfortably above the default floor, which pre-
+    # `unanalyzed` made this read `unrecognized` ("YOLO looked and found nothing
+    # nameable") — the opposite of what is true.
     store = _store(tmp_path)
     base = 1_700_000_000_000
-    # No yolo-serial analysis at all; area comfortably above the default floor.
     _one_event_ids(store, base, 3, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
     ev = store.events(None, None)["events"][0]
-    assert ev["subject"]["kind"] == "unrecognized"
+    assert ev["subject"]["kind"] == "unanalyzed"
+    # peak_area/n_frames ride along, so the card renders the same motion readout as the
+    # floor rungs it displaced.
     assert ev["subject"]["peak_area"] == pytest.approx(_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
     assert ev["subject"]["n_frames"] == 3
+
+
+def test_subject_swept_with_no_detection_above_floor_is_unrecognized(tmp_path):
+    # The other half of the pair above, and the distinction the whole feature exists for:
+    # the SAME visit, once swept with an empty result, is a measured miss -> unrecognized.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 3, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, *ids)
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unrecognized"
+
+
+def test_subject_one_swept_frame_is_enough_to_count_as_analyzed(tmp_path):
+    # `swept` is ANY yolo-serial row in the span, not full coverage: a partly-swept visit
+    # reads as analysed (its `detection.ratio` carries the nuance instead). Two motion
+    # frames, one swept.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, ids[0])
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unrecognized"
+    assert ev["detection"]["ratio"] == pytest.approx(0.0)
+
+
+def test_subject_swept_on_non_motion_frame_only_still_counts_as_analyzed(tmp_path):
+    # `swept` counts rows over the WHOLE span while `detection.ratio` counts motion frames
+    # only, so a span swept solely on its non-motion frame is swept=True with ratio=None:
+    # a real subject chip above a "not measured" rate. Locked deliberately — narrowing
+    # `swept` to motion frames would call this span unanalyzed when a span-scoped sweep
+    # (which is NOT motion-only) cannot add a single verdict to it.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    above = _SUBJECT_FLOOR_DEFAULT["min_area"] * 10
+    a = _add(store, base + 0, motion=True, area=above)
+    d = _add(store, base + 50, motion=False, area=0.0)   # inside the span, not a member
+    _c = _add(store, base + 100, motion=True, area=above)
+    _swept(store, d)
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unrecognized"
+    assert ev["detection"]["ratio"] is None
 
 
 def test_subject_below_floor_is_motion_only(tmp_path):
@@ -232,6 +295,7 @@ def test_subject_below_floor_is_motion_only(tmp_path):
     base = 1_700_000_000_000
     # A single frame, area far below the default floor and n_frames < min_frames.
     (f1,) = _one_event_ids(store, base, 1, area=_SUBJECT_FLOOR_DEFAULT["min_area"] / 10)
+    _swept(store, f1)
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "motion_only"
     assert ev["subject"]["n_frames"] == 1
@@ -271,9 +335,24 @@ def test_subject_corrupted_when_no_detection_and_corruption_present(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000
     ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, *ids)
     store.write_analysis(ids[0], _CORRUPTION_ANALYZER, True, None, {"reason": "cast"})
     ev = store.events(None, None)["events"][0]
     assert ev["subject"] == {"kind": "corrupted"}
+
+
+def test_subject_unswept_corrupt_span_is_unanalyzed_not_corrupted(tmp_path):
+    # `unanalyzed` OUTRANKS `corrupted`. That rung's contract is "YOLO detected NOTHING
+    # and a glitch explains the motion", and an unswept span cannot support the first
+    # clause — calling it corrupted would claim the detector rejected frames it never saw
+    # (changelog 226's rule). The visit is also still worth a look, so it keeps the kind
+    # that offers the analyse button.
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    store.write_analysis(ids[0], _CORRUPTION_ANALYZER, True, None, {"reason": "cast"})
+    ev = store.events(None, None)["events"][0]
+    assert ev["subject"]["kind"] == "unanalyzed"
 
 
 def test_subject_cat_in_corrupt_frame_stays_cat(tmp_path):
@@ -293,7 +372,8 @@ def test_subject_no_detection_no_corruption_falls_back_to_unrecognized(tmp_path)
     # ladder falls through the (un-fired) corrupted rung to unrecognized. Never crashes.
     store = _store(tmp_path)
     base = 1_700_000_000_000
-    _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, *ids)
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "unrecognized"
 
@@ -304,6 +384,7 @@ def test_subject_corruption_verdict_zero_does_not_trigger_corrupted(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000
     ids = _one_event_ids(store, base, 2, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, *ids)
     store.write_analysis(ids[0], _CORRUPTION_ANALYZER, False, None, {"reason": None})
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "unrecognized"
@@ -319,7 +400,8 @@ def test_subject_corruption_anywhere_in_visit_span_triggers_corrupted(tmp_path):
     above = _SUBJECT_FLOOR_DEFAULT["min_area"] * 10
     a = _add(store, base + 0, motion=True, area=above)
     d = _add(store, base + 50, motion=False, area=0.0)  # in span [a, c], NON-motion
-    _c = _add(store, base + 100, motion=True, area=above)
+    c = _add(store, base + 100, motion=True, area=above)
+    _swept(store, a, c)
     store.write_analysis(d, _CORRUPTION_ANALYZER, True, None, {"reason": "cast"})
     ev = store.events(None, None)["events"][0]
     assert ev["subject"] == {"kind": "corrupted"}
@@ -528,6 +610,7 @@ def test_events_uses_default_floor_when_no_active_model(tmp_path):
     store = _store(tmp_path)
     base = 1_700_000_000_000
     (f1,) = _one_event_ids(store, base, 1, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, f1)  # the floor rungs sit BELOW `unanalyzed`; unswept never reaches them
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "unrecognized"
 
@@ -539,6 +622,7 @@ def test_events_uses_default_floor_when_active_model_metrics_has_no_subject_floo
     vid = _add_version(store, metrics={"per_cat": []})
     store.promote_model(vid)
     (f1,) = _one_event_ids(store, base, 1, area=_SUBJECT_FLOOR_DEFAULT["min_area"] * 10)
+    _swept(store, f1)
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "unrecognized"
 
@@ -555,6 +639,7 @@ def test_events_uses_learned_floor_from_active_model_metrics(tmp_path):
     area = _SUBJECT_FLOOR_DEFAULT["min_area"] * 10  # clears default, not the learned floor
     assert area < learned_floor["min_area"]
     (f1,) = _one_event_ids(store, base, 1, area=area)
+    _swept(store, f1)
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "motion_only"
 
@@ -570,6 +655,7 @@ def test_events_partial_stamped_floor_fills_missing_key_from_default(tmp_path):
     vid = _add_version(store, metrics={"subject_floor": {"min_area": 0.5}})
     store.promote_model(vid)
     (f1,) = _one_event_ids(store, base, 1, area=0.1)  # < 0.5 stamped min_area; 1 < default min_frames
+    _swept(store, f1)
     ev = store.events(None, None)["events"][0]
     assert ev["subject"]["kind"] == "motion_only"
 

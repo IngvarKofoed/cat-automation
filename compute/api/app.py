@@ -511,6 +511,21 @@ class FlagSpanRequest(BaseModel):
         return v
 
 
+def _reject_bool_cat_ids(v):
+    """Reject a boolean inside an ``exclude_cat_ids`` list at the pydantic boundary.
+
+    Shared by both training request models (mirroring ``LocationRequest``'s guard):
+    pydantic treats ``bool`` as an int subtype, so without this ``[true]`` would coerce
+    to cat id 1 and silently drop whichever cat happens to be first on the roster from a
+    build. ``mode="before"`` so it sees the raw JSON value.
+    """
+    if isinstance(v, list):
+        for item in v:
+            if isinstance(item, bool):
+                raise ValueError("must be a cat id, not a boolean")
+    return v
+
+
 class FeasibilityRunRequest(BaseModel):
     """Body of ``POST /api/training/feasibility/run``: which crop grades to embed.
 
@@ -519,9 +534,20 @@ class FeasibilityRunRequest(BaseModel):
     separability bottleneck. A grade outside ``_QUALITIES`` is a client mistake (400).
     Both ``null`` and ``[]`` collapse to ``None`` (no filter) at the store/manager
     boundary, so the two spell the same "all crops" request.
+
+    ``exclude_cat_ids`` is the cats to leave OUT of the scored set — the same list Build
+    takes, because a validation run forecasts the gallery you would build at those
+    grades, so an exclusion applied only to the build would be invisible to the number.
+    ``null``/``[]`` both mean "exclude nothing"; see ``GalleryBuildRequest``.
     """
 
     qualities: "list[str] | None" = None
+    exclude_cat_ids: "list[int] | None" = None
+
+    @field_validator("exclude_cat_ids", mode="before")
+    @classmethod
+    def _reject_bool_ids(cls, v):
+        return _reject_bool_cat_ids(v)
 
 
 class GalleryBuildRequest(BaseModel):
@@ -541,10 +567,21 @@ class GalleryBuildRequest(BaseModel):
     cats that visit most and calibrates the threshold mostly on their pairs. ``ge=1``, and
     booleans are rejected (pydantic treats ``bool`` as an int subtype, so ``true`` would
     otherwise mean "one crop per cat").
+
+    ``exclude_cat_ids`` names roster cats to leave OUT of this build — a cat that is not
+    worth enrolling *yet*, held back without RETIRING it (which would also drop it from
+    the annotation picker and so stop the labelling we are waiting for). It is an
+    EXCLUDE-list, not an include-list, so ``null``/``[]`` mean "enrol everyone" and a cat
+    added to the roster later is enrolled by default; duplicates are harmless. An id
+    naming no roster cat at all is a client mistake (400) — a stale UI holding a deleted
+    cat's id should be told, not silently ignored — while an id naming a RETIRED cat is
+    accepted as a no-op, since ``active_only`` already excludes it. Booleans are rejected
+    for the same reason ``max_per_cat`` rejects them.
     """
 
     qualities: "list[str] | None" = None
     max_per_cat: "int | None" = Field(default=None, ge=1)
+    exclude_cat_ids: "list[int] | None" = None
 
     @field_validator("max_per_cat", mode="before")
     @classmethod
@@ -552,6 +589,11 @@ class GalleryBuildRequest(BaseModel):
         if isinstance(v, bool):
             raise ValueError("must be a crop count, not a boolean")
         return v
+
+    @field_validator("exclude_cat_ids", mode="before")
+    @classmethod
+    def _reject_bool_ids(cls, v):
+        return _reject_bool_cat_ids(v)
 
 
 class IdentifyRunRequest(BaseModel):
@@ -2333,6 +2375,30 @@ def create_app(
             oracle, since_id, until_id, limit=limit, uncertain_only=uncertain_only
         )
 
+    @app.get("/api/label/enrollable")
+    def api_label_enrollable(qualities: "list[str] | None" = Query(default=None)):
+        # What a gallery build at these grades would enrol, per ACTIVE roster cat — the
+        # Model-building page's exclude-a-cat list (see the gallery-build cat-exclusion
+        # spec). `qualities` is a REPEATED query param (?qualities=gallery&qualities=ok),
+        # matching how the grade selection is spelled elsewhere; absent means ALL grades,
+        # the same `None`-is-no-filter convention `labeled_crops` uses.
+        #
+        # Deliberately NOT folded into /api/label/regime-coverage: that one answers "which
+        # cat needs NIGHT data" and is consumed by the Cats page for exactly that, so
+        # adding a grade filter to it would leave one endpoint with two contracts and
+        # silently change what the Cats page reports.
+        if qualities is not None:
+            bad = [q for q in qualities if q not in _QUALITIES]
+            if bad:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
+                )
+        return {
+            "qualities": qualities,
+            "cats": store.enrollable_cats(tuple(qualities) if qualities is not None else None),
+        }
+
     @app.get("/api/label/regime-coverage")
     def api_label_regime_coverage():
         # Per-cat day/night labelled-crop coverage (admin-next P4) so the operator sees
@@ -2618,6 +2684,28 @@ def create_app(
     # install hint, not as a delayed ``status().error``. ``Embedder`` is imported LAZILY
     # inside the run endpoint so this module stays torch-free at import.
 
+    def _resolve_exclusions(exclude_cat_ids: "list[int] | None") -> "list[int] | None":
+        # The shared cat-exclusion selection Build and Validate both take (see the
+        # gallery-build cat-exclusion spec). `None`/`[]` both mean "exclude nothing" ->
+        # `None` at the store/manager boundary, the same collapse `qualities` applies, and
+        # the ids are sorted+deduped so two spellings of one request are one request.
+        #
+        # An id naming NO roster cat is a 400: a stale UI holding a deleted cat's id is
+        # asking to exclude something that does not exist, and silently ignoring it would
+        # build a gallery the operator did not ask for. An id naming a RETIRED cat is
+        # accepted as a no-op — `active_only` already excludes it, so rejecting it would
+        # turn a harmless stale tick into an error.
+        if not exclude_cat_ids:
+            return None
+        wanted = sorted({int(c) for c in exclude_cat_ids})
+        known = {c["id"] for c in store.list_cats()}
+        unknown = [c for c in wanted if c not in known]
+        if unknown:
+            raise HTTPException(
+                status_code=400, detail=f"no such cat(s): {unknown!r}"
+            )
+        return wanted
+
     @app.post("/api/training/feasibility/run")
     def api_training_feasibility_run(req: FeasibilityRunRequest):
         # Validate the grade selection FIRST (400) — a client mistake, before any deps
@@ -2631,6 +2719,7 @@ def create_app(
                     detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
                 )
         qualities = list(req.qualities) if req.qualities else None
+        excluded = _resolve_exclusions(req.exclude_cat_ids)
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Fewer than 2 crops or 2 distinct
@@ -2639,8 +2728,12 @@ def create_app(
         # Ordering this ABOVE the dep check matters: on a box without the analysis extras a
         # first-run operator with no labels should be told to LABEL DATA (the real next step),
         # not to install torch — the dependency only blocks once there is data to embed.
+        # The exclusion is applied here, not just in the probe: it is the only parameter that
+        # can drop whole CATS, so the guard must count exactly what the run will embed.
         n_crops, n_cats = store.count_identified_crops(
-            tuple(qualities) if qualities else None, active_only=True
+            tuple(qualities) if qualities else None,
+            active_only=True,
+            exclude_cat_ids=tuple(excluded) if excluded else None,
         )
         if n_crops < 2 or n_cats < 2:
             return {
@@ -2649,7 +2742,15 @@ def create_app(
                 "n_cats": n_cats,
                 "message": (
                     f"Not enough labelled data yet: {n_crops} crop(s) across {n_cats} "
-                    "cat(s). Label at least two cats before validating."
+                    "cat(s). "
+                    + (
+                        # Name the cause: "not enough labelled data" is misleading when the
+                        # operator has plenty and has merely deselected too much.
+                        f"{len(excluded)} cat(s) are excluded — re-include one, or label "
+                        "at least two cats before validating."
+                        if excluded
+                        else "Label at least two cats before validating."
+                    )
                 ),
             }
 
@@ -2668,7 +2769,10 @@ def create_app(
         # double-click of the currently-RUNNING job, never a pending re-run — a
         # feasibility run reads the growing labelled set, so a deliberate re-run after
         # more labelling is not a duplicate and must enqueue.
-        return {**training_manager.enqueue_feasibility(store, qualities), "enough": True}
+        return {
+            **training_manager.enqueue_feasibility(store, qualities, excluded),
+            "enough": True,
+        }
 
     @app.post("/api/training/cancel")
     def api_training_cancel():
@@ -2755,13 +2859,16 @@ def create_app(
                     detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
                 )
         qualities = list(req.qualities) if req.qualities else None
+        excluded = _resolve_exclusions(req.exclude_cat_ids)
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Same ordering rationale
         # as feasibility: an operator with no labels yet should be told to LABEL
         # DATA, not to install torch.
         n_crops, n_cats = store.count_identified_crops(
-            tuple(qualities) if qualities else None, active_only=True
+            tuple(qualities) if qualities else None,
+            active_only=True,
+            exclude_cat_ids=tuple(excluded) if excluded else None,
         )
         if n_crops < 2 or n_cats < 2:
             return {
@@ -2770,8 +2877,16 @@ def create_app(
                 "n_cats": n_cats,
                 "message": (
                     f"Not enough labelled data: {n_crops} crop(s) across {n_cats} "
-                    "cat(s). Grade representative crops as gallery, or widen the "
-                    "selection."
+                    "cat(s). "
+                    + (
+                        # Name the cause — with cats deselected, "not enough labelled data"
+                        # is misleading: there may be plenty, just not in the ticked set.
+                        f"{len(excluded)} cat(s) are excluded — re-include one, grade "
+                        "representative crops as gallery, or widen the selection."
+                        if excluded
+                        else "Grade representative crops as gallery, or widen the "
+                        "selection."
+                    )
                 ),
             }
 
@@ -2790,9 +2905,13 @@ def create_app(
         # Enough to run: enqueue on the training queue (same dedup-running-only
         # semantics as the other training enqueues — see TrainingManager). The cap is NOT
         # pre-checked against the counts above: it can only reduce crops per cat, never the
-        # number of cats, so it cannot turn a passing set into an unbuildable one.
+        # number of cats, so it cannot turn a passing set into an unbuildable one. The
+        # EXCLUSION can, which is why it IS applied to the pre-check above — that premise
+        # holds for the cap alone.
         return {
-            **training_manager.enqueue_gallery_build(store, qualities, req.max_per_cat),
+            **training_manager.enqueue_gallery_build(
+                store, qualities, req.max_per_cat, excluded
+            ),
             "enough": True,
         }
 

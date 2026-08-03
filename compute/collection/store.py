@@ -5714,6 +5714,7 @@ class Store:
         label_kinds: "tuple[str, ...]" = ("identified",),
         qualities: "tuple[str, ...] | None" = None,
         active_only: bool = False,
+        exclude_cat_ids: "tuple[int, ...] | None" = None,
     ) -> "list[dict]":
         """Durable labelled crops for the feasibility / gallery experiments.
 
@@ -5760,6 +5761,17 @@ class Store:
         ``c.active = 1`` would silently drop every catless crop, which is not a
         retired cat's crop and has no business being filtered here.
 
+        ``exclude_cat_ids`` drops crops belonging to the named roster cats — the
+        per-build "not enrolled *yet*" selection (see the gallery-build cat-exclusion
+        spec), distinct from ``active_only``'s "no longer tracked". ``None`` / an empty
+        tuple exclude nothing, so the field fails toward enrolling everyone: a cat added
+        to the roster later is enrolled by default. Duplicates are harmless. Filtered
+        HERE rather than in ``build_gallery`` so the endpoint's ``count_identified_crops``
+        pre-check can apply the identical filter and count exactly what the build embeds.
+        NULL-safe for the same reason ``active_only`` is: a catless kind
+        (``unknown_cat``) has a NULL ``d.cat_id``, and a bare ``NOT IN`` would drop every
+        such crop, which is not an excluded cat's crop.
+
         The store stays cv2-free: it hands back paths, never pixels."""
         kinds = tuple(label_kinds)
         if not kinds:
@@ -5778,6 +5790,12 @@ class Store:
             params += list(quals)
         if active_only:
             where += " AND (d.cat_id IS NULL OR c.active = 1)"
+        excluded = tuple({int(c) for c in exclude_cat_ids}) if exclude_cat_ids else ()
+        if excluded:
+            where += " AND (d.cat_id IS NULL OR d.cat_id NOT IN (%s))" % ",".join(
+                "?" for _ in excluded
+            )
+            params += list(excluded)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id,"
@@ -5860,7 +5878,10 @@ class Store:
         }
 
     def count_identified_crops(
-        self, qualities: "tuple[str, ...] | None", active_only: bool = False
+        self,
+        qualities: "tuple[str, ...] | None",
+        active_only: bool = False,
+        exclude_cat_ids: "tuple[int, ...] | None" = None,
     ) -> "tuple[int, int]":
         """The (crop count, distinct-cat count) of ``identified`` crops for a quality filter.
 
@@ -5883,6 +5904,12 @@ class Store:
         build that then returns ``insufficient_labels``. No NULL-safety clause is
         needed here (unlike ``labeled_crops``) because ``label_kind = 'identified'``
         already implies a non-NULL ``cat_id``.
+
+        ``exclude_cat_ids`` mirrors ``labeled_crops``' per-build exclusion and MUST
+        match what the guarded job passes, for a sharper reason than ``active_only``'s:
+        an exclusion is the first build parameter that can reduce the CAT count, so a
+        guard that ignored it would wave through a build whose surviving set falls under
+        the two-cat floor. Same ``None``/empty = exclude nothing collapse.
         """
         quals = tuple(qualities) if qualities is not None else None
         if quals is not None:
@@ -5898,12 +5925,83 @@ class Store:
             params += list(quals)
         if active_only:
             where += " AND cat_id IN (SELECT id FROM cats WHERE active = 1)"
+        excluded = tuple({int(c) for c in exclude_cat_ids}) if exclude_cat_ids else ()
+        if excluded:
+            where += " AND cat_id NOT IN (%s)" % ",".join("?" for _ in excluded)
+            params += list(excluded)
         with self._lock:
             n_crops, n_cats = self._conn.execute(
                 f"SELECT COUNT(*), COUNT(DISTINCT cat_id) FROM dataset_items WHERE {where}",
                 params,
             ).fetchone()
         return (int(n_crops), int(n_cats))
+
+    def enrollable_cats(self, qualities: "tuple[str, ...] | None" = None) -> "list[dict]":
+        """Per ACTIVE roster cat, what a gallery build at ``qualities`` would enrol.
+
+        Feeds the Model-building page's exclude-a-cat checkbox list (see the
+        gallery-build cat-exclusion spec)::
+
+            {cat_id, cat_name, is_resident, crops, label_commits}
+
+        ``crops`` is that cat's ``identified`` crops with a materialised crop file at the
+        requested grades — the SAME universe ``labeled_crops`` enrols and
+        ``count_identified_crops`` counts, i.e. what a build STARTS from, BEFORE
+        ``cap_per_cat`` applies a per-cat cap (so it is also the number a cap is chosen
+        against). ``qualities`` follows their shared semantics: ``None``
+        applies NO grade filter, a tuple restricts to ``quality IN (...)`` (a NULL grade
+        can't satisfy it), an explicitly empty tuple selects nothing (every count 0), and
+        a grade outside ``_QUALITIES`` raises ``ValueError`` so a bad request is a 400.
+
+        ``label_commits`` counts DISTINCT ``labeled_ts`` values — ``add_dataset_items``
+        stamps it once per commit and one label keypress commits one visit, so it stands
+        in for a VISIT count, which is what recall actually tracks (a cat can hold the
+        most crops and the worst recall). It is an APPROXIMATION and named for what it
+        counts rather than what it proxies: measured against gap-clustered visits it read
+        ~12% high, and a field called ``visits`` would invite exactly that over-trust.
+
+        RETIRED cats are omitted entirely — ``active_only`` already excludes them from
+        every build, so showing one as unchecked-but-present would imply that ticking it
+        enrols it. A cat with zero matching crops IS included (LEFT JOIN), so a resident
+        that has nothing at these grades surfaces rather than silently missing. Ordered
+        by cat id (creation order, matching ``list_cats``). One lock hold, one query.
+        """
+        quals = tuple(qualities) if qualities is not None else None
+        if quals is not None:
+            for q in quals:
+                if q not in _QUALITIES:
+                    raise ValueError(f"quality must be one of {_QUALITIES}, got {q!r}")
+        # The grade filter rides in the JOIN's ON clause, not a WHERE: in a WHERE it would
+        # drop the zero-crop cats the LEFT JOIN exists to keep. An empty `quals` tuple
+        # selects nothing, spelled as a never-true predicate so every cat still lists at 0.
+        on = "d.cat_id = c.id AND d.label_kind = 'identified' AND d.crop_path IS NOT NULL"
+        params: "list" = []
+        if quals is not None:
+            if quals:
+                on += " AND d.quality IN (%s)" % ",".join("?" for _ in quals)
+                params += list(quals)
+            else:
+                on += " AND 0"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT c.id, c.name, c.is_resident, COUNT(d.id),"
+                " COUNT(DISTINCT d.labeled_ts)"
+                f" FROM cats c LEFT JOIN dataset_items d ON {on}"
+                " WHERE c.active = 1"
+                " GROUP BY c.id, c.name, c.is_resident"
+                " ORDER BY c.id",
+                params,
+            ).fetchall()
+        return [
+            {
+                "cat_id": int(r[0]),
+                "cat_name": r[1],
+                "is_resident": bool(r[2]),
+                "crops": int(r[3]),
+                "label_commits": int(r[4]),
+            }
+            for r in rows
+        ]
 
     def cat_regime_coverage(
         self, is_night: "Callable[[int], bool] | None" = None

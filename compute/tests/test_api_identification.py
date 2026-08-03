@@ -111,8 +111,17 @@ class FakeTrainingManager:
         self.gallery_build_calls: "list[dict]" = []
         self.identify_calls: "list[dict]" = []
 
-    def enqueue_gallery_build(self, store, qualities, max_per_cat=None) -> dict:
-        self.gallery_build_calls.append({"store": store, "qualities": qualities})
+    def enqueue_gallery_build(
+        self, store, qualities, max_per_cat=None, exclude_cat_ids=None
+    ) -> dict:
+        self.gallery_build_calls.append(
+            {
+                "store": store,
+                "qualities": qualities,
+                "max_per_cat": max_per_cat,
+                "exclude_cat_ids": exclude_cat_ids,
+            }
+        )
         return {"position": 0, "deduped": False}
 
     def enqueue_identify(self, store, since_id, until_id) -> dict:
@@ -191,7 +200,9 @@ def test_gallery_build_happy_enqueues(make_app, monkeypatch):
     assert body["enough"] is True
     assert body["position"] == 0
     assert body["deduped"] is False
-    assert manager.gallery_build_calls == [{"store": store, "qualities": ["gallery"]}]
+    assert manager.gallery_build_calls == [
+        {"store": store, "qualities": ["gallery"], "max_per_cat": None, "exclude_cat_ids": None}
+    ]
 
 
 def test_gallery_build_null_qualities_forwards_none(make_app, monkeypatch):
@@ -205,7 +216,9 @@ def test_gallery_build_null_qualities_forwards_none(make_app, monkeypatch):
     resp = client.post("/api/training/gallery/build", json={})
     assert resp.status_code == 200
     assert resp.json()["enough"] is True
-    assert manager.gallery_build_calls == [{"store": store, "qualities": None}]
+    assert manager.gallery_build_calls == [
+        {"store": store, "qualities": None, "max_per_cat": None, "exclude_cat_ids": None}
+    ]
 
 
 # --- GET /api/training/models ----------------------------------------------------

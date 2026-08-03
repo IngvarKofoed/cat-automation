@@ -16,9 +16,10 @@ class _StubStore:
     def __init__(self, rows: "list[dict]") -> None:
         self._rows = rows
 
-    def labeled_crops(self, kinds, qualities, active_only=False):
-        # Signature mirrors Store.labeled_crops. The probe passes active_only=True;
-        # the stub's rows stand in for the already-filtered result.
+    def labeled_crops(self, kinds, qualities, active_only=False, exclude_cat_ids=None):
+        # Signature mirrors Store.labeled_crops. The probe passes active_only=True (and an
+        # exclusion when one was requested); the stub's rows stand in for the
+        # already-filtered result, so both filters are the real store's business.
         return list(self._rows)
 
 

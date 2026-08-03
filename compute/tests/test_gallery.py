@@ -303,6 +303,84 @@ def test_build_gallery_quality_filter_forwarded(tmp_path, monkeypatch):
     assert result["metrics"]["threshold_balanced_acc"] is None
 
 
+def test_build_gallery_excluded_cat_is_not_enrolled_and_is_recorded(tmp_path, monkeypatch):
+    # The per-build cat exclusion (docs/specs/2026-08-03-gallery-build-cat-exclusion.md):
+    # the cat's crops never reach the embedder, and the ids land on the version's metrics —
+    # without which a gallery built WITHOUT a cat is indistinguishable from one with it,
+    # and comparing two builds is the whole reason to leave one out.
+    store = _store(tmp_path)
+    cat_a, cat_b, cat_c = store.create_cat("A"), store.create_cat("B"), store.create_cat("C")
+    fids = [_add_frame(store, i) for i in range(1, 7)]
+    rows = []
+    for i, cat in enumerate([cat_a, cat_a, cat_b, cat_b, cat_c, cat_c]):
+        rows.append({"frame_id": fids[i], "label_kind": "identified", "cat_id": cat["id"],
+                     "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": f"{i}.jpg"})
+    axis = {cat_a["id"]: [1.0, 0.0, 0.0], cat_b["id"]: [0.0, 1.0, 0.0], cat_c["id"]: [0.0, 0.0, 1.0]}
+    vectors_by_path = {os.path.join(store.dataset_root, r["crop_path"]): axis[r["cat_id"]]
+                       for r in rows}
+    store.add_dataset_items(rows)
+    monkeypatch.setattr(gallery, "Embedder", _stub_embedder_factory(vectors_by_path))
+
+    out_dir = str(tmp_path / "models" / "v-excl")
+    result = build_gallery(store, out_dir, exclude_cat_ids=[cat_c["id"], cat_c["id"]])
+
+    assert result["enough"] is True
+    assert result["n_crops"] == 4 and result["n_cats"] == 2  # C's two crops never embedded
+    assert result["metrics"]["excluded_cat_ids"] == [cat_c["id"]]  # deduped
+    assert [c["cat_id"] for c in result["metrics"]["per_cat"]] == [cat_a["id"], cat_b["id"]]
+    # The artifact itself holds no vector for the excluded cat, so at Run time its visits
+    # can only resolve to unknown — nothing reads the exclusion there.
+    gal = load_gallery(os.path.join(out_dir, "gallery.npz"))
+    assert set(gal.cat_ids.tolist()) == {cat_a["id"], cat_b["id"]}
+
+
+def test_build_gallery_no_exclusion_records_none(tmp_path, monkeypatch):
+    # A build that excluded nothing reads the SAME as one made before the field existed —
+    # correct, since that is exactly what it was.
+    store = _store(tmp_path)
+    cat_a, cat_b = store.create_cat("A"), store.create_cat("B")
+    fids = [_add_frame(store, i) for i in range(1, 3)]
+    rows = [
+        {"frame_id": fids[0], "label_kind": "identified", "cat_id": cat_a["id"],
+         "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": "a.jpg"},
+        {"frame_id": fids[1], "label_kind": "identified", "cat_id": cat_b["id"],
+         "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": "b.jpg"},
+    ]
+    vectors_by_path = {os.path.join(store.dataset_root, "a.jpg"): [1.0, 0.0],
+                       os.path.join(store.dataset_root, "b.jpg"): [0.0, 1.0]}
+    store.add_dataset_items(rows)
+    monkeypatch.setattr(gallery, "Embedder", _stub_embedder_factory(vectors_by_path))
+
+    result = build_gallery(store, str(tmp_path / "models" / "v-plain"))
+    assert result["metrics"]["excluded_cat_ids"] is None
+
+
+def test_build_gallery_excluding_below_the_floor_writes_nothing(tmp_path, monkeypatch):
+    # An exclusion is the ONLY build parameter that can drop whole cats, so the builder's
+    # own cold-start guard is the second line behind the endpoint's pre-check — and its
+    # message must not read as "you have no labels" when the operator deselected too much.
+    store = _store(tmp_path)
+    cat_a, cat_b = store.create_cat("A"), store.create_cat("B")
+    fids = [_add_frame(store, i) for i in range(1, 4)]
+    store.add_dataset_items([
+        {"frame_id": fids[0], "label_kind": "identified", "cat_id": cat_a["id"],
+         "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": "a1.jpg"},
+        {"frame_id": fids[1], "label_kind": "identified", "cat_id": cat_a["id"],
+         "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": "a2.jpg"},
+        {"frame_id": fids[2], "label_kind": "identified", "cat_id": cat_b["id"],
+         "quality": "gallery", "bbox": [0, 0, 5, 5], "crop_path": "b1.jpg"},
+    ])
+    monkeypatch.setattr(gallery, "Embedder", _NeverConstructed)
+
+    out_dir = str(tmp_path / "models" / "v-floor")
+    result = build_gallery(store, out_dir, exclude_cat_ids=[cat_b["id"]])
+
+    assert result["enough"] is False and result["reason"] == "insufficient_labels"
+    assert result["n_crops"] == 2 and result["n_cats"] == 1
+    assert "1 excluded cat(s)" in result["message"]
+    assert not os.path.isdir(out_dir)
+
+
 def test_build_gallery_insufficient_labels_short_circuits_without_embedder(tmp_path, monkeypatch):
     store = _store(tmp_path)
     cat_a = store.create_cat("A")

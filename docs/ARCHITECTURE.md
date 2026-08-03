@@ -598,6 +598,16 @@ the queue back into Annotate:
   best-graded crops per cat, **spread over time** rather than taken from one visit
   (a contiguous run is one visit in one light), and discards no labels — a later
   build may enrol different ones.
+  A build (and a validation run, so the effect is measurable) also takes an optional
+  **cat exclude-list**: cats to leave out of *this* build because they are not worth
+  enrolling **yet** — too few visits to represent. It is distinct from *retiring*, which
+  means "stop tracking this cat" and also removes it from the annotation picker, blocking
+  the very labelling the exclusion waits for. An exclude-list, not an include-list, so a
+  cat added later is enrolled by default; it is a per-build parameter, never persisted;
+  and it is part of the version's identity (dedup key, artifact dir, `metrics`), because
+  a gallery built without a cat must be distinguishable from one with it. Nothing reads
+  it at Run time — an excluded cat is simply absent from the gallery and resolves to
+  *unknown*.
 - **Promotion.** A built version is promoted to the active model that Run uses —
   exactly one is active at a time. Versions are retained in the model store so a bad
   one can be rolled back (by promoting the retired one). A version that is not active

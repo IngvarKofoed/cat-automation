@@ -2068,3 +2068,43 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      2439 MB), via two pair-length `int64` gathers for the cross-visit mask. The largest
      addition is gone — finding the matrix min/max no longer boolean-index-copies the whole
      matrix (~1.16 GB at 12k crops), since `1 - (unit @ unit.T)` is always finite.
+
+330. A cat can be left out of ONE gallery build without being retired: the Model page's new
+     shared checkbox list sends `exclude_cat_ids` on build AND validate. Retiring was the
+     only mechanism and is the wrong one — it also drops the cat from the annotation picker,
+     stopping the labelling the exclusion is waiting for.
+     Spec: docs/specs/2026-08-03-gallery-build-cat-exclusion.md.
+
+331. It is an EXCLUDE-list, never an include-list, so absent/empty means "enrol everyone"
+     and a cat added to the roster later is enrolled by default — an include-list would
+     silently drop a new resident from every repeated build. Per-build only, never
+     persisted: a reload re-ticks everyone.
+
+332. Filtered in SQL on `labeled_crops` AND `count_identified_crops`, the pair that must
+     agree. It is the FIRST build parameter that can reduce the CAT count, so the pre-check
+     applies it too — the cap's "only reduces crops per cat" premise does not hold here, and
+     the two-cat floor would otherwise pass on cats the build then drops. The message names
+     the exclusion: "not enough labelled data" misreads when it was merely deselected.
+
+333. The exclusion is part of the artifact's identity — dedup key (ids SORTED, so tick order
+     is not identity), a `-ex<n>` dir-slug fragment after `-max<cap>`, and the ids on the
+     version's / run's `metrics`. Without it a gallery built without Store Kali is
+     indistinguishable from one with it, and a second Build with a different selection is
+     silently dropped. Both lists NAME the cats (a count cannot be compared between builds).
+
+334. Validate takes the same list, from the SAME shared control — deliberately unlike the
+     grade checkboxes, which stay per-panel. Validation scores the crops, not a gallery, so
+     an exclusion applied only to the build is invisible to the number; two independent
+     lists would let you build without a cat, validate with it, and read the unmoved score
+     as "the exclusion didn't help".
+
+335. New `GET /api/label/enrollable` returns, per ACTIVE cat, crops + `label_commits` at the
+     requested grades — pre-cap, which is also what a cap is picked against. Counts follow the
+     Build grades: a cat with 50 labels may have 17 at gallery grade, so 50 is the wrong
+     number to decide on. `label_commits` is named for what it counts, not the visits it
+     proxies (~12% high). Retired cats are omitted — unticking implies ticking would enrol.
+
+336. Excluding a RESIDENT is allowed with no guard: a newly added resident held back until
+     it has crossings is precisely the case. The row shows `is_resident` and both counts, so
+     the choice is informed rather than prevented — recall tracks visits, and the cat with
+     the most crops measured the worst recall (Store Jihn 2725 crops, 69%).

@@ -69,7 +69,7 @@ class _SuccessProbe:
         self.n_cats = n_cats
         self.out_dirs: "list[str]" = []
 
-    def __call__(self, store, out_dir, qualities=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
         self.calls += 1
         self.out_dirs.append(out_dir)
         if progress is not None:
@@ -101,7 +101,7 @@ class _GatedProbe:
         self.release = threading.Event()
         self.calls = 0
 
-    def __call__(self, store, out_dir, qualities=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
         self.calls += 1
         if progress is not None:
             progress(0, 1)
@@ -135,7 +135,7 @@ class _CancelProbe:
     def __init__(self) -> None:
         self.entered = threading.Event()
 
-    def __call__(self, store, out_dir, qualities=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
         self.entered.set()
         while True:
             if progress is not None and not progress(0, 100):
@@ -212,7 +212,10 @@ def test_dedup_guards_running_double_click_but_rerun_after_completion_is_fresh(t
     # A distinct quality selection is a real new job behind the running one.
     other = manager.enqueue_feasibility(store, ["gallery"])
     assert other["deduped"] is False and other["position"] == 1
-    assert [j["params"] for j in manager.status()["queue"]] == [["gallery"]]
+    # feasibility params are the (qualities, exclude_cat_ids) pair, so the shared cat
+    # exclusion lands in the dedup key too — two runs that scored different cat sets must
+    # never collapse onto one another. status() converts only the outer level.
+    assert [j["params"] for j in manager.status()["queue"]] == [[("gallery",), None]]
 
     gated.release.set()
     assert _wait(lambda: not manager.running)
@@ -258,7 +261,7 @@ def test_probe_exception_records_failed(tmp_path):
     # history record and status().error, and no row written.
     store = _store(tmp_path)
 
-    def boom(store, out_dir, qualities=None, progress=None):
+    def boom(store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
         raise RuntimeError("probe boom")
 
     manager = TrainingManager(probe_runner=boom)
@@ -277,7 +280,7 @@ def test_not_enough_data_is_done_with_message_and_no_row(tmp_path):
     # message via status().result but writes no row — distinct from a red 'failed' job.
     store = _store(tmp_path)
 
-    def not_enough(store, out_dir, qualities=None, progress=None):
+    def not_enough(store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
         return {"enough": False, "n_crops": 1, "n_cats": 1, "quality": "all",
                 "message": "Not enough labelled data yet: 1 crops across 1 cat(s)."}
 
@@ -308,7 +311,7 @@ def test_cancel_after_completion_is_done_and_keeps_row(tmp_path):
         def __init__(self) -> None:
             self.manager = None
 
-        def __call__(self, store, out_dir, qualities=None, progress=None):
+        def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
             if progress is not None:
                 progress(0, 2)
                 progress(2, 2)

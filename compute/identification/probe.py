@@ -477,6 +477,7 @@ def run_feasibility_probe(
     store,
     out_dir: str,
     qualities: "tuple[str, ...] | None" = None,
+    exclude_cat_ids: "tuple[int, ...] | None" = None,
     progress: "object | None" = None,
 ) -> dict:
     """Run the probe over the store's ``identified`` crops → summary dict + report.
@@ -485,6 +486,13 @@ def run_feasibility_probe(
     grade); ``progress`` is forwarded to ``Embedder.embed_paths`` as its
     ``progress(done, total)`` callback (which also carries the cancel signal — a
     falsy return raises ``EmbedCancelled``, left to propagate here).
+
+    ``exclude_cat_ids`` leaves the named roster cats out of the scored set — the same
+    per-build selection ``build_gallery`` takes, offered here because a validation run
+    forecasts the gallery you would build at those grades: an exclusion applied only to
+    the build is invisible to the number, and the errors it removes still appear. Echoed
+    back in the summary so the caller can record WHICH cat set a run scored (a run over a
+    different set is not comparable with one over the whole roster).
 
     Guards the too-little-data cases instead of raising, returning a structured
     ``{'enough': False, 'reason': ..., 'message': ...}`` so the endpoint can surface
@@ -496,10 +504,13 @@ def run_feasibility_probe(
     with the headline metrics. Does NOT touch the DB.
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
+    excluded = tuple(sorted({int(c) for c in exclude_cat_ids})) if exclude_cat_ids else ()
     # active_only: score the CURRENT household. A retired cat is one we no longer
     # need to tell apart, and leaving it in would move the separability numbers
     # away from the gallery that actually gets built (which excludes it too).
-    labels = store.labeled_crops(("identified",), qualities, active_only=True)
+    labels = store.labeled_crops(
+        ("identified",), qualities, active_only=True, exclude_cat_ids=excluded or None
+    )
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:
@@ -511,7 +522,12 @@ def run_feasibility_probe(
             "quality": quality_label,
             "message": (
                 f"Not enough labelled data yet: {n_crops} crops across {n_cats} cat(s). "
-                "Label at least two cats."
+                + (
+                    f"Label at least two cats, or re-include one of the {len(excluded)} "
+                    "excluded cat(s)."
+                    if excluded
+                    else "Label at least two cats."
+                )
             ),
         }
 
@@ -586,4 +602,8 @@ def run_feasibility_probe(
         # The honest headline, lifted for the caller to persist as the run's `metrics`
         # (see TrainingManager._run_feasibility) and to show in the runs table.
         "visits": metrics.get("visits"),
+        # WHICH cat set this run scored, persisted alongside `visits` — a run that
+        # excluded a cat is not comparable with one over the whole roster, and that has
+        # to be visible in the runs row rather than only in the request that made it.
+        "excluded_cat_ids": list(excluded) or None,
     }

@@ -121,14 +121,19 @@ def build_gallery(
     out_dir: str,
     qualities: "tuple[str, ...] | None" = None,
     max_per_cat: "int | None" = None,
+    exclude_cat_ids: "tuple[int, ...] | None" = None,
     progress: "Callable[[int, int], bool] | None" = None,
 ) -> dict:
     """Embed the labelled ``identified`` crops into a versioned gallery under ``out_dir``.
 
-    Reads ``store.labeled_crops(("identified",), qualities, active_only=True)`` —
+    Reads ``store.labeled_crops(("identified",), qualities, active_only=True,
+    exclude_cat_ids=...)`` —
     a RETIRED roster cat is excluded, which is what makes retiring one stop it
     being enrolled. Its crops are untouched, so un-retiring and rebuilding brings
-    it back. Embeds the crop files
+    it back. ``exclude_cat_ids`` is the narrower, per-build "not enrolled *yet*"
+    selection (see the gallery-build cat-exclusion spec): the cats' crops simply never
+    arrive, so no logic here branches on it — it is only recorded in ``metrics`` so a
+    version row says what it left out. Embeds the crop files
     with a fresh ``Embedder`` (first run downloads the backbone), computes a suggested
     same/different distance threshold, and writes ``<out_dir>/gallery.npz``
     (``vectors`` RAW float32 ``(N,D)``, ``cat_ids`` int64 ``(N,)``, plus the resolved
@@ -149,11 +154,16 @@ def build_gallery(
     falsy return raises ``EmbedCancelled``, left to propagate here as in the probe).
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
-    labels = store.labeled_crops(("identified",), qualities, active_only=True)
+    excluded = tuple(sorted({int(c) for c in exclude_cat_ids})) if exclude_cat_ids else ()
+    labels = store.labeled_crops(
+        ("identified",), qualities, active_only=True, exclude_cat_ids=excluded or None
+    )
     # Cap BEFORE the cold-start guard and before embedding: the guard should describe what
     # will actually be enrolled, and the dropped crops cost nothing to embed. Capping can
     # never reduce the number of distinct cats (each keeps at least one), so it cannot turn
-    # a buildable set into `insufficient_labels` on the cat count.
+    # a buildable set into `insufficient_labels` on the cat count. An EXCLUSION can (it is
+    # the only build parameter that drops whole cats) — which is why the endpoint's
+    # pre-check applies it too, and why the guard below is the second line, not the first.
     n_labelled = len(labels)
     labels = cap_per_cat(labels, max_per_cat)
     n_capped_out = n_labelled - len(labels)
@@ -168,7 +178,12 @@ def build_gallery(
             "quality": quality_label,
             "message": (
                 f"Not enough labelled data yet: {n_crops} crops across {n_cats} cat(s). "
-                "Grade representative crops as gallery, or widen the selection."
+                + (
+                    f"Re-include one of the {len(excluded)} excluded cat(s), grade "
+                    "representative crops as gallery, or widen the selection."
+                    if excluded
+                    else "Grade representative crops as gallery, or widen the selection."
+                )
             ),
         }
 
@@ -219,6 +234,12 @@ def build_gallery(
         # gallery from an uncapped one — `per_cat` alone can't distinguish "capped at 40"
         # from "only ever had 40 crops of that cat".
         "max_per_cat": max_per_cat,
+        # The per-build cat exclusion, recorded for the same reason: without it a gallery
+        # built without Store Kali is indistinguishable from one with it, and comparing
+        # two builds is the whole point of leaving a cat out. Ids, not a count — a count
+        # cannot be compared between two builds. `None` when nothing was excluded, which
+        # is also what a version built before the field existed reads as (correct: it was).
+        "excluded_cat_ids": list(excluded) or None,
         "n_labelled": n_labelled,
         "n_capped_out": n_capped_out,
         "backbone": embedder.backbone,
@@ -230,6 +251,8 @@ def build_gallery(
         # no-detection event into ``unrecognized`` vs ``motion_only``. May be ``None``
         # (too few labelled visits) — stored as-is; the reader then falls back to its
         # conservative default. Recomputed on every build, so it sharpens with labels.
+        # Deliberately NOT filtered by `exclude_cat_ids`: it measures whether motion is
+        # CAT-SIZED, not which cat, so an excluded cat's visits stay valid evidence for it.
         "subject_floor": store.labeled_cat_motion_floor(),
     }
 

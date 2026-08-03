@@ -82,6 +82,52 @@ _ENV_REPORTS_KEEP = "CAT_TRAINING_REPORTS_KEEP"
 _DEFAULT_REPORTS_KEEP = "25"
 
 
+def _norm_excluded(exclude_cat_ids: "list | None") -> "tuple[int, ...] | None":
+    """Canonicalise a cat-exclusion selection for a job's params: sorted, deduped, or ``None``.
+
+    ``None`` and ``[]`` both mean "exclude nothing" → ``None``, the same collapse
+    ``qualities`` applies, so the dedup key and the artifact slug don't distinguish two
+    spellings of the same request. Sorting is what makes unticking two cats in either
+    order ONE job rather than two.
+    """
+    if not exclude_cat_ids:
+        return None
+    return tuple(sorted({int(c) for c in exclude_cat_ids}))
+
+
+def _run_metrics(result: dict) -> "dict | None":
+    """The ``feasibility_runs.metrics`` block for a successful probe result, or ``None``.
+
+    Carries only the keys the probe actually produced, so an OLDER probe (no visit block,
+    no exclusion echo) still writes NULL rather than a dict of ``None``s — the runs table
+    renders a missing key as "not measured", which must stay distinguishable from a
+    measured zero.
+    """
+    metrics = {}
+    if result.get("visits") is not None:
+        metrics["visits"] = result["visits"]
+    if result.get("excluded_cat_ids"):
+        metrics["excluded_cat_ids"] = result["excluded_cat_ids"]
+    return metrics or None
+
+
+def _params_note(
+    quals: "tuple[str, ...] | None", cap: "int | None", excluded: "tuple[int, ...] | None"
+) -> str:
+    """The parenthesised human label fragment for a build/validation job's params.
+
+    Empty when nothing is set, so a default job's label stays the bare kind. The
+    exclusion prints as a COUNT here (this string is for the logs); the ids themselves
+    live on the version/run row, which is what a later comparison reads.
+    """
+    parts = (
+        ([_quality_slug(quals)] if quals else [])
+        + ([f"max {cap}/cat"] if cap else [])
+        + ([f"−{len(excluded)} cat(s)"] if excluded else [])
+    )
+    return "" if not parts else " (" + ", ".join(parts) + ")"
+
+
 @dataclass(frozen=True)
 class _Job:
     """One queued (or running) training job, immutable once created.
@@ -91,9 +137,11 @@ class _Job:
     and belong to whatever job is currently running) nor the store (a single instance
     shared by every job, held on the manager). ``kind`` selects the run function
     (``'feasibility'`` | ``'gallery-build'`` | ``'identify'`` | ``'visit-identify'``);
-    ``params`` is the hashable job payload — for ``'feasibility'`` / ``'gallery-build'``
-    the ``qualities`` tuple (``None`` = all grades), for ``'identify'`` and
-    ``'visit-identify'`` the ``(since_id, until_id)`` window bounds.
+    ``params`` is the hashable job payload — for ``'feasibility'`` the
+    ``(qualities, exclude_cat_ids)`` pair, for ``'gallery-build'`` the
+    ``(qualities, max_per_cat, exclude_cat_ids)`` triple (each element ``None`` when
+    unset), for ``'identify'`` and ``'visit-identify'`` the ``(since_id, until_id)``
+    window bounds.
     The per-run timestamped output dir is assigned when the job *runs*, so it is
     deliberately NOT part of the job or its dedup key. ``label`` is a human-readable name
     for the logs only.
@@ -194,54 +242,71 @@ class TrainingManager:
 
     # --- Public enqueue API --------------------------------------------------------------
 
-    def enqueue_feasibility(self, store: "Store", qualities: "list | None") -> dict:
+    def enqueue_feasibility(
+        self,
+        store: "Store",
+        qualities: "list | None",
+        exclude_cat_ids: "list | None" = None,
+    ) -> dict:
         """Enqueue a feasibility validation run over the ``identified`` crops of ``qualities``.
 
         ``qualities`` is the crop-grade selection from the Validate panel's checkboxes —
-        ``None`` (or empty) means "all grades", which is normalised to ``params=None`` so the
-        dedup key and the report slug are stable regardless of how "all" was expressed. The
-        heavy deps and the labelled-crop pre-check are the *endpoint's* concern (it runs
-        ``Embedder.ensure_available()`` and ``count_identified_crops`` synchronously before
-        calling here); this method just builds the job, records the store, and dedups+appends
-        under the lock, promoting the head if idle (see ``_enqueue``).
+        ``None`` (or empty) means "all grades", which is normalised to ``None`` inside the
+        params so the dedup key and the report slug are stable regardless of how "all" was
+        expressed. The heavy deps and the labelled-crop pre-check are the *endpoint's*
+        concern (it runs ``Embedder.ensure_available()`` and ``count_identified_crops``
+        synchronously before calling here); this method just builds the job, records the
+        store, and dedups+appends under the lock, promoting the head if idle (see
+        ``_enqueue``).
+
+        ``exclude_cat_ids`` is the shared cat-exclusion selection (the same list Build
+        takes), so a validation run forecasts the gallery that build would produce.
+        ``params`` is therefore the PAIR ``(qualities_or_None, excluded_or_None)`` with the
+        ids SORTED, so unticking two cats in either order is one job — and so the
+        double-click guard cannot collapse two runs that scored different cat sets.
 
         Returns ``{**status(), "position": int, "deduped": bool}`` — ``position`` is how many
         jobs must finish before this one starts (0 = running now), and ``deduped`` is True
         only when this exact request is already the *running* job (a double-click), never for
         a pending one.
         """
-        params = tuple(qualities) if qualities else None
-        label = "feasibility" if params is None else f"feasibility ({_quality_slug(params)})"
+        quals = tuple(qualities) if qualities else None
+        excluded = _norm_excluded(exclude_cat_ids)
+        params = (quals, excluded)
+        label = "feasibility" + _params_note(quals, None, excluded)
         job = _Job(kind="feasibility", params=params, label=label)
         return self._enqueue(store, job)
 
     def enqueue_gallery_build(
-        self, store: "Store", qualities: "list | None", max_per_cat: "int | None" = None
+        self,
+        store: "Store",
+        qualities: "list | None",
+        max_per_cat: "int | None" = None,
+        exclude_cat_ids: "list | None" = None,
     ) -> dict:
         """Enqueue a gallery build over the ``identified`` crops of ``qualities``.
 
         ``qualities`` is the crop-grade selection from the Build panel's checkboxes —
-        ``None`` (or empty) means "all grades", normalised to ``params=None`` so the dedup
-        key and the artifact-dir slug are stable regardless of how "all" was expressed. Like
-        ``enqueue_feasibility`` the heavy deps + labelled-crop pre-check are the *endpoint's*
-        concern; this just builds the job and dedups+appends under the lock (see
-        ``_enqueue``). Same ``{**status(), "position", "deduped"}`` return.
+        ``None`` (or empty) means "all grades", normalised to ``None`` inside the params so
+        the dedup key and the artifact-dir slug are stable regardless of how "all" was
+        expressed. Like ``enqueue_feasibility`` the heavy deps + labelled-crop pre-check are
+        the *endpoint's* concern; this just builds the job and dedups+appends under the lock
+        (see ``_enqueue``). Same ``{**status(), "position", "deduped"}`` return.
 
         ``max_per_cat`` (``None`` = uncapped) balances the gallery across cats — see
-        ``cap_per_cat``. Unlike ``feasibility``, gallery-build's ``params`` is therefore a
-        PAIR — ``(qualities_or_None, max_per_cat_or_None)`` — so it lands in the dedup key:
-        changing only the cap and pressing Build again is genuinely different work, and with
-        the cap outside the key the double-click guard would silently drop it.
+        ``cap_per_cat``; ``exclude_cat_ids`` leaves named cats out of this build entirely
+        (the shared Validate/Build selection). gallery-build's ``params`` is therefore the
+        TRIPLE ``(qualities_or_None, max_per_cat_or_None, excluded_or_None)``, so both land
+        in the dedup key: changing only the cap — or only which cats are ticked — and
+        pressing Build again is genuinely different work, and with either outside the key
+        the double-click guard would silently drop it. The ids are SORTED, so unticking two
+        cats in either order is one job rather than two.
         """
         quals = tuple(qualities) if qualities else None
         cap = int(max_per_cat) if max_per_cat else None
-        params = (quals, cap)
-        label = "gallery-build" + (
-            "" if quals is None and cap is None
-            else " (" + ", ".join(
-                ([_quality_slug(quals)] if quals else []) + ([f"max {cap}/cat"] if cap else [])
-            ) + ")"
-        )
+        excluded = _norm_excluded(exclude_cat_ids)
+        params = (quals, cap, excluded)
+        label = "gallery-build" + _params_note(quals, cap, excluded)
         job = _Job(kind="gallery-build", params=params, label=label)
         return self._enqueue(store, job)
 
@@ -494,8 +559,16 @@ class TrainingManager:
         on a not-enough-data run it writes NO row and returns the friendly message for the UI.
         Returns the summary dict stashed into ``status().result``.
         """
+        # feasibility params are always the (qualities, exclude_cat_ids) pair built by
+        # `enqueue_feasibility` — unpacked here rather than treated as a bare grades tuple.
+        quals, excluded = job.params
         ts = int(time.time() * 1000)
-        slug = "all" if job.params is None else _quality_slug(job.params)
+        slug = "all" if quals is None else _quality_slug(quals)
+        if excluded:
+            # A count, not the ids: the dir name is a human handle and the exact ids live in
+            # the run's `metrics`. Appended LAST so the slug stays `<grades>[-ex<n>]` and two
+            # runs' dir names stay comparable — the same shape the gallery artifact uses.
+            slug += f"-ex{len(excluded)}"
         out_dir = os.path.join(store.training_root, f"{ts}-{slug}")
 
         def progress(done: int, total: int) -> bool:
@@ -505,7 +578,8 @@ class TrainingManager:
         result = self._probe_runner(
             store,
             out_dir,
-            qualities=(list(job.params) if job.params else None),
+            qualities=(list(quals) if quals else None),
+            exclude_cat_ids=(list(excluded) if excluded else None),
             progress=progress,
         )
 
@@ -530,11 +604,11 @@ class TrainingManager:
                 result["threshold"],
                 report_dir=os.path.basename(out_dir),
                 # The visit-held-out block, so the runs list can rank by the honest number
-                # and not only by the crop-level one. Absent (older probe) writes NULL,
-                # which reads back as "not measured".
-                metrics=(
-                    {"visits": result["visits"]} if result.get("visits") is not None else None
-                ),
+                # and not only by the crop-level one, plus WHICH cat set was scored — a run
+                # that left a cat out is not comparable with one over the whole roster, so
+                # the runs row has to say so. Both absent writes NULL, which reads back as
+                # "not measured" (what every run recorded before either field existed is).
+                metrics=_run_metrics(result),
             )
         except Exception:
             # The report dir is already on disk but the row insert failed (locked/full/WAL).
@@ -555,6 +629,7 @@ class TrainingManager:
             "threshold": result["threshold"],
             "report_dir": os.path.basename(out_dir),
             "visits": result.get("visits"),
+            "excluded_cat_ids": result.get("excluded_cat_ids"),
         }
 
     def _run_gallery_build(self, job: "_Job", store: "Store") -> "dict":
@@ -571,13 +646,20 @@ class TrainingManager:
         insert fails (WAL/locked/full) before re-raising, so a failed insert never leaves a dir
         without its row. Returns the summary stashed into ``status().result``.
         """
-        # gallery-build params are always the (qualities, max_per_cat) pair built by
-        # `enqueue_gallery_build` — unpacked here rather than treated as a bare grades tuple.
-        quals, cap = job.params
+        # gallery-build params are always the (qualities, max_per_cat, exclude_cat_ids)
+        # triple built by `enqueue_gallery_build` — unpacked here rather than treated as a
+        # bare grades tuple.
+        quals, cap, excluded = job.params
         ts = int(time.time() * 1000)
         slug = "all" if quals is None else _quality_slug(quals)
         if cap:
             slug += f"-max{cap}"   # the cap is part of the artifact's identity, like the grades
+        if excluded:
+            # So is the exclusion — but as a COUNT, not an id list: the dir name is a human
+            # handle, and the exact ids live on the version's `metrics`. Appended AFTER the
+            # cap so the slug stays `<ts>-<grades>[-max<cap>][-ex<n>]` and two builds' dir
+            # names are comparable.
+            slug += f"-ex{len(excluded)}"
         out_dir = os.path.join(store.models_root, f"{ts}-{slug}")
 
         def progress(done: int, total: int) -> bool:
@@ -589,6 +671,7 @@ class TrainingManager:
             out_dir,
             qualities=(list(quals) if quals else None),
             max_per_cat=cap,
+            exclude_cat_ids=(list(excluded) if excluded else None),
             progress=progress,
         )
 

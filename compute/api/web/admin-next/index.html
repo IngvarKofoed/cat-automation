@@ -3721,6 +3721,24 @@
         </div>
       </div>
       <div class="card">
+        <h3>Cats to enrol <span class="note">(applies to Validate and Build)</span></h3>
+        <div id="mCats" class="qwrap"><span class="note">…</span></div>
+        <span id="mCatsNote" class="note"></span>
+        <p class="hint">Untick a cat to leave it out of the next build — a cat that is not
+          worth enrolling <i>yet</i> (too few visits to represent), held back WITHOUT
+          retiring it. Retiring is the wrong tool here: it also drops the cat from the
+          annotation picker, which would stop the labelling you are waiting for.
+          An excluded cat's visits resolve to <i>unknown cat</i>, and its labels and crops
+          are untouched — re-tick it and rebuild to enrol it.</p>
+        <p class="hint">Counts follow the <b>Build</b> grade selection below — they are that
+          cat's crops at those grades, <i>before</i> any <b>Max per cat</b> cap applies (which
+          is what makes them the right numbers for picking a cap). <b>Label commits</b> stands in
+          for a VISIT count (one label keypress commits one visit) — recall tracks visits,
+          not crops, so a cat can hold the most crops and still be the worst recognised.
+          Treat it as approximate: it reads a few percent high. Not saved — a reload
+          re-ticks everyone, so a forgotten exclusion cannot quietly persist.</p>
+      </div>
+      <div class="card">
         <h3>1 · Validate <span class="note">(optional)</span></h3>
         <div class="row">${qChecks('v')}<span id="mValNote" class="note grow"></span><button id="mValidate">Validate</button></div>
         <p class="hint">Scores the LABELLED CROPS at those grades — how separable the cats are,
@@ -3754,6 +3772,9 @@
 
     let alive = true;
     let covWarning = '';
+    // id -> name over the WHOLE roster (retired included), so a version/run row can name the
+    // cats it left out. Populated by loadRoster() before the two tables first render.
+    let catNames = new Map();
     const pct = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
     const f3 = (x) => (x == null ? '—' : x.toFixed(3));
 
@@ -3764,6 +3785,118 @@
       if ($(`#${p}Poor`, view).checked) q.push('poor');
       return q.length ? q : null; // empty selection ⇒ null ⇒ all grades (backend contract)
     };
+
+    // --- The shared cat-exclusion list ------------------------------------------------
+    // ONE list drives both Validate and Build, deliberately unlike the grade checkboxes
+    // (which are per-panel): with two independent lists you could build excluding a cat,
+    // validate WITHOUT excluding it, watch the number not move, and conclude the exclusion
+    // didn't help — having measured a different cat set. Page state only; a reload re-ticks
+    // everyone, so the field always fails toward enrolling.
+    let enrollable = [];
+    const excluded = new Set();
+    let catsSeq = 0;
+
+    // The wire is an EXCLUDE-list: the unticked ids, or null for "enrol everyone". So a cat
+    // added to the roster later is enrolled by default, which an include-list would silently
+    // drop from every repeated build.
+    const getExcluded = () => (excluded.size ? [...excluded].sort((a, b) => a - b) : null);
+
+    function catsTable() {
+      if (!enrollable.length) {
+        return '<span class="note">No active cats — add one on <a href="#cats">Cats</a>.</span>';
+      }
+      const COMMITS_TIP = 'Distinct label commits — one keypress labels one visit, so this '
+        + 'stands in for a visit count. Approximate: it reads a few percent high.';
+      return '<table class="qtable wtable">'
+        // The KIND column absorbs the slack, not Cat: with Cat flexible, "resident" was
+        // pushed to the far right of the row, reading as unrelated to the name beside it.
+        + '<colgroup><col style="width:64px"><col style="width:180px"><col>'
+        + '<col style="width:90px"><col style="width:120px"></colgroup>'
+        + '<thead><tr><th>Enrol</th><th>Cat</th><th></th>'
+        + '<th class="num" title="Crops at the Build grades — what a build would embed">Crops</th>'
+        + `<th class="num" title="${esc(COMMITS_TIP)}">Label commits</th></tr></thead><tbody>`
+        + enrollable.map((c) => {
+          const off = excluded.has(c.cat_id);
+          return `<tr${off ? ' class="dim"' : ''}>`
+            + `<td><input type="checkbox" data-cat="${c.cat_id}"${off ? '' : ' checked'}`
+            + ` aria-label="enrol ${esc(c.cat_name)}"></td>`
+            + `<td class="qname">${esc(c.cat_name)}</td>`
+            // Resident vs neighbour is shown, never enforced: a resident with too few
+            // visits to enrol is precisely the case this exists for, and the household
+            // knows its own cats better than a threshold would.
+            + `<td class="note">${c.is_resident ? 'resident' : 'neighbour'}</td>`
+            + `<td class="num">${fmtInt(c.crops)}</td>`
+            + `<td class="num">${fmtInt(c.label_commits)}</td></tr>`;
+        }).join('')
+        + '</tbody></table>';
+    }
+    function renderCats() {
+      const el = $('#mCats', view);
+      el.innerHTML = catsTable();
+      el.querySelectorAll('input[data-cat]').forEach((cb) => cb.addEventListener('change', () => {
+        const id = Number(cb.dataset.cat);
+        if (cb.checked) excluded.delete(id); else excluded.add(id);
+        // Focus left on a checkbox is harmless here (this page binds no bare keys), but the
+        // row's dim class has to follow the tick, so re-render and restate the count.
+        renderCats();
+        renderCatsNote();
+      }));
+      renderCatsNote();
+    }
+    function renderCatsNote() {
+      const quals = getQualities('b');
+      const left = enrollable.length - excluded.size;
+      // Listed in the TABLE's order, not the order they were unticked, so the sentence and
+      // the rows above it read the same way round.
+      const names = enrollable.filter((c) => excluded.has(c.cat_id)).map((c) => c.cat_name);
+      // Drop any stale-refetch tone (below) — via classList, never `className`, which would
+      // also drop whatever layout class the span carries (entry 214).
+      $('#mCatsNote', view).classList.remove('bad');
+      $('#mCatsNote', view).textContent = enrollable.length
+        ? `Counts at the Build grades: ${quals ? quals.join(' + ') : 'all'} · `
+          + `enrolling ${left} of ${enrollable.length} cat(s)`
+          + (names.length ? ` · leaving out ${names.join(', ')}` : '')
+        : '';
+    }
+    async function loadEnrollable() {
+      const seq = ++catsSeq;
+      const quals = getQualities('b');
+      const qs = quals ? '?' + quals.map((q) => `qualities=${encodeURIComponent(q)}`).join('&') : '';
+      try {
+        const r = await api('GET', '/api/label/enrollable' + qs);
+        // Sequence guard: a grade change fires a second fetch, and a slow earlier one
+        // landing afterwards would restore the previous grades' counts (entry 235).
+        if (!alive || seq !== catsSeq) return;
+        enrollable = r.cats || [];
+        // Prune ticks for cats that left the list (retired elsewhere meanwhile): they are
+        // already excluded by `active_only`, and keeping an id the panel cannot show would
+        // leave the selection saying more than the screen does.
+        const live = new Set(enrollable.map((c) => c.cat_id));
+        [...excluded].forEach((id) => { if (!live.has(id)) excluded.delete(id); });
+        renderCats();
+      } catch (e) {
+        if (!alive || seq !== catsSeq) return;
+        // KEEP the last-good rows. Replacing them with the error would leave `excluded`
+        // populated with no checkbox on screen to clear it — a build would then silently
+        // leave out cats the operator can neither see nor re-tick. The rows are still live
+        // (ticking is pure in-memory state, no fetch), so the control survives the outage;
+        // only the COUNTS are stale, which the note has to say. With no table yet — the
+        // first load failed — there is no selection to lose, so the error stands alone.
+        if (enrollable.length) {
+          // Red, so leaving the rows up cannot read as "the refetch quietly succeeded".
+          $('#mCatsNote', view).classList.add('bad');
+          $('#mCatsNote', view).textContent =
+            `Counts are stale — could not reload for the current grades (${e.message}). `
+            + 'Ticks below still apply.';
+        } else {
+          $('#mCats', view).innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+        }
+      }
+    }
+    // The counts are only meaningful against a grade selection, so the BUILD panel's grades
+    // drive them (the artifact is what the decision is about) and a change refetches.
+    ['bGallery', 'bOk', 'bPoor'].forEach((id) =>
+      $(`#${id}`, view).addEventListener('change', loadEnrollable));
 
     // Blank / 0 / a non-number all mean "no cap" — the backend takes null, and `ge=1`
     // would 422 on a 0 typed into the field.
@@ -3776,7 +3909,7 @@
       $('#mBuildNote', view).textContent = 'starting…';
       try {
         const r = await api('POST', '/api/training/gallery/build',
-          { qualities: getQualities('b'), max_per_cat: getCap() });
+          { qualities: getQualities('b'), max_per_cat: getCap(), exclude_cat_ids: getExcluded() });
         $('#mBuildNote', view).textContent = r.enough === false ? r.message : 'build enqueued';
         if (r.enough !== false) pollJob();
       } catch (e) { $('#mBuildNote', view).textContent = e.message; }
@@ -3784,7 +3917,10 @@
     async function validate() {
       $('#mValNote', view).textContent = 'starting…';
       try {
-        const r = await api('POST', '/api/training/feasibility/run', { qualities: getQualities('v') });
+        // The SAME exclude-list Build uses — a validation run forecasts the gallery you
+        // would build, so an exclusion applied to only one of the two is unmeasurable.
+        const r = await api('POST', '/api/training/feasibility/run',
+          { qualities: getQualities('v'), exclude_cat_ids: getExcluded() });
         $('#mValNote', view).textContent = r.enough === false ? r.message : 'validation enqueued';
         if (r.enough !== false) pollJob();
       } catch (e) { $('#mValNote', view).textContent = e.message; }
@@ -3811,6 +3947,16 @@
       const tip = out ? `capped at ${mx} crops per cat — ${out} labelled crop(s) not enrolled` : `capped at ${mx} crops per cat`;
       return ` <span class="note" title="${esc(tip)}">≤${mx}/cat</span>`;
     }
+    // The cats a build/run left out, by NAME rather than as a count: comparing two builds is
+    // why the exclusion is part of the artifact's identity at all, and a count cannot be
+    // compared. An id whose cat no longer exists renders `#<id>` rather than being dropped,
+    // so a row never under-reports what it left out.
+    function exclNote(ids) {
+      if (!ids || !ids.length) return '';
+      const names = ids.map((id) => catNames.get(id) || `#${id}`);
+      return ` <span class="note" title="${esc('excluded: ' + names.join(', '))}">`
+        + `−${esc(names.join(', '))}</span>`;
+    }
     function modelsTable(models) {
       if (!models.length) return '<span class="note">No gallery versions yet — build one above.</span>';
       const chip = (s) => (s === 'active' ? '<span class="pill ok">active</span>'
@@ -3835,7 +3981,8 @@
         // "which crops went in" — and `n_vectors` alone can't distinguish a gallery capped
         // at 40 from one whose cats only ever had 40 crops.
         + models.map((m) => `<tr><td>${chip(m.status)}</td><td class="num">v${m.id}</td>`
-          + `<td class="qname">${esc(m.quality || 'all')}${capNote(m)}</td>`
+          + `<td class="qname">${esc(m.quality || 'all')}${capNote(m)}`
+          + `${exclNote(m.metrics && m.metrics.excluded_cat_ids)}</td>`
           + `<td class="num">${fmtInt(m.n_vectors)}</td><td class="num">${fmtInt(m.n_cats)}</td>`
           + `<td class="num">${m.threshold == null ? '<span class="note warn">uncalibrated</span>' : f3(m.threshold)}</td>`
           + `<td class="num">${fmtTs(m.created_ts)}</td><td class="num">${action(m)}</td></tr>`).join('')
@@ -3865,13 +4012,17 @@
         const byId = new Map(models.map((m) => [String(m.id), m]));
         el.querySelectorAll('button[data-promote]').forEach((b) => b.addEventListener('click', () => promote(Number(b.dataset.promote))));
         el.querySelectorAll('button[data-del]').forEach((b) => b.addEventListener('click', () => deleteModel(byId.get(b.dataset.del))));
-        checkCoverage();
       } catch (_) {}
     }
-    async function checkCoverage() {
+    // The roster read behind two things: the promote-time night-coverage warning, and the
+    // id→name map the version / validation-run rows resolve their exclusions against. It is
+    // regime-coverage (not the new enrollable list) because that one returns EVERY roster
+    // cat, retired included — an exclusion may well name a cat that has since been retired.
+    async function loadRoster() {
       try {
         const r = await api('GET', '/api/label/regime-coverage');
         if (!alive) return;
+        catNames = new Map((r.cats || []).map((c) => [c.cat_id, c.cat_name]));
         const noNight = (r.available ? (r.cats || []) : []).filter((c) => c.is_resident && c.total > 0 && c.night === 0).map((c) => c.cat_name);
         covWarning = noNight.length ? `⚠ No night crops for: ${noNight.join(', ')} — unrecognizable after dark.` : '';
         $('#mCovWarn', view).textContent = covWarning;
@@ -3916,7 +4067,11 @@
         + '<th class="num" title="Each visit hidden whole and matched against the others, named by Run&#39;s own vote rule. First number: correct of those it decided. Second (dim): the share it declined to name. This is the comparable number.">Visit · declined</th>'
         + '<th class="num" title="Leave-one-CROP-out. Reads high: a crop\'s nearest neighbour is usually the adjacent frame of its own visit. Kept for comparison with older runs.">kNN</th>'
         + '<th class="num">AUC</th><th class="num">Threshold</th><th></th></tr></thead><tbody>'
-        + runs.map((r) => `<tr><td>${fmtTs(r.ts)}</td><td class="qname">${esc(r.quality || 'all')}</td>`
+        // The exclusion rides in the Grades cell here too: a run that scored a different cat
+        // set is not comparable with one over the whole roster, and that has to be visible in
+        // the row rather than only in the stored JSON.
+        + runs.map((r) => `<tr><td>${fmtTs(r.ts)}</td><td class="qname">${esc(r.quality || 'all')}`
+          + `${exclNote(r.metrics && r.metrics.excluded_cat_ids)}</td>`
           + `<td class="num">${fmtInt(r.n_crops)}</td><td class="num">${fmtInt(r.n_cats)}</td>`
           + visitCell(r)
           + `<td class="num dim">${pct(r.knn_accuracy)}</td><td class="num">${f3(r.auc)}</td><td class="num">${f3(r.threshold)}</td>`
@@ -3974,7 +4129,18 @@
         if (a == null && b == null) return base;
         return `${base} · #${a == null ? '…' : a}–#${b == null ? '…' : b}`;
       }
-      return `${base} · ${esc(params.join('+'))}`;
+      // A build's params are [grades, max_per_cat, excluded]; a validation's are [grades,
+      // excluded] — NESTED arrays, so a flat join would print "gallery,," . Each element may
+      // be null, and all-null (the default request) reads as the bare kind.
+      const grades = params[0];
+      const cap = kind === 'gallery-build' ? params[1] : null;
+      const excl = kind === 'gallery-build' ? params[2] : params[1];
+      const bits = [];
+      if (grades && grades.length) bits.push(grades.join('+'));
+      if (cap) bits.push(`max ${cap}/cat`);
+      // A count here, not names: this is a queue row, and the ids are on the version/run row.
+      if (excl && excl.length) bits.push(`−${excl.length} cat${excl.length === 1 ? '' : 's'}`);
+      return bits.length ? `${base} · ${esc(bits.join(' · '))}` : base;
     }
     // Running-job rate, the same client-side anchor the tuning page uses: items done /
     // seconds since the anchor, re-anchored on job identity (and on done going backwards,
@@ -4032,14 +4198,19 @@
         else q.innerHTML = '<span class="note">Nothing running or queued.</span>';
         $('#mQueueCtl', view).hidden = !queued.length;
         $('#mJob', view).textContent = s.error && !s.running ? 'last error: ' + s.error : '';
-        if (finished) { loadModels(); loadRuns(); }
+        // The roster comes along: a finished build may have been the operator's cue to retire
+        // or rename a cat, and both tables resolve their exclusions through catNames.
+        if (finished) { loadRoster(); loadModels(); loadRuns(); }
       } catch (_) {}
     }
 
     $('#mClearQ', view).addEventListener('click', () =>
       api('POST', '/api/training/queue/clear').catch(() => {}).then(() => { if (alive) pollJob(); }));
 
-    loadModels(); loadRuns(); pollJob();
+    // The roster FIRST: both tables name their excluded cats out of catNames, so rendering
+    // them before it lands would print `#7` for a cat that has a perfectly good name.
+    loadRoster().then(() => { if (alive) { loadModels(); loadRuns(); } });
+    loadEnrollable(); pollJob();
     const timer = setInterval(pollJob, 3000);
     return () => { alive = false; clearInterval(timer); };
   }

@@ -322,6 +322,25 @@
   .note.bad { color: var(--bad); }
   .phase-list { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
   .phase-list li { margin: 3px 0; }
+  /* The operating-stage picker: three tall radio-ish cards, one selected. Deliberately NOT
+     a .seg — each option carries a sentence of consequence (what it keeps, what it costs),
+     which a single-line segmented control has no room for, and picking a stage is a
+     less-frequent, more consequential act than a segment flip. */
+  .stage-picker { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .stage-picker button { display: block; text-align: left; padding: 10px 12px; height: auto;
+    border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2);
+    color: var(--muted); white-space: normal; }
+  .stage-picker button b { display: block; color: var(--text); font-size: 13px; margin-bottom: 3px; }
+  .stage-picker button span { display: block; font-size: 12px; line-height: 1.45; }
+  .stage-picker button.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface-2)); }
+  .stage-picker button.sel b { color: var(--accent); }
+  .stage-picker button:disabled { opacity: .55; }
+  /* One label + one readout per line, for the always-on workers that no longer have toggles. */
+  .wrow { display: flex; gap: 10px; align-items: baseline; padding: 5px 0; }
+  .wrow + .wrow { border-top: 1px solid var(--border); }
+  .wrow > .wk { flex: 0 0 130px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--muted); }
+  .wrow > .note { flex: 1; min-width: 0; }
   .stub-tag { display: inline-block; margin-bottom: 12px; font-size: 12px; font-weight: 600;
     color: var(--accent); background: var(--surface-2); border: 1px solid var(--border);
     border-radius: 999px; padding: 2px 10px; }
@@ -893,7 +912,7 @@
 
   // ---- Route table -------------------------------------------------------
   const ROUTES = [
-    { id: 'start', title: 'Start', sub: 'Phase, persistence mode, and housekeeping', mount: mountStart },
+    { id: 'start', title: 'Start', sub: 'Operating stage, collection, and housekeeping', mount: mountStart },
     { id: 'tuning', title: 'Motion tuning', sub: 'Trust the motion gate', mount: mountTuning },
     { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', mount: mountFrames },
     { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', mount: mountAnnotate },
@@ -954,45 +973,52 @@
   // =======================================================================
   function mountStart(view) {
     view.innerHTML = `
-      <div class="card">
-        <h3>Workflow phases</h3>
-        <ol class="phase-list">
-          <li><b>Motion tuning</b> — keep <i>all</i> frames (a gate miss is only visible in a stored non-motion frame).</li>
-          <li><b>Annotation</b> — motion-only capture is safe once the gate is trusted.</li>
-          <li><b>Build &amp; promote</b> a model.</li>
-          <li><b>Active learning</b> — keep annotating; relabel mistakes.</li>
-        </ol>
-        <p class="hint">Phase 1 is what licenses the disk savings in phase 2+, so persistence mode follows the phase (below).</p>
+      <div class="card" id="healthCard" hidden>
+        <h3>Health</h3>
+        <div id="healthRows"></div>
+        <p class="hint">Shown first in <b>Running</b>, where nothing is expected to be watching this page.</p>
       </div>
 
       <div class="card">
-        <h3>Capture mode</h3>
-        <div class="row">
-          <div class="seg" id="modeSeg">
-            <button data-mo="0" title="Persist every frame — needed to measure gate misses">Tuning · keep all frames</button>
-            <button data-mo="1" title="Drop non-motion frames to save disk">Collecting · motion only</button>
-          </div>
-          <span id="modeNote" class="note"></span>
+        <h3>Operating stage</h3>
+        <div class="stage-picker" id="stagePicker">
+          <button data-stage="tuning">
+            <b>1 · Tuning</b>
+            <span>Keeps <b>every</b> frame. A gate miss only exists in a stored non-motion
+              frame, so this is the only stage where recall can be measured.</span>
+          </button>
+          <button data-stage="collecting">
+            <b>2 · Collecting</b>
+            <span>Annotate and train. Keeps <b>motion frames only</b> — false triggers stay
+              measurable, misses do not.</span>
+          </button>
+          <button data-stage="running">
+            <b>3 · Running</b>
+            <span>Done teaching. Same capture as Collecting; the difference is that no
+              human input is expected.</span>
+          </button>
         </div>
-        <div class="row">
-          <label class="note" id="oracleLabel" title="Run YOLO over every new frame as it arrives — never over older ones">
-            <input type="checkbox" id="oracleChk" aria-describedby="oracleNote"> YOLO all
-          </label>
-          <span id="oracleNote" class="note"></span>
-        </div>
-        <p class="hint">Runs <b>YOLO</b> continuously over new frames — motion <i>and</i> non-motion
-          — so Motion tuning finds a day already covered instead of waiting on a manual sweep.
-          Keep-all only: a gate miss lives in a non-motion frame, which motion-only capture never
-          stores. Forward-only: switching it on (or restarting compute) starts from the newest
-          frame, so anything captured while it was off — earlier days, a pause, a restart — still
-          needs a manual sweep from Motion tuning.</p>
+        <p id="stageNote" class="note"></p>
+        <p id="stagePurgeHint" class="note warn" hidden></p>
+        <p class="hint">The stage is the only control for capture mode and the two always-on
+          workers — there is no combination to assemble by hand, which is what used to leave
+          Collecting with no detection at all before a model was promoted.</p>
+      </div>
+
+      <div class="card">
+        <h3>Always on</h3>
+        <div class="wrow"><span class="wk">Detection</span><span id="detNote" class="note"></span></div>
+        <div class="wrow"><span class="wk">Live naming</span><span id="liveNote" class="note"></span></div>
+        <p class="hint">Both run in every stage and yield the GPU to any manual job.
+          Detection sweeps at whatever coverage the stage stores; live naming idles until a
+          gallery is promoted. Both are forward-only — they cover frames from the moment
+          compute started, so older windows still need a manual sweep from Motion tuning.</p>
       </div>
 
       <div class="card">
         <h3>Collection</h3>
         <div class="row">
           <button id="collectorBtn"></button>
-          <button id="liveIdBtn"></button>
           <span class="grow"></span>
           <button id="clearBtn" class="danger">Clear all frames…</button>
         </div>
@@ -1051,42 +1077,27 @@
     `;
 
     let alive = true;
-    // True while a /api/yolo-oracle/{start,stop} POST is in flight, so the periodic poll's
-    // renderStats does not overwrite the checkbox the click handler is holding inert.
-    let oracleSubmitting = false;
+    // True while a /api/stage POST is in flight, so the periodic poll's renderStats does not
+    // re-select the button the click handler is holding inert (the same in-flight-flag
+    // discipline the Training page's Run button and the old oracle checkbox used: a refresh
+    // landing mid-POST would re-derive `sel`/`disabled` from stale server state, unlock the
+    // guard, and flash the pre-POST selection).
+    let stageSubmitting = false;
 
-    // --- Capture mode ---
-    const modeSeg = $('#modeSeg', view);
-    modeSeg.addEventListener('click', async (e) => {
-      const btn = e.target.closest('button'); if (!btn) return;
-      const mo = btn.dataset.mo === '1';
-      try { await api('POST', '/api/collector/motion-only', { motion_only: mo }); await refresh(); }
-      catch (err) { $('#modeNote', view).textContent = 'Failed: ' + err.message; }
-    });
-
-    // --- YOLO-all oracle (continuous full-coverage sweep) ---
-    // The checkbox is optimistic; refresh() re-renders it from the server's reported intent,
-    // so a failed POST reverts the box rather than leaving it lying about the worker's state.
-    $('#oracleChk', view).addEventListener('change', async (e) => {
-      const box = e.target, wanted = box.checked;
-      // Hold the box inert until the POST settles. `start()` best-effort-joins a just-stopped
-      // worker thread for up to 2s, so an off→on click can await that long — plenty of room
-      // for a second click to fire a concurrent /stop whose ordering at the manager lock is
-      // undefined, settling opposite to the user's last intent. refresh() re-derives disabled.
-      box.disabled = true;
-      // ...and tell the 3s poll to leave the box alone while it is. Without this, a refresh()
-      // landing mid-POST re-derives `disabled` from server state — unlocking the box the guard
-      // just locked (so the very double-click above becomes possible again) and briefly
-      // reverting `checked` to the pre-POST value. Same in-flight-flag discipline the Training
-      // page's Run button uses.
-      oracleSubmitting = true;
+    // --- Operating stage ---
+    $('#stagePicker', view).addEventListener('click', async (e) => {
+      const btn = e.target.closest('button'); if (!btn || btn.disabled) return;
+      const wanted = btn.dataset.stage;
+      const picker = $('#stagePicker', view);
+      picker.querySelectorAll('button').forEach(b => b.disabled = true);
+      stageSubmitting = true;
       let failed = null;
-      try { await api('POST', wanted ? '/api/yolo-oracle/start' : '/api/yolo-oracle/stop'); }
+      try { await api('POST', '/api/stage', { stage: wanted }); }
       catch (err) { failed = err; }
-      oracleSubmitting = false;  // released BEFORE refresh, so refresh re-derives the box
-      await refresh();  // re-render from server state FIRST (reverts the box if the POST failed)
-      if (failed) {     // ...then report, so this refresh can't overwrite the message
-        const n = $('#oracleNote', view);
+      stageSubmitting = false;  // released BEFORE refresh, so refresh re-derives the buttons
+      await refresh();          // re-render from server state FIRST (reverts on failure)
+      if (failed) {             // ...then report, so this refresh can't overwrite the message
+        const n = $('#stageNote', view);
         n.className = 'note bad'; n.textContent = 'Failed: ' + failed.message;
       }
     });
@@ -1095,10 +1106,6 @@
     $('#collectorBtn', view).addEventListener('click', async () => {
       const running = $('#collectorBtn', view).dataset.running === '1';
       try { await api('POST', running ? '/api/collector/stop' : '/api/collector/start'); await refresh(); } catch (_) {}
-    });
-    $('#liveIdBtn', view).addEventListener('click', async () => {
-      const running = $('#liveIdBtn', view).dataset.running === '1';
-      try { await api('POST', running ? '/api/live-identify/stop' : '/api/live-identify/start'); await refresh(); } catch (_) {}
     });
     $('#clearBtn', view).addEventListener('click', async () => {
       if (!confirm('Delete ALL stored frames? Labels, models, and avatars are kept — only the rolling frame buffer is cleared.')) return;
@@ -1150,44 +1157,104 @@
         ['Oldest', fmtTs(s.oldest_ts), 'ts'], ['Newest', fmtTs(s.newest_ts), 'ts'],
       ].map(([k, v, cls]) => `<div class="stat${cls ? ' ' + cls : ''}"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 
-      // Capture mode
-      for (const b of modeSeg.querySelectorAll('button')) b.classList.toggle('sel', (b.dataset.mo === '1') === !!s.motion_only);
-      $('#modeNote', view).textContent = s.motion_only ? 'Motion-only: gate misses are unmeasurable while this is on.' : 'Keeping every frame.';
-
-      // YOLO-all oracle. `running` is INTENT, so it stays on while the worker idles under
-      // motion-only capture — hence the note distinguishes "idle" from "off", so an enabled
-      // but deliberately-idle worker is never mistaken for a broken one.
-      const oracle = s.yolo_oracle || {};
-      const oBox = $('#oracleChk', view), oNote = $('#oracleNote', view);
-      // Skipped entirely while a start/stop POST is in flight: the click handler owns the box
-      // then (it is deliberately checked-but-disabled), and rewriting it here would unlock the
-      // guard and flash the stale pre-POST value. The note below still renders — it is
-      // read-only text, and it is re-rendered by the refresh() the handler awaits.
-      if (!oracleSubmitting) {
-        oBox.checked = !!oracle.running;
-        // Blocked from being turned ON in motion-only capture (it can't cover anything there),
-        // but never blocked from being turned OFF — a control you can't switch off is a trap.
-        const lockOn = !!s.motion_only && !oracle.running;
-        oBox.disabled = lockOn;
-        $('#oracleLabel', view).classList.toggle('dim', lockOn);
+      // --- Operating stage. `stage` is absent on a compute that predates it, and FastAPI
+      // ignores the unknown body field, so POSTing would 200 while changing nothing — say so
+      // rather than letting the picker look like it worked (entries 164/173/183, all the same
+      // lesson: the dev proxy serves a LOCAL admin against a REMOTE compute).
+      const stage = s.stage || null;
+      const picker = $('#stagePicker', view), sNote = $('#stageNote', view);
+      if (!stageSubmitting) {
+        picker.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('sel', b.dataset.stage === stage);
+          b.disabled = !stage;
+        });
+      }
+      if (!stage) {
+        sNote.className = 'note bad';
+        sNote.textContent = 'This compute build has no operating stage — pull + restart it. '
+          + `Capture is currently ${s.motion_only ? 'motion-only' : 'keep-all'}.`;
+      } else {
+        sNote.className = 'note';
+        sNote.textContent = stage === 'tuning'
+          ? 'Keeping every frame — recall is measurable, and the store fills faster.'
+          : 'Motion frames only — false triggers stay measurable, misses do not.';
       }
 
+      // Out of Tuning with non-motion frames still stored, point at the purge. Keyed on
+      // LEFTOVER FRAMES (count − motion_count), not on watching for a stage transition:
+      // derived from state, so it survives a reload and disappears by itself once there is
+      // nothing left to reclaim. A LINK, never a run — eviction sheds those frames on its own
+      // under real disk pressure, and coupling irreversible deletion to a mode toggle is
+      // something you discover afterwards.
+      const purge = $('#stagePurgeHint', view);
+      const leftover = (s.count || 0) - (s.motion_count || 0);
+      const showPurge = !!stage && stage !== 'tuning' && leftover > 0;
+      purge.hidden = !showPurge;
+      if (showPurge) {
+        purge.innerHTML = `<b class="mono">${fmtInt(leftover)}</b> non-motion frames are `
+          + 'leftover from keep-all capture. Eviction sheds them first under disk pressure — '
+          + 'or reclaim now via <b>Cleanup → Drop non-motion frames</b> below, which is '
+          + 'irreversible and makes that window\'s misses permanently unmeasurable.';
+      }
+
+      // --- The two always-on workers, as READOUTS. No toggles: the stage is the intent, and
+      // a switch that nothing wants off is a switch that can be left wrong.
+      const oracle = s.yolo_oracle || {};
       let cls = 'note', txt;
-      if (s.motion_only) {
-        if (oracle.running) { cls = 'note warn'; txt = 'Idle — motion-only capture drops the non-motion frames it needs.'; }
-        else { txt = 'Off — keep-all mode only.'; }
-      } else if (oracle.running) {
-        txt = `Sweeping · up to date through frame #${fmtInt(oracle.watermark)}`
-          + (oracle.last_tick_ts ? ` · last tick ${fmtClock(oracle.last_tick_ts)}` : '');
+      if (!oracle.running) {
+        cls = 'note warn';
+        txt = 'Not running — new frames are getting no YOLO verdicts, so visits will read '
+          + '"not analysed" and the annotation queue will not fill.';
       } else {
-        txt = 'Off — Motion tuning needs a manual YOLO sweep per day.';
+        txt = `Sweeping ${s.motion_only ? 'motion frames' : 'every frame'}`
+          + ` · covered through frame #${fmtInt(oracle.watermark)}`
+          + (oracle.last_tick_ts ? ` · last tick ${fmtClock(oracle.last_tick_ts)}` : '');
       }
       // last_error is deliberately STICKY (it outlives the tick that set it, so a returning
       // operator still sees it), so it is appended as history rather than replacing the state
-      // — branching on it first would hide "Idle"/"Sweeping" for the rest of the process's
-      // life after one transient fault, and read as broken while the worker swept happily.
+      // — branching on it first would hide "Sweeping" for the rest of the process's life after
+      // one transient fault, and read as broken while the worker swept happily.
       if (oracle.last_error) { cls = 'note warn'; txt += ' · last error: ' + oracle.last_error; }
-      oNote.className = cls; oNote.textContent = txt;
+      const dn = $('#detNote', view); dn.className = cls; dn.textContent = txt;
+
+      // Live naming. A running worker with no promoted gallery idles every tick, which is
+      // correct rather than broken — the Active model card below says which it is, so this
+      // readout does not re-fetch it just to reword the same sentence.
+      const live = s.live_identify || {};
+      let lcls = 'note', ltxt;
+      if (!live.running) {
+        lcls = 'note warn';
+        ltxt = 'Not running — new visits will not be named.';
+      } else {
+        ltxt = `Running · named through frame #${fmtInt(live.watermark)}`
+          + (live.last_tick_ts ? ` · last tick ${fmtClock(live.last_tick_ts)}` : '')
+          + ' · idles until a gallery is promoted';
+      }
+      if (live.last_error) { lcls = 'note warn'; ltxt += ' · last error: ' + live.last_error; }
+      const ln = $('#liveNote', view); ln.className = lcls; ln.textContent = ltxt;
+
+      // --- Health, surfaced FIRST in Running, where nothing is expected to be watching.
+      const healthCard = $('#healthCard', view);
+      healthCard.hidden = stage !== 'running';
+      if (stage === 'running') {
+        // A worker's `running` is INTENT: both keep it true and set a sticky `last_error`
+        // when a tick throws, so testing `running` alone renders green over a worker that
+        // has analysed nothing in days. That is the exact failure this card exists to
+        // catch — it leads the page precisely because nobody is expected to scroll.
+        const workerRow = (label, w, okMsg, stoppedMsg) => {
+          if (!w.running) return [label, false, stoppedMsg];
+          if (w.last_error) return [label, false, 'ERRORING — ' + w.last_error];
+          return [label, true, okMsg];
+        };
+        const rows = [
+          ['Collecting', !!s.collector_running, s.collector_running ? 'frames arriving' : 'STOPPED — no frames are being stored'],
+          workerRow('Detection', oracle, 'verdicts current', 'STOPPED — visits will not be classified'),
+          workerRow('Naming', live, 'visits being named', 'STOPPED — visits will not be named'),
+        ];
+        $('#healthRows', view).innerHTML = rows.map(([k, ok, msg]) =>
+          `<div class="wrow"><span class="wk">${k}</span>`
+          + `<span class="note${ok ? '' : ' bad'}">${ok ? '' : '⚠ '}${msg}</span></div>`).join('');
+      }
 
       // Collector
       const cb = $('#collectorBtn', view);
@@ -1196,13 +1263,6 @@
       cb.className = s.collector_running ? 'on' : '';
       $('#collectorNote', view).textContent = (!s.collector_running && s.resume_available)
         ? 'Was collecting when the process last stopped — Resume picks it back up.' : '';
-
-      // Live identify
-      const lb = $('#liveIdBtn', view);
-      const liveRunning = s.live_identify && s.live_identify.running;
-      lb.dataset.running = liveRunning ? '1' : '0';
-      lb.textContent = liveRunning ? 'Stop live naming' : 'Start live naming';
-      lb.className = liveRunning ? 'on' : '';
     }
     function renderCleanup(c) {
       view.querySelectorAll('button[data-act="run"]').forEach(b => b.disabled = c.running);

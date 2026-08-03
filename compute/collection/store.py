@@ -43,6 +43,61 @@ from shared.motion import corruption_thresholds, lighting_version  # import-ligh
 # rather than one round-trip per row, so freeing space after a burst stays cheap.
 _EVICT_BATCH = 64
 
+# The three operating stages (see docs/specs/2026-08-02-operating-stages.md). ONE
+# persisted setting is the single intent for capture mode and the always-on
+# workers, replacing the hand-assembled `motion_only` / `yolo_oracle` /
+# `live_identify` switch trio — which is what made the stage-2 "nothing detects"
+# hole reachable at all.
+#
+# `collecting` and `running` are the SAME configuration by design; `running` adds
+# only the assertion that no human input is expected (the UI reflects it). Stated
+# rather than dressed up as a third recipe.
+STAGE_TUNING = "tuning"
+STAGE_COLLECTING = "collecting"
+STAGE_RUNNING = "running"
+STAGES = (STAGE_TUNING, STAGE_COLLECTING, STAGE_RUNNING)
+
+# Which stages keep every frame. Only `tuning` does: a gate MISS is a non-motion
+# frame that in fact held a cat, visible nowhere else and unrecoverable once the
+# frame was never written — that single fact is what licenses the disk cost.
+_STAGE_KEEPS_ALL = (STAGE_TUNING,)
+
+
+def _recv_ts_from_relpath(rel_path: str) -> "int | None":
+    """Recover ``recv_ts`` from a media relpath, or ``None`` if it doesn't parse.
+
+    ``add`` composes the name as ``<date>/<hour>/<recv_ts_ms>_f<edge_frame_id>.jpg``,
+    so the millisecond — which ``idx_frames_recv_ts`` indexes — is recoverable from
+    the filename. That is what lets the orphan sweep probe by an INDEXED column
+    instead of the unindexed ``path`` (a full table scan per file). Splits on the
+    LAST ``_f`` so a future dir or prefix change can't silently mis-parse, and
+    returns ``None`` for anything unexpected so the caller falls back rather than
+    guessing a file is garbage.
+    """
+    base = os.path.basename(rel_path.replace("\\", "/"))
+    head, sep, _ = base.rpartition("_f")
+    if not sep or not head.isdigit():
+        return None
+    return int(head)
+
+
+def stage_keeps_all_frames(stage: str) -> bool:
+    """Whether ``stage`` persists non-motion frames (``tuning`` only).
+
+    The ONE place the stage→capture-mode mapping lives, so the API route that
+    writes the collector's flag and the eviction policy that decides whether
+    non-motion frames are still precious cannot disagree about a stage.
+    """
+    return stage in _STAGE_KEEPS_ALL
+
+# Settings-KV keys owned by the stage model.
+_STAGE_KEY = "stage"
+# How far the id axis has had its non-motion frames stripped by PREFERENTIAL
+# eviction (see `_evict_locked`). Always a prefix `[1, N]`, because eviction works
+# from the oldest end — so one advancing integer expresses it exactly, where a
+# `purge_spans` row per batch would bloat a table `motion_only_spans` then unions.
+_NONMOTION_EVICTED_KEY = "nonmotion_evicted_through"
+
 # The columns every query selects, in this order, so _row_to_dict can unpack a
 # fetched tuple positionally without re-stating the layout at each call site.
 _ROW_COLUMNS = "id, recv_ts, edge_ts, frame_id, motion, area, bbox"
@@ -416,6 +471,16 @@ class Store:
         self._total_bytes = int(row[0])
         self._count = int(row[1])
         self._motion_count = int(row[2])
+        # The operating stage, and the preferential-eviction frontier, both held in
+        # memory for the SAME reason as the counters above: `_evict_locked` consults
+        # them while it already holds `self._lock`, and `get_setting`/`set_setting`
+        # acquire that lock themselves (a plain non-reentrant `threading.Lock`), so
+        # reading either through the KV from inside eviction would deadlock the store.
+        # Seeded once here, then maintained in lockstep — `set_stage` for the stage,
+        # `_evict_locked` for the frontier — and persisted through the caller's
+        # already-open connection rather than via `set_setting`.
+        self._stage = self._load_stage()
+        self._nonmotion_evicted_through = self._load_nonmotion_evicted()
 
     def _init_schema(self) -> None:
         # Schema is fixed by the spec; the (motion, area) index is what makes the
@@ -717,21 +782,86 @@ class Store:
                 self._total_bytes = int(row[0])
                 self._count = int(row[1])
                 self._motion_count = int(row[2])
+                # Resync the preferential-eviction frontier for the SAME reason as the
+                # counters: `_evict_locked` may have advanced it in memory before the
+                # failure, and the rollback just discarded the matching KV write. Left
+                # advanced it would sit ahead of the persisted value, and the `>` guard
+                # would then never re-persist it — so a restart would silently REGRESS
+                # the marker to the older DB value and stop warning over a window whose
+                # non-motion frames really are gone.
+                self._nonmotion_evicted_through = self._load_nonmotion_evicted()
                 raise
 
     def _evict_locked(self) -> None:
-        """Delete oldest rows+files while the running total exceeds the cap.
+        """Delete rows+files while the running total exceeds the cap.
 
-        Caller holds the lock. Evicts by ascending ``id`` (insertion order = age),
-        keeping ``_total_bytes`` in lockstep as each file is removed. A missing
-        file (already gone) is ignored — the row is still dropped and its recorded
-        size still subtracted, so the total can't drift.
+        Caller holds the lock. Keeps ``_total_bytes`` / ``_count`` /
+        ``_motion_count`` in lockstep as each file is removed (all via
+        ``_delete_frame_locked``, the single accounting path). A missing file
+        (already gone) is ignored — the row is still dropped and its recorded size
+        still subtracted, so the total can't drift.
+
+        **Victim order depends on the stage.** In ``tuning`` this is byte-for-byte
+        the historical behaviour: plain ascending ``id``, motion and non-motion
+        alike. Note what that does NOT mean — non-motion frames are not spared
+        there, they age out at the same rate as everything else; they are merely
+        never *preferentially* targeted, because in that stage they are the data the
+        stage exists to collect (a gate miss lives in one).
+
+        Outside ``tuning`` the gate is trusted and non-motion frames earn nothing,
+        so they are reclaimed FIRST (oldest of those first), falling back to plain
+        oldest-first once none are left. The effect is that the store keeps motion
+        history — the annotatable part — much further back for the same disk, and a
+        leftover keep-all window from a previous tuning stint is shed gradually
+        under real disk pressure rather than wiped on a mode toggle.
+
+        That preference is what makes the frontier marker necessary: it strips
+        windows PARTIALLY (motion frames present, non-motion gone), where plain
+        oldest-first removes whole windows and so leaves nothing to misread. An
+        unmarked partially-stripped window would report near-perfect gate recall
+        over frames that were deleted, so every preferential delete advances
+        ``_nonmotion_evicted_through`` and ``motion_only_spans`` folds it in.
         """
+        prefer_nonmotion = not stage_keeps_all_frames(self._stage)
+        # Highest non-motion id dropped by the PREFERENTIAL path this call. Only that
+        # path advances the frontier: under plain oldest-first the whole window goes,
+        # so there is nothing left to misread, and keeping the marker untouched is
+        # what makes `tuning` byte-for-byte identical to before.
+        stripped_through = 0
         while self._total_bytes > self._max_bytes:
-            rows = self._conn.execute(
-                "SELECT id, path, bytes, motion FROM frames ORDER BY id ASC LIMIT ?",
-                (_EVICT_BATCH,),
-            ).fetchall()
+            rows = []
+            preferential = False
+            if prefer_nonmotion:
+                # ORDER BY recv_ts, NOT id — `idx_frames_motion_recv (motion, recv_ts)`
+                # serves this in index order with no sort, whereas `ORDER BY id` under
+                # `WHERE motion = 0` has no index to satisfy it and makes SQLite
+                # temp-b-tree-sort the ENTIRE remaining non-motion partition to return
+                # 64 rows. That ran once per `add` (~10/s) inside the write lock, for
+                # the whole multi-day shedding this feature exists to do: measured
+                # 66 ms at 1.9M non-motion rows and linear in them, i.e. 0.8-2.6 s of
+                # lock hold per second of capture — the entries 102-105 starvation, and
+                # the same plan-not-correctness trap as the orphan sweep above.
+                # Equivalent victims: recv_ts is non-decreasing with id (the invariant
+                # entries 103/276/278 already lean on) and the index's implicit rowid
+                # tiebreak resolves a shared millisecond into id order.
+                # Chose this over adding `(motion, id)` — also measured fast — because
+                # an index costs write time on every insert forever to speed a
+                # maintenance path, and this one already exists. The trade: if recv_ts
+                # ever DID step backwards, victims stop being an exact id-prefix, so
+                # the `max()`-tracked marker below over-claims unmeasurability rather
+                # than under-claiming it. That is the fail-safe direction (entries
+                # 97/126/167) and the same tolerance entry 278 already accepts.
+                rows = self._conn.execute(
+                    "SELECT id, path, bytes, motion FROM frames WHERE motion = 0"
+                    " ORDER BY recv_ts ASC LIMIT ?",
+                    (_EVICT_BATCH,),
+                ).fetchall()
+                preferential = bool(rows)
+            if not rows:
+                rows = self._conn.execute(
+                    "SELECT id, path, bytes, motion FROM frames ORDER BY id ASC LIMIT ?",
+                    (_EVICT_BATCH,),
+                ).fetchall()
             if not rows:
                 # Total says we're over cap but there are no rows to drop — the
                 # total is authoritative-from-DB, so this can't happen; guard
@@ -739,11 +869,25 @@ class Store:
                 self._total_bytes = 0
                 self._count = 0
                 self._motion_count = 0
-                return
+                break
             for row_id, rel_path, n_bytes, motion in rows:
                 self._delete_frame_locked(row_id, rel_path, n_bytes, bool(motion))
+                if preferential:
+                    stripped_through = max(stripped_through, int(row_id))
                 if self._total_bytes <= self._max_bytes:
                     break
+        if stripped_through > self._nonmotion_evicted_through:
+            # Persist through the caller's connection, NOT `set_setting` — that
+            # acquires `self._lock`, which this call already holds, and the lock is
+            # not reentrant. No commit here either: the caller commits (see `add`),
+            # so the marker lands in the SAME transaction as the row deletes it
+            # describes and the two can never diverge on disk. The caller's rollback
+            # path re-reads it for the same reason.
+            self._nonmotion_evicted_through = stripped_through
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (_NONMOTION_EVICTED_KEY, str(stripped_through)),
+            )
 
     def _delete_frame_locked(self, row_id: int, rel_path: str, n_bytes: int, motion: bool) -> None:
         """Delete one frame's file + row + cascaded rows; decrement counters in lockstep.
@@ -1035,10 +1179,24 @@ class Store:
             # `dataset_items`, a flag is a work item, not output — nothing is lost that
             # a fresh look at the new frames can't re-flag.
             self._conn.execute("DELETE FROM label_flags")
+            # Reset the preferential-eviction frontier for the SAME rowid-reuse reason
+            # as mode_changes / purge_spans / label_flags above: it is a frame id, and a
+            # full clear restarts ids at 1, so a stale value would mark every brand-new
+            # frame as non-motion-stripped and banner a fresh store as "misses
+            # unmeasurable". `settings` as a whole is deliberately KEPT (it is config,
+            # so `stage` and `motion_only` survive the wipe) — this ONE key is frame-id
+            # state living in that table, so it is reset explicitly here rather than
+            # riding along with the config. Entries 141/143/144 each hit this hazard
+            # from a different direction.
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '0')",
+                (_NONMOTION_EVICTED_KEY,),
+            )
             self._conn.commit()
             self._total_bytes = 0
             self._count = 0
             self._motion_count = 0
+            self._nonmotion_evicted_through = 0
             return len(rows)
 
     # --- Settings + collector-mode persistence ------------------------------
@@ -1064,6 +1222,104 @@ class Store:
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
             )
             self._conn.commit()
+
+    # --- The operating stage ------------------------------------------------
+    #
+    # See docs/specs/2026-08-02-operating-stages.md. The stage owns capture mode
+    # and (via the API layer) which always-on workers run; it is read here from an
+    # in-memory field because `_evict_locked` consults it under the store lock.
+
+    def _load_stage(self) -> str:
+        """Read the persisted stage at open, falling back to ``tuning``.
+
+        A missing key is NOT derived here — that is ``derive_stage_if_unset``'s
+        job, which the API layer calls once at launch so a bare ``Store(...)`` (a
+        test, a CLI tool) never writes. An unrecognised value degrades to
+        ``tuning``: the conservative stage, since it is the only one that keeps
+        every frame and you cannot recover frames you did not store.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (_STAGE_KEY,)
+        ).fetchone()
+        value = row[0] if row else None
+        return value if value in STAGES else STAGE_TUNING
+
+    def _load_nonmotion_evicted(self) -> int:
+        """Read the preferential-eviction frontier at open; 0 when unset or junk."""
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (_NONMOTION_EVICTED_KEY,)
+        ).fetchone()
+        try:
+            return max(0, int(row[0])) if row and row[0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def get_stage(self) -> str:
+        """The current operating stage — one of ``STAGES``, never ``None``."""
+        with self._lock:
+            return self._stage
+
+    def set_stage(self, stage: str) -> None:
+        """Persist ``stage`` and update the in-memory copy eviction reads.
+
+        Raises ``ValueError`` on an unknown stage rather than silently coercing —
+        the value drives what eviction is allowed to delete first, so a typo must
+        not degrade into a policy change.
+        """
+        if stage not in STAGES:
+            raise ValueError(f"unknown stage: {stage!r}")
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (_STAGE_KEY, stage),
+            )
+            self._conn.commit()
+            self._stage = stage
+
+    def derive_stage_if_unset(self) -> str:
+        """Seed the stage ONCE from the pre-stage settings; return the current one.
+
+        Called at launch by the API layer. When ``stage`` is already persisted this
+        is a pure read. When it is absent — an install predating the stage model —
+        it is derived from the capture flag those installs did have:
+
+        - ``motion_only`` unset or ``"0"`` → ``tuning``
+        - ``motion_only == "1"``          → ``collecting``
+
+        ``running`` is NEVER derived. It and ``collecting`` are the same
+        configuration, so nothing in the store distinguishes them: it is a claim the
+        household makes, not a state that can be inferred. Guessing it from "a
+        gallery is promoted" would be wrong precisely when it matters — a model is
+        promoted *during* active learning too, so that would flip the console into
+        "nobody is watching" mid-work.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (_STAGE_KEY,)
+            ).fetchone()
+            if row and row[0] in STAGES:
+                self._stage = row[0]
+                return self._stage
+            mo = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", ("motion_only",)
+            ).fetchone()
+            derived = STAGE_COLLECTING if (mo and mo[0] == "1") else STAGE_TUNING
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (_STAGE_KEY, derived),
+            )
+            self._conn.commit()
+            self._stage = derived
+            return derived
+
+    def nonmotion_evicted_through(self) -> int:
+        """How far preferential eviction has stripped non-motion frames (0 = never).
+
+        Exposed for tests and diagnostics; the consumer that matters is
+        ``motion_only_spans``, which folds it in as the prefix span ``[1, N]``.
+        """
+        with self._lock:
+            return self._nonmotion_evicted_through
 
     # The compute-side location setting (admin-next P1; gates the P2 day/night
     # split). Three plain KV keys under the same `settings` table/lock as every
@@ -1377,6 +1633,15 @@ class Store:
         When there are no purge spans the output is byte-for-byte the motion-only
         step-function result (the common case); purge spans are only ever ADDED,
         never removing or altering a motion-only span.
+
+        The **preferential-eviction frontier** is folded in the same way, as the
+        prefix span ``[1, nonmotion_evicted_through]``: outside ``tuning``, eviction
+        reclaims non-motion frames first, which strips a window PARTIALLY (its
+        motion frames survive) and so leaves a scorecard able to read near-perfect
+        recall over frames that were deleted. Unlike a purge, that region is always
+        a prefix, so one integer describes it exactly. Zero (never evicted
+        preferentially, e.g. any store that has only ever been in ``tuning``)
+        contributes nothing.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -1385,6 +1650,7 @@ class Store:
             purge_rows = self._conn.execute(
                 "SELECT start_id, end_id FROM purge_spans"
             ).fetchall()
+            evicted_through = self._nonmotion_evicted_through
             if until_id is None:
                 (store_end,) = self._conn.execute(
                     "SELECT COALESCE(MAX(id), 0) FROM frames"
@@ -1412,15 +1678,20 @@ class Store:
             if lo <= hi:  # overlaps the window after clipping
                 spans.append({"start_id": lo, "end_id": hi})
 
-        if not purge_rows:
-            # No purges recorded → identical to the historical motion-only result,
+        # The frontier is an implicit purge span over the id prefix it has stripped.
+        stripped = list(purge_rows)
+        if evicted_through > 0:
+            stripped.append((1, evicted_through))
+
+        if not stripped:
+            # Nothing stripped → identical to the historical motion-only result,
             # including the empty-mode_changes case (spans == []).
             return spans
 
-        # Fold in the purge spans, clipped to the same window, then coalesce the
+        # Fold in the stripped spans, clipped to the same window, then coalesce the
         # union into sorted, non-overlapping intervals so a consumer never sees a
         # motion-only and a purge span double-cover the same ids.
-        for ps_start, ps_end in purge_rows:
+        for ps_start, ps_end in stripped:
             lo = int(ps_start) if since_id is None else max(int(ps_start), int(since_id))
             hi = int(ps_end) if until_id is None else min(int(ps_end), int(until_id))
             if lo <= hi:
@@ -1569,6 +1840,21 @@ class Store:
         unreferenced. It touches ONLY files under ``_media_root`` and NO DB rows (an
         orphan has none), so durable crops, labels, and models are structurally out
         of reach. Dedups the input so a repeated path isn't double-counted.
+
+        The referenced-row probe goes through the ``recv_ts`` INDEX, not a bare
+        ``WHERE path = ?``. ``frames.path`` is unindexed, so the bare form is a FULL
+        TABLE SCAN per candidate file — O(files x rows), which at millions of each is
+        effectively unbounded (measured: 11 s for 20k files against 20k rows, and the
+        cost is quadratic, not linear, in store size). Since ``add`` composes the name
+        as ``<date>/<hour>/<recv_ts_ms>_f<edge_frame_id>.jpg``, the millisecond is
+        recoverable from the filename and ``idx_frames_recv_ts`` turns each probe into
+        a seek. The ``path`` equality is still checked, on the handful of rows sharing
+        that millisecond, so the answer is identical — only the plan changes. Same
+        de-indexing trick as entries 229/265/276.
+
+        A filename that does NOT parse falls back to the slow scan rather than being
+        assumed orphaned: correctness must not depend on the naming convention holding
+        (a file written by an older scheme is still not garbage).
         """
         if not rel_paths:
             return {"deleted": 0, "bytes": 0}
@@ -1576,9 +1862,15 @@ class Store:
         deleted, freed = 0, 0
         with self._lock:
             for rel in uniq:
-                row = self._conn.execute(
-                    "SELECT 1 FROM frames WHERE path = ?", (rel,)
-                ).fetchone()
+                recv_ts = _recv_ts_from_relpath(rel)
+                if recv_ts is None:
+                    row = self._conn.execute(
+                        "SELECT 1 FROM frames WHERE path = ?", (rel,)
+                    ).fetchone()
+                else:
+                    row = self._conn.execute(
+                        "SELECT 1 FROM frames WHERE recv_ts = ? AND path = ?", (recv_ts, rel)
+                    ).fetchone()
                 if row is not None:
                     continue  # a live frame's file — never an orphan
                 abs_path = os.path.join(self._media_root, rel)
@@ -1599,8 +1891,13 @@ class Store:
 
         Walks ``_media_root`` in chunks, taking the lock only per chunk (never across
         the whole walk) to test which paths lack a ``frames`` row and sum their sizes.
-        Read-only — deletes nothing. Bounds each ``IN (...)`` at ``batch_size`` well
-        under SQLite's parameter limit.
+        Read-only — deletes nothing.
+
+        Probes through the ``recv_ts`` index per file, for the same reason
+        ``delete_orphan_batch`` does: the ``path IN (...)`` form this used to run is
+        one FULL TABLE SCAN per batch (``path`` is unindexed), so its cost grew with
+        the store on every batch. An indexed seek per file is cheaper than a scan per
+        500. Falls back to the unindexed equality for a name that doesn't parse.
         """
         count, total = 0, 0
         buf: "list[str]" = []
@@ -1610,17 +1907,22 @@ class Store:
             if not paths:
                 return
             uniq = list(dict.fromkeys(paths))
-            placeholders = ",".join("?" for _ in uniq)
+            missing: "list[str]" = []
             with self._lock:
-                existing = {
-                    r[0]
-                    for r in self._conn.execute(
-                        f"SELECT path FROM frames WHERE path IN ({placeholders})", uniq
-                    ).fetchall()
-                }
-            for rel in uniq:
-                if rel in existing:
-                    continue
+                for rel in uniq:
+                    recv_ts = _recv_ts_from_relpath(rel)
+                    if recv_ts is None:
+                        row = self._conn.execute(
+                            "SELECT 1 FROM frames WHERE path = ?", (rel,)
+                        ).fetchone()
+                    else:
+                        row = self._conn.execute(
+                            "SELECT 1 FROM frames WHERE recv_ts = ? AND path = ?",
+                            (recv_ts, rel),
+                        ).fetchone()
+                    if row is None:
+                        missing.append(rel)
+            for rel in missing:
                 count += 1
                 try:
                     total += os.path.getsize(os.path.join(self._media_root, rel))

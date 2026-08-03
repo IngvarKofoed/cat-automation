@@ -146,12 +146,15 @@ def test_start_allowed_while_motion_only(tmp_path):
     assert resp.json() == {"running": True}
 
 
-def test_promoted_model_does_not_auto_start_the_oracle(tmp_path):
-    # A DELIBERATE divergence from live-identify, which also restores when a gallery exists
-    # (changelog 100). A promoted model is a run-mode NAMING signal; the oracle is a
-    # motion-gate TUNING tool, so it starts only when the operator asked. Without this test a
-    # regression that copied live-identify's `or active_model() is not None` clause into the
-    # oracle's restore would pass the whole suite silently.
+def test_detection_worker_restores_unconditionally(tmp_path):
+    # EVERY operating stage runs the detection worker, with its coverage following the
+    # capture mode, so there is no per-worker intent left to consult: the restore is
+    # unconditional on a live app even with the `yolo_oracle` key absent (as here).
+    #
+    # This replaces a test asserting the opposite — that the worker started only when the
+    # operator asked — which held while it was a motion-gate TUNING tool that could not
+    # cover anything under motion-only capture. Now its verdicts feed event subjects, the
+    # annotation queue and the identify pass too, so "off" has no stage that wants it.
     from compute.api.app import create_app
 
     store = Store(
@@ -160,7 +163,7 @@ def test_promoted_model_does_not_auto_start_the_oracle(tmp_path):
         max_bytes=10_000_000,
     )
     manager = FakeYoloOracleManager()
-    # A live app (start_collector=True) is what runs the restore at all; the intent is OFF.
+    # A live app (start_collector=True) is what runs the restore at all.
     app = create_app(
         store=store,
         client=_FakeClient(),
@@ -170,8 +173,7 @@ def test_promoted_model_does_not_auto_start_the_oracle(tmp_path):
     )
     with TestClient(app):
         pass
-    # restore consulted the persisted intent only — and it was absent, so no GPU thread.
-    assert manager.restore_calls == [False]
+    assert manager.restore_calls == [True]
     assert manager.running is False
 
 

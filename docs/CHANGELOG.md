@@ -1874,3 +1874,96 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      focus left on the slider swallowed the operator's next label — with the modal over
      the stage to hide why. Blurs on `change` AND `pointerup`: a click landing on the
      thumb's current position changes no value and fires neither.
+
+299. One `stage` setting (`tuning` | `collecting` | `running`) is now the single intent for
+     capture mode and the two always-on workers, replacing the trio of switches
+     (`motion_only`, `yolo_oracle`, `live_identify`) an operator assembled by hand.
+     `POST /api/stage`; the Start page picker replaces three controls. Makes real the `Mode`
+     entity ARCHITECTURE had claimed since day one and the code never had.
+     Spec: docs/specs/2026-08-02-operating-stages.md.
+
+300. Fixes the hole that motivated it: between switching to motion-only capture and promoting
+     a first gallery, NOTHING detected anything. The detection worker bailed under motion-only
+     capture and live-identify bails without an active model, so visits landed `unanalyzed`
+     and the annotation queue stayed empty — noticed only when the queue you came to work was
+     blank.
+
+301. The always-on YOLO worker's coverage now FOLLOWS what is stored instead of idling: every
+     frame under keep-all, motion frames under motion-only. Renamed the DETECTION worker
+     (operator-facing only — module, class, settings keys and `analysis.analyzer` unchanged,
+     per entry 147), because its verdicts feed event subjects, per-visit aggregates, the queue's
+     membership and the identify pass — all of which need only motion frames. Only the gate
+     scorecard's MISS column ever needed the non-motion half.
+
+302. Coverage mode is read per TICK, never applied via stop/start, and both workers now restore
+     unconditionally on a live app. Load-bearing: every `start` re-seeds the watermark to the
+     frame horizon (entries 149/150), so driving a stage change through a restart would
+     silently discard the un-drained tail. Operator-visible on the first restart: anyone who
+     had "YOLO all" off finds it running — the coverage tuning wanted anyway, but a real
+     GPU-load change.
+
+303. Eviction is stage-aware: outside `tuning` it reclaims non-motion frames FIRST, so the same
+     disk holds annotatable motion history much further back. `tuning` stays byte-for-byte
+     plain oldest-first — note non-motion frames are NOT spared there, merely never
+     preferentially targeted. This is the auto-cleanup: driven by disk pressure, so no stage
+     change is destructive and a leftover keep-all window is shed gradually, not wiped.
+
+304. That preference strips windows PARTIALLY (motion frames present, non-motion gone), which
+     plain oldest-first never did — so it advances a `nonmotion_evicted_through` marker that
+     `motion_only_spans` folds in as the prefix `[1, N]`. Without it a scorecard reads
+     near-perfect gate recall over frames that were deleted: entries 97/126/167's trap, in the
+     one place it would be least visible.
+
+305. Three rails that marker needs. `clear()` RESETS it — the settings KV survives a wipe while
+     frame ids restart at 1, so a stale value would banner a fresh store as unmeasurable
+     (entries 141/143/144, a fourth direction). It is never written via `set_setting` (which
+     takes the store lock `_evict_locked` already holds — a non-reentrant deadlock), riding the
+     caller's transaction instead so it can't diverge from the deletes. And `add`'s rollback
+     re-reads it, or a discarded write would leave it ahead in memory and REGRESS on restart.
+
+306. Orphaned JPEGs are collected automatically at launch — a file with no `frames` row is
+     unreachable by construction, so removing it loses nothing and needs no marker,
+     confirmation, or stage awareness. Launch is when they exist: the changelog-42 leak is
+     created by a hard power loss.
+
+307. The orphan sweep's referenced-row probe now goes through the `recv_ts` INDEX, not a bare
+     `WHERE path = ?` — `frames.path` is unindexed, so that was a FULL TABLE SCAN per candidate
+     file: O(files x rows), quadratic in store size. Measured at 20k files / 20k rows:
+     11 s → 0.46 s, now walk-bound (≈1 min extrapolated to 2.5M files, vs effectively
+     unbounded). `add` composes the name as `<date>/<hour>/<recv_ts_ms>_f<id>.jpg`, so the
+     millisecond is recoverable; the `path` equality still runs, so the answer is identical and
+     only the plan changed. Entries 229/265/276, fourth instance.
+
+308. That was latent while the sweep was manual and cancelable — entry 306 made it automatic at
+     every launch, which would have pegged the store lock for hours and starved the collector on
+     the real store. Caught by measuring before upgrading, not by the test suite: correctness was
+     never wrong, only the plan. An unparseable filename falls back to the slow scan rather than
+     being assumed orphaned.
+
+309. Preferential eviction orders victims by `recv_ts`, not `id`. `WHERE motion = 0 ORDER BY id`
+     has NO index serving it, so SQLite temp-b-tree-sorted the whole remaining non-motion
+     partition to return 64 rows — once per `add` (~10/s) under the write lock, for the whole
+     multi-day shedding. Measured on the real schema with no ANALYZE: 7.5 ms at 238k non-motion
+     rows → 34 ms at 950k → 63 ms at 1.9M, i.e. linear, vs a flat 0.02 ms ordered by `recv_ts`
+     off the existing `idx_frames_motion_recv`. At cap that was ~0.8-2.6 s of lock hold per
+     second of capture: total starvation, entries 102-105 again.
+
+310. Chose that over adding a `(motion, id)` index — also fast — because an index costs write
+     time on every insert forever to speed a maintenance path, and this one already exists.
+     The trade: victims are an exact id-prefix only while `recv_ts` is non-decreasing with `id`
+     (entry 278: assumed, not enforced), and if it ever stepped back the `max()`-tracked marker
+     OVER-claims unmeasurability rather than under-claiming — the fail-safe direction.
+     Victim lists verified byte-identical over 3000 rows.
+
+311. The `running` health card no longer reads green over a broken worker. Both always-on
+     workers keep `running` true and set a STICKY `last_error` when a tick throws, so testing
+     the intent flag alone showed "verdicts current" while nothing had been analysed for days —
+     in the one card that exists because nobody is expected to be watching. It now fails a row
+     on `last_error` too, as the fuller readouts below it already did.
+
+312. The retroactive non-motion purge stays MANUAL by decision. Outside `tuning` no non-motion
+     frames are being stored, so every frame that job removes comes from a previous tuning
+     window — it is retroactive by construction, and auto-running it on a stage change would
+     make a mode toggle irreversibly destructive. The Start page instead links to it whenever
+     leftover non-motion frames exist, keyed on `count − motion_count` so the hint appears from
+     state and disappears once there is nothing to reclaim.

@@ -354,9 +354,10 @@ This decoupling is what makes locking, sound, and light optional: adding or
 removing that hardware changes only the mapping and the Pi's control API,
 never the brain.
 
-The mapping above applies in **run mode**. In **collection mode** (see *Operating
-modes and the learning loop*) identity isn't trusted, so the engine holds
-actuators at their safe default and only records/collects.
+The mapping above applies in the **running** stage. In **tuning** and
+**collecting** (see *Operating stages and the learning loop*) identity isn't
+trusted, so the engine holds actuators at their safe default and only
+records/collects.
 
 In the current prototype there is **no actuation at all** — the engine only
 records and collects. The full access-decision policy (how "fail safe" resolves
@@ -487,7 +488,11 @@ Core entities (storage-agnostic):
   (`cat_id` / stranger / not-cat), or `unlabelled` while queued.
 - **Model version** — a built gallery/model: `version`, `status`
   (draft / active / retired), training metrics; the active one is what Run uses.
-- **Mode** — the current operating mode (`collection` | `run`), as system state.
+- **Stage** — the current operating stage (`tuning` | `collecting` | `running`), as
+  system state: one persisted setting that owns capture mode and the always-on
+  workers. Supersedes the earlier two-value `collection | run` mode, which was
+  never built — what existed instead was three independent switches the operator
+  assembled by hand.
 
 Sightings and transitions are an append-only time series; occupancy is a
 projection over transitions and can always be rebuilt from them.
@@ -500,18 +505,39 @@ Postgres if needs grow. Media (crops/clips) is stored on the compute tier's
 filesystem, referenced by path/URL from the DB — not inlined as blobs. Retention
 is bounded (keep recent media for debugging/retraining, age out the rest).
 
-## Operating modes and the learning loop
+**Retention is a byte cap, and the stage decides what it sheds first.** The frame
+store is a fixed-size ring: over cap, it evicts. Under *tuning* that is plain
+oldest-first, motion and non-motion alike. Outside it, non-motion frames go first
+— they earn nothing once the gate is trusted, so the same disk holds annotatable
+motion history much further back. That preference strips a window *partially*, so
+it records how far it has reached; every consumer that asks "were misses
+measurable here" folds that in alongside motion-only and purge spans. The
+labelled crops, `cats`, and `model_versions` are never touched by any of it: they
+carry no FK to `frames` and live outside the media dir. Cleanup otherwise stays
+manual, except orphaned JPEGs (files with no row — unreachable by construction),
+which are collected at launch.
+
+## Operating stages and the learning loop
 
 Recognizing 4+ similar cats is the central risk, so the system is taught through
-an explicit, human-in-the-loop loop driven from the dashboard. It has two runtime
-**modes**, switchable at any time:
+an explicit, human-in-the-loop loop driven from the dashboard. It runs in one of
+three **stages**, switchable at any time, held as a single persisted setting that
+owns capture mode and the always-on workers:
 
-- **Collection.** Gather images: the generic cat detector finds cats at the door
-  and stores crops into the dataset. Access decisions stay passive/safe (identity
-  isn't trusted yet), which also makes this the **cold-start** mode — the very
-  first setup runs here, door in its safe default, until a first model exists.
-- **Run.** Normal autonomous operation (detect → identify → decide → actuate →
-  record → notify). The annotation queue's membership rule is **undecided** — a
+- **Tuning.** Trust the motion gate first. Persists **every** frame, because a
+  gate *miss* is a non-motion frame that in fact held a cat — visible nowhere
+  else, and unrecoverable once the frame was never written. That one fact is what
+  licenses the disk cost, and it is why a cold start is here.
+- **Collecting.** Gather images and annotate: the generic cat detector finds cats
+  at the door and stores crops into the dataset. Persists **motion frames only**,
+  which is safe once the gate is trusted — false triggers stay measurable, misses
+  do not. Access decisions stay passive/safe (identity isn't trusted yet), so this
+  is also where the first model is built and promoted.
+- **Running.** Normal autonomous operation (detect → identify → decide → actuate →
+  record → notify). Deliberately the **same configuration** as *Collecting* — what
+  it adds is the assertion that no human input is expected, which the console
+  reflects by leading with health rather than controls. The annotation queue's
+  membership rule is **undecided** — a
   detected visit with no label — *not* "uncertain", so a good model does not shrink
   it: every new visit joins until a human decides it. Active learning is therefore
   a **view** over that queue rather than a separate feeder: with a promoted model the
@@ -522,13 +548,21 @@ an explicit, human-in-the-loop loop driven from the dashboard. It has two runtim
   identification is invisible to this ordering by construction — that is what the
   user-app flag is for.)
 
+**Detection runs in every stage**, on an always-on worker whose coverage follows
+what is being stored (every frame under *Tuning*, motion frames otherwise). Its
+`yolo-serial` verdicts are read by far more than the gate scorecard — event
+subjects, the per-visit detection aggregates, the annotation queue's membership,
+and the crops the identify pass embeds — and all of those need only motion frames.
+Live naming likewise runs in every stage, idling until a gallery is promoted. So
+there is no stage in which new frames go un-analysed.
+
 The loop is **Collect → Annotate → Train → Run**, with Run continuously feeding
 the queue back into Annotate:
 
 - **Annotation.** In the dashboard the owner labels queued crops — assign a
   resident identity, or mark stranger / not-a-cat. Three feeders reach the queue:
-  collection-mode captures, run-mode uncertain samples, and corrections of wrong
-  identifications. A fourth, human-initiated path sits beside the queue rather than
+  collecting-stage captures, running-stage uncertain samples, and corrections of
+  wrong identifications. A fourth, human-initiated path sits beside the queue rather than
   in it: from the **user** app the household can *mark a visit for labelling* — a
   flag on that visit's frame span, worked as its own list in the admin workbench.
   It is deliberately not queue-ordered: the queue is the model's own

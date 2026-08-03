@@ -164,3 +164,59 @@ def test_test_app_does_not_restore_intent(tmp_path):
     _client, manager = _make_app(tmp_path)
     assert manager.restore_calls == []
     assert manager.running is False
+
+
+def test_live_app_restores_unconditionally(tmp_path):
+    # EVERY operating stage runs live naming, so the launch restore is unconditional —
+    # no longer gated on the persisted `live_identify` intent OR on a model being
+    # promoted (which is how it used to start itself). Asserted here for the same reason
+    # the detection worker's version is asserted in test_api_yolo_oracle.py: without it,
+    # a regression re-adding either gate passes the whole suite silently.
+    from compute.api.app import create_app
+
+    class _InertOracle:
+        """A do-nothing detection-worker stand-in, so this builds a LIVE app without the
+        real worker's lazy torch import or a spawned GPU thread."""
+
+        def __init__(self) -> None:
+            self._running = False
+
+        @property
+        def running(self) -> bool:
+            return self._running
+
+        def start(self) -> None:
+            self._running = True
+
+        def stop(self, persist: bool = True) -> None:
+            self._running = False
+
+        def join(self, timeout: "float | None" = None) -> None:
+            pass
+
+        def restore(self, flag: bool) -> None:
+            pass
+
+        def reset_watermark(self, value: int) -> None:
+            pass
+
+        def status(self) -> dict:
+            return {"running": self._running, "watermark": 0,
+                    "last_tick_ts": None, "last_error": None}
+
+    store = _store(tmp_path)
+    manager = FakeLiveIdentifyManager()
+    # No persisted "live_identify" intent and no promoted model — under either old gate
+    # this would have stayed stopped.
+    assert store.get_setting("live_identify") is None
+    assert store.active_model() is None
+    app = create_app(
+        store=store,
+        client=_FakeClient(),
+        start_collector=True,
+        live_identify_manager=manager,
+        yolo_oracle_manager=_InertOracle(),
+    )
+    with TestClient(app):
+        pass
+    assert manager.restore_calls == [True]

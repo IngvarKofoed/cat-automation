@@ -9,17 +9,19 @@ fakes and NO torch, NO model, no CUDA:
   window is capped to) and the ``get_setting``/``set_setting`` KV the watermark + intent
   persist through.
 - ``_FakeDetect`` — records each ``(since_id, until_id)`` chunk AND the full kwargs, so the
-  chunk boundaries, their order, and the load-bearing *absence* of ``motion_only`` (full
-  coverage) can all be asserted.
+  chunk boundaries, their order, and each chunk's ``motion_only`` coverage can all be
+  asserted.
 - controllable ``now_ms`` / ``is_busy`` / ``motion_only`` closures — a fixed clock makes
-  ``last_tick_ts`` deterministic; the two predicates prove the tick yields the GPU to a
-  manual job and idles under motion-only capture.
+  ``last_tick_ts`` deterministic; ``is_busy`` proves the tick yields the GPU to a manual job,
+  and ``motion_only`` selects the sweep's coverage.
 
-The load-bearing behaviors these cover: full-coverage sweeping (no ``motion_only``), the
-per-chunk ``is_busy`` re-check that lets an operator's job win mid-tick, the per-tick frame
-cap that stops a backlog monopolizing the GPU, the watermark only ever advancing past a
-COMPLETED chunk, and the no-backfill contract (every ``start`` re-seeds the watermark to the
-frame horizon, while a start on an already-running worker leaves it alone).
+The load-bearing behaviors these cover: coverage FOLLOWING the capture mode (full under
+keep-all so a gate miss is measurable, motion-only when that is all that is stored — it never
+idles, which is what kept the collecting stage fed before a gallery exists), the per-chunk
+``is_busy`` re-check that lets an operator's job win mid-tick, the per-tick frame cap that
+stops a backlog monopolizing the GPU, the watermark only ever advancing past a COMPLETED
+chunk, and the no-backfill contract (every ``start`` re-seeds the watermark to the frame
+horizon, while a start on an already-running worker leaves it alone).
 """
 from __future__ import annotations
 
@@ -141,21 +143,24 @@ def test_tick_skips_when_busy():
 # --- motion-only capture: the non-motion frames aren't stored, so coverage is unattainable -
 
 
-def test_tick_idles_when_capture_is_motion_only():
-    # The whole point of this worker is covering NON-motion frames (a gate miss is only
-    # visible there). Under motion-only capture those frames are never stored, so the tick
-    # must idle — enforced in the backend, not merely by greying the UI toggle.
+def test_tick_sweeps_motion_frames_when_capture_is_motion_only():
+    # Coverage FOLLOWS what is stored — it does not idle. Idling here is what left the
+    # collecting stage with no automatic detection at all before a gallery was promoted
+    # (live-identify bails without an active model), and the verdicts this writes feed far
+    # more than the gate scorecard: event subjects, per-visit aggregates, the annotation
+    # queue's membership, and the crops the identify pass embeds. All of those need only
+    # MOTION frames, which is exactly what is still stored here.
     store = _FakeStore(latest_id=500)
     mgr, parts = _manager(store, motion_only=lambda: True, now_ms=lambda: 77)
     mgr._tick(threading.Event())
 
-    assert parts["detect"].calls == []
-    assert parts["analyzer_factory"].calls == 0
+    assert parts["detect"].calls == [(1, _CHUNK), (_CHUNK + 1, 500)]
+    # Every chunk restricted to motion frames — the non-motion ones were never stored.
+    assert all(kw.get("motion_only") is True for kw in parts["detect"].kwargs)
     st = mgr.status()
-    assert st["watermark"] == 0
-    assert "yolo_oracle_watermark" not in store.settings
-    assert st["last_tick_ts"] == 77  # ran, idled, recorded the tick
-    assert mgr.running is False  # (intent untouched by an idle tick)
+    assert st["watermark"] == 500  # advanced + persisted exactly as under keep-all
+    assert store.settings["yolo_oracle_watermark"] == "500"
+    assert st["last_tick_ts"] == 77
 
 
 # --- happy path: the tail is swept in chunks, full-coverage, watermark advanced+persisted --
@@ -212,21 +217,26 @@ def test_tick_hands_detect_an_adapter_carrying_this_ticks_stop_event():
     adapter.record(True)
 
 
-def test_tick_resumes_when_capture_returns_to_keep_all():
-    # An operator's mid-run capture flip must take effect on the worker WITHOUT touching its
-    # intent: idle while motion-only, sweeping again when keep-all returns. The getter is read
-    # fresh each tick, so this is what makes "intent survives a temporary mode flip" true.
+def test_coverage_follows_a_capture_flip_without_stop_start():
+    # A stage change must retune COVERAGE on the next tick without touching the watermark:
+    # every `start` re-seeds it to the horizon, so applying a stage change by stop/start
+    # would silently discard the tail this worker had not yet drained. The getter being read
+    # fresh per tick is what makes that true.
     mode = {"motion_only": True}
     store = _FakeStore(latest_id=10)
     store.settings["yolo_oracle_watermark"] = "0"
     mgr, parts = _manager(store, motion_only=lambda: mode["motion_only"])
 
     mgr._tick(threading.Event())
-    assert parts["detect"].calls == []  # idled
+    assert parts["detect"].calls == [(1, 10)]
+    assert parts["detect"].kwargs[0]["motion_only"] is True
 
-    mode["motion_only"] = False  # operator flips capture back to keep-all
+    mode["motion_only"] = False  # stage change back to keep-all
+    store._latest_id = 20
     mgr._tick(threading.Event())
-    assert parts["detect"].calls == [(1, 10)]  # resumed, no re-enable needed
+    # Continues from the watermark (11), NOT from 1 — and now at full coverage.
+    assert parts["detect"].calls[1] == (11, 20)
+    assert parts["detect"].kwargs[1]["motion_only"] is False
 
 
 def test_tick_resumes_from_persisted_watermark():

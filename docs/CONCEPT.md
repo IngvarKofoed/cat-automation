@@ -98,9 +98,12 @@ The domain the system reasons about:
   from one to the other is what turns a detection into an *enter* or *leave*.
 - **Deterrent.** An action taken against a foreign cat — first line is locking
   the door; escalation is an audible scare sound.
-- **Operating mode.** Whether the system is *collecting* images to learn from or
-  *running* autonomously. The owner switches between them (see *How the system
-  learns*).
+- **Operating stage.** Which of three the system is in: *tuning* the motion gate
+  (keeping every frame, because a missed cat is only visible in a stored
+  non-motion frame), *collecting* images to learn from, or *running*
+  autonomously. The owner switches between them at any time (see *How the system
+  learns*). Collecting and running are the same configuration; running adds the
+  assertion that no human input is expected.
 - **Annotation queue.** Images awaiting the owner's label — from a collection
   run, or added automatically in run mode when an identification was uncertain.
 
@@ -212,11 +215,13 @@ the loop. It runs as a cycle:
    training data. The owner labels the queue, trains again, and accuracy improves
    with use.
 
-The owner can **switch back to collection at any time** — to add a new cat, or to
-gather more data when performance drops in some condition (say, at night).
-Registering a new resident is just collection + annotation focused on that one
-cat. And because there is no model on day one, the very first setup begins in
-collection with the door in its safe default until a first model is trained.
+The owner can **switch stage at any time** — back to collecting to add a new cat or
+gather more data when performance drops in some condition (say, at night), or back
+to tuning to re-check the motion gate after a camera change. Registering a new
+resident is just collection + annotation focused on that one cat. And because
+there is no model on day one, the very first setup begins in **tuning** — the gate
+has to be trusted before the frames it selects are worth annotating — with the door
+in its safe default until a first model is trained.
 
 ## User scenarios
 

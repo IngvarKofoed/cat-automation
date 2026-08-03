@@ -1,4 +1,11 @@
-"""The always-on YOLO-oracle worker — keeps full-coverage oracle verdicts pre-computed.
+"""The always-on DETECTION worker — keeps ``yolo-serial`` verdicts pre-computed on the tail.
+
+Operator-facing name: **the detection worker**. "Oracle" (which the module, class, settings
+keys and API paths are still named for) was a motion-*tuning* word, from when this ran only
+in the tuning stage; every stage now needs it. The identifiers are deliberately unchanged —
+``_ANALYZER = "yolo-serial"`` is half of ``analysis``'s primary key, and the settings keys
+are persisted — so this is a relabelling, exactly as entry 147 kept the ``yolo-serial`` slug
+while calling it "YOLO" in the UI.
 
 Tuning the edge's MOG2 motion gate needs a *trusted oracle* over the frames it is scored
 against, and — critically — over the **non-motion** frames too: a gate MISS is a frame the
@@ -7,6 +14,12 @@ was both stored and swept. Producing that coverage has meant picking a day on th
 tuning page and waiting on a manual ``yolo-serial`` sweep before any scorecard could be
 read. This worker removes that wait by sweeping the tail continuously as frames arrive, so
 a day captured while it was on is already ~100% covered.
+
+But the verdicts it writes are read by far more than the scorecard — event subjects, the
+per-visit detection aggregates, the annotation queue's membership, and the crops the
+identify pass embeds — and all of those need only MOTION frames. So it runs in every
+operating stage, with its coverage following what is stored (see
+``docs/specs/2026-08-02-operating-stages.md``).
 
 Two pieces, mirroring ``compute/learning/live_identify.py`` (itself mirroring
 ``compute/collection/collector.py``'s ``run_collector`` + ``CollectorManager`` pairing):
@@ -25,13 +38,15 @@ Two pieces, mirroring ``compute/learning/live_identify.py`` (itself mirroring
 - **Detect-only.** It runs ``yolo-serial`` detection and stops there — no embedding, no
   gallery, no ``identifications`` rows. So it needs no promoted model and does useful work
   from day one, where live-identify idles until something is promoted.
-- **Full coverage, not visit spans.** Live-identify detects only *closed motion clusters*
-  (which is exactly why a live-populated window is NOT tunable — see changelog 76). This
-  worker sweeps every id in the tail, motion and non-motion alike, which is what makes the
-  coverage uniform enough to score a gate against.
-- **Idles in motion-only capture.** With motion-only capture on, the non-motion frames are
-  never stored, so full coverage is both impossible and pointless; the tick no-ops (intent
-  preserved) until capture returns to keep-all.
+- **Uniform tail coverage, not visit spans.** Live-identify detects only *closed motion
+  clusters* (which is exactly why a live-populated window is NOT tunable — see changelog
+  76). This worker sweeps every in-scope id in the tail, which is what makes the coverage
+  uniform enough to score a gate against.
+- **Coverage follows the capture mode.** Keep-all capture → every frame, motion and
+  non-motion alike (the tuning stage's scorecards need the non-motion half). Motion-only
+  capture → motion frames, because the others were never stored. It no longer idles there:
+  idling is what left the collecting stage with NO automatic detection at all until a
+  gallery was promoted, since live-identify bails without an active model.
 
 **It never backfills.** Every ``start`` — an operator switch-on *and* the launch-time
 ``restore`` — seeds the watermark to the current frame horizon, so the worker only ever
@@ -39,8 +54,16 @@ covers frames captured from that moment on. Frames stored before it was switched
 days, or a gap while it was off) stay the manual sweep's job. This is deliberate: a backfill
 is an unbounded, hours-long GPU hold that starts the moment the toggle flips and silently
 delays coverage of *today* — the thing the worker exists to keep current. Catch-up WITHIN a
-run is unaffected: a tick that yielded to a manual job (or idled under motion-only capture)
-leaves the watermark alone and drains the tail on later ticks.
+run is unaffected: a tick that yielded to a manual job leaves the watermark alone and drains
+the tail on later ticks.
+
+**Known limit at a keep-all → motion-only transition.** Frames captured keep-all but not yet
+reached get motion-swept, and the watermark then passes their non-motion siblings permanently
+un-swept. One watermark cannot express two coverage levels, and those are precisely the
+frames the operator is about to drop on entering the collecting stage — so this fails in the
+direction already documented above: coverage is forward-only, older windows are the manual
+sweep's job. The reverse transition is clean (motion-only stored no non-motion frames to
+have missed).
 
 **The two always-on YOLO loops deliberately do NOT yield to each other.** Both yield to a
 manual sweep/training job (``is_busy``), but neither waits on the other: a same-frame
@@ -170,8 +193,11 @@ class YoloOracleManager:
 
     ``is_busy`` is a zero-arg predicate — True while a manual analysis/training job runs —
     that the tick consults to yield the GPU. ``motion_only`` is a zero-arg getter for the
-    CURRENT capture mode, read fresh each tick (like ``run_collector``'s) so an operator's
-    mid-run flip takes effect without touching this worker's intent. ``detect`` /
+    CURRENT capture mode, read fresh each tick (like ``run_collector``'s) so a stage change
+    takes effect on the next tick WITHOUT a stop/start — which matters because every
+    ``start`` re-seeds the watermark to the horizon, so applying a stage change that way
+    would silently discard whatever tail this worker had not yet drained. It selects the
+    sweep's COVERAGE (motion-only vs every frame); it is not a reason to idle. ``detect`` /
     ``analyzer_factory`` / ``now_ms`` are the injection seams: a test passes fakes so
     nothing here touches torch or the GPU.
     """
@@ -240,19 +266,18 @@ class YoloOracleManager:
         1. If ``is_busy()`` a manual analysis/training job holds the GPU — skip, leaving the
            watermark untouched so the tick simply resumes next interval. Operator work
            always wins.
-        2. If ``motion_only()`` the non-motion frames aren't being stored, so full coverage
-           is unattainable — idle without touching the watermark. (Enforced here, not just
-           by greying the UI toggle, so the invariant holds however the flag was flipped.)
+        2. Resolve the coverage mode from ``motion_only()`` — ONCE per tick, so this
+           window is scored uniformly even if the stage flips mid-sweep. It no longer
+           idles when set: see the module docstring's "Coverage follows the capture mode".
         3. Build the ``yolo-serial`` analyzer once (reused across chunks and ticks).
         4. Resolve the window: ``since = watermark + 1`` through ``until =
            min(store.latest_id(), watermark + _MAX_FRAMES_PER_TICK)``. Nothing new → return.
         5. Walk ``[since, until]`` in ``_CHUNK``-sized sub-windows. Before each, re-check
            stop / ``is_busy`` and bail immediately if either fired — this is the tick's yield
            granularity, since ``run_analysis`` itself only honors ``stop_event``. Each chunk
-           is a full-coverage detect (``motion_only`` left at its ``run_analysis`` default of
-           False), so motion AND non-motion frames get a verdict; ``iter_unanalyzed`` inside
-           skips any already done (e.g. a motion frame the live-identify worker raced to
-           first).
+           detects at the resolved coverage: every frame when keeping all, motion frames
+           only under motion-only capture. ``iter_unanalyzed`` inside skips any already done
+           (e.g. a motion frame the live-identify worker raced to first).
         6. Advance + persist the watermark to a chunk's ``hi`` only AFTER that chunk's detect
            returned without a pending stop — a stop mid-detect makes ``run_analysis`` return
            normally with the chunk half-swept, so advancing then would strand its tail
@@ -272,8 +297,16 @@ class YoloOracleManager:
         try:
             if self._is_busy():
                 return  # a manual analysis/training job owns the GPU — yield, watermark untouched
-            if self._motion_only():
-                return  # motion-only capture: no non-motion frames to cover — idle
+
+            # Coverage FOLLOWS what is being stored, rather than idling when full
+            # coverage is unattainable. Resolved once per tick (not per chunk) so one
+            # tick's window is scored uniformly even if the stage flips mid-sweep; the
+            # next tick picks up the new value. Under motion-only capture the
+            # non-motion frames do not exist, so restricting the sweep to motion
+            # frames covers everything there IS — which is what keeps the annotation
+            # queue, event subjects, and the identify pass fed in the collecting and
+            # running stages, where this worker used to no-op entirely.
+            motion_only = bool(self._motion_only())
 
             if self._analyzer is None:
                 # Built once and reused every chunk/tick; run_analysis.prepare() is idempotent.
@@ -316,7 +349,14 @@ class YoloOracleManager:
                     # finishing the window. Watermark stays at the last completed chunk.
                     break
                 hi = min(lo + _CHUNK - 1, until)
-                self._detect(self._store, self._analyzer, detect_manager, since_id=lo, until_id=hi)
+                self._detect(
+                    self._store,
+                    self._analyzer,
+                    detect_manager,
+                    since_id=lo,
+                    until_id=hi,
+                    motion_only=motion_only,
+                )
                 if stop_event.is_set():
                     # detect returns NORMALLY (not raising) when a stop aborts it between
                     # batches, leaving [lo, hi] only partly swept. Do NOT advance past a
@@ -433,19 +473,21 @@ class YoloOracleManager:
             self._store.set_setting(_INTENT_KEY, "0")
 
     def restore(self, flag: bool) -> None:
-        """Start the worker iff the persisted intent was on — the launch-time restore.
+        """Start the worker — the launch-time restore. ``create_app`` passes True on a live app.
 
-        Mirrors ``LiveIdentifyManager.restore``: called by ``create_app`` on a live app with
-        ``store.get_setting("yolo_oracle") == "1"``. A falsy flag is a no-op (stay stopped);
-        a truthy flag goes through ``start`` (which itself persists "1" again — harmless).
+        Mirrors ``LiveIdentifyManager.restore``, but the flag no longer comes from a persisted
+        per-worker intent: EVERY operating stage runs detection, so the stage is the only intent
+        and there is nothing left to consult. (The ``yolo_oracle`` key survives, unread.) The
+        parameter stays so a test can build a live app without spawning a GPU thread.
 
-        Unlike live-identify's restore there is deliberately no "…or a model is promoted"
-        clause: a promoted gallery is a run-mode *naming* signal, whereas this worker is a
-        motion-gate *tuning* tool, so it starts only when the operator asked for it.
-
-        Going through ``start`` means a restore also re-seeds the watermark to the horizon, so a
-        restart does not backfill either — see ``start``. Nothing is lost: frames are stored by
-        the in-process collector, so a process that was down stored none.
+        Going through ``start`` means a restore RE-SEEDS the watermark to the current frame
+        horizon, so a restart never backfills — see ``start``. The usual case loses nothing:
+        frames are stored by the in-process collector, so a process that was down stored none.
+        The exception, and the reason a store accumulates frames with no verdict: a worker that
+        was still BEHIND when the process stopped (a long manual job had been holding the GPU
+        via ``is_busy``, or it was draining a backlog) has its un-drained tail skipped
+        permanently. Those frames need a manual sweep from Motion tuning, or the per-visit
+        "Analyse this visit" button. Entry 149's accepted cost, unchanged here.
         """
         if flag:
             self.start()

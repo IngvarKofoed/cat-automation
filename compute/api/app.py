@@ -36,6 +36,7 @@ import — ``compute.sh`` launches ``uvicorn --factory ...:create_app``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 from pathlib import Path
@@ -55,10 +56,18 @@ from compute.analysis.runner import AnalysisManager
 from compute.analysis.suntimes import astral_available, night_classifier
 from compute.collection.cleanup import CleanupManager
 from compute.collection.collector import CollectorManager
-from compute.collection.store import _ANNOTATE_PAGE_DEFAULT, _QUALITIES, Store
+from compute.collection.store import (
+    _ANNOTATE_PAGE_DEFAULT,
+    _QUALITIES,
+    STAGES,
+    Store,
+    stage_keeps_all_frames,
+)
 from compute.dataset import crops
 from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams, lighting_version
+
+logger = logging.getLogger(__name__)
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 # Independently-styled front doors sharing only the /api + /media backend: the
@@ -363,6 +372,23 @@ class CollectorMotionOnlyRequest(BaseModel):
     """
 
     motion_only: bool
+
+
+class StageRequest(BaseModel):
+    """Body of ``POST /api/stage``: the desired operating stage.
+
+    One of ``tuning`` | ``collecting`` | ``running`` (validated in the route against
+    ``STAGES``, so an unknown value is a 400 rather than a silent coercion — the
+    stage decides what eviction may delete first). Typed as ``str`` rather than an
+    Enum to keep the 422 handler's shape and the error text consistent with every
+    other route here.
+
+    Setting the stage is the ONLY control for capture mode and the always-on
+    workers; ``POST /api/collector/motion-only`` survives it for debugging but the
+    UI no longer offers it (see docs/specs/2026-08-02-operating-stages.md).
+    """
+
+    stage: str
 
 
 # The annotation tool labels the trustworthy serial-YOLO detections (see the memory
@@ -891,6 +917,15 @@ def create_app(
     # /api/stats.resume_available).
     collector_manager.restore_motion_only(store.get_setting("motion_only") == "1")
 
+    # Seed the operating stage once, for an install predating it (derived from the
+    # `motion_only` flag those installs did have — see `derive_stage_if_unset`). Gated
+    # on `start_collector` for the same reason `restore_motion_only` above is not: THIS
+    # one writes to the store, and a bare launch must never silently write (changelog
+    # 28). A test app therefore reads whatever the store already holds, defaulting to
+    # `tuning` in memory without persisting it.
+    if start_collector:
+        store.derive_stage_if_unset()
+
     if start_collector:
         # The collector is now WIRED (live client above, shutdown hook below) but
         # begins only if autostart is set — otherwise a fresh launch stays stopped
@@ -931,28 +966,31 @@ def create_app(
     # Restore live-naming at launch — but ONLY on a live app. ``restore`` start()s a GPU
     # worker thread (the compute PC is the dedicated always-on box), which a test app
     # (start_collector=False) must never do; so, unlike the collector's in-memory
-    # ``restore_motion_only``, this is gated on start_collector. It starts when EITHER the
-    # operator left it on (persisted "live_identify" intent) OR a model has been promoted:
-    # with an active gallery, new visits should be named automatically without a manual
-    # toggle. (Without an active model the worker just idles each tick, so this is a no-op
-    # then.) First-ever enable still seeds the watermark to the frame horizon, so it names
-    # only NEW visits — back-identifying history stays the manual Identify pass's job.
+    # ``restore_motion_only``, this is gated on start_collector.
+    #
+    # EVERY stage runs live-identify, so the restore is UNCONDITIONAL — no longer gated on
+    # the persisted "live_identify" intent or on a model being promoted. The stage is the
+    # single intent; that key is left in place but unread, which is cheaper than a KV
+    # migration. Without an active model the worker just idles each tick, so this is a
+    # no-op before the first promotion. First-ever enable still seeds the watermark to the
+    # frame horizon, so it names only NEW visits — back-identifying history stays the
+    # manual Identify pass's job.
     if start_collector:
-        want_live = (
-            store.get_setting("live_identify") == "1"
-            or store.active_model() is not None
-        )
-        live_identify_manager.restore(want_live)
+        live_identify_manager.restore(True)
 
-    # The always-on YOLO-oracle worker: sweeps the FULL-coverage tail (motion + non-motion)
-    # with yolo-serial so motion-gate scorecards need no per-day manual sweep. Built here for
+    # The always-on DETECTION worker (operator-facing name; the identifiers stay "oracle" —
+    # see its module docstring): sweeps the tail with yolo-serial so motion-gate scorecards
+    # need no per-day manual sweep, AND so event subjects, per-visit aggregates, the
+    # annotation queue and the identify pass always have verdicts to read. Built here for
     # the same reason as live-identify — it must yield the shared GPU/DB-connection to a
     # manual job — and given the SAME ``is_busy`` predicate. The two always-on YOLO loops
     # deliberately do NOT yield to each other: a same-frame detect is idempotent (analysis is
     # INSERT OR REPLACE on (frame_id, analyzer), all writes serialized on the store lock), and
     # feeding this worker's INTENT flag into live-identify's ``is_busy`` would suppress naming
-    # for as long as the oracle was enabled. ``motion_only`` is the collector's live getter:
-    # with motion-only capture on, the non-motion frames don't exist, so the tick idles.
+    # for as long as the oracle was enabled. ``motion_only`` is the collector's live getter,
+    # read fresh per tick: it selects the sweep's COVERAGE (motion frames only vs every
+    # frame), and is no longer a reason to idle — idling there is what left the collecting
+    # stage with no automatic detection before a gallery was promoted.
     # Imported LAZILY, like LiveIdentifyManager, so an injected fake keeps this module (and
     # its tests) loadable without the worker's ML deps.
     if yolo_oracle_manager is None:
@@ -965,12 +1003,30 @@ def create_app(
         )
     app.state.yolo_oracle_manager = yolo_oracle_manager
 
-    # Restore the oracle at launch — ONLY on a live app (it start()s a GPU worker thread, which
-    # a test app must never do), and ONLY from the operator's persisted intent. Deliberately no
-    # "…or a model is promoted" clause like live-identify's: a promoted gallery is a naming
-    # signal, while this worker is a motion-gate tuning tool.
+    # Restore the detection worker at launch — ONLY on a live app (it start()s a GPU worker
+    # thread, which a test app must never do), and now UNCONDITIONALLY: every stage runs it,
+    # with its coverage following the capture mode, so there is no per-worker intent left to
+    # consult. The `yolo_oracle` key is left in place but unread.
+    #
+    # Operator-visible consequence, worth expecting on the first restart after this change:
+    # anyone who had "YOLO all" switched OFF now finds it running. In `tuning` that is the
+    # coverage scorecards want anyway — the point is that it stops being a switch one can
+    # forget — but it IS a GPU-load change, not a silent no-op.
     if start_collector:
-        yolo_oracle_manager.restore(store.get_setting("yolo_oracle") == "1")
+        yolo_oracle_manager.restore(True)
+
+    # Collect orphaned JPEGs once, in the background. An orphan is a file with no `frames`
+    # row (the changelog-42 WAL leak): unreachable by construction, so removing it loses
+    # nothing and needs no marker, confirmation, or stage awareness. Launch is exactly when
+    # new ones exist — the leak is created by a hard power loss, so the next start is when
+    # there is something to collect. Gated on `start_collector` like the workers (a test app
+    # must not walk the media tree), and best-effort: the manager refuses if a job is somehow
+    # already running, and a failure here must never block startup.
+    if start_collector:
+        try:
+            cleanup_manager.start_orphan(store)
+        except Exception:
+            logger.exception("launch orphan sweep failed to start")
 
     @app.on_event("shutdown")
     def _shutdown() -> None:
@@ -1106,12 +1162,18 @@ def create_app(
     def api_stats():
         # Fold the collector's live run state into the store summary so the UI can render
         # its start/stop badge from the same poll it already makes. Also expose the
-        # motion-only capture flag (so the Start toggle reflects persisted state) and
-        # ``resume_available`` — the persisted collector-running intent was on yet the
-        # collector is currently stopped, i.e. the process restarted mid-run — which
-        # drives the Start-page one-click Resume prompt.
+        # motion-only capture flag (a READOUT — the stage owns it now, there is no toggle
+        # for it) and ``resume_available`` — the persisted collector-running intent was on
+        # yet the collector is currently stopped, i.e. the process restarted mid-run —
+        # which drives the Start-page one-click Resume prompt.
         return {
             **store.stats(),
+            # The operating stage — the single control the Start page renders. The
+            # `motion_only` / worker snapshots below stay in the payload as READOUTS
+            # (they are derived from the stage now, not independently settable), so
+            # the UI can still show what each worker is actually doing and surface a
+            # `last_error` without offering a toggle for it.
+            "stage": store.get_stage(),
             "collector_running": collector_manager.running,
             "motion_only": collector_manager.current_motion_only,
             "resume_available": (
@@ -1494,6 +1556,31 @@ def create_app(
         # labels that caveat and shades any overlapping window (see Motion-only spans).
         collector_manager.set_motion_only(bool(req.motion_only))
         return {"motion_only": collector_manager.current_motion_only}
+
+    @app.post("/api/stage")
+    def api_stage(req: StageRequest):
+        # Set the operating stage — the single intent that replaced the hand-assembled
+        # motion_only / yolo_oracle / live_identify switch trio (see
+        # docs/specs/2026-08-02-operating-stages.md).
+        #
+        # ORDER IS LOAD-BEARING. Capture mode goes through the collector manager, NOT a
+        # direct set_setting: that method is what records the `mode_changes` boundary row
+        # (and only on a real flip), which is what `motion_only_spans` later reconstructs
+        # the "misses unmeasurable" windows from. Persisting the stage without it would
+        # silently lose that boundary and make a motion-only window read as measurable.
+        #
+        # The detection worker needs NO call here: it reads its coverage from a live
+        # per-tick getter, so this flip is picked up on its next tick with its watermark
+        # intact. Driving it by stop/start would re-seed that watermark to the horizon and
+        # discard whatever tail it had not yet drained.
+        if req.stage not in STAGES:
+            raise HTTPException(status_code=400, detail=f"stage must be one of {list(STAGES)}")
+        collector_manager.set_motion_only(not stage_keeps_all_frames(req.stage))
+        store.set_stage(req.stage)
+        return {
+            "stage": store.get_stage(),
+            "motion_only": collector_manager.current_motion_only,
+        }
 
     @app.post("/api/live-identify/start")
     def api_live_identify_start():

@@ -1863,13 +1863,21 @@ class Store:
         with self._lock:
             for rel in uniq:
                 recv_ts = _recv_ts_from_relpath(rel)
-                if recv_ts is None:
-                    row = self._conn.execute(
-                        "SELECT 1 FROM frames WHERE path = ?", (rel,)
-                    ).fetchone()
-                else:
+                row = None
+                if recv_ts is not None:
                     row = self._conn.execute(
                         "SELECT 1 FROM frames WHERE recv_ts = ? AND path = ?", (recv_ts, rel)
+                    ).fetchone()
+                if row is None:
+                    # CONFIRM a negative with the unindexed equality before deleting. The fast
+                    # probe's correctness rests on the filename parse, and this call REMOVES A
+                    # FILE — so a parse that ever returned a wrong-but-plausible millisecond
+                    # would find no row and destroy a live frame. The scan is the expensive
+                    # form, but it only runs for candidates that already look orphaned (rare —
+                    # orphans exist only after a crash), so the cost stays off the common path
+                    # while a mis-parse degrades to slow instead of to data loss.
+                    row = self._conn.execute(
+                        "SELECT 1 FROM frames WHERE path = ?", (rel,)
                     ).fetchone()
                 if row is not None:
                     continue  # a live frame's file — never an orphan

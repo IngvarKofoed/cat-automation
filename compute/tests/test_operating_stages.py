@@ -425,6 +425,31 @@ def test_orphan_sweep_still_deletes_only_unreferenced_files(tmp_path):
     assert _os.path.isfile(_os.path.join(str(tmp_path / "media"), live_rel))  # live file kept
 
 
+def test_a_misparsed_filename_deletes_nothing(monkeypatch, tmp_path):
+    # The fast probe's correctness rests on the filename parse, and this call REMOVES FILES,
+    # so a negative is CONFIRMED with the unindexed equality before anything is deleted.
+    # Without that, a parse returning a wrong-but-plausible millisecond would find no row and
+    # destroy every live frame it looked at. Asserted with a deliberately broken parser
+    # because the failure is silent and total: the safe behaviour must be structural, not a
+    # consequence of the parse happening to be right.
+    import compute.collection.store as store_mod
+
+    store = _store(tmp_path)
+    for t in (1_700_000_000_100, 1_700_000_000_200):
+        _add(store, t, motion=True)
+    live = [r[0] for r in store._conn.execute("SELECT path FROM frames").fetchall()]
+
+    monkeypatch.setattr(store_mod, "_recv_ts_from_relpath", lambda p: 1)  # always wrong
+    res = store.delete_orphan_batch(live)
+
+    assert res["deleted"] == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0] == 2
+    import os as _os
+
+    for rel in live:
+        assert _os.path.isfile(_os.path.join(str(tmp_path / "media"), rel))
+
+
 def test_stats_reports_the_stage(tmp_path):
     store = _store(tmp_path)
     store.set_stage(STAGE_RUNNING)

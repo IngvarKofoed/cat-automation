@@ -1961,7 +1961,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      in the one card that exists because nobody is expected to be watching. It now fails a row
      on `last_error` too, as the fuller readouts below it already did.
 
-312. The retroactive non-motion purge stays MANUAL by decision. Outside `tuning` no non-motion
+312. The orphan sweep CONFIRMS a negative with the unindexed `path` equality before deleting.
+     Entry 307's fast probe rests on a filename parse, and this call removes FILES — so a parse
+     returning a wrong-but-plausible millisecond would find no row and destroy live frames.
+     Proven with a deliberately broken parser: 0 deleted instead of 20,000. The scan runs only
+     for candidates that already look orphaned (rare — orphans exist only after a crash), so
+     the normal sweep is unchanged at 0.49 s/20k files. Made structural because the failure
+     would be silent, total, and is newly AUTOMATIC at launch.
+
+313. The retroactive non-motion purge stays MANUAL by decision. Outside `tuning` no non-motion
      frames are being stored, so every frame that job removes comes from a previous tuning
      window — it is retroactive by construction, and auto-running it on a stage change would
      make a mode toggle irreversibly destructive. The Start page instead links to it whenever

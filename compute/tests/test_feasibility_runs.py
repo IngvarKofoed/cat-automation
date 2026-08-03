@@ -284,3 +284,92 @@ def test_clear_preserves_feasibility_runs_but_wipes_frames(tmp_path):
     assert len(runs) == 1  # history survives
     assert runs[0]["run_id"] == rid
     assert runs[0]["notes"] == "precious"
+
+
+def test_metrics_roundtrips_and_defaults_to_none(tmp_path):
+    """The visit-held-out block persists as JSON; omitting it reads back as None."""
+    store = _store(tmp_path)
+    plain = store.add_feasibility_run("gallery", 10, 2, 0.9, 0.8, 0.4, "d1")
+    withm = store.add_feasibility_run(
+        "gallery", 10, 2, 0.9, 0.8, 0.4, "d2",
+        metrics={"visits": {"available": True, "accuracy": 0.75, "n_scored": 12}},
+    )
+    by_id = {r["run_id"]: r for r in store.feasibility_runs()}
+    assert by_id[plain]["metrics"] is None, "a run without visit scoring is 'not measured'"
+    assert by_id[withm]["metrics"]["visits"]["accuracy"] == 0.75
+    store.close()
+
+
+def test_unparseable_metrics_degrades_to_none(tmp_path):
+    """A corrupt blob must not break the whole runs list."""
+    store = _store(tmp_path)
+    rid = store.add_feasibility_run("gallery", 10, 2, 0.9, 0.8, 0.4, "d1")
+    with store._lock:
+        store._conn.execute(
+            "UPDATE feasibility_runs SET metrics = ? WHERE id = ?", ("{not json", rid)
+        )
+        store._conn.commit()
+    rows = store.feasibility_runs()
+    assert len(rows) == 1 and rows[0]["metrics"] is None
+    store.close()
+
+
+def test_metrics_column_is_added_to_a_preexisting_table(tmp_path):
+    """The repo's first ALTER TABLE: a store created WITHOUT the column gains it on open.
+
+    Simulates the live compute PC, whose `feasibility_runs` predates the column and holds
+    five real runs. `CREATE TABLE IF NOT EXISTS` alone would silently leave it missing and
+    every insert would fail on the unknown column.
+    """
+    import sqlite3
+
+    db = str(tmp_path / "index.db")
+    # Build the pre-migration table shape by hand, with a row in it.
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE feasibility_runs (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts           INTEGER NOT NULL,
+          quality      TEXT    NOT NULL,
+          n_crops      INTEGER NOT NULL,
+          n_cats       INTEGER NOT NULL,
+          knn_accuracy REAL,
+          auc          REAL,
+          threshold    REAL,
+          report_dir   TEXT    NOT NULL,
+          notes        TEXT
+        );
+        INSERT INTO feasibility_runs (ts, quality, n_crops, n_cats, knn_accuracy, auc,
+                                      threshold, report_dir, notes)
+        VALUES (1, 'gallery', 12041, 7, 0.997, 0.878, 0.439, 'legacy-dir', NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db_path=db, media_root=str(tmp_path / "media"), max_bytes=1_000_000)
+    cols = {r[1] for r in store._conn.execute("PRAGMA table_info(feasibility_runs)").fetchall()}
+    assert "metrics" in cols
+    rows = store.feasibility_runs()
+    assert len(rows) == 1
+    assert rows[0]["knn_accuracy"] == 0.997, "the legacy row survives untouched"
+    assert rows[0]["metrics"] is None, "legacy row reads as not-measured"
+    # And a new insert carrying metrics works against the migrated table.
+    store.add_feasibility_run("gallery", 1, 2, None, None, 0.5, "d", metrics={"visits": {}})
+    assert store.feasibility_runs()[0]["metrics"] == {"visits": {}}
+    store.close()
+
+
+def test_migration_is_idempotent_across_reopens(tmp_path):
+    store = _store(tmp_path)
+    store.add_feasibility_run("gallery", 1, 2, None, None, 0.5, "d", metrics={"a": 1})
+    store.close()
+    for _ in range(2):
+        again = Store(db_path=str(tmp_path / "index.db"),
+                      media_root=str(tmp_path / "media"), max_bytes=1_000_000)
+        cols = [r[1] for r in again._conn.execute(
+            "PRAGMA table_info(feasibility_runs)").fetchall()]
+        assert cols.count("metrics") == 1
+        assert again.feasibility_runs()[0]["metrics"] == {"a": 1}
+        again.close()

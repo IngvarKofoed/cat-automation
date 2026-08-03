@@ -296,9 +296,17 @@
   .qtable tr:last-child td { border-bottom: 0; }
   .qtable td.num { text-align: right; }
   .qtable td.qname { font-variant-numeric: normal; white-space: normal; overflow-wrap: anywhere; }
+  /* Secondary/quiet reading inside a table cell: a not-measured em dash, or the number a
+     row carries only for comparison (the crop-level kNN beside the visit accuracy). Needed
+     as a BARE rule — `label.dim` and `.tchip.lit.dim` are qualified, so `class="dim"` on a
+     td or span would otherwise be a silent no-op. */
+  .qtable td.dim, .qtable .dim { color: var(--muted); }
   /* The 8-column variants (validation runs, gallery versions) — the same cells and geometry
      discipline, just more of them, so they need more room before .qwrap starts scrolling. */
   .qtable.wtable { min-width: 720px; }
+  /* Validation runs gained a 9th column (Visit) — the honest headline — so it needs a wider
+     floor than the 8-column versions table before the wrapper scrolls. */
+  .qtable.wtable.rtable { min-width: 800px; }
   .qstatus { display: inline-flex; align-items: center; gap: 6px; }
   .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .qstatus.running .dot { background: var(--warn); }
@@ -3881,14 +3889,37 @@
       const report = (r) => (r.report_available
         ? `<a class="qbtn" href="/api/training/feasibility/report/${r.run_id}" target="_blank" rel="noopener">Report</a>`
         : '<button class="qbtn" disabled title="This run\'s report was pruned from disk — its metrics remain; re-run to regenerate it.">Report</button>');
-      return '<table class="qtable wtable">'
-        + '<colgroup><col style="width:16%"><col style="width:14%"><col style="width:9%"><col style="width:8%">'
-        + '<col style="width:9%"><col style="width:9%"><col style="width:11%"><col style="width:24%"></colgroup>'
+      // VISIT is the honest headline: each visit hidden whole and matched against the
+      // others, named by Run's own vote rule. A run recorded before visit scoring existed
+      // has no `metrics` at all and reads "—" (not measured), which is a different thing
+      // from a run whose visit scoring could not be calibrated ("n/a") — and both are
+      // different from a real low score. kNN stays for comparability with those old runs,
+      // but it reads HIGH by construction (same-visit near-duplicates), hence the title.
+      const visitCell = (r) => {
+        const v = r.metrics && r.metrics.visits;
+        if (!v) return '<td class="num dim" title="This run predates visit-level scoring — not measured. Re-run to get it.">—</td>';
+        if (!v.available) {
+          const why = v.reason === 'uncalibrated_threshold'
+            ? 'No cross-visit same-cat pair, so the visit task could not be calibrated. Nothing was measured — this is not a score of zero.'
+            : 'Fewer than two visits, so none could be held out. Nothing was measured.';
+          return `<td class="num dim" title="${esc(why)}">n/a</td>`;
+        }
+        const t = `${v.correct} correct · ${v.wrong} wrong · ${v.unknown} declined, of ${v.n_scored} visits scored`
+          + `${v.unscoreable && v.unscoreable.length ? ` (+${v.unscoreable.reduce((a, u) => a + u.n_visits, 0)} unscoreable)` : ''}`;
+        return `<td class="num" title="${esc(t)}">${pct(v.accuracy)}`
+          + `<span class="dim"> · ${pct(v.unknown_rate)}</span></td>`;
+      };
+      return '<table class="qtable wtable rtable">'
+        + '<colgroup><col style="width:15%"><col style="width:12%"><col style="width:8%"><col style="width:7%">'
+        + '<col style="width:13%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:20%"></colgroup>'
         + '<thead><tr><th>Ran</th><th>Grades</th><th class="num" title="Crops scored — the labelled crops at those grades">Crops</th><th class="num">Cats</th>'
-        + '<th class="num">kNN</th><th class="num">AUC</th><th class="num">Threshold</th><th></th></tr></thead><tbody>'
+        + '<th class="num" title="Each visit hidden whole and matched against the others, named by Run&#39;s own vote rule. First number: correct of those it decided. Second (dim): the share it declined to name. This is the comparable number.">Visit · declined</th>'
+        + '<th class="num" title="Leave-one-CROP-out. Reads high: a crop\'s nearest neighbour is usually the adjacent frame of its own visit. Kept for comparison with older runs.">kNN</th>'
+        + '<th class="num">AUC</th><th class="num">Threshold</th><th></th></tr></thead><tbody>'
         + runs.map((r) => `<tr><td>${fmtTs(r.ts)}</td><td class="qname">${esc(r.quality || 'all')}</td>`
           + `<td class="num">${fmtInt(r.n_crops)}</td><td class="num">${fmtInt(r.n_cats)}</td>`
-          + `<td class="num">${pct(r.knn_accuracy)}</td><td class="num">${f3(r.auc)}</td><td class="num">${f3(r.threshold)}</td>`
+          + visitCell(r)
+          + `<td class="num dim">${pct(r.knn_accuracy)}</td><td class="num">${f3(r.auc)}</td><td class="num">${f3(r.threshold)}</td>`
           + `<td class="num">${report(r)}`
           + ` <button class="qbtn danger" data-delrun="${r.run_id}" title="Delete this validation run and its report">Delete</button>`
           + '</td></tr>').join('')

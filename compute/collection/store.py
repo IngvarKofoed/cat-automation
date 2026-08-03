@@ -714,6 +714,51 @@ class Store:
             """
         )
         self._conn.commit()
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Additive column migrations for tables that already exist in a live store.
+
+        Everything above is ``CREATE TABLE IF NOT EXISTS``, which does NOT add a column
+        to a table that predates it — so a column added to an existing table needs an
+        explicit ``ALTER TABLE``. Each entry is idempotent (probed via ``PRAGMA
+        table_info``) and purely ADDITIVE: ``ADD COLUMN`` does not rewrite the table, and
+        older rows read NULL, which every consumer must present as "not measured" rather
+        than as a zero. Rolling the code back simply leaves an unread column behind.
+        """
+        wanted = {
+            # `feasibility_runs.metrics` carries the visit-held-out block (JSON, mirroring
+            # `model_versions.metrics`) so the runs list can rank runs by the honest
+            # number instead of only the crop-level one. Rows written before it read NULL.
+            "feasibility_runs": [("metrics", "TEXT")],
+        }
+        with self._lock:
+            for table, columns in wanted.items():
+                have = {
+                    r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if not have:
+                    continue  # table absent entirely — CREATE above owns it
+                for name, decl in columns:
+                    if name not in have:
+                        try:
+                            self._conn.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                            )
+                        except sqlite3.OperationalError as exc:
+                            # The probe above and this write are not atomic ACROSS PROCESSES
+                            # — `self._lock` is per-instance, and busy_timeout only bounds
+                            # waiting for the write lock, it does not serialize check-then-act.
+                            # Several processes legitimately open the same index.db (the API
+                            # plus the CLI tools), so on the first post-upgrade launch two can
+                            # both see the column missing and both ALTER; the loser would
+                            # otherwise die inside Store.__init__ with what reads like schema
+                            # corruption. Losing that race is a no-op — the column now exists.
+                            # Narrow on purpose: "database is locked" and disk-full must stay
+                            # loud, which a blanket except would swallow.
+                            if "duplicate column" not in str(exc).lower():
+                                raise
+            self._conn.commit()
 
     def add(self, frame, recv_ts_ms: int) -> int:
         """Persist one stream frame and return its new row id.
@@ -5676,7 +5721,17 @@ class Store:
         ``label_kinds`` AND which has a materialised crop file (``crop_path`` not
         NULL), joined to ``cats`` for the display name::
 
-            {cat_id, cat_name, label_kind, quality, crop_path (ABSOLUTE), src_frame_id}
+            {cat_id, cat_name, label_kind, quality, crop_path (ABSOLUTE), src_frame_id,
+             src_recv_ts, labeled_ts}
+
+        ``labeled_ts`` is stamped ONCE per ``add_dataset_items`` call, so every crop a
+        single label keypress committed shares it exactly — which makes distinct
+        ``labeled_ts`` values a free cross-check on any re-derived visit grouping.
+
+        ``src_recv_ts`` is the frame's receive clock snapshotted at label time. It comes
+        off ``dataset_items``, NOT ``frames``, so it survives frame eviction — which is
+        what lets the visit-held-out probe group and day/night-bucket every label,
+        including those whose frames have long since aged out of the rolling buffer.
 
         ``crop_path`` is joined to ``dataset_root`` so an OFFLINE reader (the
         embedding/feasibility tool, which the lean collector never imports) opens
@@ -5725,7 +5780,8 @@ class Store:
             where += " AND (d.cat_id IS NULL OR c.active = 1)"
         with self._lock:
             rows = self._conn.execute(
-                "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id"
+                "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id,"
+                " d.src_recv_ts, d.labeled_ts"
                 " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
                 f" WHERE {where}"
                 " ORDER BY d.cat_id, d.id",
@@ -5739,6 +5795,8 @@ class Store:
                 "quality": r[3],
                 "crop_path": os.path.join(self._dataset_root, r[4]),
                 "src_frame_id": r[5],
+                "src_recv_ts": r[6],
+                "labeled_ts": r[7],
             }
             for r in rows
         ]
@@ -5942,8 +6000,14 @@ class Store:
         threshold: "float | None",
         report_dir: str,
         notes: "str | None" = None,
+        metrics: "dict | None" = None,
     ) -> int:
         """Record one completed validation run; return its new row id.
+
+        ``metrics`` is the JSON-serialisable extra block — today the visit-held-out
+        scoring — stored in the ``metrics`` column (see ``_migrate_schema``), mirroring
+        ``model_versions.metrics``. ``None`` writes NULL, which reads back as "not
+        measured": that is what every run recorded before visit scoring existed.
 
         ``report_dir`` is the ``training_root``-relative BASENAME of the run's
         report directory (e.g. ``'1721136000000-gallery'``), NOT an absolute path —
@@ -5958,7 +6022,7 @@ class Store:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO feasibility_runs (ts, quality, n_crops, n_cats, knn_accuracy, auc,"
-                " threshold, report_dir, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " threshold, report_dir, notes, metrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ts,
                     quality,
@@ -5969,6 +6033,7 @@ class Store:
                     float(threshold) if threshold is not None else None,
                     report_dir,
                     notes,
+                    json.dumps(metrics) if metrics is not None else None,
                 ),
             )
             run_id = int(cur.lastrowid)
@@ -5981,7 +6046,12 @@ class Store:
         One dict per ``feasibility_runs`` row::
 
             {run_id, ts, quality, n_crops, n_cats, knn_accuracy, auc, threshold,
-             report_available, notes}
+             report_available, notes, metrics}
+
+        ``metrics`` is the parsed JSON block (the visit-held-out scoring) or ``None`` for
+        a run recorded before it existed — a consumer must render that as "not measured",
+        never as a zero. Unparseable JSON also degrades to ``None`` rather than raising:
+        the list must keep rendering every other run.
 
         ``report_available`` is computed at read time — whether
         ``<training_root>/<report_dir>/feasibility.html`` still exists on disk — so a
@@ -5990,8 +6060,8 @@ class Store:
         placeholder instead of loading a 404 into the iframe). ``limit`` optionally
         caps the number of rows returned (``None`` = all).
         """
-        sql = "SELECT id, ts, quality, n_crops, n_cats, knn_accuracy, auc, threshold, report_dir, notes" \
-              " FROM feasibility_runs ORDER BY id DESC"
+        sql = "SELECT id, ts, quality, n_crops, n_cats, knn_accuracy, auc, threshold, report_dir," \
+              " notes, metrics FROM feasibility_runs ORDER BY id DESC"
         params: "list" = []
         if limit is not None:
             sql += " LIMIT ?"
@@ -6011,9 +6081,21 @@ class Store:
                 "threshold": r[7],
                 "report_available": os.path.isfile(os.path.join(root, r[8], "feasibility.html")),
                 "notes": r[9],
+                "metrics": self._parse_metrics(r[10]),
             }
             for r in rows
         ]
+
+    @staticmethod
+    def _parse_metrics(raw: "str | None") -> "dict | None":
+        """Parse a stored metrics JSON blob, degrading to ``None`` on anything unusable."""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def feasibility_run_report_path(self, run_id: int) -> "str | None":
         """Absolute path to a run's ``feasibility.html``, or ``None`` if it isn't on disk.

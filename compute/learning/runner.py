@@ -529,6 +529,12 @@ class TrainingManager:
                 result["auc"],
                 result["threshold"],
                 report_dir=os.path.basename(out_dir),
+                # The visit-held-out block, so the runs list can rank by the honest number
+                # and not only by the crop-level one. Absent (older probe) writes NULL,
+                # which reads back as "not measured".
+                metrics=(
+                    {"visits": result["visits"]} if result.get("visits") is not None else None
+                ),
             )
         except Exception:
             # The report dir is already on disk but the row insert failed (locked/full/WAL).
@@ -548,6 +554,7 @@ class TrainingManager:
             "auc": result["auc"],
             "threshold": result["threshold"],
             "report_dir": os.path.basename(out_dir),
+            "visits": result.get("visits"),
         }
 
     def _run_gallery_build(self, job: "_Job", store: "Store") -> "dict":

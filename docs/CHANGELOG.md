@@ -1975,3 +1975,96 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      make a mode toggle irreversibly destructive. The Start page instead links to it whenever
      leftover non-motion frames exist, keyed on `count − motion_count` so the hint appears from
      state and disappears once there is nothing to reclaim.
+
+314. Feasibility run 6's headline "100% kNN" is INFLATED and must not be read as recognition
+     accuracy: the leave-one-out masks only the diagonal, so a crop's nearest neighbour is
+     usually the adjacent frame of its OWN visit — a near-duplicate. The separation AUC (0.878)
+     and the gallery's stamped `threshold_balanced_acc` (0.804) are the numbers that survive.
+     A visit-held-out probe is the fix; until it exists, no report scores the real task.
+
+315. Cat SIZE is measurable signal the identify path discards: the embedder resizes every crop
+     to 224x224, dropping absolute size AND bbox aspect before DINOv2 sees it. Per-visit peak
+     bbox area alone separates Sultan/Store Sultan at AUC 0.84 (Jhinie/Store Jihn 0.78), every
+     foreign lookalike measuring bigger — orthogonal to appearance, and aimed at exactly the
+     pair DINOv2 is worst at. So it is a missing MECHANISM, not a data gap. Queued in docs/TODO.md.
+
+316. Validation now reports a VISIT-held-out number: each visit is hidden whole, matched
+     against the other visits, and named by Run's own rule (`Store._aggregate_identity`,
+     injected so the probe cannot drift from what Run decides). Outcomes are correct /
+     wrong / **declined** — kept apart because for a resident at the door those mean
+     opposite things. The report leads with it; crop-level kNN stays, demoted, as the one
+     number comparable with earlier runs.
+     Spec: docs/specs/2026-08-03-visit-held-out-validation.md.
+
+317. It rides the SAME embed and the SAME N×N distance matrix `run_feasibility` already
+     builds — held-out scoring is that matrix with a visit's own columns masked — so the
+     honest number costs numpy, not GPU. Additive: absent `visit_groups` the result dict
+     is byte-identical, so nothing that consumed the old shape moved.
+
+318. The visit threshold is calibrated on CROSS-VISIT same-cat pairs, never the crop-level
+     one. `_best_threshold` over all same-cat pairs is dominated by same-visit
+     near-duplicates at near-zero distance: measured 0.00063 vs 0.99934 on a real-shaped
+     fixture (1587x), at which every visit is DECLINED and the report reads 100% unknown.
+     Data-dependent — with separable cats the two coincide — so it cannot be assumed benign.
+
+319. Held-out visits are grouped PER CAT, at a coarse 60 s gap of their own
+     (`_HELDOUT_GAP_MS`), not the store's 2 s `_VISIT_GAP_MS`. Coarse is fail-safe here:
+     over-merging removes more leakage, under-merging splits one physical visit across the
+     boundary and lets the near-duplicates back in. A global time-sort would also merge two
+     cats at the door in one minute into a group with no true `cat_id` — tailgating is
+     expected here, and `dataset_items`' UNIQUE only stops two cats sharing ONE frame.
+
+320. A cat with a single visit is UNSCOREABLE, not wrong: the correct answer is absent from
+     the gallery, so it could only ever fail. Excluded from the denominator and named in the
+     report (Store Kali today). Degenerate runs — no cross-visit pair to calibrate, or fewer
+     than two visits — report `available: false` with a reason instead of numbers, since
+     "0 correct / 100% unknown" reads as catastrophe where nothing was measured.
+
+321. Day/night is scored separately, plus a CROSS-REGIME matrix (night visits against a
+     day-only gallery and vice versa) that answers whether one gallery spans both regimes:
+     night→night strong but night→day collapsed means separate galleries, not more night
+     data. Bucketed whole by each visit's first crop, the same rule `gate_scorecard`'s split
+     uses. No location or no astral disables it rather than guessing a boundary.
+
+322. `feasibility_runs` gained a `metrics` JSON column (mirroring `model_versions.metrics`),
+     carrying the visit block so the runs table can rank by the honest number. This is the
+     repo's FIRST additive migration: the schema is `CREATE TABLE IF NOT EXISTS` only, which
+     never adds a column to an existing table, so `_migrate_schema` probes `PRAGMA
+     table_info` and `ALTER TABLE ADD COLUMN`s. Pre-existing rows read NULL = "not measured",
+     which the runs table renders as `—`, distinct from an uncalibrated run's `n/a`.
+
+323. `labeled_crops` now returns `src_recv_ts` + `labeled_ts`. Both come off
+     `dataset_items`, NOT `frames`, so grouping and day/night bucketing cover every label
+     including those whose frames have aged out. `labeled_ts` is stamped once per commit, so
+     distinct values ≈ label keypresses — a free cross-check on the re-derived grouping,
+     printed in the report beside it.
+
+324. Probe charts now pin matplotlib's Agg backend (one `_plt()` accessor). They render in
+     TrainingManager's WORKER thread, where matplotlib warns a GUI backend "will likely
+     fail"; Agg is correct by definition since every figure goes straight to a base64 PNG.
+
+325. The confusion-table f-strings no longer put a BACKSLASH inside `{}`. That is a
+     SyntaxError before Python 3.12 (PEP 701 lifted it) and it fails at IMPORT for the
+     whole module, so `compute.api.app` would not have started at all — `compute.ps1`
+     accepts 3.10+. Invisible here: this dev box runs 3.13.
+
+326. The schema migration survives losing a cross-process race. The `PRAGMA table_info`
+     probe and the `ALTER TABLE` are not atomic across processes — the store lock is
+     per-instance and `busy_timeout` only bounds waiting for the write lock — and the API
+     plus the CLI tools legitimately open the same `index.db`. The loser now no-ops on
+     `duplicate column` instead of dying inside `Store.__init__` with what reads like
+     schema corruption. Narrow on purpose: "database is locked" and disk-full stay loud.
+
+327. An `available: false` visit block carries NO `auc`/`threshold_balanced_acc`. Both are
+     computed before the availability branch, so they leaked past "nothing was measured" —
+     the exact distinction the visit scoring exists to keep honest.
+
+328. A report whose visit scoring was UNAVAILABLE keeps its crop-level verdict. `demoted`
+     keyed on the visit section rendering any HTML, but it also renders an explanatory
+     banner — so an unavailable run suppressed the only verdict it had AND pointed the
+     reader at "the visit-level number above", which was never computed.
+
+329. Measured, correcting the spec: visit scoring DOES raise peak memory (n=6000: 2109 →
+     2439 MB), via two pair-length `int64` gathers for the cross-visit mask. The largest
+     addition is gone — finding the matrix min/max no longer boolean-index-copies the whole
+     matrix (~1.16 GB at 12k crops), since `1 - (unit @ unit.T)` is always finite.

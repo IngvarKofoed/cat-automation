@@ -2126,3 +2126,90 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      per-row `frames` probe, and that join is NOT removable — `iter_unidentified` selects
      `f.path` and joins identically, and the count must match its yield exactly, so an
      orphan verdict would leave progress short of 100% forever.
+
+340. New user-dashboard page `#visits` — nav is now Activity · Visits · Cats — answering
+     *how much* where Activity answers *what happened*: per-cat visit counts over the
+     trailing 6 h and 24 h, each cat's day/night split and share of named traffic, and
+     the household totals. `Store.door_stats` + `GET /api/door-stats`.
+     Spec: docs/specs/2026-08-04-user-visits-stats-page.md.
+
+341. It counts the events `Store.events` produces rather than querying `identifications`,
+     as `cats_overview` does and for the same reason: every visit is clustered by
+     `_gap_split` and named by `_aggregate_identity`, so Visits, Cats and Activity can
+     never name a moment differently — and the uncalibrated fail-safe (a NULL threshold
+     names nobody) carries over for free.
+
+342. The widest window is read ONCE and each visit folded into every window its
+     `start_ts` falls inside, so the two columns cannot disagree at their shared
+     boundary. `events` is walked in KEYSET pages under a `_MAX_STATS_PAGES` (8) budget
+     rather than widening `_MAX_EVENTS`: that cap bounds a FEED RESPONSE, while a busy
+     day exceeds 500 visits and this caller returns only counts.
+
+343. A `since_id` of None means the window holds no frame — returned as the zeroed shape,
+     never as an unbounded `events` read, which would count the newest visits in the
+     WHOLE store as though they fell inside the window. Reachable whenever the newest
+     frame predates the window (a stopped collector).
+
+344. Seven EXCLUSIVE totals buckets summing to `door_events`, so every figure the page
+     shows is derivable from the published totals. `unidentified` is cat-subject only —
+     the number rendered as "couldn't put a name to" — with `person`/`corrupted` in
+     `other`; a person at the door gets no figure of its own. A wind trigger is not a
+     visit, so `cat_visits` excludes `noise`, `other` and `unanalyzed`.
+
+345. Three honesty flags the page renders rather than swallowing: `covered` false (the
+     ring buffer does not reach back that far, so the count is PARTIAL — banner);
+     `truncated` (the page budget was spent); and `unanalyzed` separate from
+     `unidentified`, since "nothing looked" and "looked, couldn't name" are different
+     claims (entries 226/279). Without a usable gallery the per-cat rows are replaced by
+     an explanation, not a column of zeroes.
+
+346. `share` divides by NAMED visits (resident + neighbour), and is None — never 0.0 —
+     when there are none: no named traffic means unmeasured, not zero. A retired cat's
+     visits still count toward the totals (the active gallery may predate its
+     retirement), so the listed shares need not sum to 1.
+
+347. A measured zero renders as a dimmed DIGIT, not `—`, diverging from the spec's own
+     wording: across these dashboards `—` means "not measured" (entries 106/108/113/322),
+     and spending that distinction on a real zero would regress it. Day/night is omitted
+     entirely without a location — including from the section's lead, which otherwise
+     promised a split the rows did not carry.
+
+348. `last_seen` deliberately does NOT come from `door_stats`. The page already fetches
+     `/api/cats/overview` for avatars, and that field spans the whole retained feed while
+     anything computed here would span 24 h — two fields of one name meaning different
+     things on one page.
+
+349. The retired `Who's home` placeholder is GONE, not relocated: it was blocked on
+     direction detection and showed nothing. `#home` falls through the existing
+     unknown-route fallback to Activity (verified) — no alias, since redirecting it to
+     Visits would misrepresent what it asked for. Occupancy returns as its own page when
+     it can answer.
+
+350. Paging stops when the keyset bound `(oldest start_id − 1)` falls below the window's
+     own `since_id`, WITHOUT setting `truncated`. That bound crosses the floor whenever
+     the oldest cluster starts at the window's first frame; continuing asked for an
+     inverted range, got nothing, and reported truncation — putting a "figures are
+     incomplete" banner on a complete reading.
+
+351. Review repairs. The page now reports `truncated` — the budget-exhausted UNDERCOUNT —
+     as its own banner, distinct from `covered`'s retention partial. It was returned and
+     silently dropped, so a busy day (exactly when the figures matter) rendered an
+     undercount as complete: entries 97/126/167/304's trap in a new place.
+
+352. `.kicker` is no longer scoped to `.cats-section`: the Visits tally card uses the same
+     caption beside its own `h2`, where the descendant rule never applied and it rendered
+     as bold heading text (measured 18.4px/700 vs the intended 13.6px/600 muted).
+
+353. The `since_id is None` guard's test asserts `events` is NEVER CALLED, not that the
+     counts are zero. The per-event `start_ts < since_ts` filter zeroes those totals with
+     or without the guard, so the count-based test passed with the guard deleted — proven,
+     then re-proven failing after the repair. What the guard buys is not reading at all.
+
+354. Known limit, left deliberately: `door_stats` pages `events()` on the store's SHARED
+     write connection, unlike `tuning_calendar`/`lighting_histogram`/`labeled_visits`,
+     which hold their own short-lived WAL connections for exactly this reason. With the
+     Visits page open, the SSE nudge refetches every ~3 s while a cat lingers. Two
+     defensible fixes — a read connection under `events()` (wide blast radius: Activity
+     and `cats_overview` share it) or debouncing the client refetch — so it needs a
+     decision, not a patch. Per-span reads are ~5 ms, so this is added latency, not the
+     19.5 s class of entries 102-105.

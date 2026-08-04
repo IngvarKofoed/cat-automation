@@ -160,8 +160,10 @@ The compute PC serves **two** browser surfaces, split by audience:
 - **The at-a-glance dashboard** — the main user-facing app. At a glance: which
   resident cats are home and which are out, and when each last crossed ("is
   Mittens still out?"); a timeline of enter/leave events; and a log of
-  foreign-cat sightings and any deterrents. It shows status, events, and stored
-  snapshots — not a live video feed.
+  foreign-cat sightings and any deterrents. Alongside the timeline it answers *how
+  much* — how often each cat has been through the door lately, by day and after
+  dark, and how much of the traffic could not be attributed to anyone. It shows
+  status, events, and stored snapshots — not a live video feed.
 - **The admin workbench** — a separate management console where the household is
   taught and the system is tuned: reviewing and correcting identifications,
   annotating images, building and promoting models (see *How the system learns*),

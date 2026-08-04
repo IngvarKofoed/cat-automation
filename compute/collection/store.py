@@ -190,6 +190,13 @@ _MAX_EVENTS = 500
 # events with ``truncated`` set (older ones need a narrower date range).
 _EVENT_SCAN_FRAMES = 200_000
 
+# How many ``events`` pages ``door_stats`` will walk before giving up and reporting
+# ``truncated``. The stats page counts VISITS rather than rendering them, so it needs
+# more than one ``_MAX_EVENTS`` page of a busy day — but it must still be bounded, and
+# widening ``_MAX_EVENTS`` itself is wrong: that cap exists to bound a *feed response*.
+# 8 × 500 = 4000 visits in the widest window, far past a real day at this door.
+_MAX_STATS_PAGES = 8
+
 # Widest frame-id span a single "mark for labelling" flag may cover. A flag comes from a
 # client posting ONE activity event's [start_id, end_id], so any real value is tens to a
 # few hundred frames — but nothing else bounds it, and `_resolve_flag` materialises every
@@ -6893,6 +6900,242 @@ class Store:
             cat["last_seen_frame_id"] = seen["last_seen_frame_id"] if seen else None
             cat["has_crop"] = cat["id"] in with_crop
         return roster
+
+    # Which totals bucket each event falls in, in the order the ladder tests them.
+    # Exclusive and exhaustive: every event lands in exactly one, so the buckets sum to
+    # `door_events` and the UI can derive every figure it shows from the published
+    # totals (rather than from a quantity only the server ever saw).
+    _STATS_BUCKETS = (
+        "resident",       # named gallery match, roster is_resident
+        "neighbour",      # named gallery match, not a resident
+        "unknown_cat",    # identified, nothing near enough (nearest match too far)
+        "unanalyzed",     # no identity, the detector has never looked at the span
+        "unidentified",   # no identity, YOLO says cat — a cat nothing has named
+        "other",          # no identity, YOLO says person, or the span is corrupt
+        "noise",          # no identity, below the subject floor (wind, shadows)
+    )
+
+    def door_stats(
+        self,
+        *,
+        now_ms: "int | None" = None,
+        hours: "tuple[int, ...]" = (6, 24),
+        is_night: "Callable[[int], bool] | None" = None,
+    ) -> dict:
+        """Per-cat and household visit counts over trailing windows — the Visits page.
+
+        Backs the user dashboard's Visits view (see the Visits-page spec). Answers *how
+        much* rather than *what happened*: how many visits each roster cat made in the
+        last ``hours`` (default 6 h and 24 h), each cat's day/night split and share of
+        the door's named traffic, and the household totals — including how much of the
+        window nothing has named.
+
+        Counts the events ``events()`` produces rather than querying ``identifications``
+        directly, exactly as ``cats_overview`` does and for the same reason: every visit
+        tallied here was clustered by ``_gap_split``/``_VISIT_GAP_MS`` and named by
+        ``_aggregate_identity``, so Visits, Cats and Activity can never name the same
+        moment differently — and the uncalibrated-model fail-safe (an uncalibrated
+        gallery resolves every visit to "unknown") carries over for free.
+
+        **One read serves every window.** The widest window is read once and each event
+        is folded into whichever windows its ``start_ts`` falls inside, so the windows
+        cannot disagree at their shared boundary. ``events`` is walked in KEYSET pages
+        (``until_id`` = oldest loaded ``start_id`` − 1, as the frontend feed pages) under
+        the ``_MAX_STATS_PAGES`` budget, because one call clamps at ``_MAX_EVENTS`` and a
+        busy day exceeds it. No visit is lost to the partial-oldest-cluster drop
+        ``events`` performs when its frame scan caps: the next page's ``until_id``
+        excludes only the *kept* oldest event, so a dropped cluster is re-read.
+
+        ``is_night(recv_ts_ms) -> bool`` is the injected day/night classifier (the
+        astral-backed ``compute.analysis.suntimes.night_classifier``), the same
+        dependency-injection seam ``cat_regime_coverage`` and the tuning split use — the
+        store stays astral-free. A visit is bucketed **whole** by its ``start_ts``, the
+        first-frame rule ``gate_scorecard``'s split uses. ``None`` (no location, or no
+        astral) leaves every ``day``/``night`` ``None`` rather than guessing a boundary.
+
+        ``now_ms`` overrides the clock (tests); default is the wall clock. Returns::
+
+            {generated_ts, store_oldest_ts, truncated,
+             model: {id, calibrated} | None,
+             windows: {"<h>h": {hours, since_ts, covered}},
+             totals:  {"<h>h": {door_events, cat_visits, <bucket>: int, ...}},
+             cats: [{cat_id, name, is_resident,
+                     "<h>h": {visits, day, night, share}}]}
+
+        ``covered`` is False when the store does not reach back that far — on a ring
+        buffer a "last 24 h" count over 9 h of retained frames is a partial, and a
+        partial that does not say so reads as a quiet night. ``cat_visits`` = resident +
+        neighbour + unknown_cat + unidentified (a person or a wind trigger is not a
+        visit). ``share`` is the cat's visits over the window's NAMED visits (resident +
+        neighbour), ``None`` when that denominator is 0. ``cats`` holds one record per
+        ACTIVE roster cat in ``list_cats`` order, including cats with zero visits — "none
+        in 24 h" is an answer. A RETIRED cat's visits still count toward the totals (the
+        active gallery may predate its retirement, so it can still be matched), so the
+        listed shares need not sum to 1. ``truncated`` is True when the page budget was
+        spent, i.e. older visits in the window went uncounted.
+        """
+        now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        # Ascending + deduped, so "the widest window" is unambiguous and two callers
+        # asking for the same set get the same keys.
+        spans = sorted({max(1, int(h)) for h in hours})
+        keys = [f"{h}h" for h in spans]
+        since_by_key = {f"{h}h": now - h * 3_600_000 for h in spans}
+
+        oldest_ts = self.stats()["oldest_ts"]
+        model = self.active_model()
+        result: dict = {
+            "generated_ts": now,
+            "store_oldest_ts": oldest_ts,
+            "model": (
+                None if model is None
+                else {"id": model["id"], "calibrated": model["threshold"] is not None}
+            ),
+            "windows": {
+                k: {
+                    "hours": h,
+                    "since_ts": since_by_key[k],
+                    # The store reaches back far enough only if its oldest retained
+                    # frame is at or before the window's start.
+                    "covered": oldest_ts is not None and oldest_ts <= since_by_key[k],
+                }
+                for k, h in zip(keys, spans)
+            },
+            "totals": {
+                k: {"door_events": 0, "cat_visits": 0, **{b: 0 for b in self._STATS_BUCKETS}}
+                for k in keys
+            },
+        }
+
+        roster = [c for c in self.list_cats() if c["active"]]
+        # cat_id → key → counters. Built for every active cat up front so a cat with no
+        # visits still gets a full record (zeroes, not a missing row).
+        per_cat: "dict[int, dict]" = {
+            c["id"]: {k: {"visits": 0, "day": 0, "night": 0} for k in keys} for c in roster
+        }
+
+        widest_since_ts = since_by_key[keys[-1]]
+        since_id, _ = self.resolve_ts_range(widest_since_ts, None)
+        if since_id is None:
+            # No frame at or after the window's start: the window holds nothing. Return
+            # the zeroed shape — NOT an unbounded events() read, which would count the
+            # newest events in the whole store as though they fell inside the window.
+            result["truncated"] = False
+            result["cats"] = self._stats_cat_records(roster, per_cat, keys, result["totals"], is_night)
+            return result
+
+        events: "list[dict]" = []
+        truncated = False
+        until_id: "int | None" = None
+        pages = 0
+        while pages < _MAX_STATS_PAGES:
+            page = self.events(since_id, until_id, limit=_MAX_EVENTS)
+            rows = page["events"]
+            events.extend(rows)
+            pages += 1
+            if not page["truncated"]:
+                break
+            if not rows:
+                # Truncated with nothing to key the next page off (reachable when a
+                # scan-capped window's only cluster is popped — CHANGELOG 271). Paging
+                # cannot continue, so say so rather than re-requesting the same bound.
+                truncated = True
+                break
+            until_id = min(e["start_id"] for e in rows) - 1
+            if until_id < since_id:
+                # The page reached the window's own floor, so nothing is left to count
+                # and `truncated` must stay False — the flag means "older visits in this
+                # window went uncounted", and over-claiming it would put a "figures are
+                # incomplete" warning on a complete reading. (Without this the next call
+                # would ask for an inverted range, get nothing, and take the branch
+                # above.)
+                break
+        else:
+            truncated = True
+        result["truncated"] = truncated
+
+        for event in events:
+            bucket, cat_id = self._classify_stats_event(event)
+            start_ts = event["start_ts"]
+            night = is_night(start_ts) if is_night is not None else None
+            for k in keys:
+                if start_ts < since_by_key[k]:
+                    continue  # older than this window (but inside a wider one)
+                totals = result["totals"][k]
+                totals["door_events"] += 1
+                totals[bucket] += 1
+                if bucket in ("resident", "neighbour", "unknown_cat", "unidentified"):
+                    totals["cat_visits"] += 1
+                counters = per_cat.get(cat_id) if cat_id is not None else None
+                if counters is not None:
+                    counters[k]["visits"] += 1
+                    if night is not None:
+                        counters[k]["night" if night else "day"] += 1
+
+        result["cats"] = self._stats_cat_records(roster, per_cat, keys, result["totals"], is_night)
+        return result
+
+    @staticmethod
+    def _classify_stats_event(event: dict) -> "tuple[str, int | None]":
+        """One event → ``(totals bucket, cat_id | None)`` for ``door_stats``.
+
+        The ladder is exclusive and ordered: a named gallery match wins over any subject
+        reading (identity is the stronger signal, and ``events`` already promotes a
+        confident match's subject to ``cat``), then "identified but too far", then the
+        subject rungs. ``cat_id`` is set only for a named match, so it is the only
+        outcome that credits a cat's own count.
+        """
+        identity = event.get("identity")
+        if identity is not None:
+            cat_id = identity.get("cat_id")
+            if cat_id is not None:
+                return ("resident" if identity.get("is_resident") else "neighbour", int(cat_id))
+            # Identified, nothing near enough → an unknown cat was at the door.
+            return ("unknown_cat", None)
+        kind = (event.get("subject") or {}).get("kind")
+        if kind == "unanalyzed":
+            return ("unanalyzed", None)
+        if kind == "cat":
+            return ("unidentified", None)
+        if kind in ("person", "corrupted"):
+            return ("other", None)
+        # unrecognized / motion_only, and the with_subject=False case (no subject at all).
+        return ("noise", None)
+
+    @staticmethod
+    def _stats_cat_records(
+        roster: "list[dict]",
+        per_cat: "dict[int, dict]",
+        keys: "list[str]",
+        totals: dict,
+        is_night: "Callable[[int], bool] | None",
+    ) -> "list[dict]":
+        """Project ``door_stats``'s per-cat counters into the response records.
+
+        ``share`` divides by the window's NAMED visits (resident + neighbour) — the
+        traffic that could be attributed to a cat at all — not by ``door_events``, which
+        is mostly wind. ``None`` when that denominator is 0, never 0.0: no named traffic
+        means the share is unmeasured, not zero. ``day``/``night`` stay ``None`` when no
+        classifier was injected, so an absent split never reads as "all day".
+        """
+        records: "list[dict]" = []
+        named = {k: totals[k]["resident"] + totals[k]["neighbour"] for k in keys}
+        for cat in roster:
+            counters = per_cat[cat["id"]]
+            record = {
+                "cat_id": cat["id"],
+                "name": cat["name"],
+                "is_resident": cat["is_resident"],
+            }
+            for k in keys:
+                visits = counters[k]["visits"]
+                record[k] = {
+                    "visits": visits,
+                    "day": counters[k]["day"] if is_night is not None else None,
+                    "night": counters[k]["night"] if is_night is not None else None,
+                    "share": (visits / named[k]) if named[k] else None,
+                }
+            records.append(record)
+        return records
 
     def cat_avatar_crop_path(self, cat_id: int) -> "str | None":
         """Absolute path of the representative durable labelled crop for ``cat_id``, or ``None``.

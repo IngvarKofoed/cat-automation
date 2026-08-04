@@ -432,7 +432,10 @@
             align-items: baseline;
             gap: .5rem;
         }
-        .cats-section .kicker { color: var(--muted); font-weight: 600; font-size: .85rem; }
+        /* Not scoped to .cats-section: the Visits tally card uses the same caption
+           beside its own h2, and a descendant-scoped rule left it rendering as bold
+           heading text there. */
+        .kicker { color: var(--muted); font-weight: 600; font-size: .85rem; }
         .cats-section .lead { margin: 0 0 1rem; color: var(--muted); font-size: .9rem; }
         .cat-grid {
             display: grid;
@@ -503,19 +506,116 @@
         .set-photo input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
         .set-photo.busy { opacity: .6; pointer-events: none; }
 
-        /* ================= WHO'S HOME placeholder ================= */
-        .placeholder {
-            text-align: center;
-            padding: clamp(2rem, 8vw, 4.5rem) 1.5rem;
+        /* ================= VISITS =================
+           Two windows side by side throughout — the household tally and each cat's row
+           share ONE column geometry (label, then 6 h, then 24 h), so the same figure sits
+           under the same heading everywhere on the page. */
+        .tally {
             background: var(--surface);
             border: 1px solid var(--hairline);
             border-radius: var(--radius);
             box-shadow: var(--shadow);
+            padding: 1.1rem 1.1rem .9rem;
+            margin-bottom: 2rem;
         }
-        .placeholder .mark { color: var(--porch); margin-bottom: 1rem; }
-        .placeholder .mark svg { width: 52px; height: 52px; }
-        .placeholder h2 { margin: 0 0 .5rem; font-size: 1.3rem; }
-        .placeholder p { margin: 0 auto; max-width: 34ch; color: var(--muted); }
+        .tally h2 {
+            font-size: 1.15rem;
+            margin: 0 0 .8rem;
+            display: flex;
+            align-items: baseline;
+            gap: .5rem;
+        }
+        .tally-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 4.2rem 4.2rem;
+            align-items: baseline;
+            gap: .5rem;
+            padding: .4rem 0;
+            border-top: 1px solid var(--hairline);
+        }
+        .tally-row.head {
+            border-top: none;
+            padding-top: 0;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+        /* Every figure on the page is tabular so the two columns line up digit for
+           digit, and the row heights never shift as counts change width. */
+        .tally-row .n {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            font-weight: 700;
+        }
+        .tally-row .k { color: var(--muted); font-size: .92rem; }
+        /* The all-movement row is context, not a reading about cats — quieter, and set
+           apart so it can't be read as part of the cat tally above it. */
+        .tally-row.aside { color: var(--muted); }
+        .tally-row.aside .n { font-weight: 600; }
+        .tally-foot {
+            margin: .7rem 0 0;
+            font-size: .85rem;
+            color: var(--muted);
+        }
+        .tally-foot.hidden { display: none; }
+
+        .vrows { display: flex; flex-direction: column; gap: .6rem; }
+        .vrow {
+            display: grid;
+            /* avatar · who · the same two number columns as .tally-row */
+            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem;
+            align-items: center;
+            gap: .5rem;
+            padding: .7rem .9rem;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius-sm);
+            box-shadow: var(--shadow);
+        }
+        .vrow .avatar-wrap { width: 46px; height: 46px; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--porch) 30%, transparent); }
+        .vrow .avatar-fallback { font-size: 1.15rem; }
+        .vrow .who { min-width: 0; }
+        .vrow .vname {
+            font-family: var(--font-display);
+            font-weight: 700;
+            font-size: 1rem;
+            display: flex;
+            align-items: baseline;
+            gap: .4rem;
+            flex-wrap: wrap;
+        }
+        .vrow .vsub {
+            font-size: .8rem;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+        .vrow .n {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+        /* A measured zero is a real reading, so it is a digit — dimmed, never an em
+           dash, which everywhere else on these dashboards means "not measured". */
+        .vrow .n.zero { color: var(--muted); font-weight: 600; }
+        .vrows-head {
+            display: grid;
+            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem;
+            gap: .5rem;
+            padding: 0 .9rem .3rem;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+        .vrows-head span:nth-child(n+3) { text-align: right; }
+        @media (max-width: 380px) {
+            .tally-row, .vrow, .vrows-head { grid-template-columns: 46px minmax(0, 1fr) 3.2rem 3.2rem; }
+            .tally-row { grid-template-columns: minmax(0, 1fr) 3.2rem 3.2rem; }
+        }
 
         /* ================= footer ================= */
         .foot {
@@ -779,8 +879,8 @@
         </div>
         <nav class="nav">
             <a data-route="activity" href="#activity">Activity</a>
+            <a data-route="visits" href="#visits">Visits</a>
             <a data-route="cats" href="#cats">Cats</a>
-            <a data-route="home" href="#home">Who's home</a>
         </nav>
     </header>
 
@@ -812,6 +912,17 @@
             <div id="feedSentinel" aria-hidden="true"></div>
         </section>
 
+        <!-- ============ VISITS ============ -->
+        <section id="view-visits" class="view">
+            <div class="view-head">
+                <h1>Visits</h1>
+                <p class="sub">How busy the door has been, and who has been through it.</p>
+            </div>
+            <div class="note error hidden" id="visitsError"></div>
+            <div class="note warn hidden" id="visitsNote"></div>
+            <div id="visitsBody"></div>
+        </section>
+
         <!-- ============ CATS ============ -->
         <section id="view-cats" class="view">
             <div class="view-head">
@@ -823,24 +934,6 @@
             <div id="catsBody"></div>
         </section>
 
-        <!-- ============ WHO'S HOME ============ -->
-        <section id="view-home" class="view">
-            <div class="view-head">
-                <h1>Who's home</h1>
-                <p class="sub">The in-and-out board.</p>
-            </div>
-            <div class="placeholder">
-                <div class="mark">
-                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                        <path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-                        <path d="M9 21v-6h6v6" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-                    </svg>
-                </div>
-                <h2>Coming once the door can tell in from out</h2>
-                <p>We can already see who came by. To say who's <em>home</em> we need to know
-                   which way each cat was heading through the door — that's next.</p>
-            </div>
-        </section>
     </main>
 
     <footer class="foot">
@@ -896,7 +989,7 @@
     "use strict";
     (function () {
         // ================= constants =================
-        const ROUTES = ['activity', 'cats', 'home'];
+        const ROUTES = ['activity', 'visits', 'cats'];
         const DAY_MS = 86400000;
         const MAX_PLAY_FRAMES = 240;           // cap sampled/played frames per event
         // "Analyse this visit" job watch. One visit is tens of frames — a couple of
@@ -981,6 +1074,7 @@
         const activityEmptyEl = $('activityEmpty'), railEl = $('activityRail');
         const feedFootEl = $('feedFoot'), feedSentinelEl = $('feedSentinel');
         const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
+        const visitsErrorEl = $('visitsError'), visitsNoteEl = $('visitsNote'), visitsBodyEl = $('visitsBody');
         const modalEl = $('playerModal'), dialogEl = $('playerDialog');
         const playerImgEl = $('playerImg'), playerWhenEl = $('playerWhen'), playerChipSlotEl = $('playerChipSlot');
         const playerPlayBtn = $('playerPlay'), playerPrevBtn = $('playerPrev'), playerNextBtn = $('playerNext');
@@ -1473,6 +1567,7 @@
             // scroll-lock) so it can't tick in the background or reappear on return.
             if (r !== 'activity') closePlayer();
             if (r === 'activity') enterActivity();
+            else if (r === 'visits') loadVisits();
             else if (r === 'cats') loadCats();
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -2221,6 +2316,285 @@
             else if (e.key === 'ArrowRight') { pausePlayback(); showPlayerFrame(playerIndex + 1); e.preventDefault(); }
             else if (e.key === 'ArrowLeft') { pausePlayback(); showPlayerFrame(playerIndex - 1); e.preventDefault(); }
         });
+
+        // ================= VISITS view =================
+        // "How much", where Activity answers "what happened". Everything here comes from
+        // GET /api/door-stats, which counts the same events the feed renders (clustered
+        // and named by the same code), so the two views can never disagree about a visit.
+        // Refreshing is free: onRouteEnter is what the foreground resume, the SSE nudge
+        // and the fallback poll all re-run, so wiring the route in is the whole story.
+
+        // The window keys the response carries, in the order the columns show them.
+        const VISIT_WINDOWS = ['6h', '24h'];
+
+        async function loadVisits() {
+            hideNote(visitsErrorEl);
+            try {
+                // The overview rides along for avatars and each cat's whole-feed last-seen
+                // — deliberately NOT recomputed here, where it would span only 24 h and
+                // quietly mean something different from the same field on Cats.
+                const [statsRes, catsRes] = await Promise.all([
+                    fetch('/api/door-stats'),
+                    fetch('/api/cats/overview'),
+                ]);
+                if (!statsRes.ok) throw new Error(await errorFromResponse(statsRes));
+                if (!catsRes.ok) throw new Error(await errorFromResponse(catsRes));
+                renderVisits(await statsRes.json(), await catsRes.json());
+            } catch (err) {
+                visitsBodyEl.innerHTML = '';
+                hideNote(visitsNoteEl);
+                showNote(visitsErrorEl, `Couldn't load the visit counts: ${err.message}`);
+            }
+        }
+
+        function renderVisits(data, catsData) {
+            const overview = new Map((catsData.cats || []).map(c => [c.id, c]));
+            visitsBodyEl.innerHTML = '';
+
+            // Two independent reasons a figure below can be incomplete, both said once at
+            // the top because they qualify EVERY figure on the page — an undercount that
+            // doesn't say so reads as a quiet night.
+            //   • `covered` false — the store's retention doesn't reach back that far.
+            //   • `truncated`     — it does, but counting stopped at the page budget, so
+            //                       older visits inside the window went uncounted. A busy
+            //                       day is exactly when this fires, and exactly when the
+            //                       numbers matter, so it cannot be dropped.
+            const partial = VISIT_WINDOWS.filter(k => data.windows[k] && !data.windows[k].covered);
+            if (data.truncated) {
+                showNote(visitsNoteEl,
+                    'It was busy enough that we stopped counting partway back, so these ' +
+                    'figures are lower than the real ones.');
+            } else if (partial.length && typeof data.store_oldest_ts === 'number') {
+                showNote(visitsNoteEl,
+                    `We only keep pictures back to ${formatTime(data.store_oldest_ts)}, so the ` +
+                    `${partial.map(windowLabel).join(' and ')} ${partial.length > 1 ? 'figures are' : 'figure is'} partial.`);
+            } else if (partial.length) {
+                showNote(visitsNoteEl, 'Nothing has been collected yet, so there is nothing to count.');
+            } else {
+                hideNote(visitsNoteEl);
+            }
+
+            visitsBodyEl.appendChild(tallyCard(data));
+
+            // Without a usable gallery nothing is named, so every per-cat row would be a
+            // zero — say why instead of showing the column.
+            const named = data.model !== null && data.model.calibrated;
+            if (!named) {
+                const empty = document.createElement('div');
+                empty.className = 'empty';
+                empty.innerHTML = data.model === null
+                    ? '<div class="big">Not telling cats apart yet</div><div>Visits are counted above, but naming them needs a recognition model — build one in the Admin console.</div>'
+                    : '<div class="big">The model can\'t name cats yet</div><div>The current model has too little data to be calibrated, so every visit stays “unknown cat”. Label more visits and build again.</div>';
+                visitsBodyEl.appendChild(empty);
+                return;
+            }
+
+            const cats = data.cats || [];
+            const residents = cats.filter(c => c.is_resident);
+            const neighbours = cats.filter(c => !c.is_resident);
+            if (residents.length) {
+                // Only promise the day/night split when the rows will actually carry it —
+                // without a location the backend reports it unavailable and every row
+                // omits it, so the lead would be describing something not on screen.
+                const split = data.split && data.split.available;
+                visitsBodyEl.appendChild(visitsSection(
+                    'Our cats',
+                    split
+                        ? 'Visits through the door, and how they split between day and night.'
+                        : 'Visits through the door.',
+                    residents, overview, data));
+            }
+            if (neighbours.length) {
+                visitsBodyEl.appendChild(visitsSection(
+                    'Neighbours', 'Named cats that visit but live elsewhere.',
+                    neighbours, overview, data));
+            }
+        }
+
+        function windowLabel(key) { return `last ${key.replace('h', ' hours')}`; }
+
+        function tallyCard(data) {
+            const card = document.createElement('div');
+            card.className = 'tally';
+
+            const h = document.createElement('h2');
+            h.textContent = 'At the door';
+            const kicker = document.createElement('span');
+            kicker.className = 'kicker';
+            kicker.textContent = `as of ${timeOfDay(data.generated_ts)}`;
+            h.appendChild(kicker);
+            card.appendChild(h);
+
+            card.appendChild(tallyRow('', VISIT_WINDOWS.map(k => k.replace('h', ' hours')), 'head'));
+            // Cat visits first (the headline), then who they were, then all movement as
+            // context. `unidentified` is folded into the footnote rather than shown as a
+            // row: it is a gap in what we know, not a kind of visitor.
+            const rows = [
+                ['Cat visits', t => t.cat_visits],
+                ['Our cats', t => t.resident],
+                ['Neighbours', t => t.neighbour],
+                ['Unknown cats', t => t.unknown_cat],
+            ];
+            for (const [label, pick] of rows) {
+                card.appendChild(tallyRow(label, VISIT_WINDOWS.map(k => pick(data.totals[k]))));
+            }
+            card.appendChild(tallyRow(
+                'All movement at the door',
+                VISIT_WINDOWS.map(k => data.totals[k].door_events), 'aside'));
+
+            // The honest remainder: visits we can see but cannot attribute. Quoted for the
+            // WIDEST window, where the numbers are biggest and the gap most visible.
+            const widest = data.totals[VISIT_WINDOWS[VISIT_WINDOWS.length - 1]];
+            const parts = [];
+            if (widest.unidentified) parts.push(`${widest.unidentified} cat ${widest.unidentified === 1 ? 'visit' : 'visits'} we couldn't put a name to`);
+            if (widest.unanalyzed) parts.push(`${widest.unanalyzed} not looked at yet`);
+            const foot = document.createElement('p');
+            foot.className = 'tally-foot';
+            if (parts.length) {
+                foot.textContent = `In the last 24 hours: ${parts.join(' · ')}.`;
+            } else {
+                foot.classList.add('hidden');
+            }
+            card.appendChild(foot);
+            return card;
+        }
+
+        function tallyRow(label, values, extra) {
+            const row = document.createElement('div');
+            row.className = 'tally-row' + (extra ? ' ' + extra : '');
+            const k = document.createElement('span');
+            k.className = 'k';
+            k.textContent = label;
+            row.appendChild(k);
+            for (const v of values) {
+                const n = document.createElement('span');
+                n.className = 'n';
+                n.textContent = v;
+                row.appendChild(n);
+            }
+            return row;
+        }
+
+        function visitsSection(title, kicker, list, overview, data) {
+            const sec = document.createElement('div');
+            sec.className = 'cats-section';
+            const h = document.createElement('h2');
+            h.textContent = title;
+            const count = document.createElement('span');
+            count.className = 'kicker';
+            count.textContent = `${list.length}`;
+            h.appendChild(count);
+            const lead = document.createElement('p');
+            lead.className = 'lead';
+            lead.textContent = kicker;
+
+            const head = document.createElement('div');
+            head.className = 'vrows-head';
+            head.innerHTML = '<span></span><span></span>';
+            for (const key of VISIT_WINDOWS) {
+                const s = document.createElement('span');
+                s.textContent = key.replace('h', ' hours');
+                head.appendChild(s);
+            }
+
+            const rows = document.createElement('div');
+            rows.className = 'vrows';
+            // Busiest first within a group — the point of the page is who is using the
+            // door, and roster (creation) order buries that. Ties keep roster order, so
+            // a group of all-zero cats renders stably.
+            const widest = VISIT_WINDOWS[VISIT_WINDOWS.length - 1];
+            const sorted = list
+                .map((c, i) => [c, i])
+                .sort((a, b) => (b[0][widest].visits - a[0][widest].visits) || (a[1] - b[1]))
+                .map(([c]) => c);
+            for (const cat of sorted) rows.appendChild(visitRow(cat, overview.get(cat.cat_id), data));
+
+            sec.append(h, lead, head, rows);
+            return sec;
+        }
+
+        function visitRow(cat, info, data) {
+            const row = document.createElement('div');
+            row.className = 'vrow';
+
+            row.appendChild(visitAvatar(cat, info));
+
+            const who = document.createElement('div');
+            who.className = 'who';
+            const name = document.createElement('div');
+            name.className = 'vname';
+            name.textContent = cat.name || `Cat #${cat.cat_id}`;
+            const sub = document.createElement('div');
+            sub.className = 'vsub';
+            sub.textContent = visitSubLine(cat, info, data);
+            who.append(name, sub);
+            row.appendChild(who);
+
+            for (const key of VISIT_WINDOWS) {
+                const n = document.createElement('span');
+                const visits = cat[key].visits;
+                n.className = 'n' + (visits === 0 ? ' zero' : '');
+                n.textContent = visits;
+                row.appendChild(n);
+            }
+            return row;
+        }
+
+        // The row's one line of detail: how the visits split between day and night, this
+        // cat's share of the named traffic, and when we last saw them.
+        // Day/night is omitted entirely when the split is unavailable (no location set) —
+        // showing "0 night" there would be a guess dressed as a measurement.
+        // The window is NAMED, because the figures here are the widest window's while the
+        // row also carries a 6 h column: unlabelled, "3 by day" reads as the wrong number.
+        function visitSubLine(cat, info, data) {
+            const key = VISIT_WINDOWS[VISIT_WINDOWS.length - 1];
+            const widest = cat[key];
+            const parts = [];
+            // Terse on purpose: measured at 390 px this line ran to FOUR wrapped lines
+            // spelled out ("3 by day · 2 after dark · 45% of named visits"), which makes
+            // each row taller than the two counts it is annotating.
+            if (widest.visits > 0 && widest.day != null && widest.night != null) {
+                parts.push(`${widest.day} day · ${widest.night} night`);
+            }
+            if (widest.share != null && widest.visits > 0) {
+                // "of named" keeps the denominator visible — a bare percentage of an
+                // unstated total is the kind of figure this page exists not to show.
+                parts.push(`${Math.round(widest.share * 100)}% of named`);
+            }
+            const detail = parts.length ? `${key.replace('h', ' h')}: ${parts.join(' · ')}` : '';
+            // Last-seen spans the whole retained feed, NOT the window above, so it is kept
+            // outside that prefix — this is the same field the Cats view shows.
+            const lastSeen = info && typeof info.last_seen_ts === 'number' ? info.last_seen_ts : null;
+            const seen = lastSeen ? `seen ${relativeTime(lastSeen)}`
+                : (widest.visits === 0 ? 'not seen recently' : '');
+            return [detail, seen].filter(Boolean).join(' · ');
+        }
+
+        // Same photo rules as the Cats view: an uploaded avatar, else an auto-picked
+        // labelled crop, else the initial. Version-stamped so a re-uploaded photo busts
+        // its own URL (and an unchanged one stays cached).
+        function visitAvatar(cat, info) {
+            const wrap = document.createElement('div');
+            wrap.className = 'avatar-wrap';
+            const fallback = document.createElement('div');
+            fallback.className = 'avatar-fallback';
+            fallback.textContent = (cat.name || '?').trim().charAt(0).toUpperCase() || '?';
+            const img = document.createElement('img');
+            img.alt = '';
+            img.addEventListener('error', () => {
+                img.style.display = 'none';
+                fallback.style.display = 'flex';
+            });
+            if (info && info.has_avatar) {
+                fallback.style.display = 'none';
+                img.src = `/api/cats/${cat.cat_id}/avatar?v=${info.avatar_version}`;
+            } else {
+                img.style.display = 'none';
+                fallback.style.display = 'flex';
+            }
+            wrap.append(img, fallback);
+            return wrap;
+        }
 
         // ================= CATS view =================
         async function loadCats() {

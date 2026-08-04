@@ -98,6 +98,11 @@ _SSE_HEARTBEAT_TICKS = 7
 # window would shorten every "last seen" it can report.
 _EVENTS_PAGE = 100
 
+# The trailing windows the Visits page reports, in hours. Server-side rather than a query
+# param: the page is a fixed household glance, and a caller-chosen window would let the
+# widest one grow without bound (the store reads the widest once — see Store.door_stats).
+_DOOR_STATS_HOURS = (6, 24)
+
 # Config via environment variables (the edge's style; the compute tier has no
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
 _ENV_DIR = "CAT_COLLECT_DIR"
@@ -1566,6 +1571,40 @@ def create_app(
                 "X-Accel-Buffering": "no",  # tell any reverse proxy not to buffer the stream
             },
         )
+
+    @app.get("/api/door-stats")
+    def api_door_stats():
+        # The user dashboard's Visits page: per-cat and household visit counts over the
+        # trailing 6 h and 24 h (see the Visits-page spec). Named `door-stats` rather than
+        # `/api/stats` (taken — the store summary) or something under `/api/visits` (taken
+        # — the oracle-driven TUNING read, which this is not): "visits" already means two
+        # things here, so the route avoids the word.
+        #
+        # The day/night split takes the same gate as the tuning split and
+        # /api/label/regime-coverage: with no location or no astral it reports
+        # `available: False` + a reason and the store leaves every day/night None, rather
+        # than guessing a boundary and returning confidently-wrong columns.
+        coords = store.get_location()
+        available = False
+        reason = None
+        is_night = None
+        location = None
+        if coords is None:
+            reason = "location_unset"
+        elif not astral_available():
+            reason = "astral_unavailable"
+        else:
+            lat, lon = coords
+            is_night = night_classifier(lat, lon)
+            available = True
+            location = {"latitude": lat, "longitude": lon}
+        result = store.door_stats(hours=_DOOR_STATS_HOURS, is_night=is_night)
+        result["split"] = (
+            {"available": True, "location": location}
+            if available
+            else {"available": False, "reason": reason}
+        )
+        return result
 
     @app.post("/api/collector/start")
     def api_collector_start():

@@ -2108,3 +2108,21 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      it has crossings is precisely the case. The row shows `is_resident` and both counts, so
      the choice is informed rather than prevented — recall tracks visits, and the cat with
      the most crops measured the worst recall (Store Jihn 2725 crops, 69%).
+
+337. Admin Activity gained "Identify all" — a WHOLE-STORE identify pass, beside the
+     Identify that is scoped to the LOADED visits. Promoting a gallery orphans EVERY
+     stored identification (keyed by `model_version_id`), so all history reads unnamed
+     until a pass re-runs, and `/api/events`' 500-event cap means "Show older" could
+     never widen the scoped button that far. Same endpoint, both bounds omitted.
+
+338. `count_unidentified` moved to its OWN short-lived WAL read connection. UNBOUNDED —
+     the identify pass's progress denominator — it measured 4.9 s on a 4.7M-frame replica
+     with no `ANALYZE`, stalling a competing writer 7.2 s on the shared connection vs
+     0.1 ms off it (measured). The starvation class entries 102-105 removed; latent until
+     entry 337's button made the unbounded call routine.
+
+339. That 4.9 s is NOT the entries 229/265/276/307 mis-plan: the plan already seeks
+     `idx_analysis_analyzer_verdict` to the detected minority (1 ms). The cost is the
+     per-row `frames` probe, and that join is NOT removable — `iter_unidentified` selects
+     `f.path` and joins identically, and the count must match its yield exactly, so an
+     orphan verdict would leave progress short of 100% forever.

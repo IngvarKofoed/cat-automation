@@ -405,6 +405,27 @@ def test_identify_run_happy_enqueues(make_app, monkeypatch):
     assert manager.identify_calls == [{"store": store, "since_id": 1, "until_id": 5}]
 
 
+def test_identify_run_no_bounds_enqueues_the_whole_store(make_app, monkeypatch):
+    """An empty body = both bounds None = the WHOLE store — admin Activity's "Identify all".
+
+    The scoped Identify button sends the loaded visits' id span, and `/api/events` caps
+    at 500 events, so "Show older" can never widen it to the whole store. Promoting a
+    gallery orphans every stored identification (they are keyed by model_version_id), so
+    naming the history back to the oldest frame needs an UNBOUNDED pass. It is the same
+    endpoint with no window, not a second one — this locks that in, since a body model
+    whose fields lost their defaults would silently 422 the button instead.
+    """
+    monkeypatch.setattr("compute.identification.embed.Embedder.ensure_available", lambda self: None)
+    client, store, manager = make_app()
+    store.promote_model(_draft_version(store))
+
+    resp = client.post("/api/identify/run", json={})
+    assert resp.status_code == 200
+    assert resp.json()["enough"] is True
+    # None on BOTH sides — an open window, not a defaulted 0 or a resolved store range.
+    assert manager.identify_calls == [{"store": store, "since_id": None, "until_id": None}]
+
+
 def test_identify_run_inverted_range_is_400(make_app, monkeypatch):
     # Active model present, but since_id > until_id is an impossible window —
     # rejected before ever reaching the manager, same guard every windowed run uses.

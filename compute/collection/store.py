@@ -6611,18 +6611,56 @@ class Store:
         yields no-box frames too (with ``bbox = None``), so this count matches the
         iterator's yield exactly — the progress bar reaches 100%. Both bounds ``None``
         counts the whole store.
+
+        Runs on its OWN short-lived WAL read connection, NOT the shared write-locked
+        one — the move ``tuning_calendar`` / ``lighting_histogram`` / ``labeled_visits``
+        make, for the same reason. UNBOUNDED it is the identify pass's whole-store
+        denominator, and the plan is already the good one: it drives from
+        ``idx_analysis_analyzer_verdict`` straight to the detected minority (1 ms for
+        that partition) and the cost is the per-row ``frames`` rowid probe across the
+        whole table. Measured on a 4.7M-frame / 47.6k-detection replica with no
+        ``ANALYZE`` (the state the real store is in — changelog 266): 4.9 s. Holding
+        the write lock for that once per job start is the collector starvation entries
+        102-105 removed, and the Activity page's whole-store "Identify all" makes the
+        unbounded call routine rather than a curl-only path.
+
+        The move applies to EVERY caller, not just the unbounded one: ``run_identify``
+        takes this count once per job, so a live-naming tick pays it per visit span (up
+        to ``_MAX_SPANS_PER_TICK``), as does the per-visit route. Measured on the same
+        replica, a connect + pragma + close is 0.044 ms — ~0.4 ms/s at the tick's worst
+        case, against the seconds the bounded query itself used to be able to hold the
+        shared lock for. A bounded count is cheap either way; it is the whole-store one
+        that made the move necessary.
+
+        Either way ``total`` is a START-OF-JOB SNAPSHOT, and reading it off a second
+        connection only sees COMMITTED rows. Neither is new: the always-on detection
+        worker keeps writing verdicts DURING a pass, so frames can enter the pass's
+        universe after the denominator was taken and ``done`` can pass ``total``
+        regardless of which connection counted. Progress is a display value; nothing
+        branches on it.
+
+        The ``frames`` join is what costs, and it is NOT removable: ``iter_unidentified``
+        selects ``f.path`` and joins the same way, and this count is documented to match
+        that yield exactly. Eviction deletes a frame's ``analysis`` rows with it
+        (app-level, not an FK cascade), so dropping the join would *usually* agree — but
+        any orphan verdict would inflate the denominator and the progress bar would never
+        reach 100%.
         """
         range_frags, range_params = _range_bounds("f.id", since_id, until_id)
         range_sql = "".join(" AND " + frag for frag in range_frags)
         params: list = ["yolo-serial", int(model_version_id)] + range_params
-        with self._lock:
-            (count,) = self._conn.execute(
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            (count,) = conn.execute(
                 "SELECT COUNT(*) FROM frames f"
                 " JOIN analysis a ON a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1"
                 " LEFT JOIN identifications i ON i.frame_id = f.id AND i.model_version_id = ?"
                 " WHERE i.frame_id IS NULL" + range_sql,
                 params,
             ).fetchone()
+        finally:
+            conn.close()
         return int(count)
 
     def write_identifications_batch(

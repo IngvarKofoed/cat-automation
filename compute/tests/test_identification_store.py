@@ -459,6 +459,64 @@ def test_iter_unidentified_is_per_model(tmp_path):
     assert store.count_unidentified(v2) == 1
 
 
+def test_count_unidentified_reads_writes_made_on_the_shared_connection(tmp_path):
+    """It runs on its OWN short-lived connection, so it must not read a stale snapshot.
+
+    The count moved off the shared write-locked connection because unbounded it measures
+    ~5 s at the real store's size (4.7M frames), and the whole-store "Identify all" makes
+    that call routine — holding the write lock for it is the collector starvation
+    changelog 102-105 removed. A second connection only sees COMMITTED data, so this
+    pins the property that hazard turns on: every write below lands through
+    ``self._conn`` and must be visible to the very next count, with no commit of its own
+    in between.
+    """
+    store = _store(tmp_path)
+    vid = _add_version(store)
+    cat = store.create_cat("A")["id"]
+
+    assert store.count_unidentified(vid) == 0  # empty store, fresh connection each call
+
+    f1 = _add(store, 1000)
+    store.write_analysis(f1, "yolo-serial", True, 0.9, _boxes_detail([[0, 0, 4, 4, 0.9]]))
+    assert store.count_unidentified(vid) == 1  # sees the just-written verdict
+
+    f2 = _add(store, 2000)
+    store.write_analysis(f2, "yolo-serial", True, 0.8, _boxes_detail([[0, 0, 4, 4, 0.8]]))
+    assert store.count_unidentified(vid) == 2
+
+    # A batched identification write must drop f1 out on the next count — this is the
+    # resume predicate the pass's progress denominator depends on.
+    store.write_identifications_batch([(f1, vid, cat, 0.2, [0, 0, 4, 4])])
+    assert store.count_unidentified(vid) == 1
+    # The count is documented to match the iterator's yield exactly, and the two now
+    # read DIFFERENT connections — so pin that here rather than trusting it.
+    assert store.count_unidentified(vid) == len(list(store.iter_unidentified(vid)))
+
+
+def test_count_unidentified_follows_eviction(tmp_path):
+    """Eviction deletes through the SHARED connection; the count reads its own one.
+
+    A frame's `analysis` rows go with it in `_evict_locked`, so an evicted detection
+    must leave the denominator too — otherwise the identify pass's progress could never
+    reach 100%, since `iter_unidentified` cannot yield a frame that no longer exists.
+    Sized like `test_identifications_evict_with_their_frames`: a cap holding exactly
+    three frames, so the fourth insert evicts the oldest.
+    """
+    store = _store(tmp_path, max_bytes=3 * len(_JPEG_BODY))
+    vid = _add_version(store)
+
+    f1 = _add(store, 1000)
+    f2 = _add(store, 2000)
+    f3 = _add(store, 3000)
+    for fid in (f1, f2, f3):
+        store.write_analysis(fid, "yolo-serial", True, 0.9, _boxes_detail([[0, 0, 4, 4, 0.9]]))
+    assert store.count_unidentified(vid) == 3
+
+    _add(store, 4000)  # evicts f1 (oldest-first) along with its yolo-serial verdict
+    assert store.count_unidentified(vid) == 2
+    assert store.count_unidentified(vid) == len(list(store.iter_unidentified(vid)))
+
+
 def test_iter_unidentified_until_and_since_id_cap(tmp_path):
     store = _store(tmp_path)
     vid = _add_version(store)

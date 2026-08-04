@@ -4225,7 +4225,8 @@
           <label class="note"><input type="checkbox" id="acHide"> Hide our cats</label>
           <span class="grow"></span>
           <button id="acReload">Reload</button>
-          <button id="acIdentify" title="Name historical visits against the active gallery">Identify</button>
+          <button id="acIdentify" title="Name the LOADED visits against the active gallery">Identify</button>
+          <button id="acIdentifyAll" title="Name every detected frame in the store against the active gallery">Identify all</button>
         </div>
         <div id="acNote" class="note" style="margin-top:6px"></div>
       </div>
@@ -4487,9 +4488,35 @@
               + `${more ? ' (Show older first to cover more)' : ''} — progress on Model building.`);
       } catch (e) { flash('Identify: ' + e.message); }
     }
+
+    // The WHOLE-STORE pass. `/api/identify/run` takes both bounds as OPTIONAL — omitting
+    // them is what "unbounded" means everywhere else — so this is the same endpoint with
+    // no window rather than a second one. It exists because Identify above is scoped to
+    // the LOADED visits and `/api/events` caps at 500, so "Show older" cannot reach the
+    // whole store however many times it is pressed: promoting a gallery orphans EVERY
+    // stored identification (they are keyed by model_version_id), and only an unbounded
+    // pass names the history back to the store's oldest frame.
+    //   Confirmed first because the scope is the one thing the two buttons differ on and
+    // the cost is nothing alike — a page of 100 visits vs every detected frame in the
+    // store. Deliberately NOT preceded by a "how many remain" count: unbounded
+    // `count_unidentified` measures ~5 s at this store's size, so fetching it here would
+    // freeze the click for that long to tell the operator what the job's own progress row
+    // (done/total, rate, ETA) says a moment later anyway.
+    async function identifyAll() {
+      if (!confirm('Identify EVERY detected frame in the store against the active gallery?'
+                   + '\n\nThis names all history, not just the loaded visits. It is a long GPU'
+                   + ' job — resumable and cancelable, and progress shows on Model building.')) return;
+      try {
+        // No body fields at all = no window. `{}` rather than omitted, so the request
+        // still carries the JSON content type the endpoint's body model expects.
+        await api('POST', '/api/identify/run', {});
+        flash('Identify enqueued over the WHOLE store — progress on Model building.');
+      } catch (e) { flash('Identify all: ' + e.message); }
+    }
     $('#acReload', view).addEventListener('click', loadEvents);
     $('#acHide', view).addEventListener('change', renderGrid);
     $('#acIdentify', view).addEventListener('click', identifyPass);
+    $('#acIdentifyAll', view).addEventListener('click', identifyAll);
     $('#acOlder', view).addEventListener('click', loadOlderEvents);
 
     loadEvents();

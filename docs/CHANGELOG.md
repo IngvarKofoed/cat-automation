@@ -2213,3 +2213,98 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      and `cats_overview` share it) or debouncing the client refetch — so it needs a
      decision, not a patch. Per-span reads are ~5 ms, so this is added latency, not the
      19.5 s class of entries 102-105.
+
+355. The validation-runs table gained a **Visits** column — the held-out visits actually
+     scored, which is the sample the accuracy is measured over. Crops was the only count
+     on the row and is the wrong x-axis for "did more labelling buy anything": visit-held-out
+     scoring hides a visit WHOLE, so crops added inside visits already present move nothing.
+     Read off the stored `metrics.visits`; frontend only.
+
+356. That cell reports what the count and the score fail at INDEPENDENTLY. An unavailable
+     block still shows `N found` (`n_groups` is measured before the scoring gives up), and a
+     dim `+N` names the unscoreable visits — a cat with one visit has its true answer
+     structurally absent from the gallery, so no number about it can exist until it visits
+     again. That is the sharpest navigation item on the row and was buried in a tooltip.
+
+357. Known blocker for a per-cat trend, found while scoping one: the visit confusion matrix
+     IS persisted, but nothing records WHICH CAT each row is. `_run_metrics` keeps only
+     `visits` + `excluded_cat_ids`, dropping the top-level `cats` index→id map, and the index
+     is positional over the cats present in that run — so excluding one cat shifts every
+     index above it and two runs' row 3 are different cats. Existing rows are untrendable
+     and cannot be back-filled (a re-run measures today's labels). Fix is additive: persist
+     `cats` beside `visits`; the trend then starts from the next run.
+
+358. Per-cat recall now sits on the Model page's "Cats to enrol" table — visits scored,
+     recall with its declined share, and a day/night pair — so the weakest cat is visible
+     where the enrol/cap decision is made. That card's hint already said recall tracks
+     visits rather than crops and a cat can hold the most crops and still be worst
+     recognised; it now shows the number instead of only naming it.
+     Spec: docs/specs/2026-08-06-per-cat-recall-on-enrol-table.md.
+
+359. `_score_visits` returns `per_cat`, derived beside the `accuracy` built from the same
+     counts so the two can never contradict each other. Because `_visits_block` spreads
+     that return and each `regimes[name]` IS a `_score_visits` return, one addition lands
+     per-cat rows on the mixed block AND both regimes — and the whole `visits` block was
+     already persisted and lifted, so `runner.py`, `probe.py` and the store are untouched.
+     Rows self-identify by `cat_id`, retiring the positional confusion index (entry 357)
+     rather than teaching a second consumer to read it.
+
+360. Deliberately NOT passed to the `cross` cells: per-cat cross-regime is a non-goal, and
+     computing rows nothing renders would put a plausible-looking but unread number into
+     every stored run.
+
+361. Recall is `correct/(correct+wrong)` with declined reported beside it, never folded in
+     — at the door "named the wrong cat" and "declined to name" mean opposite things. So
+     a cat whose every visit was declined reads `— · 100%`: the dash is honest (nothing
+     was decided, which is not a recall of zero) and the 100% is what explains it.
+     Five cell states in all, each distinguishable: scored, nothing-decided, unscoreable
+     (`0 +1`), absent from the run, and a run with no per-cat data at all.
+
+362. The frozen columns are stamped with the run behind them and DIM when it no longer
+     matches the Build grades or the enrol ticks — both, since an exclusion changes which
+     cats every held-out visit was matched against. Dim rather than hide: the numbers stay
+     the best available reading, and hiding them on each checkbox toggle would flicker the
+     column during exactly the fiddling the table is for.
+
+363. Comparability normalises both sides, because neither is stored in the form the compare
+     implies. `all` is NOT equal to `gallery+ok+poor` — an explicit grade filter excludes
+     NULL-quality crops, so they score different sets — while an absent, null, and empty
+     exclusion list all mean "excluded nobody" (`_run_metrics` omits the key when empty,
+     `getExcluded()` returns null), which unnormalised would dim permanently in the
+     commonest configuration.
+
+364. Growth in the labelled set is NOTED ("+N crops labelled since"), never dimmed — it
+     would grey the columns on the very next label, and watching that number grow is the
+     point. Reported only while the run is otherwise comparable, since across different
+     grades the two crop counts are over different sets.
+
+365. Three empty stamps that would otherwise render alike as a blank line over three
+     dashes: no run yet, a runs fetch that FAILED (`loadRuns` swallows its errors, so
+     silence reads as "no run exists"), and runs that carry no per-cat data. The last
+     names the deployment gap too — "if a fresh run still shows this, the compute PC is on
+     an older build" — rather than only the benign cause, per entries 164/173/183.
+
+366. `loadRuns` gained a sequence guard now that it drives the cats table as well as its
+     own; two overlapping fetches landing out of order would paint an older run's recall
+     under the newer stamp. A grade tick re-renders WITHOUT refetching it (verified: the
+     runs request count is unchanged across a tick) — the ticks change no run, only the
+     client-side comparability verdict, and refetching per checkbox would walk back
+     entry 201.
+
+367. Review repairs to the above. The "+N crops labelled since" note counted EXCLUDED cats
+     on one side only — `enrollable_cats` returns every active cat while the run's
+     `n_crops` was counted post-exclusion — so holding a cat back made the stamp report its
+     whole crop count as newly labelled, on every render, forever. Now summed over the same
+     set the run used, which `runComparable` has already established.
+
+368. Three smaller ones. The 5→8 column change left the flexible kind column 50px at the
+     shared 720px table floor and clipped "neighbour"; it has its OWN 780px floor rather
+     than a raised shared one, since the other `wtable` users have different geometry.
+     Driving `renderCats` from `loadRuns` let it win the mount race and assert "No active
+     cats" — a claim, not a blank — until the roster landed; it now waits.
+
+369. A run that RAN and reported `available:false` (no cat with two visits — an ordinary
+     early-dataset state) no longer draws the "compute PC is on an older build" stamp: it
+     is a data state, re-running Validate reproduces it, and the message sent the operator
+     after a deployment problem instead of "label more distinct visits". The older-build
+     wording now fires only when no run carries a visits block at all.

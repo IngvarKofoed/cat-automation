@@ -106,6 +106,51 @@ def _visit_outcome(
     return ("correct" if named == true_cat else "wrong"), named
 
 
+def _per_cat(
+    conf: np.ndarray,
+    unscoreable: "dict[int, int]",
+    cats: "list[dict] | None",
+    n_cats: int,
+) -> "list[dict] | None":
+    """Per-cat rows off the visit confusion matrix, or ``None`` without ``cats``.
+
+    ``conf`` row ``i`` is cat ``i``'s held-out visits, its final column *declined*, so
+    ``correct``/``wrong``/``declined`` come straight off the row and ``scored`` is its
+    sum. ``recall`` is ``correct / (correct + wrong)`` — the SAME convention as the
+    block's ``accuracy``, deliberately: declined is reported beside it, never folded in,
+    because for a resident at the door "named the wrong cat" and "declined to name" mean
+    opposite things.
+
+    ``recall`` is ``None`` when nothing was decided (every visit declined), which is not
+    a recall of zero — the caller renders the two differently. An entirely-unscoreable
+    cat has an all-zero row and its count only in ``unscoreable``; both read as "no
+    number can exist for this cat yet", which is why the tally is folded onto the cat's
+    own row here instead of being left as a parallel index-keyed list.
+    """
+    if not cats:
+        return None
+    out = []
+    for i, cat in enumerate(cats[:n_cats]):
+        row = conf[i]
+        declined = int(row[n_cats])
+        correct = int(row[i])
+        scored = int(row.sum())
+        wrong = scored - correct - declined
+        decided = correct + wrong
+        out.append({
+            "cat_id": cat.get("cat_id"),
+            "cat_name": cat.get("cat_name"),
+            "scored": scored,
+            "correct": correct,
+            "wrong": wrong,
+            "declined": declined,
+            "recall": (correct / decided) if decided else None,
+            "declined_rate": (declined / scored) if scored else None,
+            "unscoreable": int(unscoreable.get(i, 0)),
+        })
+    return out
+
+
 def _score_visits(
     dist: np.ndarray,
     y: np.ndarray,
@@ -116,6 +161,7 @@ def _score_visits(
     curve_ts: "list[float]",
     aggregate,
     n_cats: int,
+    cats: "list[dict] | None" = None,
 ) -> dict:
     """Score every held-out group against the rest of the matrix.
 
@@ -124,6 +170,12 @@ def _score_visits(
     to do. ``gal_mask`` optionally restricts the gallery side to a subset of columns
     (used for the day-only / night-only cross-regime cells); ``None`` = the full mixed
     gallery.
+
+    ``cats`` (``[{cat_id, cat_name, n}]``, positionally aligned with the confusion
+    index) adds a ``per_cat`` breakdown of the same counts, each row self-identifying by
+    ``cat_id``. Derived HERE rather than by a reader of ``confusion`` so it cannot drift
+    from ``accuracy`` below, and so no consumer has to know that the index is positional
+    over the cats present in this run — an index that shifts whenever a cat is excluded.
 
     A group whose true cat has NO crop left on the gallery side is *unscoreable*: the
     correct answer is structurally absent, so it could only ever be wrong. Those are
@@ -168,6 +220,7 @@ def _score_visits(
 
     decided = counts["correct"] + counts["wrong"]
     return {
+        "per_cat": _per_cat(conf, unscoreable, cats, n_cats),
         "n_scored": n_scored,
         "correct": counts["correct"],
         "wrong": counts["wrong"],
@@ -208,6 +261,7 @@ def _visits_block(
     extra_thresholds: "dict[str, float] | None",
     labeled_ts_groups: "int | None",
     gap_ms: "int | None",
+    cats: "list[dict] | None" = None,
 ) -> dict:
     """Assemble the ``visits`` block: headline, sweep curve, day/night, cross-regime.
 
@@ -262,7 +316,7 @@ def _visits_block(
     curve_ts = sorted(set(np.linspace(lo, hi, max(2, int(n_curve))).tolist()) | marks)
 
     scored = _score_visits(
-        dist, y, groups, group_true, None, threshold, curve_ts, aggregate, n_cats
+        dist, y, groups, group_true, None, threshold, curve_ts, aggregate, n_cats, cats
     )
     out = {**base, "available": True, "reason": None, **scored,
            "marks": dict(extra_thresholds or {})}
@@ -300,8 +354,12 @@ def _visits_block(
         t_sel = [t for _G, t in sel]
         # vs the MIXED gallery — the plain day/night split. Identical to the "vs mixed"
         # column of the cross table, so the two can never disagree.
+        # `cats` is passed here too, so each regime carries its own per-cat rows — that
+        # is the whole day/night column, free. NOT to the cross cells below: per-cat
+        # cross-regime is a non-goal, and computing rows nothing reads would put a
+        # plausible-looking but unsurfaced number into every stored run.
         regimes[name] = _score_visits(
-            dist, y, g_sel, t_sel, None, threshold, [], aggregate, n_cats
+            dist, y, g_sel, t_sel, None, threshold, [], aggregate, n_cats, cats
         )
         for gal_name, gal in (("day", day_mask), ("night", night_mask)):
             cross[f"{name}_vs_{gal_name}"] = (
@@ -466,7 +524,7 @@ def run_feasibility(
             marks.setdefault("crop_level", threshold)
         result["visits"] = _visits_block(
             dist, y, n_cats, visit_groups, visit_night, aggregate,
-            threshold_cross, n_curve, marks, labeled_ts_groups, gap_ms,
+            threshold_cross, n_curve, marks, labeled_ts_groups, gap_ms, cats,
         )
         # Only on an AVAILABLE block. `_visits_block` deliberately returns none of its
         # computed fields when it reports "nothing was measured", and attaching a real

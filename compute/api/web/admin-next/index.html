@@ -307,6 +307,11 @@
   /* Validation runs gained a 9th column (Visit) — the honest headline — so it needs a wider
      floor than the 8-column versions table before the wrapper scrolls. */
   .qtable.wtable.rtable { min-width: 800px; }
+  /* Cats-to-enrol carries 8 columns of which 7 are FIXED (670px total), so at the shared
+     720px floor the flexible kind column was left 50px and clipped "neighbour" mid-word.
+     Its own floor, not a bigger shared one: the other wtable users have different geometry
+     and would gain dead space. Below this .qwrap scrolls, which is the intended behaviour. */
+  .qtable.wtable.ctable { min-width: 780px; }
   .qstatus { display: inline-flex; align-items: center; gap: 6px; }
   .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .qstatus.running .dot { background: var(--warn); }
@@ -3724,6 +3729,7 @@
         <h3>Cats to enrol <span class="note">(applies to Validate and Build)</span></h3>
         <div id="mCats" class="qwrap"><span class="note">…</span></div>
         <span id="mCatsNote" class="note"></span>
+        <div id="mCatsStamp" class="note" style="margin-top:4px"></div>
         <p class="hint">Untick a cat to leave it out of the next build — a cat that is not
           worth enrolling <i>yet</i> (too few visits to represent), held back WITHOUT
           retiring it. Retiring is the wrong tool here: it also drops the cat from the
@@ -3793,6 +3799,7 @@
     // didn't help — having measured a different cat set. Page state only; a reload re-ticks
     // everyone, so the field always fails toward enrolling.
     let enrollable = [];
+    let enrollLoaded = false;
     const excluded = new Set();
     let catsSeq = 0;
 
@@ -3801,22 +3808,131 @@
     // drop from every repeated build.
     const getExcluded = () => (excluded.size ? [...excluded].sort((a, b) => a - b) : null);
 
+    // --- Per-cat recall, read off the latest qualifying validation run ------------------
+    // Which cat to label next is a per-cat question, and the runs table answers only the
+    // household-wide one. These columns are FROZEN (they belong to a past run) while the
+    // crop counts beside them are live, so everything below is about never letting the
+    // two be read as one reading.
+    let latestRun = null;      // newest run carrying per-cat rows, or null
+    let newestVisitsRun = null; // newest run with a visits block AT ALL, per_cat or not
+    let runsCount = 0;         // runs that exist at all — separates "none" from "none qualifying"
+    let runsLoaded = false;
+    let runsFailed = false;
+
+    // Mirrors probe._quality_slug: tier-ordered '+'-join, 'all' for no filter. 'all' is
+    // NOT interchangeable with 'gallery+ok+poor' — an explicit grade filter excludes
+    // NULL-quality crops (store.labeled_crops), so the two select different sets and a
+    // run recorded under one did not score the other.
+    const QUAL_ORDER = ['gallery', 'ok', 'poor'];
+    const qualSlug = (arr) =>
+      (arr && arr.length ? QUAL_ORDER.filter((q) => arr.includes(q)).join('+') : 'all');
+    // Absent / null / empty all mean "excluded nobody": _run_metrics omits the key
+    // entirely when empty while getExcluded() returns null, and a strict compare of the
+    // two would dim the columns permanently in the commonest configuration.
+    const exclKey = (ids) => (ids && ids.length ? [...ids].slice().sort((a, b) => a - b).join(',') : '');
+
+    // Both axes, not grades alone: an exclusion changes which cats each held-out visit was
+    // matched against, so it moves EVERY cat's recall, not just the excluded one's.
+    function runComparable(run) {
+      if (!run) return false;
+      const m = run.metrics || {};
+      return (run.quality || 'all') === qualSlug(getQualities('b'))
+        && exclKey(m.excluded_cat_ids) === exclKey(getExcluded());
+    }
+    // cat_id -> row, for the mixed block and each regime. Rows self-identify, so nothing
+    // here has to know that the confusion index is positional over the run's own cat set.
+    function perCatOf(run) {
+      const v = run && run.metrics && run.metrics.visits;
+      if (!v || !v.available || !Array.isArray(v.per_cat)) return null;
+      const index = (rows) => new Map((rows || []).map((r) => [r.cat_id, r]));
+      const rg = v.regimes || null;
+      return {
+        all: index(v.per_cat),
+        day: index(rg && rg.day && rg.day.per_cat),
+        night: index(rg && rg.night && rg.night.per_cat),
+        hasRegimes: !!rg,
+      };
+    }
+
+    // `scored` with a dim `+N` unscoreable — the same shape and the same convention as the
+    // runs table's Visits cell, so one quantity is not counted two ways on two cards.
+    // `k` is the shared cell opener: every frozen cell carries the stale class together,
+    // so the three columns can never dim out of step with each other.
+    const rcell = (stale, dim, title) =>
+      `<td class="num${stale || dim ? ' dim' : ''}"${title ? ` title="${esc(title)}"` : ''}>`;
+
+    function visitsCatCell(row, stale) {
+      if (!row) return rcell(stale, true, 'Not in that validation run — excluded from it, or labelled since it ran.') + '—</td>';
+      const un = row.unscoreable || 0;
+      const t = `${row.scored} held-out visit(s) scored`
+        + (un ? ` · +${un} unscoreable: this cat has no OTHER visit to be matched against, so no number about it can exist yet.` : '');
+      return rcell(stale, false, t) + fmtInt(row.scored)
+        + (un ? `<span class="dim"> +${fmtInt(un)}</span>` : '') + '</td>';
+    }
+    // `69% · 0%` — recall then the declined share, dim. Declined is never folded into
+    // recall: for a resident at the door "named the wrong cat" and "declined to name" mean
+    // opposite things, and the run's own headline draws the same line.
+    function recallCell(row, stale) {
+      if (!row) return rcell(stale, true, '') + '—</td>';
+      if (row.scored === 0) {
+        return rcell(stale, true, 'Every visit of this cat was held out with no peer to match it against — nothing could be scored.') + '—</td>';
+      }
+      // recall null with visits scored means every one was DECLINED. Not a recall of
+      // zero: nothing was decided, and the 100% beside it is what says so.
+      const t = `${row.correct} correct · ${row.wrong} wrong · ${row.declined} declined,`
+        + ` of ${row.scored} visits scored`;
+      return rcell(stale, false, t) + pct(row.recall)
+        + `<span class="dim"> · ${pct(row.declined_rate)}</span></td>`;
+    }
+    // Each side carries its own scored count in the tooltip: 30 day visits and 1 night
+    // visit renders `97% / 100%`, and without the counts that 100% is indistinguishable
+    // from a solid night result — in the column that exists to find weak-at-night cats.
+    function regimeCell(per, catId, stale) {
+      if (!per.hasRegimes) {
+        // Phrased about THAT RUN, not the present: a location set since would make a
+        // present-tense "no location" stamp wrong.
+        return rcell(stale, true, 'That validation run had no location set, so it could not split day from night.') + '—</td>';
+      }
+      const d = per.day.get(catId), n = per.night.get(catId);
+      const side = (r) => (r && r.scored ? pct(r.recall) : '—');
+      const cnt = (label, r) => `${label}: ${r && r.scored ? `${r.scored} visit(s)` : 'none'}`;
+      return rcell(stale, false, `${cnt('day', d)} · ${cnt('night', n)}`)
+        + `${side(d)} <span class="dim">/</span> ${side(n)}</td>`;
+    }
+
     function catsTable() {
+      // "No cats" is a CLAIM, and until the roster has landed it is one we can't make.
+      // renderCats is now also driven by loadRuns, which routinely wins the mount race,
+      // so without this the card asserts the household has no cats — and points at a page
+      // to go add them — for as long as the enrollable fetch takes.
+      if (!enrollLoaded) return '<span class="note">…</span>';
       if (!enrollable.length) {
         return '<span class="note">No active cats — add one on <a href="#cats">Cats</a>.</span>';
       }
       const COMMITS_TIP = 'Distinct label commits — one keypress labels one visit, so this '
         + 'stands in for a visit count. Approximate: it reads a few percent high.';
-      return '<table class="qtable wtable">'
+      const per = perCatOf(latestRun);
+      // Dim rather than hide when the run no longer matches the current selection: the
+      // numbers are still the best available reading, and hiding them on every checkbox
+      // toggle would flicker the column during exactly the fiddling this table is for.
+      const stale = !!per && !runComparable(latestRun);
+      const noRun = '<td class="num dim">—</td>';
+      return '<table class="qtable wtable ctable">'
         // The KIND column absorbs the slack, not Cat: with Cat flexible, "resident" was
         // pushed to the far right of the row, reading as unrelated to the name beside it.
-        + '<colgroup><col style="width:64px"><col style="width:180px"><col>'
-        + '<col style="width:90px"><col style="width:120px"></colgroup>'
+        + '<colgroup><col style="width:56px"><col style="width:150px"><col>'
+        + '<col style="width:78px"><col style="width:104px">'
+        + '<col style="width:74px"><col style="width:104px"><col style="width:104px"></colgroup>'
         + '<thead><tr><th>Enrol</th><th>Cat</th><th></th>'
         + '<th class="num" title="Crops at the Build grades — what a build would embed">Crops</th>'
-        + `<th class="num" title="${esc(COMMITS_TIP)}">Label commits</th></tr></thead><tbody>`
+        + `<th class="num" title="${esc(COMMITS_TIP)}">Label commits</th>`
+        + '<th class="num" title="Held-out visits this cat was scored over in the validation run named below. A dim +N is visits that could not be scored at all.">Visits</th>'
+        + '<th class="num" title="Correct of the visits the run DECIDED for this cat, then (dim) the share it declined to name. Frozen from the run named below — it does not follow the ticks above.">Recall</th>'
+        + '<th class="num" title="The same recall scored over that cat&#39;s day visits and its night visits separately. Hover a cell for how many visits each side holds.">Day / Night</th>'
+        + '</tr></thead><tbody>'
         + enrollable.map((c) => {
           const off = excluded.has(c.cat_id);
+          const row = per ? per.all.get(c.cat_id) : null;
           return `<tr${off ? ' class="dim"' : ''}>`
             + `<td><input type="checkbox" data-cat="${c.cat_id}"${off ? '' : ' checked'}`
             + ` aria-label="enrol ${esc(c.cat_name)}"></td>`
@@ -3826,7 +3942,11 @@
             // knows its own cats better than a threshold would.
             + `<td class="note">${c.is_resident ? 'resident' : 'neighbour'}</td>`
             + `<td class="num">${fmtInt(c.crops)}</td>`
-            + `<td class="num">${fmtInt(c.label_commits)}</td></tr>`;
+            + `<td class="num">${fmtInt(c.label_commits)}</td>`
+            + (per
+              ? visitsCatCell(row, stale) + recallCell(row, stale) + regimeCell(per, c.cat_id, stale)
+              : noRun + noRun + noRun)
+            + '</tr>';
         }).join('')
         + '</tbody></table>';
     }
@@ -3842,6 +3962,67 @@
         renderCatsNote();
       }));
       renderCatsNote();
+      renderCatsStamp();
+    }
+    // Which run the frozen columns came from — and, when there is none, WHICH kind of
+    // none. Three states that would otherwise render identically (blank stamp, three
+    // dashes) and mean completely different things.
+    function renderCatsStamp() {
+      const el = $('#mCatsStamp', view);
+      el.classList.remove('bad');
+      if (!enrollable.length || !runsLoaded) { el.textContent = ''; return; }
+      if (runsFailed) {
+        // loadRuns swallows its errors by design, so without this a failed fetch is
+        // indistinguishable from "no run has ever been recorded".
+        el.classList.add('bad');
+        el.textContent = 'Could not load validation runs — the recall columns may be stale or empty.';
+        return;
+      }
+      if (!latestRun) {
+        // A run that RAN and reported available:false is a data state, not a stale build —
+        // and re-running Validate will keep producing it, so the older-build wording would
+        // send the operator after a deployment problem when the answer is "label more
+        // distinct visits". The runs table already draws this line one card below; the
+        // stamp has to draw it the same way.
+        const v = newestVisitsRun && newestVisitsRun.metrics && newestVisitsRun.metrics.visits;
+        if (v && v.available === false) {
+          el.textContent = 'The most recent validation run could not measure per-cat recall: '
+            + (v.reason === 'too_few_visits'
+              ? 'fewer than two visits, so none could be held out.'
+              : 'no cat has two separate visits, so the visit task could not be calibrated.')
+            + ' Label more distinct visits — nothing was measured, which is not a score of zero.';
+          return;
+        }
+        el.textContent = runsCount
+          // Only now is a stale build the likely story. Naming just the benign cause is
+          // entries 164/173/183's mistake — the dev proxy serves a local admin against a
+          // remote backend, so the page routinely runs ahead of its compute PC.
+          ? 'No validation run carries per-cat scoring yet — re-run Validate below. '
+            + 'If a fresh run still shows this, the compute PC is on an older build.'
+          : 'No validation run yet — run Validate below to measure per-cat recall.';
+        return;
+      }
+      const m = latestRun.metrics || {};
+      const bits = [`From validation run ${fmtTs(latestRun.ts)}`, latestRun.quality || 'all'];
+      const ex = (m.excluded_cat_ids || []).map((id) => catNames.get(id) || `#${id}`);
+      if (ex.length) bits.push(`−${ex.join(', −')}`);
+      if (runComparable(latestRun)) {
+        // Staleness in TIME is reported, never dimmed: it would grey the columns on the
+        // very next label, and watching this number grow is the point of the feature.
+        // Only meaningful when the run scored the current grade/exclusion selection —
+        // otherwise the two crop counts are over different sets.
+        // Over the SAME cat set the run used. `enrollable` carries every active cat
+        // regardless of the ticks (enrollable_cats takes no exclusion), while the run's
+        // n_crops was counted post-exclusion — so summing unfiltered would report an
+        // excluded cat's whole crop count as "labelled since", on every render, with
+        // nothing labelled. runComparable has already established the two sets match.
+        const now = enrollable.reduce((a, c) => a + (excluded.has(c.cat_id) ? 0 : (c.crops || 0)), 0);
+        const grew = now - (latestRun.n_crops || 0);
+        if (grew > 0) bits.push(`+${fmtInt(grew)} crops labelled since`);
+      } else {
+        bits.push('does not match the Build grades / enrol ticks above — recall dimmed');
+      }
+      el.textContent = bits.join(' · ');
     }
     function renderCatsNote() {
       const quals = getQualities('b');
@@ -3867,6 +4048,7 @@
         // Sequence guard: a grade change fires a second fetch, and a slow earlier one
         // landing afterwards would restore the previous grades' counts (entry 235).
         if (!alive || seq !== catsSeq) return;
+        enrollLoaded = true;
         enrollable = r.cats || [];
         // Prune ticks for cats that left the list (retired elsewhere meanwhile): they are
         // already excluded by `active_only`, and keeping an id the panel cannot show would
@@ -4046,6 +4228,34 @@
       // from a run whose visit scoring could not be calibrated ("n/a") — and both are
       // different from a real low score. kNN stays for comparability with those old runs,
       // but it reads HIGH by construction (same-visit near-duplicates), hence the title.
+      // The SAMPLE behind the accuracy beside it. Crops is the wrong x-axis for "did more
+      // labelling buy anything": visit-held-out scoring hides a visit WHOLE, so thousands of
+      // extra crops inside visits already present move nothing — only more distinct visits
+      // per cat can. A run's crop count can therefore climb all week while this stands still,
+      // which is exactly the reading the row has to make available at a glance.
+      const visitsCell = (r) => {
+        const v = r.metrics && r.metrics.visits;
+        if (!v) return '<td class="num dim" title="This run predates visit-level scoring — not measured. Re-run to get it.">—</td>';
+        const commits = v.labeled_ts_groups == null ? '' : `, from ${fmtInt(v.labeled_ts_groups)} label commits`;
+        const gap = v.gap_ms == null ? '' : ` at a ${Math.round(v.gap_ms / 1000)}s gap`;
+        // `n_groups` survives on an UNAVAILABLE block (it is measured before the scoring
+        // gives up), so a run that scored nothing still says how much it found — the count
+        // and the score fail independently and must read that way.
+        if (!v.available) {
+          return `<td class="num dim" title="${esc(`${fmtInt(v.n_groups)} visits were grouped${gap}${commits}, but none could be scored — see the accuracy column.`)}">`
+            + `${fmtInt(v.n_groups)}<span class="dim"> found</span></td>`;
+        }
+        // n_groups = n_scored + the unscoreable ones, exactly, so the suffix is that tally.
+        // Surfaced rather than left in the accuracy tooltip because it is the sharpest
+        // navigation item on the row: a cat with one visit has its true answer structurally
+        // absent from the gallery, so no number about it can exist until it visits again.
+        const un = (v.unscoreable || []).reduce((a, u) => a + u.n_visits, 0);
+        const t = `${fmtInt(v.n_scored)} held-out visits scored${gap}${commits}. This — not Crops — is the sample the`
+          + ` accuracy is measured over, and what more labelling has to grow to move it.`
+          + (un ? ` +${fmtInt(un)} unscoreable: their cat has no OTHER visit to be matched against, so they could only ever be wrong and are left out of the denominator.` : '');
+        return `<td class="num" title="${esc(t)}">${fmtInt(v.n_scored)}`
+          + (un ? `<span class="dim"> +${fmtInt(un)}</span>` : '') + '</td>';
+      };
       const visitCell = (r) => {
         const v = r.metrics && r.metrics.visits;
         if (!v) return '<td class="num dim" title="This run predates visit-level scoring — not measured. Re-run to get it.">—</td>';
@@ -4061,9 +4271,10 @@
           + `<span class="dim"> · ${pct(v.unknown_rate)}</span></td>`;
       };
       return '<table class="qtable wtable rtable">'
-        + '<colgroup><col style="width:15%"><col style="width:12%"><col style="width:8%"><col style="width:7%">'
-        + '<col style="width:13%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:20%"></colgroup>'
-        + '<thead><tr><th>Ran</th><th>Grades</th><th class="num" title="Crops scored — the labelled crops at those grades">Crops</th><th class="num">Cats</th>'
+        + '<colgroup><col style="width:14%"><col style="width:11%"><col style="width:7%"><col style="width:5%"><col style="width:8%">'
+        + '<col style="width:12%"><col style="width:7%"><col style="width:7%"><col style="width:8%"><col style="width:21%"></colgroup>'
+        + '<thead><tr><th>Ran</th><th>Grades</th><th class="num" title="Labelled crops at those grades. NOT the sample the visit accuracy is measured over — that is Visits. Crops can climb all week without this row moving.">Crops</th><th class="num">Cats</th>'
+        + '<th class="num" title="Held-out visits scored — the sample behind the accuracy beside it, and the number more labelling has to grow to move it. A dim &#43;N is visits that could not be scored at all, because their cat has no other visit to be matched against.">Visits</th>'
         + '<th class="num" title="Each visit hidden whole and matched against the others, named by Run&#39;s own vote rule. First number: correct of those it decided. Second (dim): the share it declined to name. This is the comparable number.">Visit · declined</th>'
         + '<th class="num" title="Leave-one-CROP-out. Reads high: a crop\'s nearest neighbour is usually the adjacent frame of its own visit. Kept for comparison with older runs.">kNN</th>'
         + '<th class="num">AUC</th><th class="num">Threshold</th><th></th></tr></thead><tbody>'
@@ -4073,6 +4284,7 @@
         + runs.map((r) => `<tr><td>${fmtTs(r.ts)}</td><td class="qname">${esc(r.quality || 'all')}`
           + `${exclNote(r.metrics && r.metrics.excluded_cat_ids)}</td>`
           + `<td class="num">${fmtInt(r.n_crops)}</td><td class="num">${fmtInt(r.n_cats)}</td>`
+          + visitsCell(r)
           + visitCell(r)
           + `<td class="num dim">${pct(r.knn_accuracy)}</td><td class="num">${f3(r.auc)}</td><td class="num">${f3(r.threshold)}</td>`
           + `<td class="num">${report(r)}`
@@ -4091,11 +4303,26 @@
       catch (e) { alert('delete failed: ' + e.message); }
     }
     const RUNS_SHOWN = 8;
+    let runsSeq = 0;
     async function loadRuns() {
+      // Sequence-guarded now that this drives the cats table too: it used to write only
+      // into #mRuns, but two overlapping fetches (mount plus a finished job) landing out
+      // of order would paint an older run's recall under the newer stamp.
+      const seq = ++runsSeq;
       try {
         const r = await api('GET', '/api/training/feasibility/runs');
-        if (!alive) return;
+        if (!alive || seq !== runsSeq) return;
         const runs = r.runs || [];
+        runsLoaded = true;
+        runsFailed = false;
+        runsCount = runs.length;
+        // The newest run that actually carries per-cat rows — NOT simply runs[0], which
+        // may be a legacy or an unavailable run sitting above perfectly usable data.
+        latestRun = runs.find((x) => perCatOf(x)) || null;
+        // Kept apart from latestRun: this one answers "did a run measure visits at all",
+        // which is what separates a data state from a stale build in the stamp above.
+        newestVisitsRun = runs.find((x) => x.metrics && x.metrics.visits) || null;
+        renderCats();
         // Say when the list is a slice. A capped list with nothing marking the cap reads as
         // "these are all the runs", which is how a comparison gets made against the wrong set.
         const more = runs.length > RUNS_SHOWN
@@ -4106,7 +4333,14 @@
         const byId = new Map(shown.map((r) => [String(r.run_id), r]));
         el.querySelectorAll('button[data-delrun]').forEach((b) =>
           b.addEventListener('click', () => deleteRun(byId.get(b.dataset.delrun))));
-      } catch (_) {}
+      } catch (_) {
+        // Keep whatever recall is already on screen — but SAY the fetch failed, or a
+        // blank stamp over three dashes reads as "no validation run exists".
+        if (!alive || seq !== runsSeq) return;
+        runsLoaded = true;
+        runsFailed = true;
+        renderCatsStamp();
+      }
     }
 
     // --- The job queue (the shared renderQueue, fed from the training status poll) ---

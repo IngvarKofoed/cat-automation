@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from compute.collection.store import Store
-from compute.identification.feasibility import run_feasibility
+from compute.identification.feasibility import _per_cat, run_feasibility
 
 _AGG = Store._aggregate_identity
 
@@ -336,3 +336,111 @@ def test_unavailable_block_carries_no_measurements():
     # An available block still reports both.
     ok = run_feasibility(ids, {}, vecs, visit_groups=groups, aggregate=_AGG)["visits"]
     assert ok["auc"] is not None and ok["threshold_balanced_acc"] is not None
+
+
+# --- per-cat breakdown -----------------------------------------------------------------
+# The rows the "Cats to enrol" table reads. Derived in `_score_visits` (not by a reader
+# of `confusion`) precisely so these invariants hold by construction.
+
+def test_per_cat_rows_self_identify_by_cat_id_not_position():
+    """The load-bearing property: a row names its cat, so a shifting index can't mislabel.
+
+    `confusion`'s index is positional over `sorted(set(cat_ids))`, so with a
+    non-contiguous id set (a cat retired, or excluded from this build) row 1 is NOT
+    cat 1. Reading per-cat data off the matrix without a map is what made this
+    unbuildable on stored runs; these rows carry the id themselves.
+    """
+    rng = np.random.default_rng(31)
+    ids, vecs, groups = _visit_data(rng, cats=3, visits_per_cat=3, crops_per_visit=4,
+                                    cat_sep=3.0)
+    # _visit_data labels cats 1..3; remap to a gappy, out-of-order set.
+    remap = {1: 11, 2: 3, 3: 7}
+    ids = [remap[i] for i in ids]
+    names = {11: "Mittens", 3: "Sultan", 7: "Store Jihn"}
+    v = run_feasibility(ids, names, vecs, visit_groups=groups, aggregate=_AGG)["visits"]
+
+    per_cat = v["per_cat"]
+    # Ordered by the same sorted-unique ids the confusion index uses.
+    assert [c["cat_id"] for c in per_cat] == [3, 7, 11]
+    assert [c["cat_name"] for c in per_cat] == ["Sultan", "Store Jihn", "Mittens"]
+
+
+def test_per_cat_counts_reconcile_with_the_confusion_matrix_and_headline():
+    """Rows are the same counts the block's own accuracy is built from — not a re-derivation."""
+    rng = np.random.default_rng(32)
+    ids, vecs, groups = _visit_data(rng, cats=3, visits_per_cat=4, crops_per_visit=4,
+                                    cat_sep=3.0)
+    v = run_feasibility(ids, {}, vecs, visit_groups=groups, aggregate=_AGG)["visits"]
+    per_cat, conf = v["per_cat"], v["confusion"]
+    n_cats = len(per_cat)
+
+    for i, c in enumerate(per_cat):
+        assert c["scored"] == sum(conf[i]), "scored is the confusion row sum"
+        assert c["correct"] == conf[i][i]
+        assert c["declined"] == conf[i][n_cats], "the final column is 'declined'"
+        assert c["correct"] + c["wrong"] + c["declined"] == c["scored"]
+
+    # And they roll up to the headline exactly — the per-cat column can never contradict
+    # the run's own number.
+    assert sum(c["correct"] for c in per_cat) == v["correct"]
+    assert sum(c["wrong"] for c in per_cat) == v["wrong"]
+    assert sum(c["declined"] for c in per_cat) == v["unknown"]
+    assert sum(c["scored"] for c in per_cat) == v["n_scored"]
+
+
+def test_per_cat_recall_excludes_declined_like_the_headline_accuracy():
+    """recall = correct/(correct+wrong): declined is reported beside it, never folded in.
+
+    For a resident at the door "named the wrong cat" and "declined to name" mean
+    opposite things, and the block's own `accuracy` already draws that line.
+    """
+    conf = np.array([
+        [6, 2, 0, 2],   # cat 0: 6 correct, 2 wrong, 2 declined  -> recall 6/8
+        [0, 0, 0, 5],   # cat 1: everything declined             -> recall None, not 0.0
+        [0, 0, 4, 0],   # cat 2: clean sweep (diagonal is col 2) -> recall 1.0
+    ], dtype=int)
+    rows = _per_cat(conf, {}, [{"cat_id": i + 1, "cat_name": f"c{i}"} for i in range(3)], 3)
+
+    assert rows[0]["recall"] == pytest.approx(6 / 8)
+    assert rows[0]["declined_rate"] == pytest.approx(2 / 10)
+    # Nothing decided is NOT a recall of zero — the reader renders the two differently.
+    assert rows[1]["recall"] is None and rows[1]["declined"] == 5
+    assert rows[1]["declined_rate"] == pytest.approx(1.0)
+    assert rows[2]["recall"] == pytest.approx(1.0)
+
+
+def test_per_cat_folds_the_unscoreable_tally_onto_the_cats_own_row():
+    """A single-visit cat has an all-zero row; its count survives on the row, not beside it."""
+    conf = np.zeros((2, 3), dtype=int)
+    conf[0] = [3, 0, 0]
+    rows = _per_cat(conf, {1: 2}, [{"cat_id": 10, "cat_name": "a"},
+                                   {"cat_id": 20, "cat_name": "b"}], 2)
+    assert rows[0]["unscoreable"] == 0 and rows[0]["scored"] == 3
+    # Zero scored AND unscoreable > 0 is "no number can exist yet", not a measured zero.
+    assert rows[1]["scored"] == 0 and rows[1]["recall"] is None
+    assert rows[1]["unscoreable"] == 2
+
+
+def test_each_regime_carries_per_cat_but_the_cross_cells_do_not():
+    """Day/night per-cat is free from the same addition; cross-regime is a non-goal.
+
+    Computing rows nothing surfaces would put a plausible-looking but unread number
+    into every stored run.
+    """
+    rng = np.random.default_rng(33)
+    ids, vecs, groups = _visit_data(rng, cats=3, visits_per_cat=4, crops_per_visit=4,
+                                    cat_sep=3.0)
+    nights = [i % 2 == 1 for i in range(len(groups))]
+    v = run_feasibility(ids, {}, vecs, visit_groups=groups, visit_night=nights,
+                        aggregate=_AGG)["visits"]
+
+    for regime in ("day", "night"):
+        rows = v["regimes"][regime]["per_cat"]
+        assert rows and all(r["cat_id"] is not None for r in rows)
+        # Each regime's rows sum to that regime's own scored count — the number the
+        # Day/Night tooltip has to show, so a 100% off one visit can't read as solid.
+        assert sum(r["scored"] for r in rows) == v["regimes"][regime]["n_scored"]
+
+    for cell in v["cross"].values():
+        if cell is not None:
+            assert cell["per_cat"] is None

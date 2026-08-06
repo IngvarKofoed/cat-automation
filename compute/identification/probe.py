@@ -28,6 +28,7 @@ import base64
 import html
 import io
 import json
+import math
 import os
 
 from compute.collection.store import _QUALITIES, Store
@@ -114,6 +115,121 @@ def _night_classifier(store):
         return None
 
 
+# Worst-first order for per-cat rows, shared by the TL;DR tile and the chart it sits
+# above so the two can never name a different "weakest" cat. Defined once because the
+# tie-break is the whole point: two independent min()/sort() calls agreed on the recall
+# and disagreed on the tie.
+def _WEAKEST_KEY(c: dict) -> "tuple[float, int]":  # noqa: N802 - a constant-like sort key
+    return (c["recall"], -(c.get("scored") or 0))
+
+
+def _wilson(correct: int, n: int, z: float = 1.96) -> "tuple[float, float] | None":
+    """95% Wilson score interval for ``correct`` of ``n``, or ``None`` when n == 0.
+
+    Wilson rather than the textbook normal approximation because the interesting cases
+    here sit at the ends: a cat with 8 of 8 correct has a normal-approximation interval
+    of exactly zero width, which would present "we have seen this cat eight times" as
+    certainty. Wilson stays inside [0, 1] and keeps a real width at 100%.
+
+    This is the report's main defence against its own precision. Two runs a day apart
+    differ by a handful of visits, and without an interval a 97% -> 95% step reads as a
+    regression rather than as the same number measured twice.
+    """
+    if n <= 0:
+        return None
+    p = correct / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def _worst_pair(visits: dict, cat_names: "list[str]") -> "dict | None":
+    """The largest off-diagonal cell of the visit confusion matrix.
+
+    One pair, not a ranking: a handful of errors spread evenly over five cats is a
+    different problem from all of them landing in one cell, and naming the top cell is
+    what tells the two apart at a glance. Declined (the final column) is excluded — it
+    is not a mistaken identity, and it is reported on its own.
+    """
+    conf = visits.get("confusion")
+    if not conf:
+        return None
+    best = None
+    for i, row in enumerate(conf):
+        for j, count in enumerate(row[:len(conf)]):   # drop the trailing 'declined' column
+            if i == j or not count:
+                continue
+            if best is None or count > best["count"]:
+                best = {
+                    "count": int(count),
+                    "true_index": i,
+                    "named_index": j,
+                    "true": cat_names[i] if i < len(cat_names) else f"#{i}",
+                    "named": cat_names[j] if j < len(cat_names) else f"#{j}",
+                    # Decided only — the declined column is dropped above, so counting it
+                    # here would make "7 of 31" quote a denominator the
+                    # numerator was never drawn from.
+                    "of": int(sum(row[:len(conf)])),
+                }
+    return best
+
+
+def _tldr(metrics: dict, cat_names: "list[str]") -> "dict | None":
+    """The handful of numbers the report leads with, derived from what it already has.
+
+    Everything here is a re-reading of the visit block — no new measurement — chosen so
+    each one answers a question the reader actually has: is it good (accuracy + its
+    interval), did it duck (declined), who is dragging it down (weakest), what is it
+    confusing (pair), and is the dark half the problem (night gap).
+    """
+    v = metrics.get("visits")
+    if not v or not v.get("available"):
+        return None
+    n = v.get("n_scored") or 0
+    decided = (v.get("correct") or 0) + (v.get("wrong") or 0)
+    ci = _wilson(v.get("correct") or 0, decided)
+    per_cat = [c for c in (v.get("per_cat") or []) if c.get("recall") is not None]
+    # SAME ordering as _percat_png's sort, tie-break included. Recall is a ratio of small
+    # integers, so exact ties are routine (1/2, 2/4, 3/6 all land on 0.5) — and with a
+    # plain min() the tile picked the first tied row (per_cat is cat_id order) while the
+    # chart accented the largest-sample one, naming two different cats "weakest" in one
+    # block. On a tie the bigger sample is the more defensible pick.
+    weakest = min(per_cat, key=_WEAKEST_KEY) if per_cat else None
+
+    regimes = v.get("regimes") or {}
+    day, night = regimes.get("day"), regimes.get("night")
+    gap = None
+    if day and night and day.get("accuracy") is not None and night.get("accuracy") is not None:
+        gap = night["accuracy"] - day["accuracy"]
+
+    # Unscoreable cats are not a low score — the correct answer was structurally absent
+    # from the gallery, so they could only ever have been wrong. Named, because the fix
+    # (one more visit) is different from every other row's.
+    unscoreable = [
+        {"name": cat_names[u["cat_index"]] if u["cat_index"] < len(cat_names) else f"#{u['cat_index']}",
+         "n_visits": u["n_visits"]}
+        for u in (v.get("unscoreable") or [])
+    ]
+    return {
+        "accuracy": v.get("accuracy"),
+        "ci": ci,
+        # The smallest move that is not noise, in points — the direct answer to "I
+        # labelled all week and the number went DOWN".
+        "resolution": (1.0 / decided) if decided else None,
+        "n_scored": n,
+        "decided": decided,
+        "declined": v.get("unknown") or 0,
+        "declined_rate": v.get("unknown_rate"),
+        "weakest": weakest,
+        "pair": _worst_pair(v, cat_names),
+        "night_gap": gap,
+        "day_acc": (day or {}).get("accuracy"),
+        "night_acc": (night or {}).get("accuracy"),
+        "unscoreable": unscoreable,
+    }
+
+
 def _plt():
     """pyplot with the headless Agg backend pinned.
 
@@ -139,6 +255,128 @@ def _fig_png(fig) -> str:
     fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", facecolor="#fcfcfb")
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _percat_png(visits: dict) -> str:
+    """Per-cat visit recall, worst-first, with 95% Wilson intervals.
+
+    EMPHASIS, not a categorical palette: the story is one cat, so the weakest bar takes
+    the accent and the rest sit in a light step of the same hue. Eight hues here would
+    say the cats are the subject; they are not, the recall is.
+
+    The interval is the load-bearing part. Sorted bars invite reading the order as a
+    ranking, and with 4 visits against 40 that order is mostly sampling noise — drawn
+    whiskers are what stop a cat being 'worse' on the strength of one bad visit.
+    """
+    plt = _plt()
+
+    rows = [c for c in (visits.get("per_cat") or []) if c.get("recall") is not None]
+    if not rows:
+        return ""
+    rows.sort(key=_WEAKEST_KEY)
+    names = [c["cat_name"] or f"#{c['cat_id']}" for c in rows]
+    vals = [c["recall"] for c in rows]
+    decided = [max(0, (c.get("correct") or 0) + (c.get("wrong") or 0)) for c in rows]
+    lo, hi = [], []
+    for c, d in zip(rows, decided):
+        ci = _wilson(c.get("correct") or 0, d)
+        lo.append(c["recall"] - ci[0] if ci else 0.0)
+        hi.append(ci[1] - c["recall"] if ci else 0.0)
+
+    fig, ax = plt.subplots(figsize=(6.4, 0.52 * len(rows) + 1.3))
+    y = list(range(len(rows)))
+    # Accent only on the weakest (index 0 after the sort); the rest recede.
+    colors = [_SAME_HUE if i == 0 else "#c3d8f2" for i in y]
+    ax.barh(y, vals, height=0.6, color=colors, zorder=2)
+    ax.errorbar(vals, y, xerr=[lo, hi], fmt="none", ecolor=_MUTED, elinewidth=1.2,
+                capsize=3, zorder=3)
+    for i, (val, d) in enumerate(zip(vals, decided)):
+        # Label the bar END only — the axis carries the rest, and a number inside every
+        # bar would collide with the whisker on the short ones.
+        ax.text(min(1.0, val + hi[i]) + 0.02, i, f"{val:.0%}", va="center", fontsize=9,
+                color=_INK)
+    ax.set_yticks(y)
+    # (n) is DECIDED, not scored — the recall and its interval are both computed over
+    # correct+wrong, so labelling it "scored" would print a denominator the bar is not
+    # drawn from wherever a cat has declines.
+    ax.set_yticklabels([f"{n}  ({d})" for n, d in zip(names, decided)], fontsize=9, color=_INK)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.18)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xticklabels(["0", "25%", "50%", "75%", "100%"], fontsize=8, color=_MUTED)
+    ax.set_xlabel("visits named correctly, of those decided  ·  (n) = visits decided",
+                  color=_MUTED, fontsize=9)
+    ax.set_title("Per-cat recall, weakest first — bars are 95% intervals",
+                 color=_INK, fontsize=11)
+    ax.tick_params(colors=_MUTED, length=0)
+    ax.xaxis.grid(True, color="#e8e6e1", linewidth=1, zorder=0)  # solid hairline, recessive
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return _fig_png(fig)
+
+
+def _regime_png(visits: dict) -> str:
+    """Day vs night recall per cat, as a dumbbell — two states of one item.
+
+    A dumbbell rather than grouped bars because the reader's question is the GAP, and a
+    connector draws the gap directly instead of asking them to subtract two bar lengths.
+    Returns "" without a day/night split, so no location means no chart rather than a
+    chart of one regime pretending to be both.
+    """
+    plt = _plt()
+
+    regimes = visits.get("regimes") or {}
+    day_rows = {c["cat_id"]: c for c in ((regimes.get("day") or {}).get("per_cat") or [])}
+    night_rows = {c["cat_id"]: c for c in ((regimes.get("night") or {}).get("per_cat") or [])}
+    pairs = []
+    for cid, d in day_rows.items():
+        n = night_rows.get(cid)
+        # Both sides must be measured: one end missing is not a gap of unknown size, it
+        # is no reading at all, and a dot at zero would say the opposite.
+        if n and d.get("recall") is not None and n.get("recall") is not None:
+            # Each side's decided count rides along: without it a night dot off ONE visit
+            # is indistinguishable from one off twenty, and the night side is exactly
+            # where the counts are smallest. The sibling bar chart shows (n) for the same
+            # reason; a static PNG has no tooltip to hide it in.
+            dd = (d.get("correct") or 0) + (d.get("wrong") or 0)
+            nd = (n.get("correct") or 0) + (n.get("wrong") or 0)
+            pairs.append((d["cat_name"] or f"#{cid}", d["recall"], n["recall"], dd, nd))
+    if not pairs:
+        return ""
+    pairs.sort(key=lambda p: p[2] - p[1])   # biggest night deficit first
+
+    fig, ax = plt.subplots(figsize=(6.4, 0.52 * len(pairs) + 1.3))
+    y = list(range(len(pairs)))
+    for i, (_name, d, n, _dd, _nd) in enumerate(pairs):
+        ax.plot([d, n], [i, i], color="#d8d5cf", linewidth=2, zorder=1, solid_capstyle="round")
+    # Warm = day, cool = night. Orange over the palette's amber slot deliberately: amber
+    # measures 2.11:1 on this surface, and the validator's relief for that (a table view)
+    # does not exist for PER-CAT day/night — the section below tabulates the regimes as
+    # wholes. This pair passes every check outright, worst adjacent CVD dE 29.5.
+    ax.scatter([p[1] for p in pairs], y, s=64, color=_CAT_PALETTE[7], zorder=3,
+               label="day", edgecolors="#fcfcfb", linewidths=2)
+    ax.scatter([p[2] for p in pairs], y, s=64, color=_CAT_PALETTE[4], zorder=3,
+               label="night", edgecolors="#fcfcfb", linewidths=2)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{p[0]}  ({p[3]}/{p[4]})" for p in pairs], fontsize=9, color=_INK)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.05)
+    ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_xticklabels(["0", "25%", "50%", "75%", "100%"], fontsize=8, color=_MUTED)
+    ax.set_title("Day vs night recall — biggest night deficit first  ·  (day/night visits decided)",
+                 color=_INK, fontsize=10.5, pad=22)
+    ax.tick_params(colors=_MUTED, length=0)
+    ax.xaxis.grid(True, color="#e8e6e1", linewidth=1, zorder=0)
+    ax.set_axisbelow(True)
+    # ABOVE the axes, not inside them: every dot sits at a high recall against a 0-100%
+    # scale, so the lower-right corner a legend defaults to is exactly where the last
+    # row's pair lands — measured, it covered them.
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.02), ncol=2, fontsize=8,
+              frameon=False, handletextpad=0.4, columnspacing=1.4)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return _fig_png(fig)
 
 
 def _scatter_png(metrics: dict) -> str:
@@ -385,6 +623,101 @@ def _visit_verdict(v: dict) -> str:
     return "Weak — a held-out visit is often named wrongly; this is the number that matters."
 
 
+def _tldr_section(t: "dict | None", charts: dict) -> str:
+    """The lead block: five numbers, what they cannot tell you, and two charts.
+
+    Written because the report had grown five sections and a reader had no way to know
+    which of them to act on — the honest number and an inflated one sat under similar
+    headings, and nothing said what the whole probe structurally cannot measure. Every
+    figure here is a re-reading of the visit block below, never a second measurement, so
+    the summary can never disagree with the section it summarises.
+    """
+    if not t:
+        return ""
+    pct = lambda x: "—" if x is None else f"{x:.0%}"  # noqa: E731
+    acc = pct(t["accuracy"])
+    ci = t["ci"]
+    # The interval is shown ON the headline, not beside it: the number's own width is
+    # the thing a reader comparing two runs most needs and is least likely to seek out.
+    # "pts", not "%": these are differences BETWEEN percentages, and "±7%" beside "88%"
+    # invites reading it as 7% of 88. The unit is percentage points; saying so is cheap.
+    ci_pts = (max(t["accuracy"] - ci[0], ci[1] - t["accuracy"]) * 100
+              if ci and t["accuracy"] is not None else None)
+    ci_txt = f"±{ci_pts:.0f} pts" if ci_pts is not None else ""
+    weak = t["weakest"]
+    pair = t["pair"]
+    gap = t["night_gap"]
+
+    tiles = [
+        (f"{acc} <span style='font-size:15px;color:{_MUTED}'>{ci_txt}</span>",
+         f"visits named correctly ({t['decided']} decided)"),
+        (pct(t["declined_rate"]), "declined to name — not wrong, unnamed"),
+    ]
+    tiles.append(
+        (f"{pct(weak['recall'])}", f"weakest: {html.escape(weak['cat_name'] or '?')}"
+         f" ({weak['scored']} visits)") if weak else ("—", "weakest cat")
+    )
+    tiles.append(
+        (f"{pair['count']}", f"worst mix-up: {html.escape(pair['true'])} named "
+         f"{html.escape(pair['named'])}") if pair
+        else ("0", "no cat was ever named as another")
+    )
+    if gap is not None:
+        # Round BEFORE signing: a gap of -0.004 formats as "-0 pts", which reads as a
+        # deficit that measured zero.
+        gp = round(gap * 100)
+        tiles.append((f"{gp:+d} pts" if gp else "0 pts", "night recall vs day"))
+
+    tile_html = "".join(
+        f'<div class="tile"><div class="v">{v}</div><div class="l">{l}</div></div>'
+        for v, l in tiles
+    )
+
+    # What the numbers above structurally cannot say. Each line is a real limit of this
+    # probe, not a disclaimer — the first one is the big one, and it is invisible in
+    # every figure on the page.
+    limits = [
+        "<b>No strangers were tested.</b> Every crop here belongs to a labelled cat, so "
+        "nothing measures whether a foreign cat is correctly refused — the half of the "
+        "job the door actually needs. Read these as an optimistic bound.",
+    ]
+    if t["resolution"]:
+        limits.append(
+            f"<b>One visit is {t['resolution'] * 100:.1f} points.</b> With {t['decided']} "
+            f"visits decided, a change smaller than the {ci_txt or '—'} above is sampling "
+            "noise, not progress or regression — two runs a day apart differ by a handful "
+            "of visits."
+        )
+    if t["unscoreable"]:
+        names = ", ".join(html.escape(u["name"]) for u in t["unscoreable"])
+        limits.append(
+            f"<b>{names} could not be scored at all</b> — only one visit, so the correct "
+            "answer was absent from the gallery it was matched against. Excluded from "
+            "every number above; the fix is another visit, not more crops of that one."
+        )
+    limits.append(
+        "<b>The crop-level numbers further down read high by construction</b> and are kept "
+        "only to compare with runs recorded before visit scoring existed. The per-cat table "
+        "down there is the crop-level one — not the same number as this section's."
+    )
+
+    figs = "".join(
+        f'<figure><img alt="{alt}" src="{charts[key]}"></figure>'
+        for key, alt in (("percat", "per-cat recall"), ("regime", "day vs night recall"))
+        if charts.get(key)
+    )
+    return f"""
+  <div class="tldr">
+    <h2 style="font-size:15px;margin:0 0 10px;">In short</h2>
+    <div class="tiles">{tile_html}</div>
+    {figs}
+    <div class="limits"><div class="l" style="margin-bottom:6px;">What this cannot tell you</div>
+      <ul>{''.join(f'<li>{x}</li>' for x in limits)}</ul>
+    </div>
+  </div>
+"""
+
+
 def _render_html(metrics: dict, charts: dict, quality_label: str) -> str:
     knn = metrics["knn"]
     dist = metrics["distances"]
@@ -406,6 +739,7 @@ def _render_html(metrics: dict, charts: dict, quality_label: str) -> str:
         else "Weak separation — the cats are hard to tell apart in this embedding space."
     )
     cat_names = [c["cat_name"] for c in metrics["cats"]]
+    tldr_html = _tldr_section(_tldr(metrics, cat_names), charts)
     visit_html = _visit_section(metrics, cat_names)
     if visit_html and "{curve}" in visit_html:
         visit_html = visit_html.replace("{curve}", charts.get("curve", ""))
@@ -442,9 +776,20 @@ def _render_html(metrics: dict, charts: dict, quality_label: str) -> str:
   td.na {{ color: {_MUTED}; }}
   .sub2 {{ color: {_MUTED}; font-size: 11px; }}
   .demoted {{ border-top: 1px solid rgba(11,11,11,0.10); margin-top: 32px; padding-top: 20px; }}
+  /* The lead block reads as one card so the eye takes it before the sections below,
+     which are the detail behind it rather than five peers competing for attention. */
+  .tldr {{ background: #ffffff; border: 1px solid rgba(11,11,11,0.14); border-radius: 10px;
+           padding: 18px 20px 6px; margin-bottom: 28px; }}
+  .tldr .tiles {{ margin-bottom: 18px; }}
+  .tldr .tile {{ min-width: 128px; }}
+  .limits {{ border-top: 1px solid rgba(11,11,11,0.08); padding: 12px 0 14px; }}
+  .limits .l {{ color: {_MUTED}; font-size: 12px; }}
+  .limits ul {{ margin: 0; padding-left: 18px; }}
+  .limits li {{ margin-bottom: 6px; font-size: 13px; line-height: 1.45; }}
 </style></head><body><div class="wrap">
   <h1>Can we tell our cats apart?</h1>
   <p class="sub">{metrics['n_crops']} labelled crops · {metrics['n_cats']} cats · quality: {html.escape(quality_label)} · DINOv2 embeddings</p>
+  {tldr_html}
   {visit_html}
   <div class="{'demoted' if demoted else ''}">
   <h2 style="font-size:15px;">{'Crop-level scoring (for comparison)' if demoted else 'Crop-level scoring'}</h2>
@@ -586,6 +931,11 @@ def run_feasibility_probe(
     visits_block = metrics.get("visits")
     if visits_block and visits_block.get("available"):
         charts["curve"] = _curve_png(visits_block)
+        # Both return "" when their data isn't there (no per_cat on an older shape, no
+        # day/night without a location), and _tldr_section skips a chart it has no PNG
+        # for — so the lead block shrinks rather than showing an empty frame.
+        charts["percat"] = _percat_png(visits_block)
+        charts["regime"] = _regime_png(visits_block)
     with open(os.path.join(out_dir, "feasibility.html"), "w", encoding="utf-8") as fh:
         fh.write(_render_html(metrics, charts, quality_label))
 

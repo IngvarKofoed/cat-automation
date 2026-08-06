@@ -17,6 +17,7 @@ import pytest
 
 from compute.collection.store import Store
 from compute.identification.feasibility import _per_cat, run_feasibility
+from compute.identification.probe import _tldr, _wilson, _worst_pair
 
 _AGG = Store._aggregate_identity
 
@@ -444,3 +445,142 @@ def test_each_regime_carries_per_cat_but_the_cross_cells_do_not():
     for cell in v["cross"].values():
         if cell is not None:
             assert cell["per_cat"] is None
+
+
+# --- report TL;DR: derived numbers -------------------------------------------------
+# Pure re-readings of the visit block. Tested here because the report's lead block is
+# the one place a reader takes a number without reading the section it came from.
+
+def test_wilson_keeps_width_at_a_perfect_score():
+    """The reason it is Wilson and not the normal approximation.
+
+    8-of-8 has a normal-approximation interval of exactly zero width, which would print
+    "we saw this cat eight times" as certainty — precisely the over-reading the interval
+    exists to prevent.
+    """
+    lo, hi = _wilson(8, 8)
+    assert hi == 1.0
+    assert lo < 0.75, "a perfect 8/8 must still admit real uncertainty"
+    # And it stays inside [0, 1] at the other end.
+    lo0, hi0 = _wilson(0, 5)
+    assert lo0 == 0.0 and 0 < hi0 < 1
+    assert _wilson(0, 0) is None, "no visits is not a 0% interval"
+    # More data narrows it.
+    assert (_wilson(90, 100)[1] - _wilson(90, 100)[0]) < (_wilson(9, 10)[1] - _wilson(9, 10)[0])
+
+
+def test_worst_pair_names_the_biggest_off_diagonal_cell_only():
+    """One pair, and never the diagonal or the declined column.
+
+    Declined is the final column and is not a mistaken identity — counting it would
+    make the report's "worst mix-up" the cat it most often stayed silent about.
+    """
+    #        ->A  ->B  ->C  declined
+    conf = [[10,   1,   0,   4],      # A: mostly right, 4 declined (must be ignored)
+            [ 3,   5,   7,   0],      # B: named C seven times  <- the answer
+            [ 0,   2,   9,   0]]
+    pair = _worst_pair({"confusion": conf}, ["A", "B", "C"])
+    assert (pair["true"], pair["named"], pair["count"]) == ("B", "C", 7)
+    assert pair["of"] == 15
+    # `of` is DECIDED visits — the declined column is excluded, matching the cell the
+    # count came from. Row A above has 4 declines, so a row-sum would read 15 here.
+    a_pair = _worst_pair({"confusion": [[10, 5, 0, 4], [0, 9, 0, 0], [0, 0, 9, 0]]},
+                         ["A", "B", "C"])
+    assert (a_pair["true"], a_pair["count"], a_pair["of"]) == ("A", 5, 15)
+    # A clean run has no pair at all rather than a zero-count one.
+    clean = [[4, 0, 0, 1], [0, 4, 0, 0], [0, 0, 4, 0]]
+    assert _worst_pair({"confusion": clean}, ["A", "B", "C"]) is None
+
+
+def test_tldr_derives_the_lead_numbers_and_stays_none_when_unavailable():
+    rng = np.random.default_rng(41)
+    ids, vecs, groups = _visit_data(rng, cats=3, visits_per_cat=4, crops_per_visit=4,
+                                    cat_sep=3.0)
+    m = run_feasibility(ids, {1: "A", 2: "B", 3: "C"}, vecs,
+                        visit_groups=groups, aggregate=_AGG)
+    t = _tldr(m, ["A", "B", "C"])
+    v = m["visits"]
+    assert t["accuracy"] == v["accuracy"], "the summary must not recompute the headline"
+    assert t["decided"] == v["correct"] + v["wrong"]
+    # Resolution is one visit as a share of what was DECIDED — the smallest real move.
+    assert t["resolution"] == pytest.approx(1 / t["decided"])
+    assert t["ci"][0] <= v["accuracy"] <= t["ci"][1]
+    # The weakest cat is a real per_cat row, not a recomputation.
+    assert t["weakest"] in [c for c in v["per_cat"] if c["recall"] is not None]
+    assert t["weakest"]["recall"] == min(
+        c["recall"] for c in v["per_cat"] if c["recall"] is not None)
+
+    # An unavailable block yields no summary at all, rather than a row of dashes that
+    # would read as a measured result.
+    single = run_feasibility(ids, {}, vecs, visit_groups=[groups[0]], aggregate=_AGG)
+    assert single["visits"]["available"] is False
+    assert _tldr(single, ["A", "B", "C"]) is None
+
+
+# --- report TL;DR: the two charts -----------------------------------------------------
+# Asserted because a regression to "" (or to a raised exception swallowed upstream) would
+# otherwise remove a chart from every report silently.
+
+def _pc_row(cid, name, scored, correct, wrong, declined=0):
+    dec = correct + wrong
+    return {"cat_id": cid, "cat_name": name, "scored": scored, "correct": correct,
+            "wrong": wrong, "declined": declined,
+            "recall": (correct / dec) if dec else None,
+            "declined_rate": (declined / scored) if scored else None, "unscoreable": 0}
+
+
+def test_percat_chart_renders_and_is_empty_only_when_it_has_nothing():
+    pytest.importorskip("matplotlib")
+    from compute.identification.probe import _percat_png
+
+    rows = [_pc_row(1, "A", 20, 19, 1), _pc_row(2, "B", 9, 5, 4)]
+    png = _percat_png({"per_cat": rows})
+    assert png.startswith("data:image/png;base64,") and len(png) > 2000
+    # One row is a legitimate chart; no rows, or only unscoreable rows, is not.
+    assert _percat_png({"per_cat": [rows[0]]}).startswith("data:image/png;base64,")
+    assert _percat_png({"per_cat": []}) == ""
+    assert _percat_png({}) == ""
+    assert _percat_png({"per_cat": [_pc_row(3, "C", 0, 0, 0)]}) == "", \
+        "a cat with nothing decided has no bar to draw"
+
+
+def test_regime_chart_needs_both_sides_of_a_pair():
+    pytest.importorskip("matplotlib")
+    from compute.identification.probe import _regime_png
+
+    day = [_pc_row(1, "A", 12, 12, 0), _pc_row(2, "B", 8, 6, 2)]
+    night = [_pc_row(1, "A", 5, 3, 2), _pc_row(2, "B", 4, 1, 3)]
+    png = _regime_png({"regimes": {"day": {"per_cat": day}, "night": {"per_cat": night}}})
+    assert png.startswith("data:image/png;base64,") and len(png) > 2000
+    # No location -> no regimes -> no chart, rather than one regime drawn as if it were both.
+    assert _regime_png({"regimes": None}) == ""
+    assert _regime_png({}) == ""
+    # A cat present on only ONE side is not a gap of unknown size — it is no reading.
+    only_day = {"regimes": {"day": {"per_cat": day}, "night": {"per_cat": []}}}
+    assert _regime_png(only_day) == ""
+    # Mismatched cat_ids across the regimes must not pair up by position.
+    mismatched = {"regimes": {"day": {"per_cat": [_pc_row(1, "A", 4, 4, 0)]},
+                              "night": {"per_cat": [_pc_row(9, "Z", 4, 2, 2)]}}}
+    assert _regime_png(mismatched) == ""
+
+
+def test_the_weakest_cat_tile_and_the_chart_cannot_disagree_on_a_tie():
+    """One shared ordering key, because two independent ones disagreed.
+
+    Recall is a ratio of small integers, so exact ties are routine — 1/2, 2/4 and 3/6 all
+    land on 0.5. A plain `min()` took the first tied row (per_cat is cat_id order) while
+    the chart's sort preferred the largest sample, so one report block named two different
+    cats "weakest".
+    """
+    from compute.identification.probe import _WEAKEST_KEY, _tldr
+
+    tied = [_pc_row(2, "CatB", 3, 1, 1), _pc_row(1, "CatA", 5, 2, 2)]   # both recall 0.5
+    assert tied[0]["recall"] == tied[1]["recall"]
+    t = _tldr({"visits": {"available": True, "per_cat": tied, "accuracy": 0.5,
+                          "correct": 3, "wrong": 3, "unknown": 0, "n_scored": 8,
+                          "unknown_rate": 0.0, "confusion": None, "unscoreable": []}},
+              ["CatA", "CatB"])
+    chart_first = sorted([c for c in tied if c["recall"] is not None], key=_WEAKEST_KEY)[0]
+    assert t["weakest"]["cat_id"] == chart_first["cat_id"], \
+        "the tile and the chart's accented bar must be the same cat"
+    assert t["weakest"]["cat_name"] == "CatA", "on a tie, the larger sample is the pick"

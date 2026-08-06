@@ -133,7 +133,15 @@ def test_probe_end_to_end_produces_visit_metrics(probe_env, tmp_path):
         page = fh.read()
     assert "visit accuracy" in page
     assert "Crop-level scoring (for comparison)" in page
-    assert page.count("data:image/png;base64,") == 4, "3 old charts + the sweep curve"
+    # 3 old charts + the sweep curve + the TL;DR's per-cat bars. The day/night dumbbell
+    # is NOT here: this fixture sets no location, so `regimes` is None and `_regime_png`
+    # returns "" rather than drawing one regime as if it were both.
+    assert page.count("data:image/png;base64,") == 5
+    # The lead block and its limits, which a reader takes numbers from without reading
+    # the section they came from.
+    assert "In short" in page
+    assert "What this cannot tell you" in page
+    assert "No strangers were tested" in page
 
 
 def test_day_night_split_runs_when_a_location_is_set(probe_env, tmp_path):

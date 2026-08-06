@@ -2308,3 +2308,65 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      is a data state, re-running Validate reproduces it, and the message sent the operator
      after a deployment problem instead of "label more distinct visits". The older-build
      wording now fires only when no run carries a visits block at all.
+
+370. The feasibility report leads with an "In short" block: five numbers, two charts, and
+     what the probe structurally cannot tell you. It had grown five sections with the
+     honest number and an inflated one under similar headings, and nothing said which to
+     act on. Every figure is a re-reading of the visit block below — never a second
+     measurement — so the summary cannot disagree with the section it summarises.
+
+371. The five: visit accuracy with a WILSON 95% interval, declined rate, the weakest cat,
+     the largest off-diagonal confusion cell, and the night-vs-day gap. Wilson because
+     8-of-8 has a NORMAL interval of exactly zero width, presenting eight sightings as
+     certainty. The interval sits ON the headline — its width is what a reader comparing
+     two runs most needs and is least likely to seek out.
+
+372. Intervals and gaps are labelled "pts", not "%" — they are differences BETWEEN
+     percentages, and "±7%" beside "88%" invites reading it as 7% of 88. The limits block
+     states the resolution outright ("one visit is 0.8 points"), which is the direct answer
+     to a week of labelling moving the headline the wrong way.
+
+373. The limits are real limits, not a disclaimer. Load-bearing one: NO STRANGER is in the
+     probe — every crop belongs to a labelled cat, so nothing here measures whether a
+     foreign cat is refused, the half of the job the door needs. It also names the
+     unscoreable cats (excluded from every figure) and warns that the demoted per-cat table
+     further down is the CROP-level number, not this section's.
+
+374. Two charts, both EMPHASIS rather than categorical — the story is one cat, not six.
+     Per-cat recall is worst-first, weakest bar accented, with Wilson whiskers: sorted
+     bars invite reading the order as a ranking, and at 4 visits against 40 that order is
+     mostly noise. Day/night is a dumbbell, because the reader's question is the GAP and a
+     connector draws it instead of asking them to subtract two bar lengths.
+
+375. The dumbbell uses orange over the palette's amber slot: amber measures 2.11:1 here,
+     and the validator's relief for that (a table view) does not exist for PER-CAT
+     day/night. The chosen pair passes every check, worst adjacent CVD dE 29.5. Its legend
+     sits ABOVE the axes — every dot lands at high recall, so the default lower-right
+     corner is where the last row's pair falls (measured: it covered them).
+
+376. Both charts return "" when their data is absent (no per-cat rows, no day/night without
+     a location) and the block skips a chart it has no PNG for, so a location-less run
+     shrinks the summary rather than drawing one regime as if it were both.
+
+377. Review repairs. The TL;DR's "weakest cat" tile and the chart beneath it picked the
+     weakest with DIFFERENT tie-breaks — a plain `min` (first row, i.e. lowest cat_id) vs
+     the chart's (recall, -scored) — so on a tie one block named two different cats
+     weakest. Recall is a ratio of small integers, so ties are routine: 1/2, 2/4 and 3/6
+     all land on 0.5. One shared `_WEAKEST_KEY` now orders both.
+
+378. Three smaller ones. The per-cat chart labelled its (n) "visits scored" while plotting
+     DECIDED (recall and its interval are both over correct+wrong), which diverges wherever
+     a cat has declines. The night-gap tile rounded after signing, so a −0.4 pt gap read
+     "-0 pts". `_worst_pair`'s `of` summed the declined column the function otherwise
+     drops, quoting a denominator its numerator never came from.
+
+379. The day/night dumbbell now carries each side's decided count, as its sibling bar chart
+     already did: a night dot off ONE visit was indistinguishable from one off twenty, and
+     the night side is exactly where the counts are smallest. A static PNG has no tooltip
+     to hide the number in.
+
+380. Both charts gained tests — a regression to "" would otherwise drop a figure from every
+     report silently. They pin the empty cases each returns nothing for (no rows, nothing
+     decided, no regimes, a cat present on only one side, mismatched cat_ids across
+     regimes) and that the tile and the chart cannot disagree on a tie, verified to FAIL
+     against the pre-fix rule rather than merely passing after it.

@@ -2370,3 +2370,55 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      decided, no regimes, a cat present on only one side, mismatched cat_ids across
      regimes) and that the tile and the chart cannot disagree on a tie, verified to FAIL
      against the pre-fix rule rather than merely passing after it.
+
+381. The Motion-tuning calendar MEMOIZES each day in a new `calendar_days` table, so only
+     days that actually changed are re-earned. Counting a 4-week window exactly means
+     walking every frame and verdict index entry: measured 11.3 s on a 6M-frame /
+     16.2M-verdict replica, growing with the store, and paid on every page load.
+     Now ~0 ms warm, 9.7 s cold, ~0.7 s after a sweep of one day.
+
+382. Nothing about that is a heuristic: every mutation that can move a day drops it.
+     Frame deletes and every `analysis` write/clear match by id span
+     (`_calendar_invalidate_locked`); a frame INSERT — whose id is above every existing
+     span — matches by timestamp instead. The memo and its invalidation both live in the
+     DB, so a second process's write is seen by the running server (verified).
+
+383. A day is reserved PENDING before the slow passes and filled in by a token-guarded
+     UPDATE after, so a mutation landing mid-compute deletes the placeholder and the
+     fill-in matches nothing. Without it the naive "just write the result" form caches
+     numbers already stale — proven by running its test against that form.
+     A pending row is never read, so a crash mid-compute leaves no result behind.
+
+384. Every calendar number is now a property of the DAY, not of the requested window —
+     which is what makes a day memoizable at all. The event pass therefore looks
+     `_VISIT_GAP_MS` back past local midnight for a cluster's predecessor instead of
+     treating the window edge as a cluster start. A day the window only CLIPS is not
+     memoized, since its numbers would then describe the request.
+
+385. The coverage pass counts with conditional SUMs, retiring the `+analyzer` hint
+     (entries 229/265/276/307) rather than depending on it: with no analyzer predicate
+     at all there is nothing left for the planner to mis-choose. Measured 10.1 -> 8.0 s
+     over 16.2M verdicts — the hint had also forced a temp b-tree for its GROUP BY.
+     Dropping the hint from the OLD form instead was 45x worse, so it was load-bearing.
+
+386. Known limits, both accepted. While the collector runs, TODAY is invalidated ~10x/s
+     and so is recomputed every load (~1.4 s for a full day on the real store); it
+     memoizes like any other day once collection stops. And the first load after this
+     ships is still a cold one — the memo is persisted, so a restart does not re-pay it.
+
+387. Review repairs. A day is memoized only if the ids it actually COUNTED lie inside the
+     ids the placeholder RESERVED. The reservation comes from a `recv_ts` seek, so the two
+     coincide only while `recv_ts` is non-decreasing with `id` — assumed, never enforced
+     (entry 278) — and where it isn't, a mutation to the difference slips past the
+     placeholder and a wrong count is cached with nothing left to correct it.
+
+388. The memo is re-read PER DAY inside the loop, not snapshotted once before it. A day's
+     compute takes seconds, so an invalidation landing during it must still be seen for
+     the days not yet reached; otherwise the same call serves numbers that mutation just
+     falsified. A day already read stays as read — that is a read's point-in-time
+     staleness, not a cache fault, and no memo design removes it.
+
+389. Pruning the memo now reads before it writes, and reaches BOTH ways. A fully memoized
+     call previously opened a write transaction and committed on the shared connection to
+     delete nothing — the exact traffic this feature moved off it — and days ABOVE the
+     window accumulated forever, since only days below were pruned.

@@ -369,6 +369,271 @@ def test_tuning_calendar_offset_and_midnight_straddle(tmp_path):
         assert (r["day_ms"] + off) % day == 0
 
 
+# --- Store: tuning_calendar's per-day memo ------------------------------------
+#
+# Counting a 4-week window's frames and verdicts exactly means walking every one of
+# their index entries — measured 11.3 s on a 6M-frame / 16.2M-verdict replica — so a
+# completed day is memoized in `calendar_days` and only re-earned when something
+# actually changes it. These tests pin the two halves of that: the memo is USED, and
+# every mutation that can move a day's numbers drops it.
+
+_CAL_ANALYZERS = ("yolo-serial", "mog2:baseline")
+
+
+def _cal_window(y=2026, mo=7, da=25, days=3):
+    """A whole-day-aligned UTC window, the shape the calendar page always requests."""
+    return _utc_ms(y, mo, da), _utc_ms(y, mo, da) + days * 86_400_000 - 1
+
+
+def _cal_rows(store, **kw):
+    since, until = _cal_window(**kw)
+    return store.tuning_calendar(since, until, 0, _CAL_ANALYZERS)
+
+
+def _memo_days(store):
+    """The days currently memoized (non-pending), read straight from the table."""
+    with store._lock:
+        return {
+            int(r[0])
+            for r in store._conn.execute(
+                "SELECT day FROM calendar_days WHERE pending = 0"
+            ).fetchall()
+        }
+
+
+def _seed_two_days(store):
+    """Day A (25th) and day B (26th), each with frames; returns (a_ids, b_ids)."""
+    a, b = _utc_ms(2026, 7, 25, 12), _utc_ms(2026, 7, 26, 9)
+    fid = 0
+
+    def add(recv, motion):
+        nonlocal fid
+        fid += 1
+        return store.add(
+            _frame(frame_id=fid, motion=motion, area=0.05 if motion else 0.0), recv_ts_ms=recv
+        )
+
+    a_ids = [add(a, True), add(a + 400, True), add(a + 120_000, False)]
+    b_ids = [add(b, True), add(b + 400, True)]
+    return a_ids, b_ids
+
+
+def test_tuning_calendar_serves_a_memoized_day_without_recomputing(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    _seed_two_days(store)
+    first = _cal_rows(store)
+    assert _memo_days(store), "a completed day should have been memoized"
+
+    # The direct proof that the memo is USED rather than merely written: make the
+    # compute impossible, and require the same answer anyway.
+    def explode(*a, **k):
+        raise AssertionError("recomputed a day that was memoized")
+
+    monkeypatch.setattr(Store, "_calendar_compute", explode)
+    assert _cal_rows(store) == first
+
+
+def test_tuning_calendar_memo_is_dropped_by_every_mutation_that_moves_a_day(tmp_path):
+    store = _store(tmp_path)
+    a_ids, b_ids = _seed_two_days(store)
+    day_a = _utc_ms(2026, 7, 25) // 86_400_000
+    day_b = _utc_ms(2026, 7, 26) // 86_400_000
+
+    # 1. A verdict written into day A drops A's memo and leaves B's alone...
+    _cal_rows(store)
+    assert _memo_days(store) == {day_a, day_b}
+    store.write_analysis(a_ids[0], "yolo-serial", True, 0.9, None)
+    assert _memo_days(store) == {day_b}
+    # ...and the recomputed day reports the new coverage, not the memoized zero.
+    by_day = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert by_day[day_a]["analyzed"]["yolo-serial"] == 1
+    assert by_day[day_b]["analyzed"]["yolo-serial"] == 0
+
+    # 2. A batch write likewise, matched over the batch's whole id envelope.
+    _cal_rows(store)
+    store.write_analysis_batch([(b_ids[0], "mog2:baseline", True, 0.5, None)])
+    assert _memo_days(store) == {day_a}
+
+    # 3. Clearing verdicts — the direction that would make a stale count read too HIGH.
+    _cal_rows(store)
+    store.clear_analysis("yolo-serial", since_id=a_ids[0], until_id=a_ids[-1])
+    assert _memo_days(store) == {day_b}
+    _cal_rows(store)
+    store.clear_analysis("mog2:baseline")  # unscoped → the whole id axis
+    assert _memo_days(store) == set()
+
+    # 4. A new frame LENGTHENS its day; matched by timestamp, since its id is above
+    #    every memoized span. Day A's count must follow.
+    assert _cal_rows(store)
+    store.add(_frame(frame_id=99, motion=False), recv_ts_ms=_utc_ms(2026, 7, 25, 18))
+    assert _memo_days(store) == {day_b}
+    by_day = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert by_day[day_a]["frames"] == 4
+
+    # 5. A frame DELETE (the purge/eviction accounting path) drops its day too.
+    _cal_rows(store)
+    assert store.purge_nonmotion_batch(until_id=a_ids[-1], batch_size=1)[0] == 1
+    assert _memo_days(store) == {day_b}
+    by_day = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert by_day[day_a]["frames"] == 3
+
+    # 6. A full wipe drops the memo outright — its rows are frame-id keyed, and clear
+    #    restarts ids at 1, so a survivor would describe gone frames AND intersect new ones.
+    _cal_rows(store)
+    store.clear()
+    assert _memo_days(store) == set()
+
+
+def test_tuning_calendar_does_not_memoize_a_day_the_window_clips(tmp_path):
+    # A memo row is keyed by day alone, so a day the request only half-covers must not
+    # be stored: its numbers describe the window, not the day.
+    store = _store(tmp_path)
+    a_ids, _ = _seed_two_days(store)
+    since = _utc_ms(2026, 7, 25, 12, 1)  # starts AFTER day A's first two frames
+    rows = store.tuning_calendar(since, _utc_ms(2026, 7, 27) - 1, 0, _CAL_ANALYZERS)
+    by_day = {r["day_ms"] // 86_400_000: r for r in rows}
+    assert by_day[_utc_ms(2026, 7, 25) // 86_400_000]["frames"] == 1  # the clipped count
+    assert _memo_days(store) == {_utc_ms(2026, 7, 26) // 86_400_000}  # only the whole day
+
+
+def test_tuning_calendar_memo_row_is_skipped_when_it_lacks_a_requested_analyzer(tmp_path):
+    # Registering a new analyzer must recompute the day, not report it as swept 0%.
+    store = _store(tmp_path)
+    a_ids, _ = _seed_two_days(store)
+    store.write_analysis(a_ids[0], "lighting", True, 0.5, None)
+    _cal_rows(store)  # memoized WITHOUT "lighting" in `analyzed`
+    rows = store.tuning_calendar(
+        *_cal_window(), 0, _CAL_ANALYZERS + ("lighting",)
+    )
+    by_day = {r["day_ms"] // 86_400_000: r for r in rows}
+    assert by_day[_utc_ms(2026, 7, 25) // 86_400_000]["analyzed"]["lighting"] == 1
+
+
+def test_tuning_calendar_does_not_memoize_a_day_mutated_mid_compute(tmp_path, monkeypatch):
+    # The write protocol's whole point: a day's row is reserved BEFORE the slow passes
+    # and filled in after, so a mutation landing in between deletes the placeholder and
+    # the fill-in matches nothing. Without it, the stale numbers would be memoized.
+    store = _store(tmp_path)
+    a_ids, _ = _seed_two_days(store)
+    real = Store._calendar_compute
+
+    def compute_then_mutate(self, conn, day, off, ts_lo, ts_hi, want):
+        row = real(self, conn, day, off, ts_lo, ts_hi, want)
+        if row is not None and a_ids[0] <= row["since_id"] <= a_ids[-1]:
+            self.write_analysis(a_ids[0], "yolo-serial", True, 0.9, None)
+        return row
+
+    monkeypatch.setattr(Store, "_calendar_compute", compute_then_mutate)
+    stale = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert stale[_utc_ms(2026, 7, 25) // 86_400_000]["analyzed"]["yolo-serial"] == 0
+    assert _memo_days(store) == {_utc_ms(2026, 7, 26) // 86_400_000}  # day A was NOT kept
+
+    monkeypatch.undo()
+    fresh = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert fresh[_utc_ms(2026, 7, 25) // 86_400_000]["analyzed"]["yolo-serial"] == 1
+
+
+def test_tuning_calendar_rereads_a_day_invalidated_while_an_earlier_one_computed(tmp_path, monkeypatch):
+    # The memo is re-read per day, not snapshotted once up front: a day's compute takes
+    # seconds, so an invalidation landing during it must still be seen by the SAME call
+    # for every day it has not reached yet. Otherwise that call serves the numbers the
+    # mutation just falsified. (A day already READ before the mutation is inherent
+    # point-in-time staleness, which no cache design removes.)
+    store = _store(tmp_path)
+    a_ids, b_ids = _seed_two_days(store)
+    day_a = _utc_ms(2026, 7, 25) // 86_400_000
+    day_b = _utc_ms(2026, 7, 26) // 86_400_000
+    _cal_rows(store)                                       # both days memoized
+    store.write_analysis(a_ids[0], "yolo-serial", True, 0.9, None)  # day A now needs recompute
+    real = Store._calendar_compute
+
+    def mutate_b_while_computing_a(self, conn, day, off, ts_lo, ts_hi, want):
+        row = real(self, conn, day, off, ts_lo, ts_hi, want)
+        if day == day_a:                                   # ...and day B is still ahead
+            self.write_analysis(b_ids[0], "yolo-serial", True, 0.9, None)
+        return row
+
+    monkeypatch.setattr(Store, "_calendar_compute", mutate_b_while_computing_a)
+    by_day = {r["day_ms"] // 86_400_000: r for r in _cal_rows(store)}
+    assert by_day[day_b]["analyzed"]["yolo-serial"] == 1   # not the memoized 0
+
+
+def test_tuning_calendar_skips_the_memo_when_counted_ids_escape_the_reserved_span(tmp_path):
+    # The reserved span comes from a recv_ts seek, so it covers the day only while
+    # recv_ts is non-decreasing with id — assumed, never enforced (entry 278). Where it
+    # isn't, ids counted by the day sit OUTSIDE the reservation, and a mutation to one
+    # would slip past the placeholder. The day must still be reported, just not memoized.
+    store = _store(tmp_path)
+    day_start = _utc_ms(2026, 7, 25)
+    day_end = day_start + 86_400_000 - 1
+    store.add(_frame(frame_id=1, motion=True, area=0.05), recv_ts_ms=day_start + 1_000)
+    store.add(_frame(frame_id=2, motion=True, area=0.05), recv_ts_ms=day_end + 5_000)  # clock ran ahead
+    store.add(_frame(frame_id=3, motion=True, area=0.05), recv_ts_ms=day_start + 2_000)  # then corrected
+
+    rows = store.tuning_calendar(day_start, day_end, 0, _CAL_ANALYZERS)
+    assert [r["frames"] for r in rows] == [2]              # ids 1 and 3 are in the day
+    assert rows[0]["until_id"] == 3                        # ...but the seek reserved only 1..1
+    assert _memo_days(store) == set()                      # so nothing was memoized
+
+
+def test_tuning_calendar_prune_bounds_the_memo_without_writing_when_it_needn_t(tmp_path):
+    # Bounding the table is what keeps the invalidation DELETE — which every frame insert
+    # and delete runs — a few microseconds. It has to reach BOTH ways: days above the
+    # window accumulate whenever an older one is requested, just as days below do.
+    store = _store(tmp_path)
+    _seed_two_days(store)
+    _cal_rows(store)
+    day_a = _utc_ms(2026, 7, 25) // 86_400_000
+    with store._lock:  # rows far on either side of the window, and one just inside the slack
+        for day in (day_a - 400, day_a - 3, day_a + 400):
+            store._conn.execute(
+                "INSERT OR REPLACE INTO calendar_days (tz_offset_ms, day, day_ms, since_id,"
+                " until_id, frames, events, analyzed, version, pending, token)"
+                " VALUES (0, ?, 0, 1, 2, 1, 0, '{}', 1, 0, NULL)",
+                (day,),
+            )
+        store._conn.commit()
+    _cal_rows(store)
+    assert _memo_days(store) == {day_a, day_a + 1, day_a - 3}  # both far rows gone, slack kept
+
+    # And a fully memoized call must not write on the SHARED connection at all — that
+    # traffic is what tuning_calendar moved off it. The prune used to DELETE (and so
+    # open a write transaction, and commit) on every call to match nothing.
+    seen = []
+    store._conn.set_trace_callback(lambda sql: seen.append(sql))
+    try:
+        _cal_rows(store)
+    finally:
+        store._conn.set_trace_callback(None)
+    assert seen, "trace callback saw nothing — the memo read itself should be visible"
+    writes = [q for q in seen if q.lstrip()[:6].upper() in ("DELETE", "INSERT", "UPDATE")]
+    assert writes == []
+
+
+def test_tuning_calendar_ignores_pending_and_stale_version_memo_rows(tmp_path):
+    from compute.collection import store as store_mod
+
+    store = _store(tmp_path)
+    _seed_two_days(store)
+    truth = _cal_rows(store)
+
+    # A pending row is a compute in flight (or one a crash abandoned) — never a result.
+    with store._lock:
+        store._conn.execute(
+            "UPDATE calendar_days SET pending = 1, frames = 999 WHERE pending = 0"
+        )
+        store._conn.commit()
+    assert _cal_rows(store) == truth
+
+    # A row from an older _CAL_CACHE_VERSION means the COLUMNS are unchanged but their
+    # computation is not, which nothing else could reveal.
+    with store._lock:
+        store._conn.execute("UPDATE calendar_days SET version = version - 1, frames = 999")
+        store._conn.commit()
+    assert _cal_rows(store) == truth
+    assert store_mod._CAL_CACHE_VERSION >= 1
+
+
 # --- Store: timeline_bins -----------------------------------------------------
 
 

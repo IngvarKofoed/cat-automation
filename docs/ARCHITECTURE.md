@@ -517,6 +517,15 @@ carry no FK to `frames` and live outside the media dir. Cleanup otherwise stays
 manual, except orphaned JPEGs (files with no row — unreachable by construction),
 which are collected at launch.
 
+**One table is a derived cache, not a record.** `calendar_days` memoizes the
+Motion-tuning calendar's per-day frame, event and sweep-coverage counts, because
+counting a 4-week window exactly means walking every frame and verdict index entry
+— seconds, growing with the store, on every page load. Every row is recomputable
+from `frames` + `analysis`, so it is dropped by `clear` and may be deleted outright
+with no loss. Each mutation that can move a day invalidates it, and a day is
+memoized only once the ids it counted are known to have been guarded for the whole
+of its computation — so it is never right by luck.
+
 ## Operating stages and the learning loop
 
 Recognizing 4+ similar cats is the central risk, so the system is taught through

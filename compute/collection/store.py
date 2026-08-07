@@ -206,6 +206,25 @@ _MAX_STATS_PAGES = 8
 # every event in the feed.
 _MAX_FLAG_SPAN = _EVENT_SCAN_FRAMES
 
+# Schema-independent version of what a `calendar_days` row MEANS. Bump it whenever a
+# column's computation changes (a different event-clustering rule, a different day
+# boundary), and every previously cached row is ignored and recomputed — the columns
+# are unchanged, so nothing but the numbers would otherwise reveal the drift. Not the
+# same thing as an `analyzed` key set changing, which `tuning_calendar` detects per row.
+_CAL_CACHE_VERSION = 1
+
+# The largest value a `frames.id` (an INTEGER PRIMARY KEY, i.e. the rowid) can take.
+# Used as the open upper bound when an unscoped operation invalidates the calendar
+# cache across the whole id axis.
+_MAX_ROWID = 2**63 - 1
+
+_DAY_MS = 86_400_000
+
+# How far below the requested calendar window a memoized day is kept before pruning.
+# The window rolls forward a day at a time, so a little slack absorbs a page loaded
+# either side of local midnight without re-earning those days.
+_CAL_KEEP_DAYS = 7
+
 # Ceiling on one ``list_label_flags`` read (newest first). The household flags a handful of
 # visits, but nothing prunes them automatically and the user app fetches this list on every
 # feed load, so the read gets a bound instead of trusting the list to stay short. Reaching
@@ -463,6 +482,14 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
+        # Serializes `tuning_calendar` COMPUTES, so two browser tabs opening Motion
+        # tuning at once don't each pay the same multi-second scan for identical numbers.
+        # The trade is a real wait, not a free one: the second caller blocks for the
+        # whole of the first's compute, and only the days the first MEMOIZED are then
+        # free — while the collector runs, today is invalidated ~10x/s and the waiter
+        # still recomputes it. Ordering is always `_cal_lock` -> `_lock`, never the
+        # reverse (nothing outside `tuning_calendar` takes it), so it cannot deadlock.
+        self._cal_lock = threading.Lock()
         self._init_schema()
         # Recompute the running byte total AND frame/motion counts once from the DB
         # rather than tracking them across restarts — they must survive a process
@@ -718,6 +745,38 @@ class Store:
               created_ts INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_label_flags_span ON label_flags(start_id, end_id);
+            -- `calendar_days` memoizes ONE row of the Motion-tuning calendar (see
+            -- `tuning_calendar`). It is a pure CACHE: every row is derivable from
+            -- `frames` + `analysis`, so dropping the table costs one slow recompute and
+            -- never loses information. It exists because that recompute is O(window):
+            -- counting a 4-week window's frames and verdicts exactly means walking every
+            -- one of their index entries, measured at 11 s on a 6M-frame / 16M-verdict
+            -- replica and growing with the store.
+            --   Keyed by (tz_offset_ms, day) because the day BOUNDARIES are the browser's,
+            -- not UTC's — a row computed under one offset says nothing about another.
+            -- `version` lets a change to how a column is COMPUTED retire every stale row
+            -- at once (bump `_CAL_CACHE_VERSION`); `analyzed` is JSON {analyzer: count},
+            -- read only when it covers every analyzer the caller asked for, so adding one
+            -- to `_CALENDAR_ANALYZERS` self-heals rather than reporting it as zero.
+            --   `pending` + `token` are the write protocol, not data: a row is inserted
+            -- pending BEFORE the slow passes run and filled in after, so an invalidation
+            -- landing mid-compute deletes the placeholder and the fill-in `UPDATE` then
+            -- matches nothing. That is what keeps a stale count from being cached; a
+            -- pending row is never read as a result.
+            CREATE TABLE IF NOT EXISTS calendar_days (
+              tz_offset_ms INTEGER NOT NULL,   -- the browser offset the day boundaries came from
+              day          INTEGER NOT NULL,   -- (recv_ts + tz_offset_ms) / 86400000
+              day_ms       INTEGER NOT NULL,   -- that local midnight as an epoch-ms instant
+              since_id     INTEGER NOT NULL,   -- frames.id span of the day, inclusive; also
+              until_id     INTEGER NOT NULL,   --   what an invalidation intersects against
+              frames       INTEGER NOT NULL,
+              events       INTEGER NOT NULL,
+              analyzed     TEXT    NOT NULL,   -- JSON {analyzer: frames carrying a verdict}
+              version      INTEGER NOT NULL,
+              pending      INTEGER NOT NULL,   -- 1 = placeholder, not yet a result
+              token        TEXT,               -- identifies the compute allowed to fill it in
+              PRIMARY KEY (tz_offset_ms, day)
+            );
             """
         )
         self._conn.commit()
@@ -814,6 +873,9 @@ class Store:
                 self._count += 1
                 if meta.motion:
                     self._motion_count += 1
+                # This frame lengthens its local day, so the calendar's memo of that day
+                # is now short by one. Matched by timestamp, not id — see the helper.
+                self._calendar_invalidate_day_locked(recv_ts_ms)
                 self._evict_locked()
                 self._conn.commit()
                 return int(new_id)
@@ -967,6 +1029,15 @@ class Store:
         # an identification describes a frame, so it goes with it — cheap to recompute
         # from the durable gallery, so never precious.
         self._conn.execute("DELETE FROM identifications WHERE frame_id = ?", (row_id,))
+        # This frame's disappearance changes its day's frame count AND (via the analysis
+        # cascade above) its coverage, so the calendar's memo of that day is now wrong.
+        # Hooked HERE rather than in the two callers for the reason the docstring gives
+        # for everything else in this method: it is the single accounting path, so a
+        # future third caller cannot forget it. It scans the memo table, which is why
+        # that table is pruned to a few dozen rows — at that size both this and `add`'s
+        # day-shaped sibling measure single-digit microseconds against a ~300 us `add`,
+        # so this is not the entry-309 class it superficially resembles.
+        self._calendar_invalidate_locked(row_id, row_id)
         self._total_bytes -= int(n_bytes)
         # Keep the in-memory counts in lockstep with the byte total (stats() reads
         # them instead of re-scanning): every deleted frame drops the frame count,
@@ -1244,6 +1315,12 @@ class Store:
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '0')",
                 (_NONMOTION_EVICTED_KEY,),
             )
+            # Drop the calendar memo for the SAME rowid-reuse reason: its rows are keyed
+            # by a [since_id, until_id] frame span, and a full clear restarts ids at 1,
+            # so a surviving row would both describe frames that are gone AND intersect
+            # brand-new unrelated ones — which is worse than being merely stale, since
+            # the invalidation hooks match on exactly that span.
+            self._conn.execute("DELETE FROM calendar_days")
             self._conn.commit()
             self._total_bytes = 0
             self._count = 0
@@ -2473,6 +2550,8 @@ class Store:
                     int(frame_id),
                 ),
             )
+            # A verdict landing in a day changes its calendar coverage count.
+            self._calendar_invalidate_locked(frame_id, frame_id)
             self._conn.commit()
 
     def write_analysis_batch(self, rows: "list[tuple[int, str, bool, float | None, dict | None]]") -> None:
@@ -2512,6 +2591,12 @@ class Store:
                 " SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM frames WHERE id = ?)",
                 params,
             )
+            # ONE invalidation for the batch's whole id envelope, not one per row. The
+            # cache is keyed by day span, so an envelope wider than the rows actually
+            # written can only over-invalidate (a day recomputed needlessly), never
+            # under-invalidate — and a sweep batch is contiguous anyway.
+            ids = [int(row[0]) for row in rows]
+            self._calendar_invalidate_locked(min(ids), max(ids))
             self._conn.commit()
 
     def close(self) -> None:
@@ -2764,6 +2849,49 @@ class Store:
             ).fetchone()
         return {"total": int(total), "analyzed": int(analyzed), "present": int(present)}
 
+    def _calendar_invalidate_locked(self, lo: int, hi: int) -> None:
+        """Drop cached calendar days whose id span intersects ``[lo, hi]``.
+
+        Called by the mutations whose effect is expressible as an id range: a frame
+        delete (``_delete_frame_locked`` — changes both the day's frame count and, via
+        the analysis cascade, its coverage) and every ``analysis`` write or clear. A
+        frame INSERT is the one that is not, since its id is above every existing span;
+        that goes through ``_calendar_invalidate_day_locked`` instead.
+
+        Caller holds the lock and COMMITS; this rides the caller's transaction rather
+        than opening its own, for the same two reasons ``_evict_locked``'s frontier
+        write does (changelog 305): ``self._lock`` is not reentrant, and landing the
+        invalidation in the same transaction as the rows it describes is what stops the
+        two diverging when the caller rolls back.
+
+        Intersection, not containment: an analysis sweep's ``[lo, hi]`` and a day's
+        ``[since_id, until_id]`` overlap partially all the time (a sweep chunk straddles
+        midnight), and any overlap at all makes that day's count stale.
+        """
+        self._conn.execute(
+            "DELETE FROM calendar_days WHERE since_id <= ? AND until_id >= ?",
+            (int(hi), int(lo)),
+        )
+
+    def _calendar_invalidate_day_locked(self, recv_ts: int) -> None:
+        """Drop the cached calendar day that ``recv_ts`` falls in. For frame INSERTS.
+
+        A new frame's id is above every existing day's ``until_id``, so the id-span
+        predicate ``_calendar_invalidate_locked`` uses cannot see it — the day it
+        LENGTHENS is matched by timestamp instead. ``day_ms`` is that day's local
+        midnight, so ``[day_ms, day_ms + _DAY_MS)`` is its extent under whatever offset
+        the row was computed for, and the test is exact for all of them at once.
+
+        This is why no day needs to be excluded from the memo on the grounds that it is
+        still being written to: while the collector runs, the current day is invalidated
+        ~10x/s and so is simply always recomputed, and once collection stops it memoizes
+        like any other. Caller holds the lock and commits (see the sibling above).
+        """
+        self._conn.execute(
+            "DELETE FROM calendar_days WHERE ? >= day_ms AND ? < day_ms + ?",
+            (int(recv_ts), int(recv_ts), _DAY_MS),
+        )
+
     def tuning_calendar(
         self, since_ts: int, until_ts: int, tz_offset_ms: int, analyzers: "tuple[str, ...]"
     ) -> "list[dict]":
@@ -2784,95 +2912,289 @@ class Store:
         carrying a verdict for that analyzer (the sweep-coverage numerator; the
         denominator is ``frames``).
 
-        Cost + concurrency: every pass is served by a COVERING index and touches no table
-        row — the frame count/id-span and event passes off ``idx_frames_recv_ts`` /
-        ``idx_frames_motion_recv``, the coverage pass off ``analysis``'s
-        ``(frame_id, analyzer)`` PK (see the hint note below it). Each still scans
-        O(window) index entries, and a fully-swept 4-week window is millions of them, so
-        this read runs on its OWN short-lived connection, NOT ``self._conn`` under
-        ``self._lock``: WAL lets it read the committed snapshot concurrently with the
-        collector's writes, so a big calendar scan can't stall inserts (the
-        collector-starvation class entries 102-105 removed for the polled paths). Meant for
-        on-demand use (calendar load + post-sweep refresh), not polling.
+        **Every number here is a property of the DAY, not of the requested window** —
+        which is what makes a day memoizable at all. The event pass therefore looks
+        ``_VISIT_GAP_MS`` back past local midnight for a cluster's predecessor rather
+        than treating the window edge as a cluster boundary, so a visit straddling
+        midnight is counted once, on the day it started, however the window is asked for.
+
+        Cost + concurrency: every pass is served by a COVERING index and touches no
+        table row — the frame count/id-span and event passes off ``idx_frames_recv_ts``
+        / ``idx_frames_motion_recv``, the coverage pass off ``analysis``'s
+        ``(frame_id, analyzer)`` PK. But each scans O(day) index entries, and counting
+        a fully-swept 4-week window exactly means walking every one of them: measured
+        11.3 s on a 6M-frame / 16.2M-verdict replica (of which 10.1 s was coverage
+        alone), and growing with the store. So the passes run on their OWN short-lived
+        connection, NOT ``self._conn`` under ``self._lock`` — WAL lets them read the
+        committed snapshot while the collector writes, so a scan can't stall inserts
+        (entries 102-105) — and each completed day is MEMOIZED in ``calendar_days``.
+
+        What is and isn't memoized, and why:
+
+        - A day only PARTLY inside ``[since_ts, until_ts]`` is not, since its numbers
+          would then describe the window rather than the day. Nothing else is excluded:
+          every mutation that can move a day's numbers invalidates it — frame inserts by
+          day (``_calendar_invalidate_day_locked``), frame deletes and every ``analysis``
+          write or clear by id span (``_calendar_invalidate_locked``).
+        - So while the collector runs, the CURRENT day is invalidated ~10x/s and is in
+          practice always recomputed. That is the intended cost, not an exclusion: when
+          collection stops, it memoizes like every other day and the whole calendar is
+          served from the memo.
+        - A memoized row is used only when it covers every requested analyzer, so
+          adding one to the caller's set recomputes rather than reporting it as zero.
+
+        The write protocol is what keeps a stale count from being memoized. A day's row
+        is INSERTED pending — carrying an id span wide enough to cover the whole day —
+        before the slow passes run, and filled in afterwards by an ``UPDATE`` guarded on
+        its token. Any mutation to that span meanwhile deletes the placeholder (see
+        ``_calendar_invalidate_locked``), so the fill-in matches nothing and the day is
+        simply recomputed next call. Nothing reads a pending row.
         """
         off, s, u = int(tz_offset_ms), int(since_ts), int(until_ts)
-        DAY = 86_400_000
-        days: "dict[int, dict]" = {}
-        # A fresh reader, deliberately OFF the shared write lock — see the concurrency
-        # note above. The DB file is already WAL, so this connection inherits it and sees
-        # the last committed state; only SELECTs run here, and it is always closed.
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.execute("PRAGMA busy_timeout = 5000")
+        if s > u:
+            return []
+        want = tuple(analyzers)
+        out: "dict[int, dict]" = {}
+        # One compute at a time: two tabs opening the page would otherwise each pay the
+        # same multi-second scan for the same numbers. The second waits, then hits the memo.
+        with self._cal_lock:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute("PRAGMA busy_timeout = 5000")
+            try:
+                first_day, last_day = (s + off) // _DAY_MS, (u + off) // _DAY_MS
+                self._calendar_prune(first_day, last_day)
+                for day in range(first_day, last_day + 1):
+                    # Re-read per day, NOT once up front: computing a day takes seconds,
+                    # and an invalidation landing on an already-read day during that time
+                    # would otherwise be invisible to this call, which would then serve
+                    # the numbers the mutation just falsified. A point lookup on the PK.
+                    memo = self._calendar_read_day(day, off, want)
+                    if memo is not None:
+                        out[day] = memo
+                        continue
+                    day_lo, day_hi = day * _DAY_MS - off, (day + 1) * _DAY_MS - off - 1
+                    ts_lo, ts_hi = max(day_lo, s), min(day_hi, u)
+                    span = self._calendar_day_span(conn, ts_lo, ts_hi)
+                    if span is None:
+                        continue  # no frames that day — two seeks, no scan, no row
+                    # A day the WINDOW clips is not memoized: its numbers would then
+                    # describe the request rather than the day, and the memo is keyed by
+                    # day alone. Nothing else is excluded — every mutation that can move
+                    # a day has an invalidation hook.
+                    token = os.urandom(8).hex() if day_lo >= s and day_hi <= u else None
+                    if token is not None:
+                        # Reserve BEFORE the slow passes, with the seek-derived span (a
+                        # superset of the day's live ids) so any mutation to the day
+                        # during them can find and delete this placeholder.
+                        self._calendar_reserve(day, off, span[0], span[1], token)
+                    row = self._calendar_compute(conn, day, off, ts_lo, ts_hi, want)
+                    if row is None:
+                        continue
+                    out[day] = row
+                    # Memoize only if the ids actually COUNTED lie inside the ids that
+                    # were reserved — otherwise a mutation to the difference would have
+                    # missed the placeholder, and this row could be stale on arrival.
+                    # They coincide unless `recv_ts` stepped backwards (assumed
+                    # non-decreasing with `id`, never enforced — entry 278), which is
+                    # exactly when the seek-derived span stops being a superset. Declining
+                    # to cache costs one recompute; caching here would persist a wrong
+                    # count with nothing left to correct it.
+                    if token is not None and span[0] <= row["since_id"] and row["until_id"] <= span[1]:
+                        self._calendar_store(day, off, row, token)
+            finally:
+                conn.close()
+        return [out[k] for k in sorted(out)]
+
+    def _calendar_day_span(
+        self, conn: "sqlite3.Connection", ts_lo: int, ts_hi: int
+    ) -> "tuple[int, int] | None":
+        """Id span covering ``[ts_lo, ts_hi]``, or ``None`` when it holds no frame.
+
+        Two O(log n) seeks on ``idx_frames_recv_ts``, no scan — which is also how an
+        EMPTY day is settled here for free, where the old whole-window ``GROUP BY``
+        had to scan to discover the same thing.
+
+        The span is deliberately a SUPERSET of the ids actually in the range: the upper
+        bound is one below the first frame after ``ts_hi`` (or ``_MAX_ROWID`` when there
+        is none), so an evicted tail leaves it wider rather than shorter. It is used
+        only to make the pending row catch invalidations, where wider is the safe
+        direction; the span REPORTED for the day is the exact MIN/MAX ``_calendar_compute``
+        reads.
+        """
+        first = conn.execute(
+            "SELECT id, recv_ts FROM frames WHERE recv_ts >= ? ORDER BY recv_ts LIMIT 1",
+            (int(ts_lo),),
+        ).fetchone()
+        if first is None or int(first[1]) > int(ts_hi):
+            return None
+        after = conn.execute(
+            "SELECT id FROM frames WHERE recv_ts > ? ORDER BY recv_ts LIMIT 1",
+            (int(ts_hi),),
+        ).fetchone()
+        return (int(first[0]), (int(after[0]) - 1) if after is not None else _MAX_ROWID)
+
+    def _calendar_compute(
+        self,
+        conn: "sqlite3.Connection",
+        day: int,
+        off: int,
+        ts_lo: int,
+        ts_hi: int,
+        want: "tuple[str, ...]",
+    ) -> "dict | None":
+        """The three scans behind one calendar day. Reader connection; no lock held."""
+        frames, since_id, until_id = conn.execute(
+            "SELECT COUNT(*), MIN(id), MAX(id) FROM frames WHERE recv_ts BETWEEN ? AND ?",
+            (ts_lo, ts_hi),
+        ).fetchone()
+        if not frames:
+            return None
+        # Motion-cluster (event) count. A cluster begins at a motion frame whose
+        # predecessor is > _VISIT_GAP_MS earlier; it is counted on its OWN (start) day,
+        # matching events()'s start_ts bucketing. The scan reaches _VISIT_GAP_MS BEFORE
+        # the day so a cluster running over midnight finds its predecessor and is not
+        # double-counted — the day boundary is not a cluster boundary. Index-served over
+        # idx_frames_motion_recv; only recv_ts is touched.
+        (events,) = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN recv_ts >= ?"
+            "                          AND (prev IS NULL OR recv_ts - prev > ?)"
+            "                         THEN 1 ELSE 0 END), 0)"
+            " FROM (SELECT recv_ts, LAG(recv_ts) OVER (ORDER BY recv_ts, id) AS prev"
+            "       FROM frames WHERE motion = 1 AND recv_ts BETWEEN ? AND ?)",
+            (ts_lo, _VISIT_GAP_MS, ts_lo - _VISIT_GAP_MS, ts_hi),
+        ).fetchone()
+        analyzed = {a: 0 for a in want}
+        if want:
+            # Per-analyzer sweep coverage, counted over the day's OWN id span — NOT by
+            # joining `frames` for each verdict's recv_ts. Equivalent because `recv_ts`
+            # is non-decreasing with `id` (frames are added in receive order — the same
+            # invariant `resolve_ts_range` relies on), so a day's frames occupy one
+            # contiguous id block, and because `analysis` cascade-deletes with its frame,
+            # so no orphan verdict can be counted into a day.
+            #
+            # That invariant is ASSUMED, not enforced: the collector stamps `recv_ts`
+            # from the wall clock, so a backward step across a local midnight makes two
+            # days' spans overlap and the earlier day counts the later one's verdicts
+            # too. It fails LOUDLY and in one direction only — a day reads
+            # `analyzed > frames`, i.e. coverage above 100% — never as a silent
+            # under-report. Left unguarded deliberately: clamping to the next day's first
+            # id regresses the OPPOSITE skew into a fully-swept day reading 0%, and only
+            # the join this replaced is actually immune. See CHANGELOG 277.
+            #
+            # Conditional SUMs rather than `GROUP BY analyzer`: with no analyzer
+            # predicate at all there is nothing for the planner to mis-choose, so this
+            # cannot regress into the `idx_analysis_analyzer_verdict` scan that the
+            # `+analyzer` hint had to fend off (entries 229/265/276/307 — measured 45x
+            # worse here when the hint was dropped from the GROUP BY form), and it drops
+            # the temp b-tree that form needed. Same rows visited either way; measured
+            # 10.1 s -> 8.0 s over 16.2M verdicts.
+            sums = ", ".join("COALESCE(SUM(analyzer = ?), 0)" for _ in want)
+            counts = conn.execute(
+                f"SELECT {sums} FROM analysis WHERE frame_id BETWEEN ? AND ?",
+                list(want) + [int(since_id), int(until_id)],
+            ).fetchone()
+            analyzed = {a: int(c) for a, c in zip(want, counts)}
+        return {
+            "day_ms": day * _DAY_MS - off,
+            "since_id": int(since_id),
+            "until_id": int(until_id),
+            "frames": int(frames),
+            "events": int(events),
+            "analyzed": analyzed,
+        }
+
+    def _calendar_prune(self, first_day: int, last_day: int) -> None:
+        """Drop memo rows outside the reachable window, in BOTH directions.
+
+        The calendar window rolls forward, so days below it are never read again; days
+        ABOVE it accumulate the same way whenever an older window is requested, and the
+        row key includes ``tz_offset_ms`` while this does not — so one DST flip would
+        otherwise leave a full parallel set for the same days. Bounding the table is what
+        keeps the invalidation DELETE, which scans it on every frame insert and delete, a
+        few microseconds.
+
+        Reads before it writes: a fully memoized call would otherwise open a write
+        transaction and commit on the SHARED connection to delete nothing, which is
+        exactly the traffic ``tuning_calendar`` moved off that connection.
+        """
+        lo, hi = first_day - _CAL_KEEP_DAYS, last_day + _CAL_KEEP_DAYS
+        with self._lock:
+            if self._conn.execute(
+                "SELECT 1 FROM calendar_days WHERE day < ? OR day > ? LIMIT 1", (lo, hi)
+            ).fetchone() is None:
+                return
+            self._conn.execute("DELETE FROM calendar_days WHERE day < ? OR day > ?", (lo, hi))
+            self._conn.commit()
+
+    def _calendar_read_day(self, day: int, off: int, want: "tuple[str, ...]") -> "dict | None":
+        """One memoized day, or ``None`` if it must be recomputed.
+
+        Skips pending rows (a compute in flight, or one abandoned by a crash — neither
+        is a result) and rows from an older ``_CAL_CACHE_VERSION``. A row whose
+        ``analyzed`` lacks an analyzer the caller asked for is skipped too, so
+        registering a new one recomputes the day instead of reporting it as swept 0%.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT day_ms, since_id, until_id, frames, events, analyzed"
+                " FROM calendar_days"
+                " WHERE tz_offset_ms = ? AND day = ? AND pending = 0 AND version = ?",
+                (off, day, _CAL_CACHE_VERSION),
+            ).fetchone()
+        if row is None:
+            return None
+        day_ms, since_id, until_id, frames, events, analyzed = row
         try:
-            # Frame count + id span per local day. COUNT(*)/MIN/MAX(id) are answered from
-            # idx_frames_recv_ts (id is the rowid the index carries), so no table scan.
-            for d, cnt, min_id, max_id in conn.execute(
-                "SELECT (recv_ts + ?) / ? AS d, COUNT(*), MIN(id), MAX(id)"
-                " FROM frames WHERE recv_ts BETWEEN ? AND ? GROUP BY d",
-                (off, DAY, s, u),
-            ).fetchall():
-                days[int(d)] = {
-                    "day_ms": int(d) * DAY - off,
-                    "since_id": int(min_id),
-                    "until_id": int(max_id),
-                    "frames": int(cnt),
-                    "events": 0,
-                    "analyzed": {a: 0 for a in analyzers},
-                }
-            if not days:
-                return []
-            # Motion-cluster (event) count per local day. A cluster begins at a motion
-            # frame whose predecessor is > _VISIT_GAP_MS earlier; it is counted on its
-            # OWN (start) day, matching events()'s start_ts bucketing. Index-served over
-            # idx_frames_motion_recv; only recv_ts is touched.
-            for d, ev in conn.execute(
-                "SELECT d, SUM(CASE WHEN prev IS NULL OR recv_ts - prev > ? THEN 1 ELSE 0 END)"
-                " FROM (SELECT recv_ts, (recv_ts + ?) / ? AS d,"
-                "              LAG(recv_ts) OVER (ORDER BY recv_ts, id) AS prev"
-                "       FROM frames WHERE motion = 1 AND recv_ts BETWEEN ? AND ?)"
-                " GROUP BY d",
-                (_VISIT_GAP_MS, off, DAY, s, u),
-            ).fetchall():
-                row = days.get(int(d))
-                if row is not None:
-                    row["events"] = int(ev)
-            # Per-analyzer sweep coverage, counted per day over that day's OWN id span
-            # (from the pass above) — NOT by joining `frames` for each verdict's recv_ts.
-            # Equivalent because `recv_ts` is non-decreasing with `id` (frames are added in
-            # receive order — the same invariant `resolve_ts_range` relies on), so a day's
-            # frames occupy one contiguous id block, and because `analysis` cascade-deletes
-            # with its frame, so no orphan verdict can be counted into a day.
-            #
-            # That invariant is ASSUMED, not enforced: the collector stamps `recv_ts` from
-            # the wall clock, so a backward step across a local midnight makes two days'
-            # spans overlap and the earlier day counts the later one's verdicts too. It
-            # fails LOUDLY and in one direction only — a day reads `analyzed > frames`, i.e.
-            # coverage above 100% — never as a silent under-report. Left unguarded
-            # deliberately: clamping to the next day's first id regresses the OPPOSITE skew
-            # into a fully-swept day reading 0%, and only the join this replaced is actually
-            # immune. See CHANGELOG 277.
-            #
-            # `+analyzer` DE-INDEXES that term, exactly as `_resolve_flag` and the
-            # per-span reads in `events()` do. Without it SQLite — which has no ANALYZE
-            # stats on this store — prefers `idx_analysis_analyzer_verdict` on the
-            # equality and scans each analyzer's WHOLE partition, then fetches every row.
-            # Hinted, this is a pure covering scan of the PK index (frame_id, analyzer):
-            # no table access and no frames lookup at all. Measured on a 2.5M-frame /
-            # 4.3M-verdict replica: 2590 ms joined (as it planned itself) → 880 ms.
-            if analyzers:
-                ph = ",".join("?" * len(analyzers))
-                for row in days.values():
-                    for name, cnt in conn.execute(
-                        "SELECT analyzer, COUNT(*) FROM analysis"
-                        " WHERE frame_id BETWEEN ? AND ? AND +analyzer IN (" + ph + ")"
-                        " GROUP BY analyzer",
-                        [row["since_id"], row["until_id"]] + list(analyzers),
-                    ).fetchall():
-                        if name in row["analyzed"]:
-                            row["analyzed"][name] = int(cnt)
-        finally:
-            conn.close()
-        return [days[k] for k in sorted(days)]
+            counts = json.loads(analyzed)
+        except (TypeError, ValueError):
+            return None
+        if not all(a in counts for a in want):
+            return None
+        return {
+            "day_ms": int(day_ms),
+            "since_id": int(since_id),
+            "until_id": int(until_id),
+            "frames": int(frames),
+            "events": int(events),
+            "analyzed": {a: int(counts[a]) for a in want},
+        }
+
+    def _calendar_reserve(self, day: int, off: int, lo: int, hi: int, token: str) -> None:
+        """Insert the pending row that guards one day's compute. See ``tuning_calendar``.
+
+        It carries its REAL ``day_ms`` and a day-covering id span, not placeholder
+        values, because those two columns are exactly what the invalidation predicates
+        match on — a pending row that no mutation can find would guard nothing.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO calendar_days (tz_offset_ms, day, day_ms,"
+                " since_id, until_id, frames, events, analyzed, version, pending, token)"
+                " VALUES (?, ?, ?, ?, ?, 0, 0, '{}', ?, 1, ?)",
+                (off, day, day * _DAY_MS - off, int(lo), int(hi), _CAL_CACHE_VERSION, token),
+            )
+            self._conn.commit()
+
+    def _calendar_store(self, day: int, off: int, row: dict, token: str) -> None:
+        """Fill in the reserved row — or match nothing, if it was invalidated meanwhile."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE calendar_days SET day_ms = ?, since_id = ?, until_id = ?,"
+                " frames = ?, events = ?, analyzed = ?, pending = 0, token = NULL"
+                " WHERE tz_offset_ms = ? AND day = ? AND pending = 1 AND token = ?",
+                (
+                    row["day_ms"],
+                    row["since_id"],
+                    row["until_id"],
+                    row["frames"],
+                    row["events"],
+                    json.dumps(row["analyzed"]),
+                    off,
+                    day,
+                    token,
+                ),
+            )
+            self._conn.commit()
 
     def clear_analysis(
         self,
@@ -2910,6 +3232,15 @@ class Store:
             cur = self._conn.execute(
                 "DELETE FROM analysis WHERE analyzer = ?" + range_sql + motion_sql,
                 [analyzer] + range_params,
+            )
+            # Dropping verdicts lowers a day's calendar coverage, so the memo must go
+            # with them. An unscoped clear passes the whole id axis, which drops every
+            # cached day — correct, since it wiped the analyzer everywhere. This is the
+            # one invalidation that can make a cached number read too HIGH if it were
+            # missed, which is the direction that matters (entries 97/126/167).
+            self._calendar_invalidate_locked(
+                since_id if since_id is not None else 0,
+                until_id if until_id is not None else _MAX_ROWID,
             )
             self._conn.commit()
             return cur.rowcount

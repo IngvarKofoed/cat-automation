@@ -2118,7 +2118,9 @@ def create_app(
         else:
             # Frames strictly before the window are what a scoped re-run primed from
             # (capped at _WARMUP_FRAMES by recent_before's LIMIT); drop only the shortfall.
-            pre_window = store.count_in_range(until_id=since_id - 1)
+            # Counted no further than that cap: the shortfall saturates at _WARMUP_FRAMES,
+            # so an exact count would scan from id 1 to a recent window for nothing.
+            pre_window = store.count_before_capped(since_id - 1, _WARMUP_FRAMES)
             warmup = max(0, _WARMUP_FRAMES - pre_window)
 
         # Optional day/night split (admin-next P2). It is per-visit visit-recall, so

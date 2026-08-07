@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import queue
 import threading
 import traceback
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -57,7 +59,7 @@ _LOG_EVERY = 500
 
 # How many windowed-sweep verdicts to accumulate before one batched flush (one lock
 # hold + one commit via ``write_analysis_batch``). A windowed oracle (MOG2/BSUV) must
-# analyze frames strictly in order, so it can't use the stateless path's prefetch+batch
+# analyze frames strictly in order, so it can't use the stateless path's BATCHED inference
 # producer — but its verdict WRITES don't need to be per-frame. Per-frame ``commit`` made
 # the sweep acquire the store's shared write lock once per frame, each contending with the
 # collector's continuous inserts, which starved the sweep under load. Flushing every
@@ -65,6 +67,52 @@ _LOG_EVERY = 500
 # revisits every frame each run, so verdicts lost to a cancel before their flush are simply
 # recomputed on the next run.
 _WRITE_BATCH = 256
+
+# Decode-ahead for the WINDOWED sweep. Its *inference* must stay strictly serial (MOG2's
+# rolling background and debounce streak carry across frames), but its DECODE need not:
+# reading and JPEG-decoding a frame is a pure function of the file, so decoding several
+# ahead and consuming them IN ORDER produces the identical frame sequence — verified
+# verdict-for-verdict against the serial loop.
+#
+# It is worth doing because decode DOMINATES: measured on 1280x720 q90 frames, read+decode
+# 4.79 ms vs the gate's 1.71 ms, i.e. 74% of a serial iteration. A 2-worker pool took the
+# MOG2 re-run from 166 to 332 frames/s — one day of capture (881k frames at the ~10.2 fps
+# of entry 275) from ~88 min to ~44 min per slot, and a tune compares TWO slots.
+#
+# _DECODE_LOOKAHEAD bounds the memory this costs: at most this many decoded frames are in
+# flight, so a large ROI cannot balloon the sweep (a 2304x1296 BGR frame is ~9 MB, so 8 is
+# ~72 MB). More workers is not monotonically better — 2 beat 4 and 6 on the dev box, since
+# OpenCV's decode already saturates memory bandwidth — hence an env override to tune per
+# host rather than a guessed constant.
+def _env_int(name: str, default: int) -> int:
+    """A positive int from the environment, falling back to ``default`` on anything else.
+
+    The two knobs below are read at MODULE scope, and ``compute.api.app`` imports this
+    module — so a bare ``int()`` on a value it cannot parse raised ``ValueError`` during
+    import and took the WHOLE compute tier (dashboard, collector, every worker) down with
+    it, pointing at a throughput constant. ``export CAT_WINDOWED_DECODE_WORKERS=`` is
+    enough to do it, and the comment below invites exactly that per-host tuning.
+
+    They are pure throughput knobs — no value of either can move a verdict — so a
+    malformed one must never be fatal. Falling back and logging is how this tier handles
+    bad config elsewhere (a missing ``psutil`` degrades ``/status`` to ``system: null``; an
+    unknown libcamera tuning file falls back rather than bricking capture).
+
+    Every value that parses resolves exactly as ``max(1, int(raw))`` did, so this changed
+    nothing for any input that already worked.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+
+
+_DECODE_WORKERS = _env_int("CAT_WINDOWED_DECODE_WORKERS", 2)
+_DECODE_LOOKAHEAD = _env_int("CAT_WINDOWED_DECODE_LOOKAHEAD", 8)
 
 # How many finished jobs ``status()`` reports back, most-recent-first. Bounded because the
 # history is in-memory diagnostics for a returning operator, not a durable audit log — a
@@ -168,9 +216,12 @@ def run_analysis(
          it must revisit every frame; ``total`` is the count of frames in ``[since,
          until]``.
     4. Drive the frames, by statefulness:
-       - windowed (BSUV/MOG2) → the strict-time-order serial loop: read the JPEG off disk,
-         ``cv2.imdecode`` to a BGR ndarray, ``analyzer.analyze`` it, ``store.write_analysis``
-         the verdict. Order matters (rolling background), so no batching or prefetch.
+       - windowed (BSUV/MOG2) → strict-time-order **inference** with decode running AHEAD
+         on a small thread pool: futures are consumed in submission order, so the analyzer
+         sees the identical sequence a serial loop fed it. Order matters (rolling
+         background), so inference is never batched or reordered — but decode is a pure
+         function of the file, so overlapping it changes nothing. Verdicts are written in
+         batches (``store.write_analysis_batch`` every ``_WRITE_BATCH``).
        - stateless (YOLO) → a decode-ahead **producer** thread reads+decodes frames onto a
          bounded queue while THIS thread runs inference a batch at a time
          (``analyzer.batch_size`` per call, ``store.write_analysis_batch`` per flush), so
@@ -270,11 +321,16 @@ def run_analysis(
     errors = 0
 
     if analyzer.windowed:
-        # Windowed oracle: strict-time-order decode → analyze (its rolling background
-        # depends on seeing every frame in order, so inference can be neither batched nor
-        # prefetched-with-reordering), but with verdict WRITES BATCHED — accumulate onto
-        # ``pending`` and flush every _WRITE_BATCH in one lock hold + one commit, instead of
-        # a per-frame commit that contends with the collector on every frame.
+        # Windowed oracle: strict-time-order analyze (its rolling background depends on
+        # seeing every frame in order, so inference can be neither batched nor reordered),
+        # with two things overlapped around it:
+        #  - DECODE runs AHEAD on a small thread pool. Order is preserved by consuming
+        #    futures in submission order, so the analyzer sees the identical sequence a
+        #    serial loop fed it; decode is ~74% of a serial iteration, so this is where the
+        #    wall clock is (see _DECODE_WORKERS).
+        #  - verdict WRITES are BATCHED — accumulated onto ``pending`` and flushed every
+        #    _WRITE_BATCH in one lock hold + one commit, instead of a per-frame commit that
+        #    contends with the collector on every frame.
         pending: "list[tuple]" = []
 
         def _flush_windowed() -> None:
@@ -288,28 +344,66 @@ def run_analysis(
                 store.write_analysis_batch(pending)
                 pending.clear()
 
-        for frame_id, abs_path in iterator:
-            if manager.stop_event.is_set():
-                logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
-                break
-            try:
-                image = _read_decode(abs_path)
-                result = analyzer.analyze(image)
-            except Exception:
-                # One bad frame — evicted between listing and read, corrupt bytes, a transient
-                # inference error — must not abort the sweep. Log throttled (first, then every
-                # _LOG_EVERY) so a systematic fault can't flood at frame rate, and move on.
-                errors += 1
-                if errors == 1 or errors % _LOG_EVERY == 0:
-                    logger.exception("analysis: frame %s failed (%d skipped this run)", frame_id, errors)
-                continue
-            pending.append((frame_id, analyzer.name, result.verdict, result.score, result.detail))
-            manager.record(bool(result.verdict))
-            done += 1
-            if len(pending) >= _WRITE_BATCH:
-                _flush_windowed()
-            if done % _LOG_EVERY == 0:
-                logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+        # A sliding window of at most _DECODE_LOOKAHEAD in-flight decodes, held as
+        # (frame_id, future) in submission order. Deliberately NOT the stateless path's
+        # producer-thread + queue + sentinel machinery: that exists because its consumer
+        # batches GPU calls and must drain asynchronously, whereas here the consumer is a
+        # plain in-order loop, and a bounded deque of futures preserves order by
+        # construction with no sentinel and no anti-wedge protocol to get right.
+        pool = ThreadPoolExecutor(max_workers=_DECODE_WORKERS, thread_name_prefix="analysis-decode")
+        inflight: "deque[tuple[int, object]]" = deque()
+        frames = iter(iterator)
+        try:
+            def _submit_next() -> bool:
+                """Pull one frame off the iterator and submit its decode. False when drained."""
+                nxt = next(frames, None)
+                if nxt is None:
+                    return False
+                frame_id, abs_path = nxt
+                inflight.append((frame_id, pool.submit(_read_decode, abs_path)))
+                return True
+
+            while len(inflight) < _DECODE_LOOKAHEAD and _submit_next():
+                pass
+
+            while inflight:
+                if manager.stop_event.is_set():
+                    logger.info("analysis sweep canceled: analyzer=%s after %d verdicts", analyzer.name, done)
+                    break
+                frame_id, future = inflight.popleft()
+                # Keep the pool fed before waiting on this frame, so the decoders stay busy
+                # while the gate runs — the whole point of the lookahead.
+                _submit_next()
+                try:
+                    # The decode ran on a pool thread, so its exception surfaces HERE, in
+                    # submission order — same log-and-skip cadence, same single owner of the
+                    # counter, as when the decode was inline.
+                    image = future.result()
+                    result = analyzer.analyze(image)
+                except Exception:
+                    # One bad frame — evicted between listing and read, corrupt bytes, a transient
+                    # inference error — must not abort the sweep. Log throttled (first, then every
+                    # _LOG_EVERY) so a systematic fault can't flood at frame rate, and move on.
+                    errors += 1
+                    if errors == 1 or errors % _LOG_EVERY == 0:
+                        logger.exception("analysis: frame %s failed (%d skipped this run)", frame_id, errors)
+                    continue
+                pending.append((frame_id, analyzer.name, result.verdict, result.score, result.detail))
+                manager.record(bool(result.verdict))
+                done += 1
+                if len(pending) >= _WRITE_BATCH:
+                    _flush_windowed()
+                if done % _LOG_EVERY == 0:
+                    logger.info("analysis sweep: analyzer=%s %d/%d verdicts written", analyzer.name, done, total)
+        finally:
+            # Drop the outstanding decodes rather than finishing them: on a cancel their
+            # frames are never analyzed, and on a fatal nobody will read them. wait=False
+            # keeps a cancel snappy — the at most _DECODE_WORKERS decodes already running
+            # are abandoned, and the pool threads are daemon-free but exit on their own.
+            for _fid, future in inflight:
+                future.cancel()
+            inflight.clear()
+            pool.shutdown(wait=False, cancel_futures=True)
         # Flush the final partial batch — also the path a cancel/break takes, so verdicts
         # computed before the stop are persisted rather than discarded.
         _flush_windowed()

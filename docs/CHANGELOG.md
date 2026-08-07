@@ -1079,3 +1079,75 @@ a clean one.
      read it exists for no longer fit. Six unnumbered milestone summaries stand in for them.
      Each carries forward the conventions later entries assume rather than merely naming a
      phase, since a cited entry number now resolves in the archive, not here.
+
+391. A SCOPED gate scorecard pins `frames` as the join's outer loop (`CROSS JOIN`, which
+     constrains order in SQLite without changing meaning), so a one-day Compare costs the
+     day instead of the store. Entries 229/265/276/307/385, fifth instance and the worst:
+     with no ANALYZE stats SQLite drove from `idx_analysis_analyzer_verdict`, walked the
+     oracle's WHOLE partition and applied the window bound only after probing `frames` —
+     three queries deep, three columns wide.
+
+392. Measured on a 6M-frame / 13.5M-verdict replica over one 750k-frame day: one Compare
+     click 126.7 s -> 5.7 s, with every card's visit and missed count identical.
+     The honest figure is the VDBE-step ratio, ~3x (live 214M -> 63M, a slot 234M -> 81M):
+     wall clock flatters it to 22x because the old plan also random-probes rowids across
+     the whole file, which this cache-starved dev box punishes far harder than the compute
+     PC will.
+
+393. The warm-up-threshold probe now costs ZERO VDBE steps. `ORDER BY f.id` is free in
+     rowid order, so `LIMIT 1` stops at the first scored row instead of materializing the
+     window into a temp b-tree — the pin's largest single win, and invisible in the SQL.
+
+394. UNSCOPED cards are deliberately NOT pinned: absent a range there is nothing to seek,
+     so pinning buys nothing (live 518M -> 471M steps) and costs a little on a slot column
+     (263M -> 276M). The unscoped SQL is byte-for-byte what it was, so that path carries
+     none of this change's risk.
+
+395. Two fixes measured and REJECTED, so they are not re-attempted. De-indexing the
+     analyzer term with `+` (the entry-229 remedy) is 6.7x scoped but degrades unscoped to
+     a full `SCAN o` — worse than today. And dropping the 11-arm aggregate in favour of
+     `interesting` + a count buys nothing: a bare `COUNT` costs the same as the full
+     aggregate (the SUM arms are free; the join walk is the cost), and an index-only
+     `analyzed` count off `analysis` alone measured 3.0-4.6 s against the aggregate's 2.0 s.
+
+396. Plan pinning is now a TEST, not a comment: `test_scorecard.py` asserts each scoped
+     query's plan seeks the frames id range and each unscoped one does not. Nothing else
+     can catch a regression here — the numbers are identical either way, which is how this
+     class has recurred five times. Verified to fail against the reverted pin, and the
+     default plan is wrong even on a 12-frame store, so it needs no big fixture.
+
+397. The MOG2/BSUV re-run decodes AHEAD on a small thread pool while inference stays
+     strictly serial. Its rolling background needs every frame in order, but decode is a
+     pure function of the file, so consuming futures in submission order feeds the analyzer
+     the identical sequence. Decode is 74% of a serial iteration (4.79 ms vs the gate's
+     1.71 ms at 1280x720 q90), so 2 workers took the re-run 166 -> 332 frames/s: one day of
+     capture ~88 -> ~44 min per slot, and a tune compares two slots.
+
+398. Workers/lookahead are env knobs (`CAT_WINDOWED_DECODE_WORKERS`, default 2;
+     `CAT_WINDOWED_DECODE_LOOKAHEAD`, 8) because more is NOT monotonically better — 2 beat
+     4 and 6 on the dev box, decode being memory-bandwidth bound. The lookahead is what
+     bounds the memory: a 2304x1296 BGR frame is ~9 MB, so 8 in flight is ~72 MB.
+
+399. Deliberately NOT the stateless path's producer-thread + queue + sentinel machinery: it
+     exists because that consumer batches GPU calls and must drain asynchronously, whereas
+     the windowed consumer is a plain in-order loop, where a bounded deque of futures keeps
+     order by construction with no anti-wedge protocol to get right.
+
+400. Tests pin the decode-ahead's whole contract: order preserved at five (workers,
+     lookahead) settings, byte-identical verdicts vs a forced-serial run, an undecodable
+     frame skipped in place (its exception now surfaces at `result()`, not inline), and a
+     cancel persisting exactly the prefix it computed. Verified to FAIL against an injected
+     reordering — the `(1,1)` serial case correctly still passes, a one-element deque
+     making `pop` and `popleft` the same.
+
+401. `count_before_capped` replaces the Compare's exact pre-window frame count, which was a
+     rowid scan from id 1 to the window (66 ms at 6M frames, growing) for a number that
+     saturates at 500. It matters beyond the milliseconds: that scan held the shared write
+     lock against the collector on every click — the starvation class of entries 102-105.
+     Named apart from `count_in_range` because it returns `min(preceding, cap)`, not a total.
+
+402. Remaining Compare headroom, deliberately left. Each column still walks its window
+     twice (aggregate + `interesting`), ~2 s apiece on the replica; fusing them saves only
+     ~20% since the walk, not the arms, is the cost. The structural fix is memoizing a card
+     per (day, source, oracle, params, floor) as `calendar_days` does for the calendar
+     (entry 381) — a feature with real invalidation subtleties, not a patch.

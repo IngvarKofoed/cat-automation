@@ -2195,6 +2195,34 @@ class Store:
             ).fetchone()
         return int(count)
 
+    def count_before_capped(self, frame_id: int, cap: int) -> int:
+        """How many frames precede ``frame_id``, counted no further than ``cap``.
+
+        For a caller that only needs to know whether *at least* ``cap`` frames precede a
+        point — the compare's warm-up shortfall (``max(0, WARMUP - preceding)``) is the
+        only one — an exact count is wasted work: ``COUNT(*) FROM frames WHERE id <= ?``
+        is a rowid scan from id 1 to the window, so a compare over a RECENT day walked
+        almost the whole store (66 ms at 6M frames, growing with it) to learn a number
+        that saturates at 500. Bounding the scan with a ``LIMIT`` subquery makes it O(cap)
+        — measured 66 ms -> 0.0 ms.
+
+        It matters more than the milliseconds suggest: this runs on the shared write
+        connection, so the scan held the store lock against the collector's continuous
+        inserts on every Compare click (the starvation class of changelog 102-105).
+
+        Returns ``min(preceding, cap)`` — deliberately NOT an exact count, hence the
+        separate name: a caller that needs the true total wants ``count_in_range``.
+        """
+        cap = max(0, int(cap))
+        if cap == 0:
+            return 0
+        with self._lock:
+            (count,) = self._conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM frames WHERE id <= ? LIMIT ?)",
+                (int(frame_id), cap),
+            ).fetchone()
+        return int(count)
+
     def resolve_ts_range(
         self, start_ts: "int | None", end_ts: "int | None"
     ) -> "tuple[int | None, int | None]":
@@ -3617,6 +3645,43 @@ class Store:
         warmup = max(0, int(warmup))
         is_live = source == "live"
 
+        # Optional id-range scope, applied to EVERY scored-set query below so a
+        # scoped compare scores exactly the window. ``scope_where`` is the
+        # standalone WHERE for the threshold probe (which has no other predicate);
+        # ``scope_and`` is the AND-continuation for the two queries that already
+        # filter on the warmup threshold id. Both empty (and no params) when
+        # unscoped, so an unscoped scorecard is byte-for-byte unchanged.
+        #
+        # Resolved BEFORE the FROM clause because the join ORDER depends on it (below).
+        scope_fragments, scope_params = _range_bounds("f.id", since_id, until_id)
+        scope_where = (" WHERE " + " AND ".join(scope_fragments)) if scope_fragments else ""
+        scope_and = "".join(" AND " + frag for frag in scope_fragments)
+
+        # A SCOPED card pins ``frames`` as the outer loop with CROSS JOIN, which in
+        # SQLite constrains the join order without changing the join's meaning (results
+        # verified byte-identical). Left to choose, and with no ``ANALYZE`` stats — what
+        # the real store has (entry 266) — SQLite drives from
+        # ``idx_analysis_analyzer_verdict (analyzer=?)`` and walks the oracle's WHOLE
+        # partition, probing ``frames`` per row and only THEN applying the window bound:
+        # a one-day compare pays for every verdict in the store, three queries deep, three
+        # columns wide. Pinned, the window becomes a ``frames`` rowid range scan probing
+        # ``analysis`` by its ``(frame_id, analyzer)`` PK. Entries 229/265/276/307/385,
+        # fifth instance.
+        #
+        # Measured on a 6M-frame / 13.5M-verdict replica (VDBE steps, since this box's
+        # page cache made wall clock swing 2x on an unchanged plan), one 750k-frame day:
+        # live 214.0M -> 63.3M steps, a slot column 233.6M -> 81.4M, i.e. ~3x less work
+        # per Compare click. The warmup-threshold probe goes to LITERALLY zero steps —
+        # ``ORDER BY f.id`` is free in rowid order, so ``LIMIT 1`` stops at the first
+        # scored row instead of materializing the window into a temp b-tree.
+        #
+        # UNSCOPED it is deliberately NOT pinned: there is no range to seek, so pinning
+        # buys nothing (live 518M -> 471M) and costs a little on a slot column (263M ->
+        # 276M). Absent bounds the SQL is byte-for-byte today's, so an unscoped card
+        # carries none of this risk.
+        scoped = bool(scope_fragments)
+        join_kw = "CROSS JOIN" if scoped else "JOIN"
+
         # Source column expressions + the optional source-slot JOIN. These are
         # fixed identifiers (never user input), so interpolating them is safe; the
         # analyzer/oracle names and thresholds all bind through ``?`` params.
@@ -3625,10 +3690,14 @@ class Store:
             src_join, src_params = "", []
         else:
             src_motion, src_area = "s.verdict", "s.score"
-            src_join, src_params = " JOIN analysis s ON s.frame_id = f.id AND s.analyzer = ?", [source]
+            src_join = f" {join_kw} analysis s ON s.frame_id = f.id AND s.analyzer = ?"
+            src_params = [source]
 
         # FROM + oracle JOIN (its analyzer param leads) + optional source JOIN.
-        base_from = " FROM frames f JOIN analysis o ON o.frame_id = f.id AND o.analyzer = ?" + src_join
+        base_from = (
+            f" FROM frames f {join_kw} analysis o ON o.frame_id = f.id AND o.analyzer = ?"
+            + src_join
+        )
         join_params = [oracle] + src_params
         near_zero_area = min_area / 10.0
         # "Present" = the oracle called the subject here AND (when a floor is set) it
@@ -3644,16 +3713,6 @@ class Store:
         else:
             present_core = "(o.verdict = 1)"
         missed = f"({src_motion} = 0 AND {present_core})"
-
-        # Optional id-range scope, applied to EVERY scored-set query below so a
-        # scoped compare scores exactly the window. ``scope_where`` is the
-        # standalone WHERE for the threshold probe (which has no other predicate);
-        # ``scope_and`` is the AND-continuation for the two queries that already
-        # filter on the warmup threshold id. Both empty (and no params) when
-        # unscoped, so an unscoped scorecard is byte-for-byte unchanged.
-        scope_fragments, scope_params = _range_bounds("f.id", since_id, until_id)
-        scope_where = (" WHERE " + " AND ".join(scope_fragments)) if scope_fragments else ""
-        scope_and = "".join(" AND " + frag for frag in scope_fragments)
 
         with self._lock:
             if not is_live:

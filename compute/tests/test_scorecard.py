@@ -723,3 +723,130 @@ def test_gate_fidelity_scoped_by_since_and_until_id(tmp_path):
 
     unscoped = store.gate_fidelity("mog2:candidate")
     assert unscoped == {"compared": 5, "agree": 2, "rate": pytest.approx(2 / 5)}
+
+
+# --- scoped query plan (the join-order pin) ----------------------------------
+#
+# A scoped card pins ``frames`` as the outer loop with CROSS JOIN. Without the pin, and
+# with no ``ANALYZE`` stats — what the real store has — SQLite drives from
+# ``idx_analysis_analyzer_verdict (analyzer=?)``, walks the oracle's WHOLE partition and
+# applies the window bound only after probing ``frames``: a one-day compare pays for
+# every verdict in the store. It is the fifth instance of that class (changelog
+# 229/265/276/307/385), and the numbers are identical either way, so nothing but a plan
+# assertion can catch a regression.
+
+
+def _scorecard_plans(store, **kwargs) -> "list[tuple[str, str]]":
+    """(label, first plan line) for each scored-set query one gate_scorecard issues."""
+    real = store._conn
+
+    class Spy:
+        def __init__(self): self.sql = []
+        def execute(self, sql, params=()):
+            self.sql.append((sql, list(params)))
+            return real.execute(sql, params)
+        def __getattr__(self, n): return getattr(real, n)
+
+    spy = Spy()
+    store._conn = spy
+    try:
+        store.gate_scorecard(**kwargs)
+    finally:
+        store._conn = real
+
+    out = []
+    for sql, params in spy.sql:
+        if " FROM frames f" not in sql:
+            continue
+        label = ("threshold" if sql.lstrip().startswith("SELECT f.id")
+                 else "aggregate" if "COUNT(*)" in sql else "interesting")
+        plan = real.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+        out.append((label, plan[0][-1], sql))
+    return out
+
+
+@pytest.mark.parametrize("source", ["live", "mog2:candidate"])
+def test_scoped_scorecard_drives_from_the_frames_id_range(tmp_path, source):
+    store = _store(tmp_path)
+    ids = [_seed(store, 1_000 + i * 100, motion=bool(i % 2), area=0.05,
+                 yolo=(i % 3 == 0, 0.9), slot=(i % 2, 0.05)) for i in range(12)]
+
+    plans = _scorecard_plans(
+        store, source=source, oracle="yolo", warmup=0, min_area=0.01, max_area=0.5,
+        persistence=3, since_id=ids[2], until_id=ids[9],
+    )
+    assert plans, "no scored-set query was issued"
+    for label, first, sql in plans:
+        assert first.startswith("SEARCH f USING INTEGER PRIMARY KEY"), (
+            f"{source} {label} no longer seeks the frames id range: {first}"
+        )
+        assert "CROSS JOIN" in sql, f"{source} {label} lost the join-order pin"
+
+
+@pytest.mark.parametrize("source", ["live", "mog2:candidate"])
+def test_unscoped_scorecard_is_not_pinned(tmp_path, source):
+    # Unscoped there is no range to seek, so pinning buys nothing and costs a little on a
+    # slot column — the SQL stays byte-for-byte what it was before the pin existed.
+    store = _store(tmp_path)
+    for i in range(12):
+        _seed(store, 1_000 + i * 100, motion=bool(i % 2), area=0.05,
+              yolo=(i % 3 == 0, 0.9), slot=(i % 2, 0.05))
+
+    plans = _scorecard_plans(
+        store, source=source, oracle="yolo", warmup=0, min_area=0.01,
+        max_area=0.5, persistence=3,
+    )
+    assert plans
+    for label, _first, sql in plans:
+        assert "CROSS JOIN" not in sql, f"unscoped {source} {label} must not be pinned"
+
+
+def test_pin_does_not_move_any_number(tmp_path):
+    """A window covering every frame must score exactly as the unscoped card does.
+
+    The pin only changes the plan, so a scope that admits everything has to reproduce the
+    unscoped card key-for-key — which is what makes it safe to apply on one path only.
+    """
+    store = _store(tmp_path)
+    ids = []
+    for i in range(24):
+        ids.append(_seed(store, 1_000 + i * 100, motion=bool(i % 2), area=0.004 * (i % 5),
+                         yolo=(i % 3 == 0, 0.2 + 0.1 * (i % 8)), slot=(i % 2, 0.004 * (i % 7))))
+
+    for source in ("live", "mog2:candidate"):
+        for floor in (0.0, 0.3):
+            scoped = store.gate_scorecard(
+                source, "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+                oracle_floor=floor, since_id=ids[0], until_id=ids[-1], missed_visits=True,
+            )
+            whole = store.gate_scorecard(
+                source, "yolo", warmup=0, min_area=0.01, max_area=0.5, persistence=3,
+                oracle_floor=floor, missed_visits=True,
+            )
+            assert scoped == whole, f"{source} floor={floor}: pinned card differs from unscoped"
+
+
+# --- count_before_capped (the compare's warm-up shortfall) --------------------
+
+
+def test_count_before_capped_saturates_at_the_cap(tmp_path):
+    store = _store(tmp_path)
+    ids = [_seed(store, 1_000 + i * 10, motion=False, area=0.0) for i in range(20)]
+
+    # Exact below the cap, saturated at it — never more, so the caller's
+    # max(0, WARMUP - n) shortfall is identical to what an exact count would give.
+    assert store.count_before_capped(ids[0], 5) == 1
+    assert store.count_before_capped(ids[4], 5) == 5
+    assert store.count_before_capped(ids[19], 5) == 5
+    assert store.count_before_capped(ids[19], 100) == 20
+    assert store.count_before_capped(ids[0] - 1, 100) == 0
+    assert store.count_before_capped(ids[19], 0) == 0
+
+
+def test_count_before_capped_matches_count_in_range_under_the_cap(tmp_path):
+    # Below saturation the two must agree exactly — that equivalence is what makes it
+    # safe to swap the capped form into the warm-up calculation.
+    store = _store(tmp_path)
+    ids = [_seed(store, 1_000 + i * 10, motion=False, area=0.0) for i in range(12)]
+    for anchor in ids:
+        assert store.count_before_capped(anchor, 1_000) == store.count_in_range(until_id=anchor)

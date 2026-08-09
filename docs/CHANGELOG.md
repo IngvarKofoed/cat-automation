@@ -1151,3 +1151,56 @@ a clean one.
      ~20% since the walk, not the arms, is the cost. The structural fix is memoizing a card
      per (day, source, oracle, params, floor) as `calendar_days` does for the calendar
      (entry 381) — a feature with real invalidation subtleties, not a patch.
+
+403. The annotation queue gained "Hide single-frame visits" (`min_frames`), ON by default —
+     unlike the confidence filter beside it, because thin visits are the everyday case. A
+     one-frame visit yields ONE crop, which will not be gallery-grade, so a gallery-only
+     build AND a gallery-only validation run both ignore it entirely: labelling it costs
+     attention and returns nothing. Spec: docs/specs/2026-08-09-annotation-queue-min-frames.md.
+
+404. It floors on frame COUNT, deliberately not on "has a gallery-grade frame" — the
+     predicate a build actually enrols on. Computing that server-side needs a second copy of
+     the client's `seedQuality`, and that formula has a known defect: a one-frame visit's
+     area ratio is 1.0 BY CONSTRUCTION (the frame is its own peak), so its area test cannot
+     fail and it grades `ok` structurally. Revisit the predicate once the seed is fixed.
+
+405. Each hidden count is measured with the OTHER filter still applied — `hidden_confident`
+     = confident AND thick, `hidden_thin` = thin AND uncertain — so unticking either control
+     reveals EXACTLY the number quoted. Counting each filter's full catch independently
+     would make `hidden_confident` include confident-and-thin visits that unticking would
+     not reveal: a promise the page cannot keep, in the readout that exists to stop a
+     filtered queue reading as a finished one.
+
+406. Consequence: a visit failing BOTH predicates is counted in NEITHER, so the two counts
+     do not sum to the number hidden. Status line and empty stage therefore name each figure
+     beside its own control and never show a total; both read one shared composer so they
+     cannot describe the same queue differently. Browser-verified on 8 seeded visits: both
+     filters on → shown 2, "2 confident, 3 single-frame hidden", not the 3 and 4 totals.
+
+409. `hidden_total` is that same number MEASURED (pre-filter minus post-filter), never summed
+     from the two, and is the ONLY field a "nothing left" readout may gate on. Gating on the
+     per-control pair declared the queue CLEAR — 🎉 and all — whenever every remaining visit
+     failed BOTH predicates, since neither count claims those: reachable from the ordinary
+     default floor plus "hide confident matches". Entries 97/126/167/304's trap, self-inflicted.
+
+410. That empty state now names the total and says unticking either control ALONE will not
+     reveal them, because no single-control number describes a visit both filters hid. The
+     genuine all-clear still celebrates, gated on the measured total. Found by review, not by
+     the browser pass — which had walked every OTHER combination.
+
+411. The before-the-cap regression test was HOLLOW as first written: its "thin/newest" visits
+     carried the OLDER timestamps, so the thick ones survived truncation whichever order ran
+     and the test could not fail. Proven by injecting the exact regression — old data passed,
+     repaired data fails. A test whose data contradicts its own comment asserts nothing.
+
+407. The two filters are evaluated TOGETHER, replacing the sequential `uncertain_only`
+     block, because sequencing makes each count depend on which ran first. Both orderings
+     produce the SAME surviving set and differ only in the counts, so nothing catches a
+     re-sequencing by inspection — pinned by a test asserting each untick reveals its quoted
+     number, verified to FAIL against the sequential form (`hidden_confident` 3 vs 2).
+
+408. `min_frames` is floored at 1 with NO upper clamp, unlike `limit`: any floor above the
+     largest visit empties the queue legitimately, so a bound would not prevent that —
+     `hidden_thin` is what keeps it from being SILENT. 1 is the API's no-op default and the
+     default-ON behaviour lives entirely in the client, so no other caller of
+     `/api/label/queue` changes.

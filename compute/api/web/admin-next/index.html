@@ -2264,6 +2264,7 @@
             <button data-m="labelled">Labelled</button>
           </div>
           <label class="note" id="aUncertainWrap" title="Show only the visits the active model found hard — it matched the rest confidently to a resident."><input type="checkbox" id="aUncertain"> Hide confident matches</label>
+          <label class="note" id="aThinWrap" title="Hide visits with a single detected frame. One frame is one crop, which will not be gallery-grade — so a gallery-only build and validation run both ignore it."><input type="checkbox" id="aThin" checked> Hide single-frame visits</label>
           <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
           <span id="aStatus" class="note grow">Loading queue…</span>
           <button id="aReload">Reload</button>
@@ -2298,6 +2299,15 @@
     // row), not uncertain, so a good model doesn't shrink it — weeks of correctly-named
     // visits bury the few that need attention. This filters to what the model found hard.
     let uncertainOnly = false, hiddenConfident = 0;
+    // "Hide single-frame visits": a one-frame visit yields ONE crop, which will not be
+    // gallery-grade — so a gallery-only build and a gallery-only validation run both ignore
+    // it, and labelling it costs attention for nothing. Unlike the confidence filter this
+    // ships ON: thin visits are the everyday case, so the useful state is the default rather
+    // than a habit to remember. That makes `hiddenThin` load-bearing rather than
+    // informational — it is the only thing telling the operator a short queue is a filtered
+    // one. Not persisted (as uncertainOnly isn't), so a reload returns to filtered-on.
+    const MIN_FRAMES_ON = 2;
+    let minFrames = MIN_FRAMES_ON, hiddenThin = 0, hiddenTotal = 0;
     // Sequence guard for loadQueue: two can be in flight at once (mount's initial load, the
     // Reload button, a toggle, the reload after a decision empties the page), and without
     // this the LAST RESPONSE wins rather than the last REQUEST — so a slow earlier fetch
@@ -2400,6 +2410,23 @@
       savedTimer = setTimeout(() => { savedTimer = null; el.hidden = true; }, 1800);
     }
 
+    // What the two queue filters removed, as fragments — read by BOTH the status line and
+    // the empty stage, so the two can never describe the same queue differently.
+    //   Each number is attached to ITS OWN control and no total is ever shown. The server
+    // measures each count with the other filter still applied, so unticking one control
+    // reveals exactly the number quoted — but a visit failing BOTH predicates is counted in
+    // neither, so the two do NOT sum to the number hidden. "46 hidden in total" would be a
+    // lie, in the readout that exists to stop a filtered queue reading as a finished one.
+    const hiddenParts = () => [
+      hiddenConfident ? `${hiddenConfident} confident` : '',
+      hiddenThin ? `${hiddenThin} single-frame` : '',
+    ].filter(Boolean);
+    // Whether ANY visit is hidden — the server's own measured count, never the sum of the
+    // two above. A visit failing BOTH predicates is in neither of them, so gating the
+    // "queue is clear" celebration on those two would declare the queue finished while
+    // such visits sit undecided. Reached by the ordinary default floor + "hide confident
+    // matches" pair, so it is the common compound case, not a corner.
+    const anyHidden = () => hiddenTotal > 0;
     function renderStatus() {
       const el = $('#aStatus', view);
       if (!el) return;
@@ -2407,13 +2434,15 @@
         // The decision just taken is echoed here — with the advance now instant, it is
         // the only trace of what a keypress did, and what `z` would undo.
         const last = lastDecision ? ` · last: ${lastDecision}` : '';
-        // What the filter removed is stated, never implied: with it on, an empty or short
-        // queue means "nothing hard left", NOT "nothing left to label".
-        const hid = hiddenConfident ? ` · ${hiddenConfident} confident hidden` : '';
+        // What a filter removed is stated, never implied: with one on, an empty or short
+        // queue means "nothing left that this filter admits", NOT "nothing left to label".
+        const parts = hiddenParts();
+        const hid = parts.length ? ` · ${parts.join(', ')} hidden` : '';
         el.textContent = visits.length
           ? `Visit ${idx + 1} / ${visits.length}${truncated ? '+' : ''} · ${hasModel ? 'worst-first' : 'newest-first'}${hid}${last}`
-          : (uncertainOnly && hiddenConfident
-            ? `Nothing uncertain left · ${hiddenConfident} confident match(es) hidden${last}`
+          : (anyHidden()
+            ? `Nothing left that the filters admit · ${
+              parts.length ? `${parts.join(', ')} hidden` : `${hiddenTotal} hidden`}${last}`
             : `Queue empty${last}`);
       } else if (mode === 'flagged') {
         el.textContent = flg.length
@@ -2438,12 +2467,31 @@
       // advance, a skip, a reload) closes it — leaving it open would show one visit's
       // frames over another's, the same mislabel hazard the mode guard above prevents.
       closeVisitPlayer();
-      // The empty state must not claim a clear queue when a filter is doing the emptying.
+      // The empty state must not claim a clear queue when a filter is doing the emptying —
+      // and with "Hide single-frame visits" ON by default this is a FIRST-LOAD path, reached
+      // by an operator who has toggled nothing, not an edge case. So it names each hidden
+      // count beside the control that would reveal it. No total: a visit failing both
+      // predicates is in neither count (see hiddenParts).
       if (!v) {
-        stage.innerHTML = (uncertainOnly && hiddenConfident)
-          ? `<span class="note">Nothing the model found hard — ${hiddenConfident} confidently-matched `
-            + 'visit(s) are hidden. Untick “Hide confident matches” to work them too.</span>'
-          : '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>';
+        const relax = [
+          hiddenConfident
+            ? `${hiddenConfident} confidently-matched visit(s) — untick “Hide confident matches”`
+            : '',
+          hiddenThin
+            ? `${hiddenThin} single-frame visit(s) — untick “Hide single-frame visits”`
+            : '',
+        ].filter(Boolean);
+        stage.innerHTML = !anyHidden()
+          ? '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>'
+          : relax.length
+            ? `<span class="note">Nothing left that the filters admit. Hidden: ${
+              relax.map(esc).join('; ')}.</span>`
+            // Every remaining visit fails BOTH filters, so neither per-control count
+            // claims it and no single untick would reveal it. Name the total and say so,
+            // rather than celebrating a queue that still holds work.
+            : `<span class="note">Nothing left that the filters admit — ${hiddenTotal} `
+              + 'visit(s) are hidden by the two filters together, so unticking either '
+              + 'alone will not show them. Untick both to work them.</span>';
         return;
       }
       const rep = repOf(v);
@@ -2678,6 +2726,16 @@
         ? 'Show only the visits the active model found hard — it matched the rest confidently to a resident.'
         : 'Needs a promoted model: with none, nothing has been identified, so no match is confident.';
     }
+    // Unlike the confidence toggle this needs no enable/disable: a frame count is meaningful
+    // with or without a promoted model. It is hidden outside Queue mode the same way, since
+    // Flagged spans are deliberately unfloored (a human pointing at one visit is not the
+    // bulk case) and Labelled is not a queue.
+    function renderThinToggle() {
+      const wrap = $('#aThinWrap', view), box = $('#aThin', view);
+      if (!wrap || !box) return;
+      wrap.hidden = mode !== 'queue';
+      box.checked = minFrames > 1;
+    }
     function skip(delta) {
       if (mode === 'queue') {
         if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); }
@@ -2693,11 +2751,16 @@
       const seq = ++queueSeq;
       const stage = $('#aStage', view); stage.innerHTML = '<span class="note">Loading queue…</span>';
       try {
-        // `uncertain_only` filters SERVER-side, before the page cap — client-side filtering
-        // would leave whatever few of the capped 100 happen to be uncertain.
-        const q = await api('GET', '/api/label/queue' + (uncertainOnly ? '?uncertain_only=true' : ''));
+        // Both filters run SERVER-side, before the page cap — client-side filtering would
+        // leave whatever few of the capped 100 happen to pass.
+        const qs = [];
+        if (uncertainOnly) qs.push('uncertain_only=true');
+        if (minFrames > 1) qs.push('min_frames=' + minFrames);
+        const q = await api('GET', '/api/label/queue' + (qs.length ? '?' + qs.join('&') : ''));
         if (!alive || mode !== 'queue' || seq !== queueSeq) return;   // a newer load won
         hiddenConfident = q.hidden_confident || 0;
+        hiddenThin = q.hidden_thin || 0;
+        hiddenTotal = q.hidden_total || 0;
         // Drop the frames already decided locally: a decision's write may still be in the
         // chain, so the server can legitimately still call them undecided, and offering
         // them again would label the same crop twice. Filtered PER FRAME, not per visit —
@@ -2713,6 +2776,7 @@
         }, []);
         hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0;
         renderUncertainToggle();
+        renderThinToggle();
         renderVisit();
       }
       // Guarded like the success path above — a failed load must not paint over another
@@ -3306,6 +3370,7 @@
       // take them in.
       $('#aOverview', view).hidden = m !== 'labelled';
       renderUncertainToggle();   // queue-only control
+      renderThinToggle();        // queue-only control
       const HINTS = {
         queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>v</b> play frames · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
         labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>v</b> play frames · <b>n</b>/→ next · <b>p</b>/← back',
@@ -3414,12 +3479,22 @@
     // server's page cap, so a reload is what actually fills the page with hard cases.
     $('#aUncertain', view).addEventListener('change', (e) => {
       uncertainOnly = e.target.checked;
-      hiddenConfident = 0;
+      hiddenConfident = 0; hiddenTotal = 0;
       // BLUR after toggling: `onKey` ignores every keystroke whose target is an input, so
       // leaving focus on this checkbox silently swallows the operator's next label — the
       // dropped-key failure entries 216/218 are about, and this page is keyboard-first.
       // (Blur rather than exempting checkboxes from that guard: Space is bound to skip AND
       // toggles a focused checkbox, so keeping focus would fire both.)
+      e.target.blur();
+      if (mode === 'queue') loadQueue();
+    });
+    // Same shape as the confidence toggle above, and for the same reasons: re-fetches rather
+    // than filtering what is loaded (the filter runs before the server's page cap), and
+    // BLURS after toggling, since `onKey` ignores every keystroke whose target is an input —
+    // focus left here would silently swallow the operator's next label (entries 235/242/298).
+    $('#aThin', view).addEventListener('change', (e) => {
+      minFrames = e.target.checked ? MIN_FRAMES_ON : 1;
+      hiddenThin = 0; hiddenTotal = 0;
       e.target.blur();
       if (mode === 'queue') loadQueue();
     });

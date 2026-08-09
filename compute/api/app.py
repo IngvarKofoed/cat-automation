@@ -2396,6 +2396,7 @@ def create_app(
         until_id: "int | None" = Query(default=None),
         limit: int = Query(default=_ANNOTATE_PAGE_DEFAULT),
         uncertain_only: bool = Query(default=False),
+        min_frames: int = Query(default=1),
     ):
         # The BOUNDED annotation queue (admin-next P4): the newest undecided visits,
         # capped and — once a model is active — distance-sorted worst-first (the
@@ -2411,9 +2412,15 @@ def create_app(
         # `uncertain_only` hides the visits the active model matched confidently, leaving
         # the active-learning set. Additive: default off answers exactly as before, plus a
         # `hidden_confident: 0`.
+        #   `min_frames` hides visits with fewer than N boxed frames — a single-frame visit
+        # yields one crop that will not be gallery-grade, so a gallery-only build and
+        # validation run both ignore it. Also additive: the default of 1 is the no-op, and
+        # the admin page's default-ON behaviour lives in the client (it sends 2), so no
+        # other caller of this endpoint changes. Floored, never upper-clamped, by the store.
         _validate_bounds(since_id, until_id)
         return store.annotation_queue_page(
-            oracle, since_id, until_id, limit=limit, uncertain_only=uncertain_only
+            oracle, since_id, until_id, limit=limit, uncertain_only=uncertain_only,
+            min_frames=min_frames,
         )
 
     @app.get("/api/label/enrollable")

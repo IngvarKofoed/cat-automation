@@ -161,7 +161,7 @@ def test_queue_page_empty_when_no_present_frames(tmp_path):
     page = store.annotation_queue_page("yolo-serial")
     assert page == {
         "visits": [], "truncated": False, "ordered_by": "recent", "has_model": False,
-        "hidden_confident": 0,
+        "hidden_confident": 0, "hidden_thin": 0, "hidden_total": 0,
     }
 
 
@@ -212,6 +212,157 @@ def test_queue_page_distance_sort_null_threshold_all_uncertain(tmp_path):
     # ordered worst-first (0.9 before 0.1).
     assert [v["frames"][0]["id"] for v in page["visits"]] == [fa, fb]
     assert by_id[fa]["uncertain"] is True and by_id[fb]["uncertain"] is True
+
+
+# --- 4b. MIN-FRAMES floor ------------------------------------------------------
+#
+# A single-frame visit yields ONE crop, which will not be gallery-grade — so a
+# gallery-only build and a gallery-only validation run both ignore it entirely, and
+# labelling it costs operator attention for nothing.
+
+
+def _visit(store: Store, base_ts: int, n: int, *, edge: int, dist: "float | None" = None,
+           vid: "int | None" = None, cat: "int | None" = None) -> "list[int]":
+    """One visit of ``n`` boxed frames 200 ms apart (well inside ``_VISIT_GAP_MS``)."""
+    fids = [_present(store, base_ts + i * 200, edge_id=edge + i) for i in range(n)]
+    if dist is not None:
+        store.write_identifications_batch([(f, vid, cat, dist, [0, 0, 1, 1]) for f in fids])
+    return fids
+
+
+def test_queue_page_min_frames_drops_thin_visits_and_counts_them(tmp_path):
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    thin = _visit(store, base, 1, edge=1)
+    thick = _visit(store, base + 10_000, 3, edge=10)
+
+    page = store.annotation_queue_page("yolo-serial", min_frames=2)
+    assert [v["start_id"] for v in page["visits"]] == [thick[0]]
+    assert page["hidden_thin"] == 1
+    # The dropped one is genuinely still in the store — this filters the PAGE, not the
+    # backlog: it reappears the moment the floor comes off.
+    assert len(store.annotation_queue_page("yolo-serial")["visits"]) == 2
+    assert thin  # (named for readability above)
+
+
+def test_queue_page_min_frames_default_is_a_no_op(tmp_path):
+    """The regression guard on rewriting the `uncertain_only` block."""
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    _visit(store, base, 1, edge=1)
+    _visit(store, base + 10_000, 3, edge=10)
+
+    assert store.annotation_queue_page("yolo-serial", min_frames=1) == \
+        store.annotation_queue_page("yolo-serial")
+    # Zero/negative degrade to the no-op rather than raising, and there is deliberately no
+    # upper clamp — an absurd floor legitimately empties the queue, and `hidden_thin` is
+    # what keeps that from being silent.
+    assert store.annotation_queue_page("yolo-serial", min_frames=0) == \
+        store.annotation_queue_page("yolo-serial")
+    huge = store.annotation_queue_page("yolo-serial", min_frames=9_999)
+    assert huge["visits"] == [] and huge["hidden_thin"] == 2
+
+
+def _four_bucket_store(tmp_path):
+    """2 confident+thick, 2 uncertain+thick, 1 confident+thin, 3 uncertain+thin."""
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    vid = _promote_model(store, threshold=0.5)
+    cat = store.create_cat("A")["id"]
+    conf, unc = 0.2, 0.9   # below / above the 0.5 threshold
+    slot, edge = 0, 1
+
+    def add(n, dist):
+        nonlocal slot, edge
+        _visit(store, base + slot * 10_000, n, edge=edge, dist=dist, vid=vid, cat=cat)
+        slot += 1
+        edge += n
+    for _ in range(2):
+        add(3, conf)     # confident + thick
+    for _ in range(2):
+        add(3, unc)      # uncertain + thick
+    add(1, conf)         # confident + thin  → counted in NEITHER
+    for _ in range(3):
+        add(1, unc)      # uncertain + thin
+    return store
+
+
+def test_queue_page_hidden_counts_are_what_relaxing_that_control_reveals(tmp_path):
+    """Untick either control and EXACTLY the quoted number of visits appears.
+
+    Nothing else catches a re-sequencing of the two filters: both orderings produce the
+    same surviving set and differ only in these counts.
+    """
+    store = _four_bucket_store(tmp_path)
+    both = store.annotation_queue_page("yolo-serial", uncertain_only=True, min_frames=2)
+    shown = len(both["visits"])
+    assert shown == 2                      # uncertain AND thick
+    assert both["hidden_confident"] == 2   # confident AND thick — NOT the 3 confident total
+    assert both["hidden_thin"] == 3        # thin AND uncertain — NOT the 4 thin total
+
+    # Relaxing one control reveals exactly the count that was quoted beside it.
+    relax_conf = store.annotation_queue_page("yolo-serial", uncertain_only=False, min_frames=2)
+    assert len(relax_conf["visits"]) == shown + both["hidden_confident"]
+    relax_thin = store.annotation_queue_page("yolo-serial", uncertain_only=True, min_frames=1)
+    assert len(relax_thin["visits"]) == shown + both["hidden_thin"]
+
+
+def test_queue_page_visit_failing_both_filters_is_counted_in_neither(tmp_path):
+    store = _four_bucket_store(tmp_path)
+    both = store.annotation_queue_page("yolo-serial", uncertain_only=True, min_frames=2)
+    total = len(store.annotation_queue_page("yolo-serial")["visits"])
+    hidden = total - len(both["visits"])
+    # The confident+thin visit is revealed by relaxing NEITHER control alone, so no
+    # single-control number can honestly claim it — hence the counts must not be summed
+    # or presented as a total anywhere in the UI.
+    assert hidden == both["hidden_confident"] + both["hidden_thin"] + 1
+    # ...which is why `hidden_total` is MEASURED, not summed: it is the only field a
+    # "nothing left" readout can honestly gate on.
+    assert both["hidden_total"] == hidden
+
+
+def test_queue_page_hidden_total_survives_when_both_counts_are_zero(tmp_path):
+    """The queue must not read as CLEAR when every remaining visit fails BOTH filters.
+
+    Every visit here is confident AND thin, so `hidden_confident` (confident AND thick)
+    and `hidden_thin` (thin AND uncertain) are both 0 while three visits sit undecided —
+    exactly what a caller gating on those two alone would call an empty queue. Reached by
+    the ordinary default floor plus "hide confident matches", not a corner case.
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    vid = _promote_model(store, threshold=0.5)
+    cat = store.create_cat("A")["id"]
+    for slot in range(3):
+        _visit(store, base + slot * 10_000, 1, edge=slot + 1, dist=0.2, vid=vid, cat=cat)
+
+    page = store.annotation_queue_page("yolo-serial", uncertain_only=True, min_frames=2)
+    assert page["visits"] == []
+    assert page["hidden_confident"] == 0 and page["hidden_thin"] == 0
+    assert page["hidden_total"] == 3        # the work that is still there
+    # And the three are genuinely still undecided — this filters the page, not the backlog.
+    assert len(store.annotation_queue_page("yolo-serial")["visits"]) == 3
+
+
+def test_queue_page_min_frames_applied_before_the_limit_cap(tmp_path):
+    """Fails if the filter block moves below the truncation."""
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    edge = 1
+    # The thin visits must be the NEWEST, or the test is hollow: ordering is newest-first,
+    # so were the thick ones newest they would survive the cap whether the filter ran
+    # before it or after, and a filter-moved-below-truncation regression would pass.
+    for slot in range(3):            # 3 thick visits, oldest
+        _visit(store, base + slot * 10_000, 2, edge=edge)
+        edge += 2
+    for slot in range(3, 11):        # 8 thin visits, newest — they would eat the page
+        _visit(store, base + slot * 10_000, 1, edge=edge)
+        edge += 1
+
+    page = store.annotation_queue_page("yolo-serial", limit=3, min_frames=2)
+    assert len(page["visits"]) == 3
+    assert all(len(v["frames"]) >= 2 for v in page["visits"])
+    assert page["hidden_thin"] == 8
 
 
 # --- 2. IGNORE label -----------------------------------------------------------
@@ -380,6 +531,21 @@ def test_api_label_queue_returns_bounded_page(make_app):
     assert body["truncated"] is True
     assert [v["frames"][0]["id"] for v in body["visits"]] == [ids[2], ids[1]]
     assert body["has_model"] is False and body["ordered_by"] == "recent"
+
+
+def test_api_label_queue_min_frames_param(make_app):
+    client, store = make_app()
+    base = 1_700_000_000_000
+    _visit(store, base, 1, edge=1)
+    _visit(store, base + 10_000, 3, edge=10)
+
+    # Omitted → the no-op default, plus the new counter at zero (additive: no other
+    # caller of this endpoint changes).
+    body = client.get("/api/label/queue").json()
+    assert len(body["visits"]) == 2 and body["hidden_thin"] == 0
+
+    body = client.get("/api/label/queue", params={"min_frames": 2}).json()
+    assert len(body["visits"]) == 1 and body["hidden_thin"] == 1
 
 
 def test_api_label_queue_unknown_oracle_is_400(make_app):

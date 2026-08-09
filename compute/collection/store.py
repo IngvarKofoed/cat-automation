@@ -5351,6 +5351,7 @@ class Store:
         limit: int = _ANNOTATE_PAGE_DEFAULT,
         scan_frames: int = _ANNOTATE_SCAN_FRAMES,
         uncertain_only: bool = False,
+        min_frames: int = 1,
     ) -> dict:
         """Bounded annotation queue: newest undecided visits, capped and optionally distance-sorted.
 
@@ -5363,7 +5364,22 @@ class Store:
         102–104). Returns::
 
             {visits: [...], truncated: bool, ordered_by: 'distance'|'recent', has_model: bool,
-             hidden_confident: int}
+             hidden_confident: int, hidden_thin: int}
+
+        ``min_frames`` drops visits with fewer than that many BOXED frames (this queue's
+        universe — frames carrying a cat box at or above ``_ANNOTATE_MIN_CONF``, not every
+        frame in the span). It exists because a single-frame visit yields ONE crop, that crop
+        will not be gallery-grade, and a gallery-only build and a gallery-only validation run
+        both ignore it entirely — so it costs operator attention and returns nothing. Floored
+        at 1, which is the no-op default: absent the parameter this answers exactly as it did
+        before, plus ``hidden_thin: 0``. Deliberately a frame COUNT rather than "has a
+        gallery-grade frame" (the predicate a build actually enrols on): computing that here
+        would need a second copy of the client's ``seedQuality`` formula in Python, and that
+        formula has a known defect — a one-frame visit's area ratio is 1.0 by construction
+        (the frame IS the visit's peak), so its area test cannot fail. Frame count is
+        orthogonal to that bug; revisit the grade predicate once the seed is fixed. There is
+        no upper clamp: any floor above the largest visit empties the queue legitimately, and
+        what keeps that from being SILENT is ``hidden_thin``, not a bound.
 
         ``uncertain_only`` drops the visits the active model already matched CONFIDENTLY
         to a resident, leaving the ones it found hard — what ARCHITECTURE calls the
@@ -5376,6 +5392,23 @@ class Store:
         still consume the page's slots. ``hidden_confident`` counts what it removed, so a
         short page never reads as an empty queue. A NO-OP without an active model (nothing
         has been identified, so nothing is confident) rather than an empty queue.
+
+        The two filters are evaluated TOGETHER, and each hidden count is measured with the
+        OTHER filter still applied — ``hidden_confident`` = confident AND thick,
+        ``hidden_thin`` = thin AND uncertain. So each answers "how many more would I see if I
+        relaxed THIS control", and unticking either reveals exactly the number reported.
+        Counting each filter's full catch independently would make ``hidden_confident``
+        include confident-and-thin visits that unticking would NOT reveal. The consequence is
+        that a visit failing BOTH predicates appears in NEITHER count, so the two do not sum
+        to the number hidden — callers must name each beside its own control and must not
+        present a total.
+
+        ``hidden_total`` is that number, MEASURED (pre-filter minus post-filter) rather than
+        summed from the two. It exists because a caller testing only the per-control counts
+        would call the queue CLEAR whenever every remaining visit fails BOTH predicates —
+        reachable from the ordinary default-ON floor plus "hide confident matches" — which is
+        the "filtered must never read as finished" trap. Gate any "nothing left" celebration
+        on this; use the per-control counts only for the text that names what to relax.
 
         Each visit carries the same shape ``annotation_visits`` returns
         (``frames``/``rep_frame_id``/``peak_area``/``peak_score``/``span``) plus
@@ -5414,6 +5447,11 @@ class Store:
         """
         limit = max(1, min(int(limit), _ANNOTATE_PAGE_MAX))
         scan_frames = max(1, int(scan_frames))
+        # Floored only — a zero/negative value degrades to the no-op rather than raising.
+        # Deliberately NOT clamped above the way `limit` is: no upper bound would stop an
+        # absurd floor emptying the queue (any value above the largest visit does), and
+        # `hidden_thin` is what keeps that from being silent.
+        min_frames = max(1, int(min_frames))
         # Active model read OUTSIDE the lock (active_model() re-acquires it).
         model = self.active_model()
 
@@ -5500,15 +5538,40 @@ class Store:
         else:
             visits.sort(key=lambda v: (v["span"][0], v["start_id"]), reverse=True)
 
-        # Drop the confidently-matched visits BEFORE the limit cap (see the docstring):
-        # applied after, they would still eat the page's slots and the filter would appear
-        # to do nothing on a busy store. Without a model every `uncertain` is None, so the
-        # filter is skipped entirely rather than emptying the queue.
-        hidden_confident = 0
-        if uncertain_only and model is not None:
-            kept = [v for v in visits if v["uncertain"]]
-            hidden_confident = len(visits) - len(kept)
-            visits = kept
+        # Both filters applied BEFORE the limit cap (see the docstring): applied after, the
+        # hidden visits would still eat the page's slots and a filter would appear to do
+        # nothing on a busy store. Without a model every `uncertain` is None, so the
+        # confidence filter is skipped entirely rather than emptying the queue.
+        #
+        # Evaluated TOGETHER, not as two sequential filters, because sequencing makes each
+        # count depend on which ran first. Each count is measured with the OTHER predicate
+        # still applied, so it answers "how many more would I see if I relaxed THIS control"
+        # — exactly what the operator toggling one checkbox is asking, and what the status
+        # line promises. Counting each filter's full catch independently would let
+        # `hidden_confident` include confident-AND-thin visits that unticking would NOT
+        # reveal: a promise the page cannot keep, in the readout that exists to stop a
+        # filtered queue reading as a finished one.
+        #   Consequence: a visit failing BOTH predicates is counted in NEITHER (relaxing
+        # either control alone leaves it hidden), so the two counts do not sum to the number
+        # hidden — which is why the UI names each beside its own control and shows no total.
+        drop_confident = uncertain_only and model is not None
+
+        def _keep_conf(v: dict) -> bool:
+            return not drop_confident or bool(v["uncertain"])
+
+        def _keep_thick(v: dict) -> bool:
+            return len(v["frames"]) >= min_frames
+
+        hidden_confident = sum(1 for v in visits if _keep_thick(v) and not _keep_conf(v))
+        hidden_thin = sum(1 for v in visits if _keep_conf(v) and not _keep_thick(v))
+        kept = [v for v in visits if _keep_conf(v) and _keep_thick(v)]
+        # Measured, NOT summed from the two above — that is the whole point. A visit
+        # failing BOTH predicates is in neither count, so a caller testing only those two
+        # would call the queue CLEAR while such visits sit undecided and hidden: the
+        # "filtered must never read as finished" trap (entries 97/126/167/304), reached by
+        # the ordinary default-ON + "hide confident matches" pair.
+        hidden_total = len(visits) - len(kept)
+        visits = kept
 
         if len(visits) > limit:
             truncated = True
@@ -5520,6 +5583,8 @@ class Store:
             "ordered_by": ordered_by,
             "has_model": model is not None,
             "hidden_confident": hidden_confident,
+            "hidden_thin": hidden_thin,
+            "hidden_total": hidden_total,
         }
 
     def _attach_queue_distances(self, visits: "list[dict]", model: dict) -> None:

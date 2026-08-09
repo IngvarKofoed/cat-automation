@@ -1177,6 +1177,18 @@ a clean one.
      cannot describe the same queue differently. Browser-verified on 8 seeded visits: both
      filters on → shown 2, "2 confident, 3 single-frame hidden", not the 3 and 4 totals.
 
+407. The two filters are evaluated TOGETHER, replacing the sequential `uncertain_only`
+     block, because sequencing makes each count depend on which ran first. Both orderings
+     produce the SAME surviving set and differ only in the counts, so nothing catches a
+     re-sequencing by inspection — pinned by a test asserting each untick reveals its quoted
+     number, verified to FAIL against the sequential form (`hidden_confident` 3 vs 2).
+
+408. `min_frames` is floored at 1 with NO upper clamp, unlike `limit`: any floor above the
+     largest visit empties the queue legitimately, so a bound would not prevent that —
+     `hidden_thin` is what keeps it from being SILENT. 1 is the API's no-op default and the
+     default-ON behaviour lives entirely in the client, so no other caller of
+     `/api/label/queue` changes.
+
 409. `hidden_total` is that same number MEASURED (pre-filter minus post-filter), never summed
      from the two, and is the ONLY field a "nothing left" readout may gate on. Gating on the
      per-control pair declared the queue CLEAR — 🎉 and all — whenever every remaining visit
@@ -1193,14 +1205,55 @@ a clean one.
      and the test could not fail. Proven by injecting the exact regression — old data passed,
      repaired data fails. A test whose data contradicts its own comment asserts nothing.
 
-407. The two filters are evaluated TOGETHER, replacing the sequential `uncertain_only`
-     block, because sequencing makes each count depend on which ran first. Both orderings
-     produce the SAME surviving set and differ only in the counts, so nothing catches a
-     re-sequencing by inspection — pinned by a test asserting each untick reveals its quoted
-     number, verified to FAIL against the sequential form (`hidden_confident` 3 vs 2).
+412. The crop-grade formula is now PYTHON (`store.seed_quality`) and the single source of
+     truth; every visit payload carries `seed_quality` per frame and the client displays and
+     echoes it. Forced by the queue filtering on the grade: a filter server-side and a tally
+     client-side computed by two copies of one formula is a queue that can contradict its own
+     readout. Spec: docs/specs/2026-08-09-annotation-grade-tally.md.
 
-408. `min_frames` is floored at 1 with NO upper clamp, unlike `limit`: any floor above the
-     largest visit empties the queue legitimately, so a bound would not prevent that —
-     `hidden_thin` is what keeps it from being SILENT. 1 is the API's no-op default and the
-     default-ON behaviour lives entirely in the client, so no other caller of
-     `/api/label/queue` changes.
+413. The annotation stage now says what a decision WOULD contribute — "would add 1 gallery /
+     2 poor" — in Queue and Flagged alike. `rep`/`peak` never answered the question the
+     operator actually has, and for a 2-frame visit the deciding number (the non-rep frame's
+     area ratio) was on no screen. Verified end to end: a visit reading "would add 3 gallery"
+     wrote exactly three `gallery` rows.
+
+414. `seed_quality` is kept apart from `quality` — the grade a label would write vs the grade
+     a `dataset_items` row STORES. Labelled review shows the second and writes the first, so
+     collapsing them would make its tally and its re-label disagree about one crop.
+
+415. New `require_gallery` queue filter, ON by default: keep only visits holding a crop a
+     quality-filtered build would enrol. It does NOT subsume the frame floor and both are
+     kept — a lone frame's area ratio is 1.0 by construction, so a single-frame visit at
+     ≥60% grades `gallery` on a comparison with itself, which this filter SHOWS and the
+     floor hides. Only the pair means "would contribute a crop worth enrolling".
+
+416. `canSeed` and its "your compute PC is on an older build" banner are GONE with the
+     client formula. They existed because the client could not grade a payload lacking
+     per-frame scores; the server always has the score and the peak area, so the state
+     they warned about is now unreachable.
+
+417. The grid test pins both gates at their exact edges, transcribed from the JavaScript it
+     replaces — verified to FAIL against three separate slips (a 0.7→0.75 threshold, `>=`→`>`,
+     `or`→`and`). Transcription was this change's only real risk: a silent slip would re-grade
+     every future crop, and nothing else would have noticed.
+
+418. ARCHITECTURE now describes all THREE queue filters and says which two ship on; it had
+     claimed a single opt-in "hide confident matches". The drift started with entry 403 and
+     compounded here — and the doc's job is stating what the DEFAULT view shows, which had
+     silently become "two predicates narrower than this paragraph says".
+
+419. Every visit payload asserts it carries `seed_quality`, not just the queue's. The client
+     echoes that field straight into `POST /api/label`, where `quality` defaults to None, so
+     a builder that stopped attaching it would write NULL-grade crops a quality-filtered
+     build then skips — silently. These assertions replace the `canSeed` guard that used to
+     catch that state and was deleted with the client formula (entry 416).
+
+420. A flagged span's tally reads "would add N ok SO FAR" while coverage is partial: it
+     counts only the frames actually swept, so Analyse can still add to it. Entry 226's rule
+     — flagged state is read from coverage, never from verdicts merely existing — applied to
+     a new readout.
+
+421. Changelog ordering repaired: entries 409-411 had been inserted ABOVE 407/408, stranding
+     two entries after 417 so the file no longer ended at its newest. Now strictly monotonic
+     222→421. The convention exists because this file is read top-down at session start.
+

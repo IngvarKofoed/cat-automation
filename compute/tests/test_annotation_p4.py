@@ -63,10 +63,17 @@ def _boxes_detail(boxes):
     return {"boxes": boxes}
 
 
-def _present(store: Store, recv_ts_ms: int, *, edge_id: int = 1, score: float = 0.9) -> int:
-    """Add one frame at ``recv_ts_ms`` with a yolo-serial box → a queue-present frame id."""
+def _present(store: Store, recv_ts_ms: int, *, edge_id: int = 1, score: float = 0.9,
+             side: float = 10.0) -> int:
+    """Add one frame at ``recv_ts_ms`` with a yolo-serial box → a queue-present frame id.
+
+    ``side`` is the box's edge length, so a caller can make one frame's box smaller than
+    its visit's peak and drive ``seed_quality``'s area gate (side 10 vs 10 → ratio 1.0;
+    side 5 vs 10 → ratio 0.25).
+    """
     fid = store.add(_frame(frame_id=edge_id, ts=recv_ts_ms), recv_ts_ms=recv_ts_ms)
-    store.write_analysis(fid, "yolo-serial", True, score, _boxes_detail([[0, 0, 10, 10, score]]))
+    box = [0, 0, side, side, score]
+    store.write_analysis(fid, "yolo-serial", True, score, _boxes_detail([box]))
     return fid
 
 
@@ -161,7 +168,7 @@ def test_queue_page_empty_when_no_present_frames(tmp_path):
     page = store.annotation_queue_page("yolo-serial")
     assert page == {
         "visits": [], "truncated": False, "ordered_by": "recent", "has_model": False,
-        "hidden_confident": 0, "hidden_thin": 0, "hidden_total": 0,
+        "hidden_confident": 0, "hidden_thin": 0, "hidden_no_gallery": 0, "hidden_total": 0,
     }
 
 
@@ -214,6 +221,61 @@ def test_queue_page_distance_sort_null_threshold_all_uncertain(tmp_path):
     assert by_id[fa]["uncertain"] is True and by_id[fb]["uncertain"] is True
 
 
+# --- 4a. seed_quality: the grading formula, moved from JS to Python -------------
+
+
+def test_seed_quality_gate_boundaries():
+    """Pins both gates at their exact edges — a transcription slip re-grades every crop.
+
+    Transcribed from the JavaScript this replaces:
+        if (f.score >= 0.6 && ratio >= 0.7) return 'gallery';
+        if (f.score < 0.35 || ratio < 0.3)  return 'poor';
+        return 'ok';
+    """
+    from compute.collection.store import seed_quality
+
+    def grade(score, ratio):
+        # peak_area 100 makes bbox_area numerically equal to ratio-percent.
+        return seed_quality(score, ratio * 100.0, 100.0)
+
+    # gallery needs BOTH gates; each boundary is inclusive.
+    assert grade(0.60, 0.70) == "gallery"
+    assert grade(0.59, 0.70) == "ok"          # score just under
+    assert grade(0.60, 0.69) == "ok"          # ratio just under
+    assert grade(0.99, 1.00) == "gallery"
+    # poor takes EITHER gate; both boundaries are exclusive.
+    assert grade(0.35, 0.30) == "ok"
+    assert grade(0.34, 0.30) == "poor"        # score just under
+    assert grade(0.35, 0.29) == "poor"        # ratio just under
+    # A high score cannot rescue a tiny box, and vice versa.
+    assert grade(0.95, 0.10) == "poor"
+    assert grade(0.10, 1.00) == "poor"
+
+
+def test_seed_quality_degenerate_inputs():
+    from compute.collection.store import seed_quality
+
+    # A missing score grades poor, matching the JS (`null < 0.35` coerced to `0 < 0.35`).
+    assert seed_quality(None, 50.0, 100.0) == "poor"
+    # No peak area → ratio 0 → poor, never a ZeroDivisionError.
+    assert seed_quality(0.9, 50.0, 0) == "poor"
+    assert seed_quality(0.9, 50.0, None) == "poor"
+
+
+def test_seed_quality_lone_frame_ratio_is_one_by_construction():
+    """The known defect, pinned so a 'fix' elsewhere cannot land silently.
+
+    A single-frame visit's frame IS its own peak, so ratio is exactly 1.0 and the area
+    gate cannot fail — any lone frame at or above the score gate grades `gallery` on a
+    comparison with itself. This is why the queue's frame floor is NOT subsumed by its
+    gallery filter and both are kept.
+    """
+    from compute.collection.store import seed_quality
+
+    assert seed_quality(0.60, 42.0, 42.0) == "gallery"   # would be hidden by min_frames
+    assert seed_quality(0.59, 42.0, 42.0) == "ok"
+
+
 # --- 4b. MIN-FRAMES floor ------------------------------------------------------
 #
 # A single-frame visit yields ONE crop, which will not be gallery-grade — so a
@@ -222,9 +284,15 @@ def test_queue_page_distance_sort_null_threshold_all_uncertain(tmp_path):
 
 
 def _visit(store: Store, base_ts: int, n: int, *, edge: int, dist: "float | None" = None,
-           vid: "int | None" = None, cat: "int | None" = None) -> "list[int]":
-    """One visit of ``n`` boxed frames 200 ms apart (well inside ``_VISIT_GAP_MS``)."""
-    fids = [_present(store, base_ts + i * 200, edge_id=edge + i) for i in range(n)]
+           vid: "int | None" = None, cat: "int | None" = None,
+           score: float = 0.9, side: float = 10.0) -> "list[int]":
+    """One visit of ``n`` boxed frames 200 ms apart (well inside ``_VISIT_GAP_MS``).
+
+    All frames share ``score``/``side``, so by default every frame's ratio is 1.0 and a
+    visit grades all-``gallery``; pass a low ``score`` for a visit carrying none.
+    """
+    fids = [_present(store, base_ts + i * 200, edge_id=edge + i, score=score, side=side)
+            for i in range(n)]
     if dist is not None:
         store.write_identifications_batch([(f, vid, cat, dist, [0, 0, 1, 1]) for f in fids])
     return fids
@@ -363,6 +431,133 @@ def test_queue_page_min_frames_applied_before_the_limit_cap(tmp_path):
     assert len(page["visits"]) == 3
     assert all(len(v["frames"]) >= 2 for v in page["visits"])
     assert page["hidden_thin"] == 8
+
+
+# --- 4c. GALLERY-GRADE filter --------------------------------------------------
+
+
+def test_queue_frames_carry_seed_quality(tmp_path):
+    """Every queue frame arrives graded — the client no longer derives it."""
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    # Two frames: the big one is the visit's peak (ratio 1.0); the small one is 25% of it,
+    # so it fails the area gate despite a high score.
+    _present(store, base, edge_id=1, score=0.9, side=10.0)
+    _present(store, base + 200, edge_id=2, score=0.9, side=5.0)
+
+    page = store.annotation_queue_page("yolo-serial")
+    frames = page["visits"][0]["frames"]
+    assert [f["seed_quality"] for f in frames] == ["gallery", "poor"]
+
+
+def test_every_visit_payload_carries_seed_quality(tmp_path):
+    """All four builders grade their frames, not just the queue.
+
+    The client echoes ``f.seed_quality`` straight into ``POST /api/label``, whose
+    ``quality`` field defaults to ``None`` — so a payload that silently stopped carrying
+    it would write NULL-grade crops that a quality-filtered build then skips, with
+    nothing to notice. The client-side guard that used to catch that state (``canSeed``
+    and its banner) was deleted when the formula moved server-side, so these assertions
+    are what replaced it.
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    fids = _visit(store, base, 2, edge=1, score=0.9)
+
+    # 1. the paginated queue
+    assert all(f["seed_quality"] == "gallery"
+               for f in store.annotation_queue_page("yolo-serial")["visits"][0]["frames"])
+    # 2. the unpaginated legacy queue
+    assert all(f["seed_quality"] == "gallery"
+               for f in store.annotation_visits("yolo-serial")[0]["frames"])
+    # 3. a flagged span
+    store.add_label_flag(fids[0], fids[-1])
+    flagged = store.flagged_visits("yolo-serial")
+    assert flagged and all(f["seed_quality"] == "gallery" for f in flagged[0]["frames"])
+    # 4. a labelled visit — carries BOTH grades, and they are separate fields: `quality`
+    #    is what the row stores, `seed_quality` what a re-label would write.
+    store.add_dataset_items([
+        {"frame_id": f, "label_kind": "unknown_cat", "quality": "poor",
+         "bbox": [0, 0, 10, 10], "crop_path": f"c{f}.jpg"} for f in fids
+    ])
+    lab = store.labeled_visits("yolo-serial")[0]
+    assert [f["quality"] for f in lab["frames"]] == ["poor", "poor"]
+    assert [f["seed_quality"] for f in lab["frames"]] == ["gallery", "gallery"]
+
+
+def test_queue_page_require_gallery_filters_and_counts(tmp_path):
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    # Two frames each; the low-score visit can produce no gallery crop.
+    _visit(store, base, 2, edge=1, score=0.9)               # -> gallery
+    _visit(store, base + 10_000, 2, edge=10, score=0.5)     # -> ok, no gallery
+
+    page = store.annotation_queue_page("yolo-serial", require_gallery=True)
+    assert len(page["visits"]) == 1
+    assert page["hidden_no_gallery"] == 1
+    # Default is the no-op: absent the flag, both visits and a zeroed counter.
+    plain = store.annotation_queue_page("yolo-serial")
+    assert len(plain["visits"]) == 2 and plain["hidden_no_gallery"] == 0
+
+
+def test_gallery_filter_does_not_subsume_the_frame_floor(tmp_path):
+    """The lone-frame asymmetry — the reason both filters are kept.
+
+    A single-frame visit at >=0.6 grades `gallery` because its ratio is 1.0 by
+    construction, so require_gallery SHOWS exactly what min_frames hides. Neither
+    predicate contains the other, and only the pair means "would contribute a crop
+    worth enrolling".
+    """
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    lone = _visit(store, base, 1, edge=1, score=0.9)              # row 2 of the table
+    weak = _visit(store, base + 10_000, 2, edge=10, score=0.5)    # row 3 of the table
+
+    only_gallery = store.annotation_queue_page("yolo-serial", require_gallery=True)
+    assert [v["start_id"] for v in only_gallery["visits"]] == [lone[0]]   # SHOWN
+    only_floor = store.annotation_queue_page("yolo-serial", min_frames=2)
+    assert [v["start_id"] for v in only_floor["visits"]] == [weak[0]]     # the other one
+    # Together they admit neither — which is the point.
+    both = store.annotation_queue_page("yolo-serial", min_frames=2, require_gallery=True)
+    assert both["visits"] == [] and both["hidden_total"] == 2
+
+
+def test_three_filter_hidden_counts_are_each_what_relaxing_that_one_reveals(tmp_path):
+    """Changelog 405's rule, extended to three filters."""
+    store = _store(tmp_path)
+    base = 1_700_000_000_000
+    vid = _promote_model(store, threshold=0.5)
+    cat = store.create_cat("A")["id"]
+    slot, edge = 0, 1
+
+    def add(n, dist, score):
+        nonlocal slot, edge
+        _visit(store, base + slot * 10_000, n, edge=edge, dist=dist, vid=vid, cat=cat,
+               score=score)
+        slot += 1
+        edge += n
+    add(2, 0.9, 0.9)    # uncertain, thick, gallery  -> SHOWN
+    add(2, 0.2, 0.9)    # confident only             -> hidden_confident
+    add(1, 0.9, 0.9)    # thin only (lone => gallery)-> hidden_thin
+    add(2, 0.9, 0.5)    # no-gallery only            -> hidden_no_gallery
+    add(1, 0.2, 0.5)    # fails all three            -> counted in NONE
+
+    page = store.annotation_queue_page(
+        "yolo-serial", uncertain_only=True, min_frames=2, require_gallery=True)
+    shown = len(page["visits"])
+    assert shown == 1
+    assert (page["hidden_confident"], page["hidden_thin"], page["hidden_no_gallery"]) == (1, 1, 1)
+    assert page["hidden_total"] == 4        # includes the one in no per-control count
+
+    # Relaxing any ONE control reveals exactly the count quoted beside it.
+    for kw, count in (
+        ({"uncertain_only": False}, page["hidden_confident"]),
+        ({"min_frames": 1}, page["hidden_thin"]),
+        ({"require_gallery": False}, page["hidden_no_gallery"]),
+    ):
+        args = {"uncertain_only": True, "min_frames": 2, "require_gallery": True, **kw}
+        relaxed = store.annotation_queue_page("yolo-serial", **args)
+        assert len(relaxed["visits"]) == shown + count, kw
 
 
 # --- 2. IGNORE label -----------------------------------------------------------

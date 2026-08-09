@@ -304,6 +304,50 @@ def classify_miss(area: "float | None", min_area: float, max_area: float) -> str
 _LABEL_KINDS = ("identified", "unknown_cat", "not_cat", "ignored")
 _QUALITIES = ("gallery", "ok", "poor")
 
+# Crop-grade gates. A crop is graded on its detection confidence AND how much of the
+# visit's BEST box it fills — `ratio` is relative to that visit's own peak area, so the
+# grade says "how fully was the cat in view compared to its own best moment here", not
+# how good the crop is in absolute terms.
+#   These lived in the admin page's JavaScript until the annotation queue needed to FILTER
+# on the result: a filter server-side and a tally client-side computed by two copies of one
+# formula is a queue that can contradict its own readout, so Python is now the single source
+# of truth and the client displays and echoes what it is given.
+_GRADE_GALLERY_MIN_SCORE = 0.6
+_GRADE_GALLERY_MIN_RATIO = 0.7
+_GRADE_POOR_MAX_SCORE = 0.35
+_GRADE_POOR_MAX_RATIO = 0.3
+
+
+def seed_quality(
+    score: "float | None", bbox_area: float, peak_area: "float | None"
+) -> str:
+    """Grade one crop: ``gallery`` | ``ok`` | ``poor``.
+
+    ``bbox_area``/``peak_area`` are the frame's own box area and its VISIT's peak (the
+    largest box in the cluster), so ``ratio`` is within-visit and the peak-area frame
+    always scores 1.0.
+
+    KNOWN DEFECT, deliberately preserved here rather than fixed in passing: on a
+    single-frame visit the frame IS the peak, so ``ratio`` is 1.0 by construction and the
+    area gate cannot fail — meaning any lone frame at or above the score gate grades
+    ``gallery`` on a comparison with itself. That is why the annotation queue's frame-count
+    floor is NOT subsumed by its gallery-grade filter and both are kept (see
+    ``annotation_queue_page``). Fixing it means either an absolute area gate (which
+    re-grades every crop) or a rule that a lone frame caps at ``ok``; both are their own
+    change with their own before/after count.
+
+    A ``None`` score grades ``poor``, matching the JavaScript this replaces (``null <
+    0.35`` coerced to ``0 < 0.35``). Pure — no store, no cv2 — so it is unit-testable on
+    plain numbers, as ``cap_per_cat`` is.
+    """
+    s = 0.0 if score is None else float(score)
+    ratio = (bbox_area / peak_area) if peak_area else 0.0
+    if s >= _GRADE_GALLERY_MIN_SCORE and ratio >= _GRADE_GALLERY_MIN_RATIO:
+        return "gallery"
+    if s < _GRADE_POOR_MAX_SCORE or ratio < _GRADE_POOR_MAX_RATIO:
+        return "poor"
+    return "ok"
+
 # Minimum yolo-serial detection confidence for a frame to enter the annotation
 # queue (see ``_present_frames``). The oracle runs recall-first at conf 0.15 and
 # hallucinates cats on empty frames (a bare tile floor reads as a low-conf "cat"),
@@ -5272,11 +5316,13 @@ class Store:
                 for fr in cluster
             ]
             rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            peak_area = self._bbox_area(rep["bbox"])
+            self._attach_seed_quality(out_frames, peak_area)
             visits.append(
                 {
                     "frames": out_frames,
                     "rep_frame_id": rep["id"],
-                    "peak_area": self._bbox_area(rep["bbox"]),
+                    "peak_area": peak_area,
                     "peak_score": max(fr["score"] for fr in cluster),
                     "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
                 }
@@ -5352,6 +5398,7 @@ class Store:
         scan_frames: int = _ANNOTATE_SCAN_FRAMES,
         uncertain_only: bool = False,
         min_frames: int = 1,
+        require_gallery: bool = False,
     ) -> dict:
         """Bounded annotation queue: newest undecided visits, capped and optionally distance-sorted.
 
@@ -5364,7 +5411,30 @@ class Store:
         102–104). Returns::
 
             {visits: [...], truncated: bool, ordered_by: 'distance'|'recent', has_model: bool,
-             hidden_confident: int, hidden_thin: int}
+             hidden_confident: int, hidden_thin: int, hidden_no_gallery: int,
+             hidden_total: int}
+
+        ``require_gallery`` keeps only visits holding at least one crop that would grade
+        ``gallery`` (each frame carries its ``seed_quality``) — what a quality-filtered
+        build actually enrols, so it is the contribution that earns an operator's attention.
+        Default ``False`` is the no-op; the admin page's default-ON lives in the client.
+
+        It does NOT subsume ``min_frames``, and both are kept for that reason. The two
+        overlap without either containing the other:
+
+        ===========================  ==============  =================
+        visit                        min_frames=2    require_gallery
+        ===========================  ==============  =================
+        1 frame, score < 0.6         hidden          hidden
+        1 frame, score >= 0.6        HIDDEN          SHOWN
+        2+ frames, no gallery crop   shown           HIDDEN
+        2+ frames, >=1 gallery crop  shown           shown
+        ===========================  ==============  =================
+
+        Row 2 is ``seed_quality``'s known defect: a lone frame's ratio is 1.0 by
+        construction, so it grades ``gallery`` on a comparison with itself — the least
+        trustworthy gallery claim there is, and exactly what the frame floor exists to
+        remove. Row 3 is what the frame floor could never express.
 
         ``min_frames`` drops visits with fewer than that many BOXED frames (this queue's
         universe — frames carrying a cat box at or above ``_ANNOTATE_MIN_CONF``, not every
@@ -5393,14 +5463,13 @@ class Store:
         short page never reads as an empty queue. A NO-OP without an active model (nothing
         has been identified, so nothing is confident) rather than an empty queue.
 
-        The two filters are evaluated TOGETHER, and each hidden count is measured with the
-        OTHER filter still applied — ``hidden_confident`` = confident AND thick,
-        ``hidden_thin`` = thin AND uncertain. So each answers "how many more would I see if I
-        relaxed THIS control", and unticking either reveals exactly the number reported.
-        Counting each filter's full catch independently would make ``hidden_confident``
-        include confident-and-thin visits that unticking would NOT reveal. The consequence is
-        that a visit failing BOTH predicates appears in NEITHER count, so the two do not sum
-        to the number hidden — callers must name each beside its own control and must not
+        All three filters are evaluated TOGETHER, and each hidden count is measured with the
+        OTHERS still applied — so each answers "how many more would I see if I relaxed THIS
+        control", and unticking any one reveals exactly the number reported. Counting each
+        filter's full catch independently would make ``hidden_confident`` include
+        confident-and-thin visits that unticking would NOT reveal. The consequence is that a
+        visit failing TWO OR MORE predicates appears in NO per-control count, so they do not
+        sum to the number hidden — callers must name each beside its own control and must not
         present a total.
 
         ``hidden_total`` is that number, MEASURED (pre-filter minus post-filter) rather than
@@ -5497,10 +5566,12 @@ class Store:
                 for fr in cluster
             ]
             rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            peak_area = self._bbox_area(rep["bbox"])
+            self._attach_seed_quality(out_frames, peak_area)
             visits.append({
                 "frames": out_frames,
                 "rep_frame_id": rep["id"],
-                "peak_area": self._bbox_area(rep["bbox"]),
+                "peak_area": peak_area,
                 "peak_score": max(fr["score"] for fr in cluster),
                 "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
                 "start_id": min(ids),
@@ -5562,9 +5633,21 @@ class Store:
         def _keep_thick(v: dict) -> bool:
             return len(v["frames"]) >= min_frames
 
-        hidden_confident = sum(1 for v in visits if _keep_thick(v) and not _keep_conf(v))
-        hidden_thin = sum(1 for v in visits if _keep_conf(v) and not _keep_thick(v))
-        kept = [v for v in visits if _keep_conf(v) and _keep_thick(v)]
+        def _keep_gallery(v: dict) -> bool:
+            if not require_gallery:
+                return True
+            return any(fr["seed_quality"] == "gallery" for fr in v["frames"])
+
+        hidden_confident = sum(
+            1 for v in visits if _keep_thick(v) and _keep_gallery(v) and not _keep_conf(v)
+        )
+        hidden_thin = sum(
+            1 for v in visits if _keep_conf(v) and _keep_gallery(v) and not _keep_thick(v)
+        )
+        hidden_no_gallery = sum(
+            1 for v in visits if _keep_conf(v) and _keep_thick(v) and not _keep_gallery(v)
+        )
+        kept = [v for v in visits if _keep_conf(v) and _keep_thick(v) and _keep_gallery(v)]
         # Measured, NOT summed from the two above — that is the whole point. A visit
         # failing BOTH predicates is in neither count, so a caller testing only those two
         # would call the queue CLEAR while such visits sit undecided and hidden: the
@@ -5584,8 +5667,25 @@ class Store:
             "has_model": model is not None,
             "hidden_confident": hidden_confident,
             "hidden_thin": hidden_thin,
+            "hidden_no_gallery": hidden_no_gallery,
             "hidden_total": hidden_total,
         }
+
+    def _attach_seed_quality(self, frames: "list[dict]", peak_area: "float | None") -> None:
+        """Stamp each frame with the grade a label written now WOULD give its crop.
+
+        Named apart from ``quality``, which on ``labeled_visits`` is the grade actually
+        STORED on the ``dataset_items`` row: the two differ exactly where it matters (a
+        ``not_cat`` correction stores NULL, and a re-label re-seeds), so collapsing them
+        would make the Labelled tally and the re-label write disagree about one crop.
+
+        Every visit builder calls this with its own ``peak_area``, so a frame's grade is
+        always relative to the visit it is being shown in.
+        """
+        for fr in frames:
+            fr["seed_quality"] = seed_quality(
+                fr.get("score"), self._bbox_area(fr["bbox"]), peak_area
+            )
 
     def _attach_queue_distances(self, visits: "list[dict]", model: dict) -> None:
         """Set each visit's ``distance`` to the nearest active-gallery match over its span, or ``None``.
@@ -5710,12 +5810,17 @@ class Store:
                 for fr in cluster
             ]
             rep = max(cluster, key=lambda fr: (self._bbox_area(fr["bbox"]), fr["id"]))
+            peak_area = self._bbox_area(rep["bbox"])
+            # Both grades ride along here: `quality` is what the row STORES, `seed_quality`
+            # what a re-label would write. Labelled review shows the first and writes the
+            # second, which is the whole reason they are separate fields.
+            self._attach_seed_quality(out_frames, peak_area)
             mixed = len({(fr["label_kind"], fr["cat_id"]) for fr in cluster}) > 1
             visits.append(
                 {
                     "frames": out_frames,
                     "rep_frame_id": rep["id"],
-                    "peak_area": self._bbox_area(rep["bbox"]),
+                    "peak_area": peak_area,
                     "peak_score": max(fr["score"] for fr in cluster),
                     "span": [cluster[0]["recv_ts"], cluster[-1]["recv_ts"]],
                     "label_kind": rep["label_kind"],
@@ -6001,6 +6106,7 @@ class Store:
             span = [boxed[0]["recv_ts"], boxed[-1]["recv_ts"]]
             rep_id, peak_area = rep["id"], self._bbox_area(rep["bbox"])
             peak_score = max(fr["score"] for fr in boxed)
+            self._attach_seed_quality(boxed, peak_area)
         else:
             # Nothing to label: keep the record renderable anyway. The span falls back
             # to the live frames, and to the flag's captured start_ts once they are gone

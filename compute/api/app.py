@@ -2397,6 +2397,7 @@ def create_app(
         limit: int = Query(default=_ANNOTATE_PAGE_DEFAULT),
         uncertain_only: bool = Query(default=False),
         min_frames: int = Query(default=1),
+        require_gallery: bool = Query(default=False),
     ):
         # The BOUNDED annotation queue (admin-next P4): the newest undecided visits,
         # capped and — once a model is active — distance-sorted worst-first (the
@@ -2417,10 +2418,15 @@ def create_app(
         # validation run both ignore it. Also additive: the default of 1 is the no-op, and
         # the admin page's default-ON behaviour lives in the client (it sends 2), so no
         # other caller of this endpoint changes. Floored, never upper-clamped, by the store.
+        #   `require_gallery` keeps only visits holding a crop that would grade `gallery` —
+        # what a quality-filtered build enrols. It does NOT subsume `min_frames` (a lone
+        # frame's area ratio is 1.0 by construction, so it grades `gallery` on a comparison
+        # with itself); see the store docstring's table. Both default off here and ON in the
+        # admin client, the same split `min_frames` uses.
         _validate_bounds(since_id, until_id)
         return store.annotation_queue_page(
             oracle, since_id, until_id, limit=limit, uncertain_only=uncertain_only,
-            min_frames=min_frames,
+            min_frames=min_frames, require_gallery=require_gallery,
         )
 
     @app.get("/api/label/enrollable")

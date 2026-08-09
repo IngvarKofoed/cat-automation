@@ -2264,7 +2264,8 @@
             <button data-m="labelled">Labelled</button>
           </div>
           <label class="note" id="aUncertainWrap" title="Show only the visits the active model found hard — it matched the rest confidently to a resident."><input type="checkbox" id="aUncertain"> Hide confident matches</label>
-          <label class="note" id="aThinWrap" title="Hide visits with a single detected frame. One frame is one crop, which will not be gallery-grade — so a gallery-only build and validation run both ignore it."><input type="checkbox" id="aThin" checked> Hide single-frame visits</label>
+          <label class="note" id="aThinWrap" title="Hide visits with a single detected frame. A lone frame's area ratio is 1.0 by construction, so its grade rests on a comparison with itself — the least trustworthy gallery claim there is."><input type="checkbox" id="aThin" checked> Hide single-frame visits</label>
+          <label class="note" id="aGalleryWrap" title="Hide visits holding no gallery-grade crop — nothing a quality-filtered build would enrol, so labelling them adds nothing to the gallery."><input type="checkbox" id="aGallery" checked> Hide visits with no gallery crop</label>
           <label class="fld inline" id="aFilterWrap" style="display:none">Show label<select id="aFilter"></select></label>
           <span id="aStatus" class="note grow">Loading queue…</span>
           <button id="aReload">Reload</button>
@@ -2308,6 +2309,12 @@
     // one. Not persisted (as uncertainOnly isn't), so a reload returns to filtered-on.
     const MIN_FRAMES_ON = 2;
     let minFrames = MIN_FRAMES_ON, hiddenThin = 0, hiddenTotal = 0;
+    // "Hide visits with no gallery crop": keeps only visits holding a crop a quality-filtered
+    // build would actually enrol. Ships ON, like the frame floor. It does NOT replace that
+    // floor — a lone frame's area ratio is 1.0 by construction, so a single-frame visit at
+    // >=60% grades `gallery` on a comparison with itself and this filter SHOWS it while the
+    // floor hides it. The two overlap without either containing the other.
+    let requireGallery = true, hiddenNoGallery = 0;
     // Sequence guard for loadQueue: two can be in flight at once (mount's initial load, the
     // Reload button, a toggle, the reload after a decision empties the page), and without
     // this the LAST RESPONSE wins rather than the last REQUEST — so a slow earlier fetch
@@ -2341,13 +2348,21 @@
     const decided = new Set();
     let preloads = [];
 
-    const bboxArea = (b) => (b ? Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]) : 0);
-    function seedQuality(f, v) {
-      const ratio = v.peak_area ? bboxArea(f.bbox) / v.peak_area : 0;
-      if (f.score >= 0.6 && ratio >= 0.7) return 'gallery';
-      if (f.score < 0.35 || ratio < 0.3) return 'poor';
-      return 'ok';
-    }
+    // The crop-grade formula used to live here. It is now Python (`store.seed_quality`) and
+    // every payload carries `seed_quality` per frame: the queue FILTERS on that grade
+    // server-side, and a filter and a tally computed by two copies of one formula is a queue
+    // that can contradict its own readout. So the client displays what it is given and echoes
+    // it back on commit — it no longer derives a grade.
+    //   `f.seed_quality` = the grade a label written NOW would give this crop.
+    //   `f.quality`      = the grade already STORED on a dataset_items row (Labelled only).
+    // The tally of the grades a decision would write. Same shape Labelled review's committed
+    // tally uses, so the two pages don't speak different dialects.
+    const seedTally = (frames) => {
+      const n = frames.reduce((m, f) => m.set(f.seed_quality, (m.get(f.seed_quality) || 0) + 1),
+        new Map());
+      return ['gallery', 'ok', 'poor'].filter((g) => n.get(g))
+        .map((g) => `${n.get(g)} ${g}`).join(' / ');
+    };
     const cropUrl = (f) => `/api/label/crop/${f.id}?box=${f.bbox.map(Math.round).join(',')}`;
     const repOf = (v) => (v ? (v.frames.find((f) => f.id === v.rep_frame_id) || v.frames[0]) : null);
     const current = () => visits[idx];
@@ -2420,12 +2435,13 @@
     const hiddenParts = () => [
       hiddenConfident ? `${hiddenConfident} confident` : '',
       hiddenThin ? `${hiddenThin} single-frame` : '',
+      hiddenNoGallery ? `${hiddenNoGallery} no-gallery` : '',
     ].filter(Boolean);
     // Whether ANY visit is hidden — the server's own measured count, never the sum of the
-    // two above. A visit failing BOTH predicates is in neither of them, so gating the
-    // "queue is clear" celebration on those two would declare the queue finished while
-    // such visits sit undecided. Reached by the ordinary default floor + "hide confident
-    // matches" pair, so it is the common compound case, not a corner.
+    // parts above. A visit failing TWO OR MORE predicates is in none of them, so gating the
+    // "queue is clear" celebration on the per-control counts would declare the queue
+    // finished while such visits sit undecided. With three filters on by default that is
+    // the common compound case, not a corner.
     const anyHidden = () => hiddenTotal > 0;
     function renderStatus() {
       const el = $('#aStatus', view);
@@ -2480,6 +2496,9 @@
           hiddenThin
             ? `${hiddenThin} single-frame visit(s) — untick “Hide single-frame visits”`
             : '',
+          hiddenNoGallery
+            ? `${hiddenNoGallery} with no gallery crop — untick “Hide visits with no gallery crop”`
+            : '',
         ].filter(Boolean);
         stage.innerHTML = !anyHidden()
           ? '<span class="note">Nothing to annotate — the queue is clear. 🎉</span>'
@@ -2490,8 +2509,8 @@
             // claims it and no single untick would reveal it. Name the total and say so,
             // rather than celebrating a queue that still holds work.
             : `<span class="note">Nothing left that the filters admit — ${hiddenTotal} `
-              + 'visit(s) are hidden by the two filters together, so unticking either '
-              + 'alone will not show them. Untick both to work them.</span>';
+              + 'visit(s) are each hidden by more than one filter, so unticking any single '
+              + 'one will not show them. Untick the others too to work them.</span>';
         return;
       }
       const rep = repOf(v);
@@ -2501,7 +2520,7 @@
           <div class="astage-crop"><img src="${cropUrl(rep)}" alt="crop"></div>
           <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
         </div>
-        <div class="note" style="margin-top:8px">${v.frames.length} frames · rep ${detPct(rep.score)} · peak ${Math.round((v.peak_score || 0) * 100)}%${dist}</div>
+        <div class="note" style="margin-top:8px">${v.frames.length} frames · rep ${detPct(rep.score)} · peak ${Math.round((v.peak_score || 0) * 100)}% · would add ${esc(seedTally(v.frames))}${dist}</div>
         <div class="row" style="margin-top:10px">${PLAY_BTN}</div>
       `;
       // Same box placement (and the same confidence traffic light) the two overviews use —
@@ -2574,7 +2593,7 @@
       // in Flagged review, STORED in Labelled review — the same split the two modes already
       // make elsewhere. Omitted where there is no crop to grade (a not_cat / ignored row),
       // rather than reading "ungraded" about a crop that was never written (entry 248).
-      const gradeOf = (f) => (mode === 'labelled' ? (f.quality || null) : seedQuality(f, v));
+      const gradeOf = (f) => (mode === 'labelled' ? (f.quality || null) : f.seed_quality);
       function caption(f) {
         const g = gradeOf(f);
         return [
@@ -2684,7 +2703,7 @@
     function commitLabel(decision, cat_id) {
       const v = current(); if (!v) return;
       const withCrop = decision !== 'not_cat';
-      const frames = v.frames.map((f) => withCrop ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) } : { frame_id: f.id });
+      const frames = v.frames.map((f) => withCrop ? { frame_id: f.id, bbox: f.bbox, quality: f.seed_quality } : { frame_id: f.id });
       const what = decision === 'identified'
         ? ((cats.find((c) => c.id === cat_id) || {}).name || `cat #${cat_id}`)
         : (LABEL_TEXT[decision] || decision);
@@ -2736,6 +2755,14 @@
       wrap.hidden = mode !== 'queue';
       box.checked = minFrames > 1;
     }
+    // Queue-only for the same reason: Flagged shows the tally but is never filtered on it.
+    // Needs no model either — a grade is computed from the frame's own box and score.
+    function renderGalleryToggle() {
+      const wrap = $('#aGalleryWrap', view), box = $('#aGallery', view);
+      if (!wrap || !box) return;
+      wrap.hidden = mode !== 'queue';
+      box.checked = requireGallery;
+    }
     function skip(delta) {
       if (mode === 'queue') {
         if (visits.length) { idx = (idx + delta + visits.length) % visits.length; renderVisit(); }
@@ -2756,10 +2783,12 @@
         const qs = [];
         if (uncertainOnly) qs.push('uncertain_only=true');
         if (minFrames > 1) qs.push('min_frames=' + minFrames);
+        if (requireGallery) qs.push('require_gallery=true');
         const q = await api('GET', '/api/label/queue' + (qs.length ? '?' + qs.join('&') : ''));
         if (!alive || mode !== 'queue' || seq !== queueSeq) return;   // a newer load won
         hiddenConfident = q.hidden_confident || 0;
         hiddenThin = q.hidden_thin || 0;
+        hiddenNoGallery = q.hidden_no_gallery || 0;
         hiddenTotal = q.hidden_total || 0;
         // Drop the frames already decided locally: a decision's write may still be in the
         // chain, so the server can legitimately still call them undecided, and offering
@@ -2777,6 +2806,7 @@
         hasModel = !!q.has_model; truncated = !!q.truncated; idx = 0;
         renderUncertainToggle();
         renderThinToggle();
+        renderGalleryToggle();
         renderVisit();
       }
       // Guarded like the success path above — a failed load must not paint over another
@@ -2810,14 +2840,12 @@
       if (v.label_kind === 'unknown_cat') return identityChip({ cat_id: null });
       return `<span class="tchip motion">${esc(labelText(v))}</span>`;
     }
-    // A re-label re-seeds each crop's grade with the queue's own formula, so the two
-    // paths can't grade the same crop differently — and correcting a not-a-cat (whose
-    // stored grade is NULL) to a real cat yields graded crops a gallery build can use.
-    // A compute build predating the per-frame `score` / `peak_area` fields can't seed,
-    // so it falls back to passing the stored grade through (the old console's behaviour)
-    // rather than seeding everything 'poor' off a missing peak area.
-    const canSeed = (v) => v && v.peak_area != null;
-    const qualityFor = (f, v) => (canSeed(v) && f.score != null ? seedQuality(f, v) : (f.quality || null));
+    // A re-label re-seeds each crop's grade from the SERVER's `seed_quality`, the same field
+    // the queue commits, so the two paths cannot grade one crop differently — and correcting
+    // a not-a-cat (whose stored grade is NULL) to a real cat yields graded crops a gallery
+    // build can use. The old `canSeed` guard and its "your compute PC is on an older build"
+    // banner are gone with the client-side formula: the server always has the score and the
+    // peak area, so there is no longer a payload it cannot grade.
 
     // The event-level overview: one tile per labelled visit in the filtered set. This is
     // the surface for FINDING a mislabel — the stage below shows a single visit's crops,
@@ -2911,7 +2939,7 @@
       // up to ~100 crops of one visit — the bulk of the page, for a reading nobody makes
       // per crop; what a reviewer wants from grades is what this visit would contribute to
       // a quality-filtered gallery build, which is exactly the tally. Ungraded crops ARE
-      // counted (a build skips them, so they matter — see the canSeed note).
+      // counted (a build skips them, so they matter).
       //   Suppressed entirely for the crop-less kinds: `not_cat` is committed with
       // quality/bbox/crop_path all NULL, and an `ignored` row carries no crop either, so a
       // tally there would read "N ungraded" about crops that were never written — a
@@ -2939,7 +2967,6 @@
           <div class="fimg astage-full"><img src="/media/${rep.id}" data-box='${JSON.stringify(rep.bbox)}'><div class="fbox ${bandOf(rep.score)}" hidden></div></div>
         </div>
         <div class="note" style="margin-top:8px">${meta}</div>
-        ${canSeed(v) ? '' : '<div class="note warn" style="margin-top:6px">This compute build predates the per-crop scores a re-label re-seeds from, so each crop keeps its stored grade — a not-a-cat correction stays ungraded and a quality-filtered gallery build will skip it. Pull + restart the compute PC.</div>'}
         <div class="row" style="margin-top:12px">
           <button id="aPrev" title="Previous visit (p / ←)"${lab.length < 2 ? ' disabled' : ''}>← Prev</button>
           <button id="aNext" title="Next visit (n / →)"${lab.length < 2 ? ' disabled' : ''}>Next →</button>
@@ -2975,7 +3002,7 @@
       busy = true;
       const withCrop = decision !== 'not_cat';
       const payload = v.frames.map((f) => withCrop
-        ? { frame_id: f.id, bbox: f.bbox, quality: qualityFor(f, v) }
+        ? { frame_id: f.id, bbox: f.bbox, quality: f.seed_quality }
         : { frame_id: f.id });
       const what = decision === 'identified'
         ? ((cats.find((c) => c.id === cat_id) || {}).name || `cat #${cat_id}`)
@@ -3152,6 +3179,15 @@
         `${cov.n_live != null ? cov.n_live : '?'} frames in store`,
         `${cov.n_swept != null ? cov.n_swept : '?'} analysed`,
         `${frames.length} labellable`,
+        // Informational only here — flagged spans are deliberately unfloored (entry 225),
+        // so nothing filters them on this. Omitted when there is nothing to grade.
+        //   Qualified "so far" on a PARTIAL span: the tally covers only the frames actually
+        // swept, so Analyse can still add to it. Entry 226's rule — a flagged span's state
+        // is read from COVERAGE, never from verdicts merely existing — and an incomplete
+        // reading must not present as a complete one.
+        ...(frames.length
+          ? [`would add ${seedTally(frames)}${v.state === 'partial' ? ' so far' : ''}`]
+          : []),
         `flagged ${fmtTs(v.created_ts)}`,
       ].join(' · ');
       // A span can hold frames from two labelling gestures (an event span is a MOTION
@@ -3184,11 +3220,11 @@
           <button id="aFlgDismiss" class="danger">Dismiss (d)</button>
         </div>
         ${frames.length ? `<div class="afilm">${frames.map((f) => {
-          // The grade a decision here WOULD write (seedQuality is the same formula the
-          // queue uses), not the stored one — a flagged span is often unlabelled, and
-          // showing the seeded grade is what makes an unfloored faint crop's `poor`
-          // visible before it is committed.
-          const q = seedQuality(f, v);
+          // The grade a decision here WOULD write (the server's `seed_quality`, the same
+          // field the queue commits), not the stored one — a flagged span is often
+          // unlabelled, and showing the seeded grade is what makes an unfloored faint
+          // crop's `poor` visible before it is committed.
+          const q = f.seed_quality;
           return `<div class="at${f.id === v.rep_frame_id ? ' rep' : ''}">
             <img src="${cropUrl(f)}" loading="lazy" alt="crop">
             <span class="aq" data-q="${q}" title="detection ${detPct(f.score)} → grade ${q}">${q}</span>
@@ -3237,7 +3273,7 @@
       busy = true;
       const withCrop = decision !== 'not_cat';
       const payload = frames.map((f) => withCrop
-        ? { frame_id: f.id, bbox: f.bbox, quality: seedQuality(f, v) }
+        ? { frame_id: f.id, bbox: f.bbox, quality: f.seed_quality }
         : { frame_id: f.id });
       const what = decision === 'identified'
         ? ((cats.find((c) => c.id === cat_id) || {}).name || `cat #${cat_id}`)
@@ -3371,6 +3407,7 @@
       $('#aOverview', view).hidden = m !== 'labelled';
       renderUncertainToggle();   // queue-only control
       renderThinToggle();        // queue-only control
+      renderGalleryToggle();     // queue-only control
       const HINTS = {
         queue: 'Keys: <b>1–9</b> roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>g</b> ignore · <b>v</b> play frames · <b>n</b>/→ skip · <b>p</b>/← back · <b>z</b> undo last',
         labelled: 'Keys: <b>1–9</b> re-label to a roster cat · <b>u</b> unknown cat · <b>x</b> not a cat · <b>d</b> send back to the queue · <b>v</b> play frames · <b>n</b>/→ next · <b>p</b>/← back',
@@ -3495,6 +3532,14 @@
     $('#aThin', view).addEventListener('change', (e) => {
       minFrames = e.target.checked ? MIN_FRAMES_ON : 1;
       hiddenThin = 0; hiddenTotal = 0;
+      e.target.blur();
+      if (mode === 'queue') loadQueue();
+    });
+    // Third focusable control on this row, same contract: re-fetch (the filter runs before
+    // the server's page cap) and BLUR, or `onKey` swallows the operator's next label.
+    $('#aGallery', view).addEventListener('change', (e) => {
+      requireGallery = e.target.checked;
+      hiddenNoGallery = 0; hiddenTotal = 0;
       e.target.blur();
       if (mode === 'queue') loadQueue();
     });

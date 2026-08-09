@@ -550,10 +550,19 @@ owns capture mode and the always-on workers:
   detected visit with no label — *not* "uncertain", so a good model does not shrink
   it: every new visit joins until a human decides it. Active learning is therefore
   a **view** over that queue rather than a separate feeder: with a promoted model the
-  queue sorts worst-first by gallery distance, and an opt-in *hide confident matches*
-  filter drops the visits the model already matched confidently, leaving exactly the
-  cases it found hard. The filter is applied before the page cap, and reports how many
-  it hid, so a short queue never reads as an empty one. (A confidently *wrong*
+  queue sorts worst-first by gallery distance, and three filters narrow what it shows.
+  *Hide confident matches* is opt-in and drops the visits the model already matched
+  confidently, leaving the cases it found hard. The other two ship **on**, and together
+  mean "would contribute a crop worth enrolling": a **frame floor** (a single-frame visit
+  yields one crop) and a **gallery-grade floor** (keep only visits holding a crop a
+  quality-filtered build would enrol). Neither of those two contains the other — a lone
+  frame's area ratio is 1.0 by construction, so a single-frame visit above the score gate
+  grades *gallery* on a comparison with itself, which the grade floor admits and the frame
+  floor rejects — so both are kept. All three are applied before the page cap, and each
+  reports how many it hid, measured with the others still applied so unticking one control
+  reveals exactly the number quoted. A visit failing two or more is in no per-control
+  count, so a separately measured total is what any "nothing left" readout may gate on —
+  a filtered queue must never read as a finished one. (A confidently *wrong*
   identification is invisible to this ordering by construction — that is what the
   user-app flag is for.)
 

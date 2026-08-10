@@ -484,10 +484,13 @@ Core entities (storage-agnostic):
   `timestamp`, triggering intent/event.
 - **Notification** — an alert sent to the owner and its delivery state.
 - **Dataset item** — a stored crop for learning: image ref, `source`
-  (collection | run-uncertain | correction), and a **label** once annotated
+  (collection | run-uncertain | correction), the **geometry** it was cut under
+  (absent = the original squash-resize convention), and a **label** once annotated
   (`cat_id` / stranger / not-cat), or `unlabelled` while queued.
 - **Model version** — a built gallery/model: `version`, `status`
-  (draft / active / retired), training metrics; the active one is what Run uses.
+  (draft / active / retired), training metrics, and the crop geometry it enrolled;
+  the active one is what Run uses. Its threshold is a settable operating point
+  rather than a fixed build output (see *Training*).
 - **Stage** — the current operating stage (`tuning` | `collecting` | `running`), as
   system state: one persisted setting that owns capture mode and the always-on
   workers. Supersedes the earlier two-value `collection | run` mode, which was
@@ -597,13 +600,30 @@ the queue back into Annotate:
   set with the *same* backbone, a validation run at given grades forecasts the gallery
   built at those grades — at different grades it describes a different set. Treat its
   numbers as an optimistic bound: the probe scores crops against their own labelled
-  peers, while Run matches *unseen* frames and must also reject strangers.
+  peers, while Run matches *unseen* frames.
+  A run also measures **stranger rejection**, by holding each cat wholly out of the
+  gallery and scoring its visits with *unknown* as the correct answer — an
+  impersonation of a *resident* being the outcome the door actually cares about. That
+  curve, swept against the same thresholds as ordinary scoring, is what an operating
+  point is chosen from; a threshold picked only for best balanced accuracy over pair
+  distances tends to sit so far out that nothing is ever declined. A run likewise
+  forecasts a **capped** gallery (several caps at once, threshold recalibrated under
+  each), so the cap can be chosen without building to find out.
+  Runs are scoped to one **crop geometry** — the convention a crop was cut and resized
+  under. A gallery is built from exactly one, since 1-NN over a blend of two feature
+  spaces is silently worse matching with no symptom; the stamp is per crop, so a store
+  holding two conventions is filterable rather than mixed.
 - **Training.** The owner triggers a training job over the labelled data. With
   the embedding + gallery approach this is usually just **rebuilding the gallery**
   from the annotated crops — cheap and fast; a full fine-tune of the embedding
   model is the heavier, rarer path. Training produces a new **model version**,
-  carrying its own suggested threshold and separability metrics computed from the
-  vectors it enrolled (one vector per enrolled crop).
+  carrying a *starting* threshold and separability metrics computed from the
+  vectors it enrolled (one vector per enrolled crop). That threshold is a
+  **setting, not a build output**: it is applied at read time, so the owner can
+  move the operating point on an existing version without rebuilding, and the
+  build's own value is retained beside it so how far it has moved stays visible.
+  Because it is read-time, changing it restates the recorded history — the same
+  visits are re-named on the next read.
   Keep the gallery built from *clean, representative* crops of each cat; blurry or
   extreme-angle hard cases are useful for tuning the threshold and for validation,
   but folding them into the gallery would blur the embedding space (a stranger's

@@ -20,6 +20,12 @@ package docstring). Decode goes through ``cv2.imdecode`` over the file bytes —
 matching ``compute.ingest.client`` — rather than ``cv2.imread``, which mishandles
 non-ASCII paths on Windows (the compute tier's real host).
 
+Both helpers take an optional ``margin`` that expands the box first (``_expand_box``) —
+the context-margin half of a crop **geometry**; the resize half (letterbox vs. squash)
+is the embedder's, not this module's. A margin is BAKED into the written pixels and
+unrecoverable from the file afterwards, which is why the ``dataset_items`` row that
+records the crop also carries a ``geometry`` stamp naming how it was cut.
+
 Re-encode quality is a deliberate q95: unlike the collector's verbatim frame
 store (which must never re-encode the wire bytes), these crops are a small,
 hand-curated training set where preserving detail beats saving bytes.
@@ -54,7 +60,43 @@ def _clamp_box(box, width: int, height: int) -> "tuple[int, int, int, int]":
     return x1, y1, x2, y2
 
 
-def crop_bytes(jpeg_path: str, box) -> bytes:
+def _expand_box(box, margin: float):
+    """Push ``box``'s four edges outward by ``margin`` × its own width/height.
+
+    The **context margin** half of a crop geometry (see
+    ``identification.embed.geometry_descriptor``). A margin of ``0.1`` adds 10% of the
+    box's width to each side and 10% of its height to top and bottom — so the box comes
+    out 20% wider and 20% taller. Expressed per-EDGE because that is what "how much
+    context around the cat" means to the eye; the doubling is stated here so nobody has
+    to infer it from the arithmetic.
+
+    Why it exists: YOLO's box clips tail tips and extended paws, and those are exactly
+    the parts that distinguish two similar cats seen from above. Expected to be weakly
+    NEGATIVE overall — every cat at this door shares one fixed doorway, so extra context
+    is common-mode and dilutes between-cat separation — which is why it is a measurable
+    per-run arm rather than a default.
+
+    ``margin <= 0`` returns ``box`` UNCHANGED (identity, not a re-rounded copy), so the
+    legacy path is byte-identical. Negative is a ``ValueError``: shrinking the box would
+    clip the cat, the opposite of the point. Returns floats and does NOT clamp — the
+    caller's ``_clamp_box`` still runs afterwards, which is what keeps the expansion
+    honest at a frame edge (the clamp trims what fell outside the image instead of the
+    margin pushing the box out of bounds). A malformed ``box`` is passed straight
+    through so ``_clamp_box`` raises the single, familiar error for it.
+    """
+    if margin < 0:
+        raise ValueError(f"margin must be >= 0 (a margin EXPANDS the box), got {margin!r}")
+    if not margin or box is None or len(box) < 4:
+        return box
+    x1, y1, x2, y2 = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+    lo_x, hi_x = sorted((x1, x2))
+    lo_y, hi_y = sorted((y1, y2))
+    dx = (hi_x - lo_x) * margin
+    dy = (hi_y - lo_y) * margin
+    return [lo_x - dx, lo_y - dy, hi_x + dx, hi_y + dy]
+
+
+def crop_bytes(jpeg_path: str, box, margin: float = 0.0) -> bytes:
     """Crop the JPEG at ``jpeg_path`` to ``box`` and return re-encoded JPEG bytes.
 
     ``box`` is ``[x1, y1, x2, y2]`` in the JPEG's pixel space, clamped to the
@@ -63,6 +105,12 @@ def crop_bytes(jpeg_path: str, box) -> bytes:
     degenerate after clamping; raises ``OSError`` if the file can't be read (the
     caller distinguishes "no such frame" upstream via ``store.path_for`` +
     ``os.path.isfile``).
+
+    ``margin`` expands the box first (``_expand_box``) — the context-margin half of a
+    crop geometry. It defaults to 0, the legacy convention every stored crop was cut at,
+    so an omitting caller's bytes are unchanged. A crop cut at a non-zero margin BAKES
+    it into the pixels, which is why the row that records it also carries a ``geometry``
+    stamp: nothing downstream can recover the margin from the file itself.
     """
     import cv2
     import numpy as np
@@ -73,7 +121,7 @@ def crop_bytes(jpeg_path: str, box) -> bytes:
     if img is None:
         raise ValueError(f"failed to decode JPEG: {jpeg_path!r}")
     height, width = img.shape[:2]
-    x1, y1, x2, y2 = _clamp_box(box, width, height)
+    x1, y1, x2, y2 = _clamp_box(_expand_box(box, margin), width, height)
     crop = img[y1:y2, x1:x2]
     ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
     if not ok:
@@ -81,7 +129,9 @@ def crop_bytes(jpeg_path: str, box) -> bytes:
     return buf.tobytes()
 
 
-def materialize(jpeg_path: str, box, dest_abs: str, root: "str | None" = None) -> bool:
+def materialize(
+    jpeg_path: str, box, dest_abs: str, root: "str | None" = None, margin: float = 0.0
+) -> bool:
     """Crop ``jpeg_path`` to ``box`` and write it to ``dest_abs``; return success.
 
     Best-effort by contract: any failure (unreadable source, degenerate box,
@@ -94,11 +144,18 @@ def materialize(jpeg_path: str, box, dest_abs: str, root: "str | None" = None) -
     path inside ``root`` (after ``realpath``), so a crafted crop path can't escape
     the dataset tree; a ``dest_abs`` outside ``root`` returns ``False`` without
     writing. Pass the store's ``dataset_root`` here.
+
+    ``margin`` is forwarded to ``crop_bytes`` — the context-margin half of a crop
+    geometry, so a crop can be cut AT a geometry rather than only at the legacy one.
+    Default 0 keeps the label-commit path unchanged. Note that a negative margin comes
+    back as a plain ``False`` here (``_expand_box``'s ``ValueError`` is swallowed by the
+    best-effort contract), so callers that take a margin from an operator validate it
+    themselves — ``geometry_descriptor``/``parse_geometry`` do, at their own boundary.
     """
     if root is not None and not _within(dest_abs, root):
         return False
     try:
-        data = crop_bytes(jpeg_path, box)
+        data = crop_bytes(jpeg_path, box, margin)
         parent = os.path.dirname(dest_abs)
         if parent:
             os.makedirs(parent, exist_ok=True)

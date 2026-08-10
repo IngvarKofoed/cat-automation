@@ -112,7 +112,7 @@ class FakeTrainingManager:
         self.identify_calls: "list[dict]" = []
 
     def enqueue_gallery_build(
-        self, store, qualities, max_per_cat=None, exclude_cat_ids=None
+        self, store, qualities, max_per_cat=None, exclude_cat_ids=None, geometry=None
     ) -> dict:
         self.gallery_build_calls.append(
             {
@@ -120,6 +120,7 @@ class FakeTrainingManager:
                 "qualities": qualities,
                 "max_per_cat": max_per_cat,
                 "exclude_cat_ids": exclude_cat_ids,
+                "geometry": geometry,
             }
         )
         return {"position": 0, "deduped": False}
@@ -201,7 +202,8 @@ def test_gallery_build_happy_enqueues(make_app, monkeypatch):
     assert body["position"] == 0
     assert body["deduped"] is False
     assert manager.gallery_build_calls == [
-        {"store": store, "qualities": ["gallery"], "max_per_cat": None, "exclude_cat_ids": None}
+        {"store": store, "qualities": ["gallery"], "max_per_cat": None, "exclude_cat_ids": None,
+         "geometry": None}
     ]
 
 
@@ -217,7 +219,8 @@ def test_gallery_build_null_qualities_forwards_none(make_app, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["enough"] is True
     assert manager.gallery_build_calls == [
-        {"store": store, "qualities": None, "max_per_cat": None, "exclude_cat_ids": None}
+        {"store": store, "qualities": None, "max_per_cat": None, "exclude_cat_ids": None,
+         "geometry": None}
     ]
 
 

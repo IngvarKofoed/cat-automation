@@ -51,8 +51,18 @@ from typing import TYPE_CHECKING
 
 from compute.analysis import get_analyzer
 from compute.analysis.runner import DetectAdapter, run_analysis
-from compute.identification.embed import EmbedCancelled, Embedder
-from compute.identification.gallery import load_gallery, run_identify
+from compute.identification.embed import (
+    EmbedCancelled,
+    Embedder,
+    canonical_geometry,
+    parse_geometry,
+)
+from compute.identification.gallery import (
+    _geometry_kwargs,
+    _model_geometry,
+    load_gallery,
+    run_identify,
+)
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -226,20 +236,39 @@ class LiveIdentifyManager:
         """(Re)build the resident ``Embedder`` + gallery iff absent or the model changed.
 
         Keeps the worker's query embedder in the SAME feature space as the active
-        gallery: rebuild only when ``(backbone, imgsz)`` differs from the resident one (a
-        fresh promotion of a differently-configured model), otherwise reuse it across
-        ticks so a visit never triggers a ``torch.hub`` weight reload. ``run_identify``
-        re-checks this match and raises on a mismatch, so keeping them in sync here is
-        what keeps that guard silent. The gallery ``.npz`` is likewise loaded once and
-        reused, reloaded only when ``gallery_path`` changes (a promotion) — so a visit
-        also never re-reads it off disk. Worker-thread only; no lock.
+        gallery: rebuild only when ``(backbone, imgsz, geometry)`` differs from the
+        resident one (a fresh promotion of a differently-configured model), otherwise
+        reuse it across ticks so a visit never triggers a ``torch.hub`` weight reload.
+        ``run_identify`` re-checks this match and raises on a mismatch, so keeping them in
+        sync here is what keeps that guard silent. The gallery ``.npz`` is likewise loaded
+        once and reused, reloaded only when ``gallery_path`` changes (a promotion) — so a
+        visit also never re-reads it off disk. Worker-thread only; no lock.
+
+        Geometry rides ``_geometry_kwargs``, which yields ``{}`` for a legacy model — so
+        the factory call stays byte-identical for every gallery built before geometry
+        existed, and a duck-typed test factory that predates the parameter keeps working.
+        Without this the guard would fire on the first non-legacy promotion and park a
+        sticky ``last_error`` on the worker instead of naming cats.
         """
+        want_geometry = _model_geometry(model)
         if (
             self._resident is None
             or self._resident.backbone != model["backbone"]
             or self._resident.imgsz != model["imgsz"]
+            # Canonicalised on BOTH sides, exactly as `run_identify`'s guard does — this
+            # is the same check written twice, and a real `Embedder` returns an already
+            # canonical descriptor, so the difference only shows through the duck-typed
+            # factory seam. There an un-normalised stamp would never compare equal, and
+            # the miss is silent: the embedder is rebuilt EVERY tick (a torch.hub reload
+            # per visit, which this method exists to prevent) before run_identify raises.
+            or canonical_geometry(getattr(self._resident, "geometry", None)) != want_geometry
         ):
-            embedder = self._embedder_factory(model=model["backbone"], imgsz=model["imgsz"])
+            letterbox, margin = parse_geometry(want_geometry)
+            embedder = self._embedder_factory(
+                model=model["backbone"],
+                imgsz=model["imgsz"],
+                **_geometry_kwargs(letterbox, margin),
+            )
             embedder.prepare()
             self._resident = embedder
         if self._resident_gallery is None or self._resident_gallery_path != model["gallery_path"]:

@@ -95,7 +95,7 @@ class _SuccessGalleryBuilder:
         self.n_cats = n_cats
         self.n_vectors = n_vectors
 
-    def __call__(self, store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None, **kwargs):
         self.calls += 1
         self.out_dirs.append(out_dir)
         if progress is not None:
@@ -130,7 +130,7 @@ class _GatedGalleryBuilder:
         self.release = threading.Event()
         self.calls = 0
 
-    def __call__(self, store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None, **kwargs):
         self.calls += 1
         if progress is not None:
             progress(0, 1)
@@ -230,7 +230,7 @@ def test_gallery_build_not_enough_writes_no_row_and_surfaces_message(tmp_path):
     # model_versions row — distinct from a red 'failed' job.
     store = _store(tmp_path)
 
-    def not_enough(store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None):
+    def not_enough(store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None, progress=None, **kwargs):
         return {
             "enough": False,
             "n_crops": 1,
@@ -365,11 +365,11 @@ def test_dedup_guards_running_double_click_but_not_pending_rerun(tmp_path):
     # A distinct quality selection is a real new job behind the running one.
     other = manager.enqueue_gallery_build(store, ["gallery"])
     assert other["deduped"] is False and other["position"] == 1
-    # gallery-build params are the (qualities, max_per_cat, exclude_cat_ids) triple, so the
-    # cap AND the cat exclusion land in the dedup key — changing only one of them is
-    # genuinely different work, not a double-click.
+    # gallery-build params are the (qualities, max_per_cat, exclude_cat_ids, geometry)
+    # tuple, so the cap, the cat exclusion AND the crop convention land in the dedup key —
+    # changing only one of them is genuinely different work, not a double-click.
     assert [j["params"] for j in manager.status()["queue"]] == [
-        [("gallery",), None, None]
+        [("gallery",), None, None, None]
     ]   # status() converts only the outer level
 
     gated.release.set()

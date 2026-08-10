@@ -258,11 +258,11 @@ class _RecordingBuilder:
 
     def __call__(
         self, store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None,
-        progress=None,
+        geometry=None, progress=None,
     ):
         self.calls.append(
             {"out_dir": out_dir, "qualities": qualities, "cap": max_per_cat,
-             "exclude": exclude_cat_ids}
+             "exclude": exclude_cat_ids, "geometry": geometry}
         )
         return {"enough": False, "message": "no", "n_crops": 0, "n_cats": 0, "quality": "all"}
 
@@ -284,7 +284,9 @@ def test_gallery_build_params_carry_the_sorted_exclusion(tmp_path):
     manager.enqueue_gallery_build(store, ["gallery"], None, [9, 2, 9])
     assert _wait(lambda: not manager.running)
 
-    assert manager.status()["params"] == [("gallery",), None, (2, 9)]
+    # The 4th member is the crop geometry (None = legacy) — part of the key so two arms
+    # at different geometries are different work rather than one deduped press.
+    assert manager.status()["params"] == [("gallery",), None, (2, 9), None]
     assert builder.calls[0]["exclude"] == [2, 9]
     # A count, not the ids: the dir name is a human handle, and the ids live on the row.
     assert os.path.basename(builder.calls[0]["out_dir"]).endswith("-gallery-ex2")
@@ -309,7 +311,7 @@ def test_exclusion_is_part_of_the_dedup_key(tmp_path):
     entered, release, calls = threading.Event(), threading.Event(), []
 
     def gated(store, out_dir, qualities=None, max_per_cat=None, exclude_cat_ids=None,
-              progress=None):
+              progress=None, **kwargs):
         calls.append(exclude_cat_ids)
         entered.set()
         release.wait(timeout=5)
@@ -336,7 +338,7 @@ def test_exclusion_is_part_of_the_dedup_key(tmp_path):
 class _SuccessProbe:
     """Fake probe: writes a stub report and returns a successful summary with the echo."""
 
-    def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None):
+    def __call__(self, store, out_dir, qualities=None, exclude_cat_ids=None, progress=None, **kwargs):
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "feasibility.html"), "w", encoding="utf-8") as fh:
             fh.write("<html></html>")
@@ -389,13 +391,15 @@ class _SpyManager:
         self.build_calls: "list[dict]" = []
         self.feasibility_calls: "list[dict]" = []
 
-    def enqueue_gallery_build(self, store, qualities, max_per_cat=None, exclude_cat_ids=None):
+    def enqueue_gallery_build(self, store, qualities, max_per_cat=None, exclude_cat_ids=None,
+                              geometry=None):
         self.build_calls.append({"qualities": qualities, "cap": max_per_cat,
-                                 "exclude": exclude_cat_ids})
+                                 "exclude": exclude_cat_ids, "geometry": geometry})
         return {"position": 0, "deduped": False}
 
-    def enqueue_feasibility(self, store, qualities, exclude_cat_ids=None):
-        self.feasibility_calls.append({"qualities": qualities, "exclude": exclude_cat_ids})
+    def enqueue_feasibility(self, store, qualities, exclude_cat_ids=None, geometry=None):
+        self.feasibility_calls.append({"qualities": qualities, "exclude": exclude_cat_ids,
+                                       "geometry": geometry})
         return {"position": 0, "deduped": False}
 
 

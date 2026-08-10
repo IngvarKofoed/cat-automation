@@ -31,8 +31,10 @@ import json
 import math
 import os
 
+import numpy as np
+
 from compute.collection.store import _QUALITIES, Store
-from compute.identification.embed import Embedder
+from compute.identification.embed import Embedder, canonical_geometry, geometry_descriptor
 from compute.identification.feasibility import run_feasibility
 
 # Gap at which a cat's labelled crops are split into separate held-out VISITS. Its own
@@ -43,6 +45,19 @@ from compute.identification.feasibility import run_feasibility
 # A detection dropout mid-visit (the cat sits still, YOLO drops it for a few seconds)
 # would produce exactly such a split at 2 s.
 _HELDOUT_GAP_MS = 60_000
+
+# Per-cat caps forecast by default. `None` is the uncapped baseline and is deliberately
+# first — every other row is only readable as a difference from it. The values bracket the
+# real dataset's skew (the dominant cat is in the low thousands of crops, the thinnest in
+# the hundreds), and each is a mask over a matrix the run already holds, so asking for four
+# costs numpy rather than a second embed.
+_DEFAULT_CAPS: "tuple[int | None, ...]" = (None, 2000, 1000, 500)
+
+# Rows the operating-point table samples out of the (41-point) threshold grid. The whole
+# grid lives in feasibility.json; a table long enough to scroll is one nobody reads a
+# trade-off off, and the two ends of the grid are degenerate by construction (name
+# everything / name nothing).
+_OP_ROWS = 15
 
 # Validated light-mode categorical palette (fixed slot order — see the dataviz
 # reference palette; worst adjacent CVD ΔE 24.2). Identity is assigned in this
@@ -95,6 +110,34 @@ def group_visits(
             groups.append([i for i, _ts in run])
             nights.append(bool(is_night(run[0][1])) if is_night is not None else None)
     return groups, nights
+
+
+def _cap_masks(labels: "list[dict]", caps: "tuple") -> "list[dict] | None":
+    """One column mask per per-cat cap, from ``cap_per_cat``'s own selection.
+
+    The forecast has to describe what a BUILD would enrol, so the selection is the build's
+    (``gallery.cap_per_cat``) rather than a second policy re-derived here that could
+    quietly disagree with it. Imported inside the function because ``gallery`` imports this
+    module's ``_quality_slug`` at its top — a module-level import would be circular.
+
+    Rows are located by ``(src_frame_id, src_recv_ts)``, which ``dataset_items`` is UNIQUE
+    on, rather than by object identity: the key survives ``cap_per_cat`` copying or
+    rebuilding a row, which its contract does not promise either way.
+    """
+    if not caps:
+        return None
+    from compute.identification.gallery import cap_per_cat
+
+    index_of = {
+        (row["src_frame_id"], row["src_recv_ts"]): i for i, row in enumerate(labels)
+    }
+    out = []
+    for cap in caps:
+        mask = np.zeros(len(labels), dtype=bool)
+        for row in cap_per_cat(labels, cap):
+            mask[index_of[(row["src_frame_id"], row["src_recv_ts"])]] = True
+        out.append({"max_per_cat": cap, "mask": mask})
+    return out
 
 
 def _night_classifier(store):
@@ -227,6 +270,10 @@ def _tldr(metrics: dict, cat_names: "list[str]") -> "dict | None":
         "day_acc": (day or {}).get("accuracy"),
         "night_acc": (night or {}).get("accuracy"),
         "unscoreable": unscoreable,
+        # The stranger block, verbatim rather than re-read: the lead block's biggest stated
+        # limit used to be that nothing here tests a stranger, and when that IS measured the
+        # limit has to be replaced by the measurement, not merely sit beside it.
+        "strangers": v.get("strangers"),
     }
 
 
@@ -458,6 +505,12 @@ def _curve_png(visits: dict) -> str:
     rather than state one number and hide that, the curve shows how sensitive the verdict
     is — and marks the crop-level threshold and the active model's promoted one on the
     same axis for comparison.
+
+    When the stranger pass ran, its impersonation rate is drawn on the SAME axes rather
+    than in a chart of its own: the trade-off a threshold makes is between these two lines,
+    and two figures asking the reader to align two x-axes by eye is exactly how a
+    trade-off stops being read as one. Both are shares of their own curve's scored
+    visits — different denominators, which the axis label says.
     """
     plt = _plt()
 
@@ -470,6 +523,16 @@ def _curve_png(visits: dict) -> str:
         n = max(1, visits.get("n_scored") or 1)
         ax.plot(xs, [p["unknown"] / n for p in pts], color=_DIFF_HUE, linewidth=2,
                 linestyle=":", label="unknown rate")
+    # Points with no denominator are DROPPED rather than plotted at zero: a threshold
+    # nothing was scored at is not a threshold with no impersonations.
+    op = [
+        (r["threshold"], _rate(r["stranger"].get("impersonated"), r["stranger"].get("n_scored")))
+        for r in _op_points(visits)
+    ]
+    op = [(t, rate) for t, rate in op if rate is not None]
+    if op:
+        ax.plot([t for t, _r in op], [r for _t, r in op], color=_CAT_PALETTE[5],
+                linewidth=2, linestyle="--", label="stranger impersonation rate")
     thr = visits.get("threshold")
     if thr is not None:
         ax.axvline(thr, color=_INK, linestyle="--", linewidth=1.5,
@@ -482,7 +545,7 @@ def _curve_png(visits: dict) -> str:
     ax.set_ylim(0, 1.02)
     ax.set_title("Visit-level accuracy vs. threshold", color=_INK, fontsize=11)
     ax.set_xlabel("cosine distance threshold", color=_MUTED, fontsize=9)
-    ax.set_ylabel("share of scored visits", color=_MUTED, fontsize=9)
+    ax.set_ylabel("share of each curve's own scored visits", color=_MUTED, fontsize=9)
     ax.tick_params(colors=_MUTED, labelsize=8)
     ax.legend(loc="best", fontsize=8, frameon=False)
     for spine in ax.spines.values():
@@ -623,6 +686,231 @@ def _visit_verdict(v: dict) -> str:
     return "Weak — a held-out visit is often named wrongly; this is the number that matters."
 
 
+def _op_points(visits: dict, limit: "int | None" = None) -> "list[dict]":
+    """The operating-point rows: known-cat curve joined to the stranger curve by threshold.
+
+    Joined BY VALUE, not by position, and a point present on only one side is dropped —
+    the two sweeps share one grid by construction (``_visits_block`` computes it once and
+    hands it to every stranger pass), so an unpaired point means that guarantee broke, and
+    lining two such curves up by index would silently quote one threshold's declines
+    against another's impersonations.
+
+    ``limit`` samples the result down to that many rows, always keeping the ends and the row
+    at the headline threshold — that row is the one the report's other numbers were computed
+    at, so a table that omitted it would not contain the reading it is meant to explain. The
+    chart passes no limit: a line has room for the whole grid, a table does not.
+    """
+    strangers = visits.get("strangers") or {}
+    if not strangers.get("available"):
+        return []
+    known = {float(p["threshold"]): p for p in (visits.get("curve") or [])}
+    rows = [
+        {"threshold": float(s["threshold"]), "known": known[float(s["threshold"])], "stranger": s}
+        for s in (strangers.get("curve") or [])
+        if float(s["threshold"]) in known
+    ]
+    if limit is None or len(rows) <= limit or limit < 2:
+        return rows
+    step = (len(rows) - 1) / float(limit - 1)
+    keep = {int(round(i * step)) for i in range(limit)}
+    head_t = visits.get("threshold")
+    if head_t is not None:
+        # Nearest row to the headline threshold — it is a grid mark, so this normally hits
+        # it exactly; `min` rather than an equality test keeps the row present even if the
+        # mark ever stops landing on a grid point.
+        keep.add(min(range(len(rows)), key=lambda i: abs(rows[i]["threshold"] - head_t)))
+    return [rows[i] for i in sorted(keep)]
+
+
+def _stranger_section(metrics: dict) -> str:
+    """Stranger rejection: how often an UNENROLLED cat is handed a known cat's name.
+
+    The report's other sections all score cats the gallery contains, so every one of them
+    is blind to this by construction — which is why this section states what it measures
+    before it states a number, and why an unavailable block still renders a banner rather
+    than nothing at all.
+    """
+    v = metrics.get("visits") or {}
+    s = v.get("strangers")
+    if not s:
+        return ""
+    if not s.get("available"):
+        why = {
+            "single_cat_gallery": (
+                f"Holding one cat out of {s.get('n_cats', '?')} leaves a gallery of one, "
+                "where every impersonation lands on the only remaining cat — that is a "
+                "property of the arithmetic, not of the embedding. Nothing was measured. "
+                "Three labelled cats is the floor."
+            ),
+            "no_cat_index": (
+                "The run carried no cat index, so an impersonation could not be attributed "
+                "to a cat or split by resident vs neighbour. Nothing was measured."
+            ),
+            "no_visits": "No held-out cat had a visit to score. Nothing was measured.",
+        }.get(s.get("reason"), "The stranger scoring could not run.")
+        return (
+            '<h2 style="font-size:15px;">Stranger rejection</h2>'
+            '<div class="verdict"><strong>Not measured.</strong> '
+            f'{html.escape(why)}</div>'
+        )
+
+    split = s.get("resident_split")
+    res_txt = _pct(s.get("resident_impersonation_rate")) if split else "—"
+    rows = "".join(
+        f"<tr><td>{html.escape(c.get('cat_name') or '?')}</td>"
+        f"<td>{'resident' if c.get('is_resident') else ('neighbour' if c.get('is_resident') is False else '—')}</td>"
+        f"<td>{c.get('n_scored', 0)}</td>"
+        f"<td>{c.get('rejected', 0)}</td>"
+        f"<td>{_pct(c.get('impersonation_rate'))}</td>"
+        f"<td>{c.get('as_resident', 0)}</td>"
+        f"<td>{html.escape(_named_as(c))}</td></tr>"
+        for c in (s.get("per_cat") or [])
+    )
+    # The row attribute and the sub-span are built OUTSIDE the f-string braces: a
+    # backslash inside an f-string expression is a SyntaxError before Python 3.12 (PEP 701
+    # lifted it) and it fails at IMPORT for the whole module — compute.ps1 accepts 3.10+.
+    op_rows = ""
+    for r in _op_points(v, _OP_ROWS):
+        head = ' style="font-weight:600;"' if _is_headline(r, v) else ""
+        as_res = r["stranger"].get("as_resident", 0)
+        op_rows += (
+            f"<tr{head}><td>{r['threshold']:.3f}</td>"
+            f"<td>{_pct(r['known'].get('accuracy'))}</td>"
+            f"<td>{_share(r['known'].get('unknown'), v.get('n_scored'))}</td>"
+            f"<td>{_share(r['stranger'].get('impersonated'), r['stranger'].get('n_scored'))}"
+            f'<span class="sub2"> ({as_res} as a resident)</span></td></tr>'
+        )
+    # A cat that could not be held out at all has no reading, and a table that simply
+    # omitted it would read as a roster of cats that were all measured.
+    skipped = s.get("skipped") or []
+    skipped_txt = "" if not skipped else (
+        '<p class="sub">Not held out, so no number exists for them: '
+        + ", ".join(f"{html.escape(str(k.get('cat_id')))} ({html.escape(str(k.get('reason')))})"
+                    for k in skipped)
+        + ".</p>"
+    )
+    op_html = "" if not op_rows else f"""
+  <h2 style="font-size:15px;">Operating point — what a tighter threshold buys and costs</h2>
+  <table><tr><th>threshold</th><th>known-cat recall</th><th>known-cat declines</th>
+    <th>impersonations (resident)</th></tr>{op_rows}</table>
+  <p class="sub">Both columns are swept over the SAME grid, so a row reads as one setting:
+     at this cutoff, known cats are named correctly this often (of the visits it decided),
+     it declines this share of them, and it hands a known cat's name to this share of the
+     held-out ones. Recall excludes declines — they are the column beside it — so read the
+     two together. The bold row is the threshold every other number in this report was
+     computed at; the full grid is in <code>feasibility.json</code>.</p>"""
+
+    return f"""
+  <h2 style="font-size:15px;">Stranger rejection — is an unenrolled cat refused?</h2>
+  <div class="tiles">
+    <div class="tile"><div class="v">{_pct(s.get('impersonation_rate'))}</div>
+      <div class="l">held-out visits given a known cat's name</div></div>
+    <div class="tile"><div class="v">{res_txt}</div>
+      <div class="l">…and given one of OUR cats' names</div></div>
+    <div class="tile"><div class="v">{s.get('n_scored', 0)}</div>
+      <div class="l">visits scored, over {s.get('n_cats_held_out', 0)} held-out cats</div></div>
+  </div>
+  <p class="sub">Each cat is removed from the gallery in turn and its own visits are
+     re-scored against the rest. The correct answer is then <em>unknown</em> — there is no
+     right name available — so declining is success and any name is an impersonation. A
+     held-out neighbour stands in for a genuine stranger; a held-out resident stands in for
+     one of ours before it has been enrolled. Both figures above are shares of the SAME
+     denominator — held-out visits — so the second is not a fraction of the first.
+     Rejected {s.get('rejected', 0)} · impersonated {s.get('impersonated', 0)}
+     ({s.get('as_resident', 0)} as a resident, {s.get('as_neighbour', 0)} as a neighbour)
+     of {s.get('n_scored', 0)}.
+     {'' if split else 'The resident / neighbour split is UNAVAILABLE for this run — the roster flag did not reach the probe, so "named as one of ours" could not be counted and is shown as not measured rather than as zero.'}</p>
+  <table><tr><th>held-out cat</th><th>kind</th><th>visits</th><th>rejected</th>
+    <th>impersonation rate</th><th>as a resident</th><th>named as</th></tr>{rows}</table>
+  {skipped_txt}
+  {op_html}"""
+
+
+def _is_headline(row: dict, visits: dict) -> bool:
+    """Is this operating-point row the one at the run's own threshold?"""
+    head = visits.get("threshold")
+    return head is not None and abs(row["threshold"] - float(head)) < 1e-12
+
+
+def _rate(part: "int | None", whole: "int | None") -> "float | None":
+    """``part / whole``, or ``None`` when nothing was counted — never a zero standing in."""
+    if part is None or not whole:
+        return None
+    return part / whole
+
+
+def _share(part: "int | None", whole: "int | None") -> str:
+    """``part`` of ``whole`` as a percentage — an em dash when the whole is unmeasured."""
+    return _pct(_rate(part, whole))
+
+
+def _named_as(row: dict) -> str:
+    """The cats a held-out cat was mistaken for, biggest first — the actionable half.
+
+    An impersonation RATE says how leaky the gallery is; WHO it leaked into is what a
+    reader acts on (a lookalike pair is a different problem from a cat that attracts
+    everything)."""
+    named = sorted(row.get("named") or [], key=lambda n: -int(n["n"]))
+    if not named:
+        return "—"
+    return ", ".join(f"{n.get('cat_name') or ('#' + str(n.get('cat_id')))} ×{n['n']}"
+                     for n in named)
+
+
+def _caps_section(metrics: dict) -> str:
+    """The capped-gallery forecast: what a per-cat cap would do, without building one.
+
+    Two columns per cap on purpose. ``cap_per_cat`` claims to fix two biases — the dominant
+    cat's vectors blanketing the embedding space, and the threshold being calibrated from a
+    distance distribution those cats' pairs dominate — so a forecast that recalibrated only,
+    or held the threshold only, would answer half the question and read as the whole.
+    """
+    caps = (metrics.get("visits") or {}).get("caps")
+    if not caps:
+        return ""
+    rows = ""
+    for c in caps:
+        recal, fixed = c.get("recalibrated"), c.get("fixed") or {}
+        thr = c.get("threshold")
+        # The DENOMINATOR, beside every rate read off it. Both columns score the same
+        # visits, so one cell serves both — and a cap that made visits unscoreable is
+        # exactly when its recall is not comparable to the row above, so the `+N` is not
+        # decoration. Matches the runs table's `N +M` shape for the same distinction.
+        col = recal or fixed
+        n_scored, n_uns = col.get("n_scored"), col.get("n_unscoreable") or 0
+        rows += (
+            f"<tr><td>{'uncapped' if c.get('max_per_cat') is None else c['max_per_cat']}</td>"
+            f"<td>{c.get('n_vectors', 0)}</td>"
+            f"<td>{c.get('n_cats', 0)}</td>"
+            f"<td>{'—' if n_scored is None else n_scored}"
+            f"{f' <span class=\"sub\">+{n_uns}</span>' if n_uns else ''}</td>"
+            f"<td>{'—' if thr is None else f'{thr:.3f}'}</td>"
+            f"<td>{_pct((recal or {}).get('accuracy'))}</td>"
+            f"<td>{_pct((recal or {}).get('unknown_rate'))}</td>"
+            f"<td>{_pct(fixed.get('accuracy'))}</td>"
+            f"<td>{_pct(fixed.get('unknown_rate'))}</td></tr>"
+        )
+    return f"""
+  <h2 style="font-size:15px;">If the gallery were capped per cat</h2>
+  <table><tr><th>cap</th><th>vectors</th><th>cats</th><th>visits</th><th>threshold</th>
+    <th colspan="2">recalibrated under the cap</th>
+    <th colspan="2">at the uncapped threshold</th></tr>
+  <tr><th></th><th></th><th></th><th></th><th></th><th>recall</th><th>declines</th>
+    <th>recall</th><th>declines</th></tr>{rows}</table>
+  <p class="sub">Each cap is the SAME selection a build would make (best grades first,
+     spread over time), applied as a gallery mask over this run's own distances — so this
+     forecasts the gallery you would get, not a second policy that could disagree with one.
+     A dash under threshold means the survivors held no cross-visit same-cat pair to
+     calibrate from, and only the fixed-threshold column is a reading.
+     <b>Compare recall only between rows at the same visit count.</b> Two caveats pull
+     opposite ways: where a cap happens to select crops from the visit being held out, that
+     cat's gallery for that fold sits just below the cap, understating it — but a tight cap
+     can also leave a cat's every surviving vector inside the held-out visit, which makes
+     that visit unscoreable (the dim <span class="sub">+N</span>) and drops it from the
+     denominator rather than counting it wrong. A recall that rose while the visit count
+     fell has measured an easier set, not a better gallery.</p>"""
+
+
 def _tldr_section(t: "dict | None", charts: dict) -> str:
     """The lead block: five numbers, what they cannot tell you, and two charts.
 
@@ -676,11 +964,37 @@ def _tldr_section(t: "dict | None", charts: dict) -> str:
     # What the numbers above structurally cannot say. Each line is a real limit of this
     # probe, not a disclaimer — the first one is the big one, and it is invisible in
     # every figure on the page.
-    limits = [
-        "<b>No strangers were tested.</b> Every crop here belongs to a labelled cat, so "
-        "nothing measures whether a foreign cat is correctly refused — the half of the "
-        "job the door actually needs. Read these as an optimistic bound.",
-    ]
+    strangers = t.get("strangers")
+    if strangers and strangers.get("available"):
+        # Measured, so it stops being a limit and becomes a finding. Still stated here
+        # rather than only in its own section: this block is where a reader takes their
+        # numbers, and "the door refuses strangers this often" belongs beside them.
+        # Both rates are over the SAME denominator — held-out visits — so the sentence says
+        # so rather than writing "20% of them", which reads as a share of the 30% above it.
+        as_res = (
+            f", and {pct(strangers.get('resident_impersonation_rate'))} of them were given "
+            "one of OUR cats' names — the direction that lets a stranger through the door"
+            if strangers.get("resident_split") else
+            ", though the resident / neighbour split could not be counted for this run"
+        )
+        limits = [
+            f"<b>Strangers WERE tested: of {strangers.get('n_scored', 0)} held-out visits, "
+            f"{pct(strangers.get('impersonation_rate'))} were given a known cat's name"
+            f"{as_res}.</b> These are still real cats we have labelled, standing in "
+            "for one we have not — a true stranger has never been seen by this door at all.",
+        ]
+    else:
+        limits = [
+            "<b>No strangers were tested.</b> Every crop here belongs to a labelled cat, so "
+            "nothing measures whether a foreign cat is correctly refused — the half of the "
+            "job the door actually needs. Read these as an optimistic bound."
+            + (
+                " The held-out-cat pass ran but could not be scored on this run "
+                f"({html.escape(str((strangers or {}).get('reason') or 'unknown'))}); see "
+                "the stranger-rejection section below."
+                if strangers else ""
+            ),
+        ]
     if t["resolution"]:
         limits.append(
             f"<b>One visit is {t['resolution'] * 100:.1f} points.</b> With {t['decided']} "
@@ -743,6 +1057,11 @@ def _render_html(metrics: dict, charts: dict, quality_label: str) -> str:
     visit_html = _visit_section(metrics, cat_names)
     if visit_html and "{curve}" in visit_html:
         visit_html = visit_html.replace("{curve}", charts.get("curve", ""))
+    # Both sit directly under the visit block and above the demoted crop-level one: they
+    # answer the questions that block cannot (a cat it never saw; a gallery it was not
+    # built from), and both return "" when their feature was not requested.
+    stranger_html = _stranger_section(metrics)
+    caps_html = _caps_section(metrics)
     # With visit-held-out scoring present the crop-level block is DEMOTED: it stays (it is
     # the one number comparable with runs recorded before this existed) but it stops being
     # what a reader sees first, and it carries the explanation of why it reads high.
@@ -791,6 +1110,8 @@ def _render_html(metrics: dict, charts: dict, quality_label: str) -> str:
   <p class="sub">{metrics['n_crops']} labelled crops · {metrics['n_cats']} cats · quality: {html.escape(quality_label)} · DINOv2 embeddings</p>
   {tldr_html}
   {visit_html}
+  {stranger_html}
+  {caps_html}
   <div class="{'demoted' if demoted else ''}">
   <h2 style="font-size:15px;">{'Crop-level scoring (for comparison)' if demoted else 'Crop-level scoring'}</h2>
   {(
@@ -824,6 +1145,10 @@ def run_feasibility_probe(
     qualities: "tuple[str, ...] | None" = None,
     exclude_cat_ids: "tuple[int, ...] | None" = None,
     progress: "object | None" = None,
+    max_per_cat: "list[int | None] | tuple | None" = _DEFAULT_CAPS,
+    strangers: bool = True,
+    letterbox: bool = False,
+    margin: float = 0.0,
 ) -> dict:
     """Run the probe over the store's ``identified`` crops → summary dict + report.
 
@@ -839,23 +1164,53 @@ def run_feasibility_probe(
     back in the summary so the caller can record WHICH cat set a run scored (a run over a
     different set is not comparable with one over the whole roster).
 
+    ``strangers`` (on) adds the held-out-CAT pass: how often a cat the gallery has never
+    seen is handed a known cat's name. On by default because a run without it measures only
+    the half of the door's job the labelled set can see, which is the blind spot this whole
+    scoring exists to close — it costs one extra scoring pass over a matrix already in
+    memory, not a second embed.
+
+    ``max_per_cat`` is a LIST of per-cat caps to forecast — ``(None, 2000, 1000, 500)`` by
+    default, ``None``/``[]`` for no forecast. Each is applied through
+    ``gallery.cap_per_cat`` (the build's own selection, not a second policy) and scored as
+    a gallery mask over the same distances, with the threshold recalibrated under it.
+
+    ``letterbox`` / ``margin`` select the crop GEOMETRY this run scores. Only crops whose
+    ``geometry`` stamp matches are read — a run at a geometry embeds the pixels cut at that
+    geometry, so a margin arm over legacy crops would report a margin it never applied
+    (see ``build_gallery``, which filters the same way and for the same reason). The margin
+    itself is NOT passed to the embedder: it is already baked into the crop file's pixels,
+    and ``embed_paths`` rejects it outright rather than applying it twice.
+
     Guards the too-little-data cases instead of raising, returning a structured
     ``{'enough': False, 'reason': ..., 'message': ...}`` so the endpoint can surface
     an empty-state. ``reason`` distinguishes a benign cold-start
     (``'insufficient_labels'`` — fewer than 2 labelled crops/cats) from a genuine
     fault (``'decode_failure'`` — enough labels existed but too few crops decoded);
     the CLI maps the latter to a non-zero exit. On success it writes
-    ``feasibility.{json,html}`` under ``out_dir`` and returns ``{'enough': True, ...}``
-    with the headline metrics. Does NOT touch the DB.
+    ``feasibility.{json,html}`` plus ``visit_outcomes.json`` under ``out_dir`` and returns
+    ``{'enough': True, ...}`` with the headline metrics. Does NOT touch the DB.
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
     excluded = tuple(sorted({int(c) for c in exclude_cat_ids})) if exclude_cat_ids else ()
+    # Canonicalise + validate BEFORE the store read, as `build_gallery` does: a negative
+    # margin is rejected here rather than silently shrinking a box, and the descriptor is
+    # what the row stamps are compared against below.
+    geometry = geometry_descriptor(bool(letterbox), float(margin))
+    caps = tuple(max_per_cat) if max_per_cat else ()
     # active_only: score the CURRENT household. A retired cat is one we no longer
     # need to tell apart, and leaving it in would move the separability numbers
     # away from the gallery that actually gets built (which excludes it too).
     labels = store.labeled_crops(
         ("identified",), qualities, active_only=True, exclude_cat_ids=excluded or None
     )
+    # Geometry filter in Python, not SQL: `labeled_crops` returns the stamp but has no
+    # filter for it, and the canonical comparison (`m10` == `m10.0`, an unknown stamp
+    # never matching) is not a `WHERE geometry = ?`. Like the exclusion it can drop whole
+    # CATS, so it runs before the floor below, not after.
+    n_all_geometries = len(labels)
+    labels = [row for row in labels if canonical_geometry(row.get("geometry")) == geometry]
+    n_other_geometry = n_all_geometries - len(labels)
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:
@@ -865,6 +1220,7 @@ def run_feasibility_probe(
             "n_crops": n_crops,
             "n_cats": n_cats,
             "quality": quality_label,
+            "geometry": geometry,
             "message": (
                 f"Not enough labelled data yet: {n_crops} crops across {n_cats} cat(s). "
                 + (
@@ -873,10 +1229,27 @@ def run_feasibility_probe(
                     if excluded
                     else "Label at least two cats."
                 )
+                # Named separately, because "not enough labelled data" is a lie when the
+                # operator has thousands of crops and merely asked for a geometry almost
+                # none of them are cut at.
+                + (
+                    f" {n_other_geometry} labelled crop(s) are cut at a different geometry "
+                    f"and were left out of this {geometry or 'legacy'} run."
+                    if n_other_geometry
+                    else ""
+                )
             ),
         }
 
-    embedder = Embedder()
+    # Letterbox only, never the margin: `embed_paths` reads whole crop FILES, whose pixels
+    # already carry whatever margin they were cut at, and it rejects a non-zero margin
+    # outright rather than applying it a second time. The geometry FILTER above is what
+    # makes `margin` mean something here. `_geometry_kwargs` is imported from the gallery
+    # (not re-derived) so a build and a probe at one geometry construct one embedder — and
+    # imported inside the function because `gallery` imports this module at its top.
+    from compute.identification.gallery import _geometry_kwargs
+
+    embedder = Embedder(**_geometry_kwargs(bool(letterbox), 0.0))
     embedder.prepare()
     emb, kept = embedder.embed_paths([row["crop_path"] for row in labels], progress=progress)
     kept_labels = [labels[i] for i in kept]
@@ -894,6 +1267,7 @@ def run_feasibility_probe(
             "n_crops": n_crops,
             "n_cats": n_cats,
             "quality": quality_label,
+            "geometry": geometry,
             "message": (
                 f"Only {n_decoded} crops across {n_decoded_cats} cat(s) decoded — "
                 "cannot measure separability."
@@ -902,10 +1276,19 @@ def run_feasibility_probe(
 
     cat_ids = [row["cat_id"] for row in kept_labels]
     cat_names = {row["cat_id"]: (row["cat_name"] or f"cat #{row['cat_id']}") for row in kept_labels}
+    # The roster flag, carried per cat so an impersonation can be split by whether the
+    # impersonated cat is one of OURS. Read off the same rows the crops came from, so it
+    # cannot disagree with the crop it describes.
+    cat_residents = {row["cat_id"]: row.get("is_resident") for row in kept_labels}
     # Visit-held-out scoring rides the SAME embeddings and the same distance matrix — the
     # expensive part is the embed above, so the honest number costs numpy, not GPU.
     is_night = _night_classifier(store)
     groups, nights = group_visits(kept_labels, is_night)
+    # `group_visits` sorts each cat's rows by `src_recv_ts` before splitting, so a group's
+    # FIRST index is its earliest crop. Half of the `(cat_id, first_src_recv_ts)` key two
+    # runs' per-visit outcomes are joined on; it has to come from here because
+    # `feasibility.py` is deliberately pure-numpy and holds no timestamps.
+    visit_meta = [{"first_src_recv_ts": int(kept_labels[G[0]]["src_recv_ts"])} for G in groups]
     active = store.active_model()
     marks = {}
     if active and active.get("threshold") is not None:
@@ -922,11 +1305,33 @@ def run_feasibility_probe(
         extra_thresholds=marks,
         labeled_ts_groups=len({row["labeled_ts"] for row in kept_labels}),
         gap_ms=_HELDOUT_GAP_MS,
+        cat_residents=cat_residents,
+        visit_meta=visit_meta,
+        strangers=strangers,
+        cap_masks=_cap_masks(kept_labels, caps),
     )
+    # OUT of the metrics dict before anything persists it. `feasibility_runs.metrics` rows
+    # are kept indefinitely and the Model page parses 100 of them on every load, so a
+    # per-visit list — which grows with the door's traffic — belongs in the run dir, which
+    # `prune_feasibility_reports` bounds at 25.
+    outcomes = (metrics.get("visits") or {}).pop("outcomes", None)
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "feasibility.json"), "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
+    if outcomes is not None:
+        # Self-describing: a paired comparison reads two of these and has to know which arm
+        # each one is, and the run dir name alone does not say.
+        with open(os.path.join(out_dir, "visit_outcomes.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "geometry": geometry,
+                "quality": quality_label,
+                "excluded_cat_ids": list(excluded) or None,
+                "gap_ms": _HELDOUT_GAP_MS,
+                "threshold": (metrics.get("visits") or {}).get("threshold"),
+                "n": len(outcomes),
+                "visits": outcomes,
+            }, fh, indent=2)
     charts = {"scatter": _scatter_png(metrics), "confusion": _confusion_png(metrics), "hist": _hist_png(metrics)}
     visits_block = metrics.get("visits")
     if visits_block and visits_block.get("available"):
@@ -956,4 +1361,9 @@ def run_feasibility_probe(
         # excluded a cat is not comparable with one over the whole roster, and that has
         # to be visible in the runs row rather than only in the request that made it.
         "excluded_cat_ids": list(excluded) or None,
+        # And WHICH crop convention it scored. Same reason, one level sharper: two
+        # geometry arms are compared against each other, so a run that does not name its
+        # own geometry is not auditable after the fact. `None` = legacy.
+        "geometry": geometry,
+        "n_other_geometry": n_other_geometry,
     }

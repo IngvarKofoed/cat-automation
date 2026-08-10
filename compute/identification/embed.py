@@ -33,6 +33,126 @@ _DEFAULT_MODEL = "dinov2_vits14"
 _DEFAULT_IMGSZ = 224
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+# The ImageNet mean carried back into 0–255 pixel space — the letterbox PAD colour.
+# After ``(x/255 − mean)/std`` a pixel of exactly this colour is 0.0 in every channel,
+# so the padding contributes nothing to the vector. Black (0,0,0) would instead land at
+# ≈(−2.12, −2.04, −1.80) and inject a large constant into every embedding, weighted by
+# how much of the square the pad covers — which varies with each box's aspect ratio, so
+# it would be a per-crop bias rather than a shared offset the model could ignore.
+_IMAGENET_MEAN_255 = tuple(v * 255.0 for v in _IMAGENET_MEAN)
+
+# The one non-legacy resize token. Kept as a constant because the descriptor string is
+# a persisted value (``dataset_items.geometry``) — a typo here would silently split one
+# convention into two that never match each other.
+_GEOMETRY_LETTERBOX = "letterbox"
+
+
+def geometry_descriptor(letterbox: bool, margin: float) -> "str | None":
+    """The stable string naming a crop convention — ``None`` for **legacy**.
+
+    Legacy is squash-resize with no context margin: what every crop cut before this
+    existed follows, and what an absent ``dataset_items.geometry`` stamp means. It is
+    deliberately spelled ``None`` rather than ``"legacy"`` so a NULL column value and
+    an omitting caller mean exactly the same thing without a translation step.
+
+    Non-legacy renders as ``+``-joined tokens, resize first: ``"letterbox"``,
+    ``"m10"``, ``"letterbox+m10"``. The margin token is the fraction as a PERCENT
+    (``m10`` = 0.10) via ``%g``, so 0.125 reads ``m12.5`` and no value round-trips to a
+    different string than it came from. A negative margin is rejected here rather than
+    quietly shrinking the box — it would clip the cat, which is the opposite of what a
+    context margin is for.
+    """
+    if margin < 0:
+        raise ValueError(f"margin must be >= 0 (a margin EXPANDS the box), got {margin!r}")
+    parts: "list[str]" = []
+    if letterbox:
+        parts.append(_GEOMETRY_LETTERBOX)
+    if margin:
+        parts.append(f"m{margin * 100:g}")
+    return "+".join(parts) or None
+
+
+def parse_geometry(descriptor: "str | None") -> "tuple[bool, float]":
+    """Inverse of ``geometry_descriptor``: a stamp → ``(letterbox, margin)``.
+
+    ``None`` / ``""`` is legacy → ``(False, 0.0)``. An unknown token raises
+    ``ValueError`` rather than being skipped: a stamp this build cannot read names a
+    convention it cannot reproduce, and embedding those pixels under a *guessed*
+    geometry is the silent feature-space blend the stamp exists to prevent.
+    """
+    if descriptor is None or not str(descriptor).strip():
+        return False, 0.0
+    letterbox = False
+    margin = 0.0
+    for token in str(descriptor).strip().split("+"):
+        token = token.strip()
+        if token == _GEOMETRY_LETTERBOX:
+            letterbox = True
+        elif token.startswith("m") and len(token) > 1:
+            try:
+                percent = float(token[1:])
+            except ValueError:
+                raise ValueError(f"bad margin token {token!r} in geometry {descriptor!r}") from None
+            if percent < 0:
+                raise ValueError(f"negative margin token {token!r} in geometry {descriptor!r}")
+            margin = percent / 100.0
+        else:
+            raise ValueError(f"unknown geometry token {token!r} in {descriptor!r}")
+    return letterbox, margin
+
+
+def canonical_geometry(value: "str | None") -> "str | None":
+    """Canonical form of a STORED geometry stamp, for comparing two conventions.
+
+    Falsy → ``None`` (legacy). A parseable stamp is re-rendered through
+    ``geometry_descriptor``, so ``"m10"`` and ``"m10.0"`` compare equal and token order
+    can't split one convention in two. An UNPARSEABLE stamp is returned **unchanged**
+    rather than raising: it names a convention written by some other build, and the
+    only safe reading is "not mine" — which excludes those crops from a build here
+    instead of blending them into it.
+    """
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return geometry_descriptor(*parse_geometry(value))
+    except ValueError:
+        return str(value)
+
+
+def _letterbox_square(img, size: int):
+    """Aspect-preserving resize of ``img`` into a ``size``×``size`` float32 canvas.
+
+    The alternative to ``cv2.resize(img, (size, size))``, which SQUASHES: real door
+    boxes run from 191×46 to 538×298, so a squash distorts by up to ~4.8× and — worse —
+    by a *different* factor per frame within one visit, which is variation the embedder
+    has to spend capacity on. Here the crop keeps its shape and the leftover is padded.
+
+    Padded with ``_IMAGENET_MEAN_255`` (see there): the canvas is float32 so the pad
+    value is exact, while the resized CONTENT is assigned in from cv2's uint8 result, so
+    the pixels that came from the image carry the same 8-bit quantisation the legacy
+    path gives them. Filter follows direction — ``INTER_AREA`` shrinking (the legacy
+    path's choice, and correct there since a detection crop is almost always larger than
+    224), ``INTER_LINEAR`` enlarging, where ``INTER_AREA`` degenerates to a blurry
+    nearest-neighbour.
+
+    ``img`` is RGB at this point (``_embed_items`` converts before calling), which is the
+    channel order ``_IMAGENET_MEAN_255`` is written in.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = img.shape[:2]
+    scale = min(size / float(width), size / float(height))
+    new_w = max(1, min(size, int(round(width * scale))))
+    new_h = max(1, min(size, int(round(height * scale))))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+    canvas = np.empty((size, size, 3), dtype=np.float32)
+    canvas[:, :] = _IMAGENET_MEAN_255
+    top = (size - new_h) // 2
+    left = (size - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = resized
+    return canvas
 
 
 class EmbedCancelled(Exception):
@@ -48,11 +168,31 @@ class Embedder:
     imports arrive in ``prepare()``. ``embed_paths`` returns raw (un-normalised)
     embeddings — the feasibility metrics L2-normalise themselves, so the vectors
     can be cached/reused for a future gallery without a baked-in normalisation.
+
+    ``letterbox`` and ``margin`` are the crop GEOMETRY (see ``geometry_descriptor``),
+    and both default to **legacy** — squash resize, no margin. That default is
+    load-bearing, not a shrug: every already-promoted gallery was embedded this way, and
+    flipping the default would silently mismatch each of those galleries against its own
+    queries. It is the exact failure the ``backbone``/``imgsz`` stamps exist to prevent,
+    which is why geometry is stamped the same way rather than assumed.
     """
 
-    def __init__(self, model: "str | None" = None, imgsz: "int | None" = None) -> None:
+    def __init__(
+        self,
+        model: "str | None" = None,
+        imgsz: "int | None" = None,
+        letterbox: bool = False,
+        margin: float = 0.0,
+    ) -> None:
         self.model_name = model or os.environ.get(_ENV_MODEL, _DEFAULT_MODEL)
         self._imgsz = int(imgsz if imgsz is not None else os.environ.get(_ENV_IMGSZ, _DEFAULT_IMGSZ))
+        self._letterbox = bool(letterbox)
+        self._margin = float(margin)
+        # Validate at CONSTRUCTION, where the caller's stack is still on screen — a
+        # negative margin shrinks the box, so it would silently clip the cat rather than
+        # fail. ``geometry_descriptor`` owns the rule; calling it here also means the
+        # descriptor property below can never raise.
+        geometry_descriptor(self._letterbox, self._margin)
         self._model = None
         self._device: "str | None" = None
 
@@ -69,6 +209,26 @@ class Embedder:
         """The resolved square input side fed to the backbone (``CAT_EMBED_IMGSZ`` /
         default). Persisted alongside ``backbone`` for the same rebuild-exactly reason."""
         return self._imgsz
+
+    @property
+    def letterbox(self) -> bool:
+        """Whether the resize preserves aspect and pads (vs. the legacy squash)."""
+        return self._letterbox
+
+    @property
+    def margin(self) -> float:
+        """Context-margin fraction applied to a detection box before cropping (0 = off)."""
+        return self._margin
+
+    @property
+    def geometry(self) -> "str | None":
+        """This embedder's crop convention as the stamp string — ``None`` for legacy.
+
+        The third member of the ``(backbone, imgsz, geometry)`` triple that identifies a
+        feature space. Callers stamp it: ``build_gallery`` onto the version's ``metrics``
+        and the re-cut tool onto each ``dataset_items`` row, so a later build can filter
+        to ONE convention instead of blending two."""
+        return geometry_descriptor(self._letterbox, self._margin)
 
     def ensure_available(self) -> None:
         """Verify the heavy deps import; raise ``ImportError`` with the fix if not."""
@@ -120,7 +280,23 @@ class Embedder:
         value the run aborts at that batch boundary by raising ``EmbedCancelled``,
         so a Cancel interrupts the long phase instead of running to completion.
         ``progress=None`` leaves behavior byte-identical to a plain embed.
+
+        A non-zero ``margin`` is a hard ``ValueError`` here rather than being ignored:
+        there is no detection box left in a stored crop FILE to expand, because the
+        margin was already baked into its pixels when ``dataset.crops.materialize`` cut
+        it. Silently dropping it would make ``Embedder(margin=0.1).embed_paths`` and
+        ``.embed_crops`` produce two different feature spaces from one object — so a
+        caller on the gallery side builds the embedder letterbox-only and lets the row's
+        ``geometry`` stamp record that the pixels already carry the margin. The
+        ``letterbox`` half applies here exactly as it does to a live query crop.
         """
+        if self._margin:
+            raise ValueError(
+                f"embed_paths() cannot honour margin={self._margin!r}: a stored crop file "
+                "has no detection box left to expand — the margin was baked in when the "
+                "crop was cut. Build the embedder with margin=0.0 for the gallery side; "
+                "the row's `geometry` stamp is what records that its pixels carry it."
+            )
         # A path is its own item; no crop — the shared engine embeds the full frame.
         return self._embed_items(
             paths, batch_size, progress,
@@ -150,15 +326,22 @@ class Embedder:
         produced a row, so the caller can align its frame ids/boxes to the embeddings.
         The ``progress``/cancel contract is identical to ``embed_paths`` (both route
         through ``_embed_items``).
+
+        A non-zero ``margin`` expands the box BEFORE clamping — outward on all four
+        edges by that fraction of the box's own width/height — so a tail tip or an
+        extended paw that YOLO's box clipped is still in the crop. Expanding before the
+        clamp (rather than after) is what keeps the expansion honest at a frame edge: the
+        clamp then trims the part that fell outside the image instead of the margin
+        pushing the whole box out of bounds.
         """
-        from compute.dataset.crops import _clamp_box
+        from compute.dataset.crops import _clamp_box, _expand_box
 
         def crop(img, item):
             # The only real difference from embed_paths: crop to the detection box.
             _path, box = item
             height, width = img.shape[:2]
             try:
-                x1, y1, x2, y2 = _clamp_box(box, width, height)
+                x1, y1, x2, y2 = _clamp_box(_expand_box(box, self._margin), width, height)
             except ValueError:
                 logger.warning("embed: degenerate box %r for %s (skipped)", box, item[0])
                 return None  # skip — same effect as an undecodable file
@@ -172,9 +355,12 @@ class Embedder:
     def _embed_items(self, items, batch_size, progress, *, path_of, crop, caller):
         """Shared embedding engine behind ``embed_paths``/``embed_crops``.
 
-        The batching, progress/cancel contract, decode-skip, ImageNet normalisation,
-        and final concat live here ONCE so the two public methods can't drift (which
-        would embed gallery vs query crops differently). Per item: ``path_of(item)``
+        The batching, progress/cancel contract, decode-skip, RESIZE, ImageNet
+        normalisation, and final concat live here ONCE so the two public methods can't
+        drift (which would embed gallery vs query crops differently). The resize is the
+        newest member of that list and the reason it matters most: letterbox-vs-squash
+        applied on one side only is a feature-space mismatch with no symptom other than
+        worse matching. Per item: ``path_of(item)``
         gives the JPEG path; after decode, ``crop(img, item)`` transforms the BGR image
         (identity for ``embed_paths``, crop-to-box for ``embed_crops``) or returns
         ``None`` to skip it — an undecodable file skips the same way. ``caller`` names
@@ -232,7 +418,14 @@ class Embedder:
             if img is None:
                 continue  # crop rejected this item (e.g. degenerate box) — already logged
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (self._imgsz, self._imgsz), interpolation=cv2.INTER_AREA)
+            if self._letterbox:
+                # float32 canvas — see `_letterbox_square`; `.float()` below is then a
+                # no-op and the pad lands at exactly 0.0 after the normalisation.
+                img = _letterbox_square(img, self._imgsz)
+            else:
+                # Legacy: squash to the square. Left byte-identical on purpose — every
+                # already-promoted gallery's vectors came through this line.
+                img = cv2.resize(img, (self._imgsz, self._imgsz), interpolation=cv2.INTER_AREA)
             t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
             buf.append(t)
             buf_idx.append(i)

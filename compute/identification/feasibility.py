@@ -28,6 +28,20 @@ The three things it measures, matching the three views the report draws:
   plus a cross-regime matrix (can a day-only gallery name a night visit?) that answers
   whether one gallery can span both regimes.
 
+- **Stranger rejection** (opt-in, ``strangers``) — the half of the door's job every
+  measurement above is structurally blind to: each crop scored there belongs to a cat we
+  have labelled, so nothing says how often a cat we have NEVER labelled is handed a known
+  cat's name. Holding a whole CAT out of the gallery turns each of its visits into a
+  trial whose only correct answer is *declined*. Split by whether the impersonated cat is
+  a resident or a neighbour, because "stranger let in as one of ours" is the outcome the
+  door cares about and "stranger named as another neighbour" is not.
+
+- **Capped-gallery forecast** (opt-in, ``cap_masks``) — what a per-cat cap would do,
+  without building the gallery to find out. The cap's own selection becomes a gallery
+  mask over this same matrix, and the threshold is RECALIBRATED under it, because a cap
+  is meant to fix the calibration bias as well as the density one (see
+  ``gallery.cap_per_cat``); both columns are reported so which half moved is visible.
+
 Distances are COSINE distance (1 − cosine similarity) over L2-normalised
 embeddings — the standard metric for re-ID embedding spaces.
 """
@@ -151,6 +165,57 @@ def _per_cat(
     return out
 
 
+def _cat_id_of(cats: "list[dict] | None", index: "int | None") -> "int | None":
+    """The REAL ``cat_id`` behind a positional cat index, or ``None``.
+
+    The index is positional over ``sorted(set(cat_ids))`` — the cats present in THIS run —
+    so it shifts the moment a cat is excluded or retired, and two runs' "cat 3" are then
+    different cats (entry 357's trap). Anything leaving this module keyed by cat has to
+    come through here."""
+    if not cats or index is None or index < 0 or index >= len(cats):
+        return None
+    return cats[index].get("cat_id")
+
+
+def _resident_bucket(cats: "list[dict] | None", index: int) -> str:
+    """Which impersonation bucket naming cat ``index`` falls in.
+
+    Three, not two: ``is_resident`` is ``None`` when the roster flag was never plumbed
+    through (no ``cat_residents``), and counting an unknown flag as *neighbour* would
+    report the dangerous direction as measured-and-zero. The block reports the split as
+    unavailable when any cat lands in ``as_unknown``."""
+    flag = cats[index].get("is_resident") if cats and 0 <= index < len(cats) else None
+    if flag is True:
+        return "as_resident"
+    return "as_neighbour" if flag is False else "as_unknown"
+
+
+def _outcome_row(
+    cats: "list[dict] | None",
+    gi: int,
+    true_cat: int,
+    outcome: str,
+    named: "int | None",
+    group_meta: "list[dict]",
+    group_night: "list[bool | None] | None",
+) -> dict:
+    """One row of the per-visit outcome list two arms are compared over.
+
+    ``(cat_id, first_src_recv_ts)`` is the join key, which is why both halves are the
+    caller's data rather than this module's: the timestamp comes from ``group_meta`` (no
+    timestamps live here) and the ids come through ``cats`` (a positional index is only
+    meaningful inside the run that produced it)."""
+    meta = group_meta[gi] if gi < len(group_meta) else {}
+    night = group_night[gi] if group_night is not None and gi < len(group_night) else None
+    return {
+        "cat_id": _cat_id_of(cats, true_cat),
+        "first_src_recv_ts": meta.get("first_src_recv_ts"),
+        "outcome": outcome,
+        "named": _cat_id_of(cats, named),
+        "night": None if night is None else bool(night),
+    }
+
+
 def _score_visits(
     dist: np.ndarray,
     y: np.ndarray,
@@ -162,6 +227,10 @@ def _score_visits(
     aggregate,
     n_cats: int,
     cats: "list[dict] | None" = None,
+    *,
+    stranger: bool = False,
+    group_meta: "list[dict] | None" = None,
+    group_night: "list[bool | None] | None" = None,
 ) -> dict:
     """Score every held-out group against the rest of the matrix.
 
@@ -186,23 +255,52 @@ def _score_visits(
     threshold in ``curve_ts``, since the threshold enters only through
     ``_aggregate_identity``'s below-threshold filter — so the sweep costs votes, not
     distance maths.
+
+    **``stranger`` mode** inverts the unscoreable branch above rather than inheriting it.
+    Called with ``gal_mask = (y != C)`` and only ``C``'s groups, every group's true cat is
+    absent from the gallery BY DESIGN — so the branch that skips them would score nothing
+    at all, which is why this is an explicit mode and not a consequence of the mask. Here
+    *unknown* is the CORRECT answer (the stranger was rejected) and any name is an
+    impersonation, recorded by which cat was impersonated and whether that cat is a
+    resident. The returned shape is deliberately different: no ``accuracy``, because
+    ``correct/(correct+wrong)`` over a pass whose correct answer is "no name" reads as a
+    flat zero.
+
+    ``group_meta`` (parallel to ``groups``, carrying ``first_src_recv_ts``) switches on the
+    per-visit ``outcomes`` list two runs are compared over. It comes from the caller
+    because this module holds no timestamps, and its ids are resolved through ``cats`` —
+    a positional index means nothing outside the run that produced it.
     """
     counts = {"correct": 0, "wrong": 0, "unknown": 0}
     unscoreable: "dict[int, int]" = {}
     # rows = true cat index, cols = predicted cat index, final column = unknown.
     conf = np.zeros((n_cats, n_cats + 1), dtype=int)
-    curve = {float(t): {"correct": 0, "wrong": 0, "unknown": 0} for t in curve_ts}
+    buckets = ("as_resident", "as_neighbour", "as_unknown")
+    curve = {
+        float(t): {"correct": 0, "wrong": 0, "unknown": 0, **{b: 0 for b in buckets}}
+        for t in curve_ts
+    }
+    named_counts: "dict[int, int]" = {}
+    impersonated_as = {b: 0 for b in buckets}
+    outcomes: "list[dict] | None" = [] if group_meta is not None else None
     n_scored = 0
 
-    for G, true_cat in zip(groups, group_true):
-        # Is the true cat represented on the gallery side, outside this group?
-        others = y == true_cat
-        others[G] = False
-        if gal_mask is not None:
-            others &= gal_mask
-        if not others.any():
-            unscoreable[true_cat] = unscoreable.get(true_cat, 0) + 1
-            continue
+    for gi, (G, true_cat) in enumerate(zip(groups, group_true)):
+        if not stranger:
+            # Is the true cat represented on the gallery side, outside this group?
+            others = y == true_cat
+            others[G] = False
+            if gal_mask is not None:
+                others &= gal_mask
+            if not others.any():
+                unscoreable[true_cat] = unscoreable.get(true_cat, 0) + 1
+                if outcomes is not None:
+                    # Recorded, not dropped: a paired comparison joins two runs' visits, and
+                    # a visit missing from one side would read as "this arm never saw it"
+                    # rather than "no number can exist for it".
+                    outcomes.append(_outcome_row(
+                        cats, gi, true_cat, "unscoreable", None, group_meta, group_night))
+                continue
 
         d = dist[G, :]  # advanced indexing already copies
         if gal_mask is not None:
@@ -215,8 +313,54 @@ def _score_visits(
         outcome, named = _visit_outcome(span, headline_t, true_cat, aggregate)
         counts[outcome] += 1
         conf[true_cat, n_cats if named is None else named] += 1
+        if named is not None:
+            named_counts[named] = named_counts.get(named, 0) + 1
+            impersonated_as[_resident_bucket(cats, named)] += 1
+        if outcomes is not None:
+            outcomes.append(_outcome_row(
+                cats, gi, true_cat, outcome, named, group_meta, group_night))
         for t in curve_ts:
-            curve[float(t)][_visit_outcome(span, float(t), true_cat, aggregate)[0]] += 1
+            oc, nm = _visit_outcome(span, float(t), true_cat, aggregate)
+            curve[float(t)][oc] += 1
+            # Only in stranger mode: this is the inner loop (every visit x every grid
+            # point) and the buckets are read out nowhere else.
+            if stranger and nm is not None:
+                curve[float(t)][_resident_bucket(cats, nm)] += 1
+
+    if stranger:
+        # Everything not rejected is an impersonation — derived by subtraction rather than
+        # read off `wrong`, so a caller who handed in a gal_mask that does NOT exclude the
+        # held-out cat cannot make an impersonation vanish into `correct`.
+        rejected = counts["unknown"]
+        return {
+            "n_scored": n_scored,
+            "rejected": rejected,
+            "impersonated": n_scored - rejected,
+            "impersonation_rate": ((n_scored - rejected) / n_scored) if n_scored else None,
+            **impersonated_as,
+            # WHO it leaked into, by id and name only — no positional index leaves here.
+            # An impersonation rate says how leaky the gallery is; the name is what a
+            # reader acts on, and a stored index would mean a different cat in the next run.
+            "named": [
+                {
+                    "cat_id": _cat_id_of(cats, i),
+                    "cat_name": (cats[i].get("cat_name") if cats and i < len(cats) else None),
+                    "is_resident": (cats[i].get("is_resident") if cats and i < len(cats) else None),
+                    "n": int(n),
+                }
+                for i, n in sorted(named_counts.items())
+            ],
+            "curve": [
+                {
+                    "threshold": float(t),
+                    "n_scored": n_scored,
+                    "rejected": curve[float(t)]["unknown"],
+                    "impersonated": n_scored - curve[float(t)]["unknown"],
+                    **{b: curve[float(t)][b] for b in buckets},
+                }
+                for t in curve_ts
+            ],
+        }
 
     decided = counts["correct"] + counts["wrong"]
     return {
@@ -233,10 +377,15 @@ def _score_visits(
             {"cat_index": int(c), "n_visits": int(n)} for c, n in sorted(unscoreable.items())
         ],
         "confusion": conf.tolist(),
+        # Spelled out rather than splatted from `curve[t]`: the accumulator also carries the
+        # impersonation buckets the stranger mode fills, and splatting would leak three
+        # always-zero keys into every known-cat curve point ever recorded.
         "curve": [
             {
                 "threshold": float(t),
-                **curve[float(t)],
+                "correct": curve[float(t)]["correct"],
+                "wrong": curve[float(t)]["wrong"],
+                "unknown": curve[float(t)]["unknown"],
                 "accuracy": (
                     curve[float(t)]["correct"]
                     / (curve[float(t)]["correct"] + curve[float(t)]["wrong"])
@@ -246,7 +395,223 @@ def _score_visits(
             }
             for t in curve_ts
         ],
+        # Last, and only when asked for: this is the one field that leaves the metrics dict
+        # for a file of its own (see run_feasibility_probe) because it grows with the visit
+        # count, and `feasibility_runs.metrics` is kept indefinitely.
+        **({"outcomes": outcomes} if outcomes is not None else {}),
     }
+
+
+# Below three cats, holding one out leaves a ONE-CAT gallery: every impersonation lands on
+# the single remaining cat and the readout is a property of the arithmetic, not of the
+# embedding. Reported as unavailable, because "100% impersonation" reads as catastrophe
+# where the honest reading is that nothing was measured.
+_STRANGER_MIN_CATS = 3
+
+
+def _stranger_block(
+    dist: np.ndarray,
+    y: np.ndarray,
+    groups: "list[list[int]]",
+    group_true: "list[int]",
+    headline_t: float,
+    curve_ts: "list[float]",
+    aggregate,
+    n_cats: int,
+    cats: "list[dict] | None",
+) -> dict:
+    """Hold each cat out of the gallery in turn and score its visits as strangers.
+
+    One pass per cat ``C`` with ``gal_mask = (y != C)``, over ``C``'s groups only. Every
+    such visit is a trial with no correct name available: *unknown* is the fail-safe answer
+    (**rejected**) and any name is an **impersonation**. Held-out residents and held-out
+    neighbours are both scored — a neighbour simulates a genuine stranger, a resident
+    simulates a cat that exists but has not been enrolled yet, and both are real situations
+    at this door.
+
+    The headline is MICRO-averaged over held-out visits, with per-cat rows beside it — the
+    same shape and convention ``_per_cat`` and the block's own ``accuracy`` use, so the
+    curve and the rows cannot disagree. Macro-averaging over cats would weight a
+    three-visit cat equally with a two-hundred-visit one; the per-cat rows are where a thin
+    cat stays visible.
+
+    ``curve_ts`` is the KNOWN-cat pass's grid, handed in rather than derived here: a masked
+    pass's own distance range differs, so the two curves would not pair up point for point
+    by themselves — and pairing them is the whole operating-point table.
+    """
+    if not cats:
+        # Without the index there is no way to say WHICH cat was impersonated, and an
+        # impersonation count with no resident/neighbour split answers a different question
+        # from the one this block exists for.
+        return {"available": False, "reason": "no_cat_index"}
+    if n_cats < _STRANGER_MIN_CATS:
+        return {"available": False, "reason": "single_cat_gallery", "n_cats": int(n_cats)}
+
+    buckets = ("as_resident", "as_neighbour", "as_unknown")
+    totals = {"n_scored": 0, "rejected": 0, "impersonated": 0, **{b: 0 for b in buckets}}
+    curve_acc = {
+        float(t): {"n_scored": 0, "rejected": 0, "impersonated": 0, **{b: 0 for b in buckets}}
+        for t in curve_ts
+    }
+    per_cat: "list[dict]" = []
+    skipped: "list[dict]" = []
+
+    for ci in range(n_cats):
+        sel = [G for G, t in zip(groups, group_true) if t == ci]
+        if not sel:
+            # A cat with crops but no group can only arise from a caller that grouped a
+            # different label set than it labelled; named rather than silently absent.
+            skipped.append({"cat_id": _cat_id_of(cats, ci), "reason": "no_visits"})
+            continue
+        gal = y != ci
+        scored = _score_visits(
+            dist, y, sel, [ci] * len(sel), gal, headline_t, curve_ts, aggregate, n_cats,
+            cats, stranger=True,
+        )
+        row = {
+            "cat_id": _cat_id_of(cats, ci),
+            "cat_name": cats[ci].get("cat_name"),
+            "is_resident": cats[ci].get("is_resident"),
+            **{k: v for k, v in scored.items() if k != "curve"},
+        }
+        per_cat.append(row)
+        for key in ("n_scored", "rejected", "impersonated", *buckets):
+            totals[key] += int(scored[key])
+        for point in scored["curve"]:
+            acc = curve_acc[float(point["threshold"])]
+            for key in ("n_scored", "rejected", "impersonated", *buckets):
+                acc[key] += int(point[key])
+
+    if not per_cat:
+        return {"available": False, "reason": "no_visits"}
+
+    n = totals["n_scored"]
+    # The split is only claimed when EVERY named cat could be classified. A missing roster
+    # flag would otherwise be reported as a measured zero in the dangerous direction.
+    split_known = totals["as_unknown"] == 0
+    return {
+        "available": True,
+        "reason": None,
+        "n_cats_held_out": len(per_cat),
+        "n_scored": n,
+        "rejected": totals["rejected"],
+        "impersonated": totals["impersonated"],
+        "impersonation_rate": (totals["impersonated"] / n) if n else None,
+        "as_resident": totals["as_resident"],
+        "as_neighbour": totals["as_neighbour"],
+        "as_unknown": totals["as_unknown"],
+        "resident_impersonation_rate": (
+            (totals["as_resident"] / n) if (n and split_known) else None
+        ),
+        "resident_split": split_known,
+        "per_cat": per_cat,
+        # Rates are left to the reader: the row already carries its own denominator, and
+        # this curve is stored per run on a table that is parsed 100 rows at a time.
+        "curve": [curve_acc[float(t)] | {"threshold": float(t)} for t in curve_ts],
+        "skipped": skipped,
+    }
+
+
+def _caps_block(
+    dist: np.ndarray,
+    y: np.ndarray,
+    groups: "list[list[int]]",
+    group_true: "list[int]",
+    iu: np.ndarray,
+    ju: np.ndarray,
+    pair_d: np.ndarray,
+    same_pair: np.ndarray,
+    cross_pair: np.ndarray,
+    cap_masks: "list[dict]",
+    base_t: float,
+    aggregate,
+    n_cats: int,
+) -> "list[dict]":
+    """Forecast a per-cat-capped gallery: one row per cap, scored over this same matrix.
+
+    Each cap's own selection (``gallery.cap_per_cat``, run by the caller — the policy must
+    be the build's, not a second one that could disagree with it) arrives as a column mask.
+    The threshold is RECALIBRATED under that mask, over cross-visit same-cat pairs drawn
+    from the surviving columns, because ``cap_per_cat`` names two biases and a forecast
+    reusing the uncapped threshold answers only the first. Both columns are reported —
+    ``recalibrated`` and ``fixed`` (the uncapped threshold, unchanged) — so which half of
+    the bias moved is visible rather than inferred.
+
+    One subtlety, in the fail-safe direction: under leave-one-visit-out the held-out visit's
+    columns are masked anyway, so where a cap happened to select crops from the held-out
+    visit that cat's effective gallery for that fold sits slightly BELOW the cap. That
+    under-represents the true cat, so on the visits it scores a cap is understated here.
+
+    That is NOT a guarantee the row cannot flatter, and the other direction is why
+    ``n_scored``/``n_unscoreable`` are reported per cap rather than left implicit: a tight
+    cap can leave a cat's every surviving vector inside the visit being held out, which
+    makes that visit *unscoreable* and drops it from the DENOMINATOR instead of counting it
+    wrong. Measured on a 4-cat fixture, capping to 1 moved 20 scored visits to 16 and lifted
+    reported recall 40% -> 56% with no gallery improvement whatever. So a cap's accuracy is
+    only comparable to the row above it at the same ``n_scored``.
+    """
+    out: "list[dict]" = []
+    for entry in cap_masks:
+        mask = np.asarray(entry["mask"], dtype=bool)
+        # Transient and freed per iteration: at 12k crops each pair-length array is ~72 MB
+        # (bool) / ~576 MB (float64), which is why the caps are scored one at a time rather
+        # than by materialising every mask's pair set up front.
+        surviving = mask[iu] & mask[ju]
+        same_cross = pair_d[same_pair & cross_pair & surviving]
+        diff_surv = pair_d[(~same_pair) & surviving]
+        recal_t, recal_bal = _best_threshold(same_cross, diff_surv)
+        del surviving, same_cross, diff_surv
+
+        # The sweep re-votes an already-computed span, so asking for the fixed threshold as
+        # a curve point costs one vote per visit instead of a second pass over the matrix.
+        head_t = base_t if recal_t is None else recal_t
+        scored = _score_visits(
+            dist, y, groups, group_true, mask, head_t,
+            [] if recal_t is None else [float(base_t)], aggregate, n_cats, None,
+        )
+        # Carried, not inferable: a cap can push a visit out of the denominator entirely
+        # (its cat's every surviving vector sits inside the held-out visit), so an accuracy
+        # read without the count it was measured over can rise purely by shrinkage.
+        n_unscoreable = sum(int(u["n_visits"]) for u in scored["unscoreable"])
+        head = {
+            "n_scored": scored["n_scored"],
+            "n_unscoreable": n_unscoreable,
+            "correct": scored["correct"],
+            "wrong": scored["wrong"],
+            "unknown": scored["unknown"],
+            "accuracy": scored["accuracy"],
+            "unknown_rate": scored["unknown_rate"],
+        }
+        if recal_t is None:
+            recalibrated, fixed = None, head
+        else:
+            point = scored["curve"][0]
+            recalibrated = head
+            fixed = {
+                "n_scored": scored["n_scored"],
+                "n_unscoreable": n_unscoreable,
+                "correct": point["correct"],
+                "wrong": point["wrong"],
+                "unknown": point["unknown"],
+                "accuracy": point["accuracy"],
+                "unknown_rate": (
+                    (point["unknown"] / scored["n_scored"]) if scored["n_scored"] else None
+                ),
+            }
+        out.append({
+            "max_per_cat": entry.get("max_per_cat"),
+            "n_vectors": int(mask.sum()),
+            "n_cats": int(len(set(int(c) for c in y[mask]))),
+            "threshold": recal_t,
+            "threshold_balanced_acc": recal_bal,
+            # Named, not implied: a cap that leaves no cross-visit same-cat pair among the
+            # survivors cannot be calibrated, and a recalibrated column of nulls beside a
+            # populated fixed one would read as a measured collapse.
+            "reason": None if recal_t is not None else "uncalibrated_threshold",
+            "recalibrated": recalibrated,
+            "fixed": fixed,
+        })
+    return out
 
 
 def _visits_block(
@@ -262,6 +627,9 @@ def _visits_block(
     labeled_ts_groups: "int | None",
     gap_ms: "int | None",
     cats: "list[dict] | None" = None,
+    *,
+    visit_meta: "list[dict] | None" = None,
+    strangers: bool = False,
 ) -> dict:
     """Assemble the ``visits`` block: headline, sweep curve, day/night, cross-regime.
 
@@ -279,9 +647,21 @@ def _visits_block(
     ``threshold`` is the cross-visit-calibrated value (see ``run_feasibility``), NOT the
     crop-level one — that one is calibrated on same-visit near-duplicates and is far too
     tight here. It is passed in ``extra_thresholds`` as a curve reference instead.
+
+    ``strangers`` adds the held-out-CAT block, which shares this function's ``curve_ts``
+    (see ``_stranger_block``) — the only place it is computed. ``visit_meta`` switches on
+    the per-visit outcome list, and applies to the MAIN pass only: the regime and
+    cross-regime cells re-score subsets of the same visits, so emitting there would put
+    each visit in the list several times under different galleries.
     """
     if aggregate is None:
         raise ValueError("visit_groups requires an aggregate (Store._aggregate_identity)")
+    if visit_meta is not None and len(visit_meta) != len(groups):
+        # A misaligned meta list silently stamps one visit's timestamp onto another, which a
+        # paired comparison then joins on. Loud, because nothing downstream could detect it.
+        raise ValueError(
+            f"visit_meta has {len(visit_meta)} entries for {len(groups)} groups"
+        )
     for gi, G in enumerate(groups):
         if not G:
             raise ValueError(f"visit group {gi} is empty")
@@ -316,10 +696,19 @@ def _visits_block(
     curve_ts = sorted(set(np.linspace(lo, hi, max(2, int(n_curve))).tolist()) | marks)
 
     scored = _score_visits(
-        dist, y, groups, group_true, None, threshold, curve_ts, aggregate, n_cats, cats
+        dist, y, groups, group_true, None, threshold, curve_ts, aggregate, n_cats, cats,
+        group_meta=visit_meta, group_night=visit_night,
     )
     out = {**base, "available": True, "reason": None, **scored,
            "marks": dict(extra_thresholds or {})}
+
+    # Held-out CATS, on the SAME grid as the held-out visits above — that shared grid is
+    # what lets the two curves be read as one operating-point table instead of two
+    # unrelated sweeps.
+    if strangers:
+        out["strangers"] = _stranger_block(
+            dist, y, groups, group_true, threshold, curve_ts, aggregate, n_cats, cats
+        )
 
     # --- Day/night and the cross-regime matrix -----------------------------------------
     # Regime is a per-GROUP property (each visit is bucketed whole by its first crop), so
@@ -398,6 +787,10 @@ def run_feasibility(
     extra_thresholds: "dict[str, float] | None" = None,
     labeled_ts_groups: "int | None" = None,
     gap_ms: "int | None" = None,
+    cat_residents: "dict[int, bool | None] | None" = None,
+    visit_meta: "list[dict] | None" = None,
+    strangers: bool = False,
+    cap_masks: "list[dict] | None" = None,
 ) -> dict:
     """Separability scorecard over ``embeddings`` (N,D) labelled by ``cat_ids`` (len N).
 
@@ -420,6 +813,20 @@ def run_feasibility(
     reference points on the sweep curve (e.g. ``{"active_model": 0.44}``).
     ``labeled_ts_groups`` and ``gap_ms`` are recorded verbatim for the report's grouping
     cross-check — this function does no clustering of its own.
+
+    **Open-set additions**, each also additive and each riding the same distance matrix:
+
+    - ``strangers`` adds ``visits.strangers`` — every cat held out of the gallery in turn,
+      so an unenrolled cat's visits are scored with *declined* as the correct answer. Needs
+      ``cat_residents`` (``cat_id`` → roster flag) to split an impersonation by whether the
+      impersonated cat is one of ours; without it the split reports itself unmeasured.
+    - ``cap_masks`` (``[{max_per_cat, mask}]``) adds ``visits.caps`` — a per-cap forecast
+      under the caller's own ``cap_per_cat`` selection, recalibrated under each mask.
+    - ``visit_meta`` (one dict per group, carrying ``first_src_recv_ts``) adds
+      ``visits.outcomes``, the per-visit list two runs are compared over.
+
+    ``cat_residents`` is the only one that touches an existing key: each ``cats`` entry
+    gains ``is_resident`` when it is supplied, and is left exactly as before when it is not.
     """
     e = _l2_normalize(np.asarray(embeddings, dtype=np.float64))
     n = e.shape[0]
@@ -488,7 +895,11 @@ def run_feasibility(
 
     proj = _pca_2d(e)
     cats = [
-        {"cat_id": c, "cat_name": cat_names.get(c) or f"cat #{c}", "n": int((ids == c).sum())}
+        {"cat_id": c, "cat_name": cat_names.get(c) or f"cat #{c}", "n": int((ids == c).sum()),
+         # Only when the roster flag was actually supplied. Defaulting it to None instead
+         # would put an unmeasured-looking field on every run ever recorded, and the
+         # stranger block's split reads exactly this key to decide whether it can claim one.
+         **({"is_resident": cat_residents.get(c)} if cat_residents is not None else {})}
         for c in uniq
     ]
     result = {
@@ -525,6 +936,7 @@ def run_feasibility(
         result["visits"] = _visits_block(
             dist, y, n_cats, visit_groups, visit_night, aggregate,
             threshold_cross, n_curve, marks, labeled_ts_groups, gap_ms, cats,
+            visit_meta=visit_meta, strangers=strangers,
         )
         # Only on an AVAILABLE block. `_visits_block` deliberately returns none of its
         # computed fields when it reports "nothing was measured", and attaching a real
@@ -533,4 +945,14 @@ def run_feasibility(
         if result["visits"].get("available"):
             result["visits"]["auc"] = auc_cross
             result["visits"]["threshold_balanced_acc"] = bal_cross
+            # Same gate for the cap forecast: it re-scores the same held-out visits, so
+            # where those could not be scored at all there is nothing for a cap to move.
+            # Computed here rather than in `_visits_block` because the recalibration reads
+            # the pair arrays this function already materialised.
+            if cap_masks:
+                group_true = [int(y[G[0]]) for G in visit_groups]
+                result["visits"]["caps"] = _caps_block(
+                    dist, y, visit_groups, group_true, iu, ju, pair_d, same_pair,
+                    cross_pair, cap_masks, float(threshold_cross), aggregate, n_cats,
+                )
     return result

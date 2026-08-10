@@ -97,6 +97,10 @@
   .card > h3 { margin: 0 0 12px; font-size: 12px; color: var(--muted); font-weight: 600;
     text-transform: uppercase; letter-spacing: .5px; }
   .card .hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  /* A hint that must read as a WARNING (the threshold-is-read-time notice) — same shape as
+     .hint, coloured like .note.warn. Own rule because .hint's colour is set directly on the
+     element, not inherited, so a bare "warn" class alongside it would do nothing. */
+  .card .hint.warn { color: var(--warn); }
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
   .row + .row { margin-top: 10px; }
   .grow { flex: 1; min-width: 0; }
@@ -312,6 +316,14 @@
      Its own floor, not a bigger shared one: the other wtable users have different geometry
      and would gain dead space. Below this .qwrap scrolls, which is the intended behaviour. */
   .qtable.wtable.ctable { min-width: 780px; }
+  /* The gallery-versions table gained an editable Threshold cell (built + effective + an
+     inline edit control), which needs more room than the other 8-column wtable users and
+     content that must WRAP — unlike every other qtable cell, which is nowrap by design. */
+  .qtable.wtable.mtable { min-width: 900px; }
+  .qtable td.thr { white-space: normal; }
+  .thr-row { display: flex; gap: 5px; align-items: baseline; }
+  .thr-edit { display: flex; gap: 5px; align-items: center; margin-top: 5px; }
+  .thr-edit input { width: 74px; }
   .qstatus { display: inline-flex; align-items: center; gap: 6px; }
   .qstatus .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .qstatus.running .dot { background: var(--warn); }
@@ -499,24 +511,12 @@
   .aplay .pfull { aspect-ratio: 4 / 3; }
   .fmodal.player .aplay img { width: 100%; height: 100%; max-width: 100%; max-height: 100%;
     object-fit: contain; display: block; }
-  /* FLAGGED review's crop strip: every crop the span would contribute, with the grade the
-     queue's formula seeds it — a flagged span is often undecided and unswept, so seeing
-     what it actually holds is the point before deciding it. Read-only (grades are seeded,
-     and a re-label re-seeds them).
-     Labelled review deliberately has NO strip: it showed up to ~100 crops of one visit,
-     which buried the review it exists for, and no reading is made per crop — the grade
-     TALLY on the meta line carries what a gallery build would keep. */
-  .afilm { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
-    gap: 6px; margin-top: 12px; }
-  .afilm .at { position: relative; border: 1px solid var(--border); border-radius: 4px;
-    overflow: hidden; background: var(--bg); }
-  .afilm .at.rep { border-color: var(--accent); }
-  .afilm img { width: 100%; height: 72px; object-fit: cover; display: block; }
-  .afilm .aq { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; text-align: center;
-    text-transform: uppercase; letter-spacing: .3px; background: rgba(0,0,0,.62); color: var(--muted); }
-  .afilm .aq[data-q=gallery] { color: var(--tl-green); }
-  .afilm .aq[data-q=ok]      { color: var(--tl-amber); }
-  .afilm .aq[data-q=poor]    { color: var(--tl-red); }
+  /* NO mode carries a per-crop strip any more — Flagged review was the last, and the
+     player replaced it. A strip of ~100 thumbnails at 72px answered "what does this span
+     hold" worse than playing it does (the cat is a few percent of the top-down ROI, so a
+     thumbnail of a crop is legible only by luck), and the grade TALLY on the meta line
+     already carries the one per-crop reading a decision rests on: what a quality-filtered
+     build would keep. The player's caption still names each frame's grade and the rep. */
   /* Labelled review's EVENT overview: one tile per decided visit, so a wrong cat is found
      by SCANNING the labelled set instead of stepping through it a visit at a time — the
      mode's only surface used to be that stepper, over a per-crop strip, so it read as a
@@ -3219,17 +3219,6 @@
           ${v.state === 'unswept' || v.state === 'partial' ? '<button id="aFlgAnalyse">Analyse</button>' : ''}
           <button id="aFlgDismiss" class="danger">Dismiss (d)</button>
         </div>
-        ${frames.length ? `<div class="afilm">${frames.map((f) => {
-          // The grade a decision here WOULD write (the server's `seed_quality`, the same
-          // field the queue commits), not the stored one — a flagged span is often
-          // unlabelled, and showing the seeded grade is what makes an unfloored faint
-          // crop's `poor` visible before it is committed.
-          const q = f.seed_quality;
-          return `<div class="at${f.id === v.rep_frame_id ? ' rep' : ''}">
-            <img src="${cropUrl(f)}" loading="lazy" alt="crop">
-            <span class="aq" data-q="${q}" title="detection ${detPct(f.score)} → grade ${q}">${q}</span>
-          </div>`;
-        }).join('')}</div>` : ''}
       `;
       placeBoxes(stage);
       wireStagePlay(stage);
@@ -3866,7 +3855,19 @@
       </div>
       <div class="card">
         <h3>1 · Validate <span class="note">(optional)</span></h3>
-        <div class="row">${qChecks('v')}<span id="mValNote" class="note grow"></span><button id="mValidate">Validate</button></div>
+        <div class="row">${qChecks('v')}<label class="fld inline">Crop shape<select id="mGeom">
+          <option value="">current (squashed)</option>
+          <option value="letterbox">letterbox</option>
+          <option value="letterbox+m10">letterbox + 10% margin</option>
+          <option value="letterbox+m25">letterbox + 25% margin</option>
+        </select></label><span id="mValNote" class="note grow"></span><button id="mValidate">Validate</button></div>
+        <p class="hint"><b>Crop shape</b> is how a crop was cut and resized before the model
+          saw it. Validate and Build share this one control, for the same reason they share
+          the cat ticks: a gallery is built from ONE shape, so scoring one shape and building
+          another would compare numbers that describe different crop sets. Only crops already
+          cut at the chosen shape are used — switching needs a re-cut
+          (<span class="mono">python -m compute.tools.recut_crops --to letterbox+m10 --apply</span>),
+          and until then a non-current shape scores nothing and says so.</p>
         <p class="hint">Scores the LABELLED CROPS at those grades — how separable the cats are,
           measured with a pretrained DINOv2 + kNN. It reads no gallery, so it comes FIRST: it
           answers "is this data separable enough to build from", and a run belongs to no
@@ -3892,6 +3893,12 @@
       <div class="card">
         <h3>3 · Promote</h3>
         <div id="mCovWarn" class="note warn" style="margin-bottom:6px"></div>
+        <p class="hint warn">⚠ A version's threshold is applied at READ time, not by
+          re-running identification: changing it — including clearing it back to
+          uncalibrated — RESTATES the household's Visits and Activity figures retroactively,
+          across ALL recorded history, the instant it lands. There is no re-identify pass and
+          nothing else on either dashboard will say a threshold moved — an operator who
+          doesn't know this will think the data itself changed.</p>
         <div id="mModels" class="qwrap"><span class="note">…</span></div>
       </div>
     `;
@@ -3927,6 +3934,14 @@
     // added to the roster later is enrolled by default, which an include-list would silently
     // drop from every repeated build.
     const getExcluded = () => (excluded.size ? [...excluded].sort((a, b) => a - b) : null);
+    // The crop shape, shared by Validate and Build like the exclude-list and for the same
+    // reason: a gallery is built from ONE shape, so scoring one and building another would
+    // compare numbers describing different crop sets. '' = the current (legacy) convention,
+    // sent as null so the server's "None means legacy" reading is the only one in play.
+    // Defined HERE, beside the other shared selectors, because `runComparable` and
+    // `loadEnrollable` both call it and a `const` declared below them would be in its
+    // temporal dead zone if either ran first.
+    const getGeometry = () => $('#mGeom', view).value || null;
 
     // --- Per-cat recall, read off the latest qualifying validation run ------------------
     // Which cat to label next is a per-cat question, and the runs table answers only the
@@ -3956,8 +3971,13 @@
     function runComparable(run) {
       if (!run) return false;
       const m = run.metrics || {};
+      // Geometry belongs here for the same reason the grades and the exclusion do, and
+      // more sharply: it changes which crops every held-out visit was scored against, so
+      // a run at another crop shape describes a different set entirely. Both sides
+      // normalise absent to null — `_run_metrics` omits the key for legacy.
       return (run.quality || 'all') === qualSlug(getQualities('b'))
-        && exclKey(m.excluded_cat_ids) === exclKey(getExcluded());
+        && exclKey(m.excluded_cat_ids) === exclKey(getExcluded())
+        && (m.geometry || null) === getGeometry();
     }
     // cat_id -> row, for the mixed block and each regime. Rows self-identify, so nothing
     // here has to know that the confusion index is positional over the run's own cat set.
@@ -4140,7 +4160,12 @@
         const grew = now - (latestRun.n_crops || 0);
         if (grew > 0) bits.push(`+${fmtInt(grew)} crops labelled since`);
       } else {
-        bits.push('does not match the Build grades / enrol ticks above — recall dimmed');
+        // Names all THREE terms runComparable tests. Crop shape is one of them, so a run
+        // dimmed by geometry alone was being blamed on grades or ticks the operator could
+        // see were unchanged — sending them to re-tick a selection that was never the
+        // cause.
+        bits.push('does not match the Build grades / enrol ticks / crop shape above '
+          + '— recall dimmed');
       }
       el.textContent = bits.join(' · ');
     }
@@ -4162,7 +4187,12 @@
     async function loadEnrollable() {
       const seq = ++catsSeq;
       const quals = getQualities('b');
-      const qs = quals ? '?' + quals.map((q) => `qualities=${encodeURIComponent(q)}`).join('&') : '';
+      const parts = (quals || []).map((q) => `qualities=${encodeURIComponent(q)}`);
+      // Always send geometry — '' is the legacy selection, a real value, not "unscoped".
+      // Omitting it would count crops of every convention while the run it is compared
+      // against counted only one, which is the phantom "+N labelled since" this closes.
+      parts.push(`geometry=${encodeURIComponent(getGeometry() || '')}`);
+      const qs = '?' + parts.join('&');
       try {
         const r = await api('GET', '/api/label/enrollable' + qs);
         // Sequence guard: a grade change fires a second fetch, and a slow earlier one
@@ -4211,7 +4241,8 @@
       $('#mBuildNote', view).textContent = 'starting…';
       try {
         const r = await api('POST', '/api/training/gallery/build',
-          { qualities: getQualities('b'), max_per_cat: getCap(), exclude_cat_ids: getExcluded() });
+          { qualities: getQualities('b'), max_per_cat: getCap(), exclude_cat_ids: getExcluded(),
+            geometry: getGeometry() });
         $('#mBuildNote', view).textContent = r.enough === false ? r.message : 'build enqueued';
         if (r.enough !== false) pollJob();
       } catch (e) { $('#mBuildNote', view).textContent = e.message; }
@@ -4222,11 +4253,17 @@
         // The SAME exclude-list Build uses — a validation run forecasts the gallery you
         // would build, so an exclusion applied to only one of the two is unmeasurable.
         const r = await api('POST', '/api/training/feasibility/run',
-          { qualities: getQualities('v'), exclude_cat_ids: getExcluded() });
+          { qualities: getQualities('v'), exclude_cat_ids: getExcluded(),
+            geometry: getGeometry() });
         $('#mValNote', view).textContent = r.enough === false ? r.message : 'validation enqueued';
         if (r.enough !== false) pollJob();
       } catch (e) { $('#mValNote', view).textContent = e.message; }
     }
+    // Blur after use: `onKey` drops keystrokes targeting a SELECT, so focus left here would
+    // swallow the operator's next keyboard action (entries 235/242/298, same cause).
+    // Re-fetching the enrol counts is what keeps them describing the SELECTED shape — the
+    // grade checkboxes already do this, and geometry scopes the same counts.
+    $('#mGeom', view).addEventListener('change', (e) => { e.target.blur(); loadEnrollable(); });
     $('#mBuild', view).addEventListener('click', build);
     $('#mValidate', view).addEventListener('click', validate);
 
@@ -4259,6 +4296,11 @@
       return ` <span class="note" title="${esc('excluded: ' + names.join(', '))}">`
         + `−${esc(names.join(', '))}</span>`;
     }
+    // "uncalibrated" is a WORD, not a dash — a null threshold is a real, deliberate state
+    // (identification names nobody), distinct from "—" elsewhere on these dashboards, which
+    // means "not measured". A literal 0 renders as "0.000" since `== null` alone tells them
+    // apart, so the two can never read alike.
+    const thrVal = (x) => (x == null ? '<span class="note warn">uncalibrated</span>' : `<span class="mono">${x.toFixed(3)}</span>`);
     function modelsTable(models) {
       if (!models.length) return '<span class="note">No gallery versions yet — build one above.</span>';
       const chip = (s) => (s === 'active' ? '<span class="pill ok">active</span>'
@@ -4270,12 +4312,34 @@
             ? `<button class="qbtn" data-promote="${m.id}">${m.status === 'retired' ? 'Roll back' : 'Promote'}</button>`
             : '<span class="note bad" title="This version\'s gallery.npz is gone from disk — it cannot be promoted; rebuild instead.">no gallery file</span>')
           + ` <button class="qbtn danger" data-del="${m.id}" title="Delete this version, its gallery file, and the identities it produced">Delete</button>`);
-      return '<table class="qtable wtable">'
-        + '<colgroup><col style="width:12%"><col style="width:8%"><col style="width:14%"><col style="width:8%">'
-        + '<col style="width:10%"><col style="width:12%"><col style="width:14%"><col style="width:22%"></colgroup>'
+      // Threshold cell: EFFECTIVE (what `Store.events()` applies right now) beside AS BUILT
+      // (`metrics.threshold_built` when the store has stamped it, else today's `threshold` —
+      // the store's own "copy on first override" rule, mirrored here so a version nobody has
+      // ever touched shows its one true value on both lines rather than a blank). Showing
+      // only the moved value would hide HOW FAR it moved, which is the whole point of the
+      // setting being reversible. The edit row is a plain input (blank = uncalibrated) plus
+      // an explicit Uncalibrated button, so "clear it" never depends on remembering that an
+      // empty field means null.
+      const thrCell = (m) => {
+        const metrics = m.metrics || {};
+        const hasBuilt = Object.prototype.hasOwnProperty.call(metrics, 'threshold_built');
+        const built = hasBuilt ? metrics.threshold_built : m.threshold;
+        return `<td class="thr">`
+          + `<div class="thr-row">${thrVal(m.threshold)} <span class="note" title="Applied at READ time — every visit's name is decided against this on the NEXT page load, with no re-identify pass and no other sign anything moved.">effective</span></div>`
+          + `<div class="thr-row">${thrVal(built)} <span class="note dim" title="What this gallery's own build derived, before any override — compare against Effective to see how far it has since moved.">as built</span></div>`
+          + `<div class="thr-edit">`
+          + `<input type="number" step="0.001" min="0" max="2" class="mono" placeholder="uncalibrated" `
+          + `value="${m.threshold == null ? '' : m.threshold}" data-thr-input="${m.id}">`
+          + `<button class="qbtn" data-thr-apply="${m.id}">Apply</button>`
+          + `<button class="qbtn" data-thr-clear="${m.id}" title="Restore the uncalibrated fail-safe for this version — identification will name nobody until a new threshold is set">Uncalibrated</button>`
+          + `</div></td>`;
+      };
+      return '<table class="qtable wtable mtable">'
+        + '<colgroup><col style="width:9%"><col style="width:6%"><col style="width:11%"><col style="width:7%">'
+        + '<col style="width:6%"><col style="width:28%"><col style="width:11%"><col style="width:22%"></colgroup>'
         + '<thead><tr><th>Status</th><th class="num">Version</th><th>Grades</th>'
         + `<th class="num" title="${CROPS_TIP}">Crops</th><th class="num">Cats</th>`
-        + '<th class="num">Threshold</th><th class="num">Built</th><th></th></tr></thead><tbody>'
+        + '<th>Threshold</th><th class="num">Created</th><th></th></tr></thead><tbody>'
         // Grades · Crops · Cats in the SAME order as the validation-runs table above, so the
         // two can be read down the page: a version built at the grades a run scored covers
         // (about) the same crops, which is the only sense in which a run "belongs" to it.
@@ -4286,9 +4350,40 @@
           + `<td class="qname">${esc(m.quality || 'all')}${capNote(m)}`
           + `${exclNote(m.metrics && m.metrics.excluded_cat_ids)}</td>`
           + `<td class="num">${fmtInt(m.n_vectors)}</td><td class="num">${fmtInt(m.n_cats)}</td>`
-          + `<td class="num">${m.threshold == null ? '<span class="note warn">uncalibrated</span>' : f3(m.threshold)}</td>`
+          + thrCell(m)
           + `<td class="num">${fmtTs(m.created_ts)}</td><td class="num">${action(m)}</td></tr>`).join('')
         + '</tbody></table>';
+    }
+    // The null transition, confirmed the SAME way from every entry point. Nulling a
+    // threshold is the one destructive act on this page — on the active version every
+    // visit reads "unknown cat" household-wide on the next load — and it is reachable
+    // three ways: the Uncalibrated button, and a blank field submitted with Enter or
+    // Apply. Only the button used to ask, so select-all + delete + Enter (a slip on the
+    // way to retyping a value) reached the identical state with no prompt.
+    //   One helper rather than a guard per handler, so the three cannot drift about what
+    // they warn — and so the wording stays keyed on `status === 'active'`, which is what
+    // makes the warning worth reading.
+    function confirmNullThreshold(m) {
+      return confirm(m && m.status === 'active'
+        ? 'This is the ACTIVE model — every visit will read as unknown cat on the next page load.'
+        : 'Restore the uncalibrated fail-safe for this version?');
+    }
+    // Blank input (or a value that fails to parse) means null — the deliberate
+    // "uncalibrated" act — never a rejected request; `source_run_id` is omitted here since
+    // this control sets a threshold by hand, with no run behind the number (the endpoint
+    // still accepts one for a future caller that reads a number off a specific run).
+    async function applyThreshold(id, raw) {
+      const trimmed = String(raw ?? '').trim();
+      let threshold = null;
+      if (trimmed !== '') {
+        const n = Number(trimmed);
+        if (!Number.isFinite(n)) { alert('Enter a number between 0 and 2, or leave blank for uncalibrated.'); return; }
+        threshold = n;
+      }
+      try {
+        await api('POST', `/api/training/models/${id}/threshold`, { threshold });
+        loadModels();
+      } catch (e) { alert('threshold update failed: ' + e.message); }
     }
     async function promote(id) {
       if (covWarning && !confirm(covWarning + '\n\nPromote anyway?')) return;
@@ -4310,10 +4405,75 @@
         if (!alive) return;
         const models = r.models || [];
         const el = $('#mModels', view);
+        // A threshold edit in progress must survive this re-render. `pollJob` calls
+        // loadModels() whenever ANY training job finishes, and the innerHTML replace
+        // rebuilds every input from the server value — silently discarding what the
+        // operator had typed but not yet applied. Capture the focused input's id, its
+        // unsent value and its caret, then put them back on the new DOM.
+        const focused = el.contains(document.activeElement)
+          && document.activeElement.matches('input[data-thr-input]')
+          ? {
+              id: document.activeElement.dataset.thrInput,
+              value: document.activeElement.value,
+              start: document.activeElement.selectionStart,
+              end: document.activeElement.selectionEnd,
+            }
+          : null;
         el.innerHTML = modelsTable(models);
+        if (focused) {
+          const again = el.querySelector(`input[data-thr-input="${focused.id}"]`);
+          // Absent when that version just left the table (deleted elsewhere): the edit has
+          // nowhere to land, and restoring it onto another row would retarget it.
+          if (again) {
+            again.value = focused.value;
+            again.focus();
+            // A number input rejects setSelectionRange in some browsers; the value is the
+            // part that matters, so a failed caret restore must not throw away the rest.
+            try { again.setSelectionRange(focused.start, focused.end); } catch (_e) {}
+          }
+        }
         const byId = new Map(models.map((m) => [String(m.id), m]));
         el.querySelectorAll('button[data-promote]').forEach((b) => b.addEventListener('click', () => promote(Number(b.dataset.promote))));
         el.querySelectorAll('button[data-del]').forEach((b) => b.addEventListener('click', () => deleteModel(byId.get(b.dataset.del))));
+        // Apply reads the input beside the button it's on; Enter does the same and then
+        // blurs — this page has no letter-key shortcuts to swallow, but every other
+        // focusable control on these dashboards blurs after use (entries 235/242/298 were
+        // all the same bug: a keystroke landing on a focused field instead of the page).
+        el.querySelectorAll('input[data-thr-input]').forEach((inp) => {
+          inp.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            const id = Number(inp.dataset.thrInput);
+            // A blank field here means null, which is the destructive act — so it asks,
+            // exactly as the Uncalibrated button does. Blur regardless: a refused confirm
+            // still ends the interaction with the field's value untouched.
+            if (String(inp.value).trim() === '' && !confirmNullThreshold(byId.get(String(id)))) {
+              inp.blur();
+              return;
+            }
+            applyThreshold(id, inp.value);
+            inp.blur();
+          });
+        });
+        el.querySelectorAll('button[data-thr-apply]').forEach((b) => b.addEventListener('click', () => {
+          const id = Number(b.dataset.thrApply);
+          const inp = el.querySelector(`input[data-thr-input="${id}"]`);
+          const raw = inp ? inp.value : '';
+          if (String(raw).trim() === '' && !confirmNullThreshold(byId.get(String(id)))) {
+            if (inp) inp.blur();
+            return;
+          }
+          applyThreshold(id, raw);
+          if (inp) inp.blur();
+        }));
+        // A separate, explicit control for the null act — never inferred from an emptied
+        // field a moment before Apply is clicked, and confirmed: on the ACTIVE version this
+        // takes effect on the next page load and names every visit "unknown cat" household-wide.
+        el.querySelectorAll('button[data-thr-clear]').forEach((b) => b.addEventListener('click', () => {
+          const id = Number(b.dataset.thrClear);
+          if (!confirmNullThreshold(byId.get(String(id)))) return;
+          applyThreshold(id, '');
+        }));
       } catch (_) {}
     }
     // The roster read behind two things: the promote-time night-coverage warning, and the

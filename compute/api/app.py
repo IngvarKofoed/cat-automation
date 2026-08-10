@@ -308,6 +308,49 @@ class LightingThresholdRequest(BaseModel):
         return v
 
 
+class ModelThresholdRequest(BaseModel):
+    """Body of ``POST /api/training/models/{id}/threshold``: set (or clear) a
+    model version's identification threshold (open-set-scoring-and-calibration spec).
+
+    Mirrors ``LightingThresholdRequest`` deliberately: ``threshold`` is
+    REQUIRED-but-nullable (no default on the ``Field``), so an empty/stripped body
+    can never silently clear a calibrated value, and explicit ``null`` is the real
+    "restore the uncalibrated fail-safe" operation ``Store.set_model_threshold``
+    documents — under which identification names nobody — not a no-op default.
+    Bounded ``[0, 2]`` (cosine distance's full range): the store re-validates the
+    same bound, but rejecting here too means a mistyped ``4.36`` for ``0.436`` never
+    reaches the store as valid input — that exact slip would put every cat AND every
+    stranger below the cutoff, silently, across all history. The ``bool`` guard
+    mirrors ``LocationRequest``/``LightingThresholdRequest``: pydantic treats
+    ``bool`` as an int subtype, so without it ``true`` would coerce to a 1.0
+    threshold instead of being rejected.
+
+    ``source_run_id`` names the feasibility run the operating point was read off,
+    for the ``metrics.threshold_source_run_id`` provenance stamp (see the store
+    method) — optional, since a threshold may also be set by hand with no run
+    behind it. A boolean here is rejected for the same int-subtype reason.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    threshold: "float | None" = Field(ge=0.0, le=2.0)
+    source_run_id: "int | None" = None
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a number or null, not a boolean")
+        return v
+
+    @field_validator("source_run_id", mode="before")
+    @classmethod
+    def _reject_bool_run_id(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be a run id or null, not a boolean")
+        return v
+
+
 class LocationRequest(BaseModel):
     """Body of ``POST /api/location``: manually set the compute-side lat/lon.
 
@@ -544,10 +587,17 @@ class FeasibilityRunRequest(BaseModel):
     takes, because a validation run forecasts the gallery you would build at those
     grades, so an exclusion applied only to the build would be invisible to the number.
     ``null``/``[]`` both mean "exclude nothing"; see ``GalleryBuildRequest``.
+
+    ``geometry`` is the crop convention to score — ``null`` = legacy (squash resize, no
+    context margin), which is what every crop labelled before geometry existed is. It is
+    what makes an A/B of two crop conventions possible at all: each arm scores only the
+    crops cut at its own geometry, so a run can never report a convention it did not
+    actually embed.
     """
 
     qualities: "list[str] | None" = None
     exclude_cat_ids: "list[int] | None" = None
+    geometry: "str | None" = None
 
     @field_validator("exclude_cat_ids", mode="before")
     @classmethod
@@ -582,11 +632,16 @@ class GalleryBuildRequest(BaseModel):
     cat's id should be told, not silently ignored — while an id naming a RETIRED cat is
     accepted as a no-op, since ``active_only`` already excludes it. Booleans are rejected
     for the same reason ``max_per_cat`` rejects them.
+
+    ``geometry`` is the crop convention to enrol from — ``null`` = legacy. A gallery is
+    built from ONE convention (mixing two blends feature spaces with no symptom to
+    notice), so this is a selection, never a filter that can be widened to "any".
     """
 
     qualities: "list[str] | None" = None
     max_per_cat: "int | None" = Field(default=None, ge=1)
     exclude_cat_ids: "list[int] | None" = None
+    geometry: "str | None" = None
 
     @field_validator("max_per_cat", mode="before")
     @classmethod
@@ -2430,7 +2485,10 @@ def create_app(
         )
 
     @app.get("/api/label/enrollable")
-    def api_label_enrollable(qualities: "list[str] | None" = Query(default=None)):
+    def api_label_enrollable(
+        qualities: "list[str] | None" = Query(default=None),
+        geometry: "str | None" = Query(default=None),
+    ):
         # What a gallery build at these grades would enrol, per ACTIVE roster cat — the
         # Model-building page's exclude-a-cat list (see the gallery-build cat-exclusion
         # spec). `qualities` is a REPEATED query param (?qualities=gallery&qualities=ok),
@@ -2448,9 +2506,20 @@ def create_app(
                     status_code=400,
                     detail=f"quality must be a subset of {_QUALITIES}, got {bad!r}",
                 )
+        # `geometry` scopes the counts to one crop convention, matching what a build at
+        # that convention would actually enrol. ABSENT means unscoped (every convention),
+        # so every existing caller is unchanged; present — including the empty string,
+        # which means legacy — filters. That distinction is why the flag is `is not None`
+        # rather than truthiness: "" and "letterbox" are both real selections.
+        resolved_geometry = _resolve_geometry(geometry) if geometry is not None else None
         return {
             "qualities": qualities,
-            "cats": store.enrollable_cats(tuple(qualities) if qualities is not None else None),
+            "geometry": resolved_geometry,
+            "cats": store.enrollable_cats(
+                tuple(qualities) if qualities is not None else None,
+                geometry=resolved_geometry,
+                geometry_filter=geometry is not None,
+            ),
         }
 
     @app.get("/api/label/regime-coverage")
@@ -2738,6 +2807,34 @@ def create_app(
     # install hint, not as a delayed ``status().error``. ``Embedder`` is imported LAZILY
     # inside the run endpoint so this module stays torch-free at import.
 
+    def _resolve_geometry(geometry: "str | None") -> "str | None":
+        # The crop convention Build and Validate both take. `None`/`""` mean LEGACY
+        # (squash resize, margin 0) — not "any geometry": a gallery is built from one
+        # convention, and there is deliberately no way to ask for a mixed one.
+        # Canonicalised so `m10` and `m10.0` are one request rather than two that dedup
+        # apart and claim different artifact dirs; an unparseable value is a 400 rather
+        # than a silent fallback to legacy, which would build the wrong crop set.
+        if not geometry:
+            return None
+        # Lazy like every other `compute.identification.embed` import here. That module
+        # keeps torch out of its module scope on purpose, so this one is cheap either way
+        # — imported inline to match the surrounding discipline, not because it is heavy.
+        from compute.identification.embed import geometry_descriptor, parse_geometry
+
+        # Validate with the function that actually RAISES. `canonical_geometry` swallows
+        # `parse_geometry`'s ValueError and returns the input unchanged — deliberately, so
+        # an unrecognised STORED stamp reads as "some other build's convention" rather than
+        # crashing a read. That is the wrong reading for request input: it would let
+        # `geometry=hexagon` through to a `geometry = ?` filter that matches nothing, and
+        # the run would report zero crops instead of the 400 this promises. Same
+        # parse-then-render order `build_gallery` and `recut_crops.main` use, so a
+        # parseable value resolves byte-identically to `canonical_geometry`.
+        try:
+            resolved = geometry_descriptor(*parse_geometry(geometry))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"bad geometry: {exc}") from exc
+        return resolved
+
     def _resolve_exclusions(exclude_cat_ids: "list[int] | None") -> "list[int] | None":
         # The shared cat-exclusion selection Build and Validate both take (see the
         # gallery-build cat-exclusion spec). `None`/`[]` both mean "exclude nothing" ->
@@ -2774,6 +2871,7 @@ def create_app(
                 )
         qualities = list(req.qualities) if req.qualities else None
         excluded = _resolve_exclusions(req.exclude_cat_ids)
+        geometry = _resolve_geometry(req.geometry)
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Fewer than 2 crops or 2 distinct
@@ -2788,23 +2886,38 @@ def create_app(
             tuple(qualities) if qualities else None,
             active_only=True,
             exclude_cat_ids=tuple(excluded) if excluded else None,
+            geometry=geometry,
+            geometry_filter=True,
         )
         if n_crops < 2 or n_cats < 2:
+            # Name EVERY cause, not the first one that fires. "Not enough labelled data" is
+            # misleading when the operator has plenty and has merely deselected too much,
+            # and equally so for a geometry nothing has been re-cut to yet (the ordinary
+            # state right after switching convention) — and both can hold at once, since
+            # `count_identified_crops` ANDs the two filters. A chain that stopped at the
+            # geometry clause left the operator to re-cut, re-run, and only then discover
+            # the exclusion was independently blocking. Same hints-list shape as
+            # `gallery.build_gallery`, which already reports both together.
+            hints: "list[str]" = []
+            if geometry and n_crops == 0:
+                hints.append(
+                    f"No crops are cut at geometry {geometry!r} yet — re-cut them "
+                    "(compute.tools.recut_crops) or validate at the current one."
+                )
+            if excluded:
+                hints.append(
+                    f"{len(excluded)} cat(s) are excluded — re-include one, or label "
+                    "at least two cats before validating."
+                )
+            if not hints:
+                hints.append("Label at least two cats before validating.")
             return {
                 "enough": False,
                 "n_crops": n_crops,
                 "n_cats": n_cats,
                 "message": (
                     f"Not enough labelled data yet: {n_crops} crop(s) across {n_cats} "
-                    "cat(s). "
-                    + (
-                        # Name the cause: "not enough labelled data" is misleading when the
-                        # operator has plenty and has merely deselected too much.
-                        f"{len(excluded)} cat(s) are excluded — re-include one, or label "
-                        "at least two cats before validating."
-                        if excluded
-                        else "Label at least two cats before validating."
-                    )
+                    "cat(s). " + " ".join(hints)
                 ),
             }
 
@@ -2824,7 +2937,7 @@ def create_app(
         # feasibility run reads the growing labelled set, so a deliberate re-run after
         # more labelling is not a duplicate and must enqueue.
         return {
-            **training_manager.enqueue_feasibility(store, qualities, excluded),
+            **training_manager.enqueue_feasibility(store, qualities, excluded, geometry),
             "enough": True,
         }
 
@@ -2914,6 +3027,7 @@ def create_app(
                 )
         qualities = list(req.qualities) if req.qualities else None
         excluded = _resolve_exclusions(req.exclude_cat_ids)
+        geometry = _resolve_geometry(req.geometry)
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Same ordering rationale
@@ -2923,24 +3037,32 @@ def create_app(
             tuple(qualities) if qualities else None,
             active_only=True,
             exclude_cat_ids=tuple(excluded) if excluded else None,
+            geometry=geometry,
+            geometry_filter=True,
         )
         if n_crops < 2 or n_cats < 2:
+            # Every cause, not the first that fires — see the identical reasoning on the
+            # feasibility endpoint above, and the hints list in `gallery.build_gallery`.
+            hints: "list[str]" = []
+            if geometry and n_crops == 0:
+                hints.append(
+                    f"No crops are cut at geometry {geometry!r} yet — re-cut them "
+                    "(compute.tools.recut_crops) or build at the current one."
+                )
+            if excluded:
+                hints.append(
+                    f"{len(excluded)} cat(s) are excluded — re-include one, grade "
+                    "representative crops as gallery, or widen the selection."
+                )
+            if not hints:
+                hints.append("Grade representative crops as gallery, or widen the selection.")
             return {
                 "enough": False,
                 "n_crops": n_crops,
                 "n_cats": n_cats,
                 "message": (
                     f"Not enough labelled data: {n_crops} crop(s) across {n_cats} "
-                    "cat(s). "
-                    + (
-                        # Name the cause — with cats deselected, "not enough labelled data"
-                        # is misleading: there may be plenty, just not in the ticked set.
-                        f"{len(excluded)} cat(s) are excluded — re-include one, grade "
-                        "representative crops as gallery, or widen the selection."
-                        if excluded
-                        else "Grade representative crops as gallery, or widen the "
-                        "selection."
-                    )
+                    "cat(s). " + " ".join(hints)
                 ),
             }
 
@@ -2964,7 +3086,7 @@ def create_app(
         # holds for the cap alone.
         return {
             **training_manager.enqueue_gallery_build(
-                store, qualities, req.max_per_cat, excluded
+                store, qualities, req.max_per_cat, excluded, geometry
             ),
             "enough": True,
         }
@@ -2988,6 +3110,30 @@ def create_app(
         except ValueError as exc:
             msg = str(exc)
             status_code = 404 if "no such model" in msg else 409
+            raise HTTPException(status_code=status_code, detail=msg)
+
+    @app.post("/api/training/models/{model_id}/threshold")
+    def api_training_models_threshold(model_id: int, req: ModelThresholdRequest):
+        # Synchronous store write, same shape as promote — no queue, one small
+        # transaction (open-set-scoring-and-calibration spec's "threshold is a
+        # setting" decision). Applied at READ in Store.events(), so this takes
+        # effect on the next page load with no re-identify pass — which is also why
+        # it RESTATES the household's Visits/Activity figures across all recorded
+        # history the instant it lands; the UI carries the warning, not this route.
+        # ``req.threshold=None`` is the deliberate "restore the uncalibrated
+        # fail-safe" act (the request model makes it required-but-nullable so it can
+        # never be an accidental default). An out-of-range value is already rejected
+        # by the Field bounds above before this body runs; the store re-validates
+        # the same bound for any caller that reaches it directly, and that failure
+        # (never reachable via this route) would map to 400, alongside an unknown
+        # model id mapping to 404 as promote's own ValueError split does.
+        try:
+            return store.set_model_threshold(
+                model_id, req.threshold, source_run_id=req.source_run_id
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            status_code = 404 if "no such model" in msg else 400
             raise HTTPException(status_code=status_code, detail=msg)
 
     @app.delete("/api/training/models/{model_id}")

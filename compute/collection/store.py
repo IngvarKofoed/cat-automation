@@ -713,7 +713,8 @@ class Store:
               src_frame_id INTEGER NOT NULL,            -- frames.id at label time (linkage only)
               src_recv_ts  INTEGER NOT NULL,            -- frames.recv_ts, the clear()-safe dedup guard
               source       TEXT    NOT NULL DEFAULT 'detector',
-              labeled_ts   INTEGER NOT NULL
+              labeled_ts   INTEGER NOT NULL,
+              geometry     TEXT                         -- crop convention; NULL = legacy squash, margin 0
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_src ON dataset_items(src_frame_id, src_recv_ts);
             CREATE INDEX IF NOT EXISTS idx_dataset_cat ON dataset_items(cat_id);
@@ -841,6 +842,13 @@ class Store:
             # `model_versions.metrics`) so the runs list can rank runs by the honest
             # number instead of only the crop-level one. Rows written before it read NULL.
             "feasibility_runs": [("metrics", "TEXT")],
+            # `dataset_items.geometry` records HOW a crop was cut — the preprocessing
+            # convention its pixels follow. NULL = legacy (squash resize, no context
+            # margin), which is every row written before this column. Without it, the
+            # second geometry change after any frame eviction would leave old- and
+            # new-geometry crops side by side with no record of which is which, and a
+            # later `build_gallery` would blend feature conventions silently.
+            "dataset_items": [("geometry", "TEXT")],
         }
         with self._lock:
             for table, columns in wanted.items():
@@ -6174,6 +6182,7 @@ class Store:
             bbox         (list|str|None)  [x1,y1,x2,y2] or "x1,y1,x2,y2" (None for not_cat/ignored)
             crop_path    (str|None)       dataset-root-relative jpg (None for not_cat/ignored)
             source       (str, optional)  defaults to 'detector'
+            geometry     (str|None)       crop convention; None = legacy (squash, margin 0)
 
         ``src_recv_ts`` is resolved from ``frames`` by ``frame_id`` AT INSERT, so it
         snapshots the frame the label was made against; a ``frame_id`` no longer
@@ -6219,13 +6228,19 @@ class Store:
                     self._bbox_text(row.get("bbox")),
                     row.get("crop_path"),
                     row.get("source") or "detector",
+                    # NULL = legacy (squash resize, no context margin) — what every row
+                    # written before the geometry column means, and what an omitting
+                    # caller still means. A gallery is built from ONE convention, so
+                    # this is what lets a mixed store be filtered rather than blended.
+                    row.get("geometry"),
                 )
             )
         labeled_ts = int(time.time() * 1000)
         inserted = 0
         with self._lock:
             try:
-                for frame_id, cat_id, label_kind, quality, bbox_text, crop_path, source in prepared:
+                for (frame_id, cat_id, label_kind, quality, bbox_text, crop_path, source,
+                     geometry) in prepared:
                     r = self._conn.execute(
                         "SELECT recv_ts FROM frames WHERE id = ?", (frame_id,)
                     ).fetchone()
@@ -6233,10 +6248,10 @@ class Store:
                         continue  # frame no longer live — nothing to anchor the label to
                     cur = self._conn.execute(
                         "INSERT OR IGNORE INTO dataset_items (cat_id, label_kind, quality, bbox, crop_path,"
-                        " src_frame_id, src_recv_ts, source, labeled_ts)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " src_frame_id, src_recv_ts, source, labeled_ts, geometry)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (cat_id, label_kind, quality, bbox_text, crop_path,
-                         frame_id, int(r[0]), source, labeled_ts),
+                         frame_id, int(r[0]), source, labeled_ts, geometry),
                     )
                     inserted += cur.rowcount  # 0 when (frame_id, recv_ts) already has a row
                 self._conn.commit()
@@ -6290,8 +6305,18 @@ class Store:
         ``label_kinds`` AND which has a materialised crop file (``crop_path`` not
         NULL), joined to ``cats`` for the display name::
 
-            {cat_id, cat_name, label_kind, quality, crop_path (ABSOLUTE), src_frame_id,
-             src_recv_ts, labeled_ts}
+            {cat_id, cat_name, is_resident, label_kind, quality, geometry,
+             crop_path (ABSOLUTE), src_frame_id, src_recv_ts, labeled_ts}
+
+        ``is_resident`` is the roster flag (``None`` for a catless kind). The open-set
+        probe needs it to split an impersonation by whether the impersonated cat is one
+        of ours — "stranger named as a resident" is the outcome the door cares about and
+        "stranger named as another neighbour" is not — and it is read here rather than
+        by a second query so it cannot disagree with the crop it describes.
+
+        ``geometry`` is the crop's preprocessing convention (``None`` = legacy: squash
+        resize, no context margin). A gallery must be built from ONE convention, so
+        ``build_gallery`` filters on it; mixing two would blend feature spaces silently.
 
         ``labeled_ts`` is stamped ONCE per ``add_dataset_items`` call, so every crop a
         single label keypress committed shares it exactly — which makes distinct
@@ -6367,7 +6392,7 @@ class Store:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT d.cat_id, c.name, d.label_kind, d.quality, d.crop_path, d.src_frame_id,"
-                " d.src_recv_ts, d.labeled_ts"
+                " d.src_recv_ts, d.labeled_ts, c.is_resident, d.geometry"
                 " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
                 f" WHERE {where}"
                 " ORDER BY d.cat_id, d.id",
@@ -6383,6 +6408,10 @@ class Store:
                 "src_frame_id": r[5],
                 "src_recv_ts": r[6],
                 "labeled_ts": r[7],
+                # NULL-safe by construction: the LEFT JOIN leaves both NULL for a
+                # catless kind, which is "no roster cat", not "not a resident".
+                "is_resident": None if r[8] is None else bool(r[8]),
+                "geometry": r[9],
             }
             for r in rows
         ]
@@ -6445,11 +6474,68 @@ class Store:
             "source": "labeled",
         }
 
+    def update_dataset_geometry(self, moves: "list[tuple[int, str, str | None, str]]") -> "list[int]":
+        """Re-point label rows at re-cut crop files; return the ids actually updated.
+
+        The re-cut tool's write path (``compute/tools/recut_crops.py``): each move is
+        ``(dataset_item_id, new_crop_path, geometry, expected_old_crop_path)``, where the
+        paths are dataset-root-RELATIVE (matching what ``add_dataset_items`` stores) and
+        ``geometry`` is the crop convention its pixels now follow (``None`` = legacy).
+
+        The write is a COMPARE-AND-SWAP on ``crop_path``, not a bare id match, because
+        ``dataset_items.id`` is ``INTEGER PRIMARY KEY`` with no ``AUTOINCREMENT``: SQLite
+        hands a deleted rowid straight back to the next insert, and
+        ``/api/label/relabel`` deletes a visit's rows and re-commits the same frames — so
+        the id the tool read can belong to a DIFFERENT, freshly-labelled row by the time
+        it writes. Matching on the path it actually read makes such a row fail to match,
+        so it is never reported as moved and its crop file is never unlinked.
+
+        This exists because the alternative through the existing public API —
+        ``delete_dataset_items`` then ``add_dataset_items`` — is not equivalent for a
+        re-cut: it destroys the label for the duration of the gap, resets ``labeled_ts``
+        (which is stamped once per keypress and is relied on as a cross-check on
+        re-derived visit grouping), and drops ``source``. A re-cut changes only which
+        PIXELS a label points at; nothing about the label itself moves, so it is an
+        UPDATE, not a delete-and-reinsert.
+
+        Returns the ids the UPDATE actually MATCHED — not a count, because the caller
+        deletes the superseded crop file only for rows that moved. A row that vanished or
+        was replaced mid-run no longer owns the path the caller is about to delete, so
+        unlinking it would leave the operator's fresh row pointing at nothing. A count
+        cannot express which rows those were. One lock hold, one commit, rollback on error
+        (``add``'s discipline), so a failed batch cannot leave half its rows committed on
+        the shared connection.
+        """
+        if not moves:
+            return []
+        prepared = [
+            (str(path), geom, int(item_id), str(old_path))
+            for item_id, path, geom, old_path in moves
+        ]
+        updated: "list[int]" = []
+        with self._lock:
+            try:
+                for path, geom, item_id, old_path in prepared:
+                    cur = self._conn.execute(
+                        "UPDATE dataset_items SET crop_path = ?, geometry = ?"
+                        " WHERE id = ? AND crop_path = ?",
+                        (path, geom, item_id, old_path),
+                    )
+                    if cur.rowcount:
+                        updated.append(item_id)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return updated
+
     def count_identified_crops(
         self,
         qualities: "tuple[str, ...] | None",
         active_only: bool = False,
         exclude_cat_ids: "tuple[int, ...] | None" = None,
+        geometry: "str | None" = None,
+        geometry_filter: bool = False,
     ) -> "tuple[int, int]":
         """The (crop count, distinct-cat count) of ``identified`` crops for a quality filter.
 
@@ -6478,6 +6564,14 @@ class Store:
         an exclusion is the first build parameter that can reduce the CAT count, so a
         guard that ignored it would wave through a build whose surviving set falls under
         the two-cat floor. Same ``None``/empty = exclude nothing collapse.
+
+        ``geometry`` mirrors ``build_gallery``'s crop-convention filter and, like the
+        exclusion, can reduce the CAT count — so the pre-check must apply it or it counts
+        crops the build will then discard. It needs the separate ``geometry_filter`` flag
+        because ``None`` is a MEANINGFUL value here (legacy: squash resize, margin 0), not
+        "no filter" — the same collapse ``build_gallery`` refuses, since there is
+        deliberately no way to ask for a mixed-convention build. Every existing caller
+        omits both and is unfiltered, exactly as before.
         """
         quals = tuple(qualities) if qualities is not None else None
         if quals is not None:
@@ -6497,6 +6591,12 @@ class Store:
         if excluded:
             where += " AND cat_id NOT IN (%s)" % ",".join("?" for _ in excluded)
             params += list(excluded)
+        if geometry_filter:
+            if geometry is None:
+                where += " AND geometry IS NULL"
+            else:
+                where += " AND geometry = ?"
+                params.append(geometry)
         with self._lock:
             n_crops, n_cats = self._conn.execute(
                 f"SELECT COUNT(*), COUNT(DISTINCT cat_id) FROM dataset_items WHERE {where}",
@@ -6504,7 +6604,12 @@ class Store:
             ).fetchone()
         return (int(n_crops), int(n_cats))
 
-    def enrollable_cats(self, qualities: "tuple[str, ...] | None" = None) -> "list[dict]":
+    def enrollable_cats(
+        self,
+        qualities: "tuple[str, ...] | None" = None,
+        geometry: "str | None" = None,
+        geometry_filter: bool = False,
+    ) -> "list[dict]":
         """Per ACTIVE roster cat, what a gallery build at ``qualities`` would enrol.
 
         Feeds the Model-building page's exclude-a-cat checkbox list (see the
@@ -6550,6 +6655,18 @@ class Store:
                 params += list(quals)
             else:
                 on += " AND 0"
+        # Geometry rides the ON clause for the same reason the grade filter does — in a
+        # WHERE it would drop the zero-crop cats the LEFT JOIN exists to keep. It takes the
+        # separate flag because `None` MEANS legacy here, exactly as in
+        # `count_identified_crops`. Without it this returns crops a geometry-scoped build
+        # will discard, and the Model page subtracts a scoped run's `n_crops` from an
+        # unscoped total — reporting crops as newly labelled that were merely never re-cut.
+        if geometry_filter:
+            if geometry is None:
+                on += " AND d.geometry IS NULL"
+            else:
+                on += " AND d.geometry = ?"
+                params.append(geometry)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT c.id, c.name, c.is_resident, COUNT(d.id),"
@@ -7056,6 +7173,78 @@ class Store:
                 )
                 self._conn.commit()
                 model["status"] = "active"
+        return model
+
+    def set_model_threshold(
+        self,
+        version_id: int,
+        threshold: "float | None",
+        source_run_id: "int | None" = None,
+    ) -> dict:
+        """Set a version's identification ``threshold``; return its updated row dict.
+
+        The operating point is applied at READ (``events()`` passes it to
+        ``_aggregate_identity``), so this takes effect on the next read with no
+        re-identify pass and is instantly reversible — which is exactly why it is a
+        setting rather than a rule inside ``build_gallery``. It also means a change
+        RESTATES history: every visit already recorded is re-named on the next page
+        load, so the caller's UI must say so.
+
+        ``threshold`` of ``None`` restores the uncalibrated fail-safe, under which
+        ``_aggregate_identity`` names nobody. A number is validated ``0 <= t <= 2``
+        (cosine distance's full range) — unbounded, a mistyped ``4.36`` for ``0.436``
+        would put every cat AND every stranger below the cutoff, silently, across all
+        history.
+
+        Two provenance stamps ride the same transaction, because both outlive the run
+        that justified them:
+
+        - ``metrics.threshold_built`` — the build's own value, copied from the current
+          ``threshold`` column **only when absent**. No row written before this method
+          existed has it, so the first override would otherwise destroy the built value
+          with nothing recording it. Copied once and never overwritten, so repeated
+          edits keep pointing at what the build actually computed.
+        - ``metrics.threshold_source_run_id`` — the feasibility run the point was read
+          off, when the caller names one. Without it a threshold outlives its
+          justification with no way to see which run's grades and exclusions produced
+          it. Unlike ``threshold_built`` this is rewritten on every call and set to
+          ``None`` when no run is named, because it describes the value being written:
+          keeping an earlier run's id on a hand-set number asserts a justification that
+          is false rather than absent.
+
+        Raises ``ValueError`` for an unknown id or an out-of-range threshold.
+        """
+        version_id = int(version_id)
+        if threshold is not None:
+            threshold = float(threshold)
+            if not (0.0 <= threshold <= 2.0):
+                raise ValueError(
+                    f"threshold must be within [0, 2] (cosine distance), got {threshold!r}"
+                )
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._MODEL_COLUMNS} FROM model_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such model version: {version_id}")
+            model = self._model_row_to_dict(row)
+            metrics = dict(model.get("metrics") or {})
+            if "threshold_built" not in metrics:
+                metrics["threshold_built"] = model.get("threshold")
+            # Written on EVERY call, cleared when no run is named: the stamp describes the
+            # value being written, so carrying a previous run's id onto a hand-set number
+            # would attribute this operating point to grades and exclusions that produced a
+            # different one. A stale justification is worse than an absent one.
+            metrics["threshold_source_run_id"] = (
+                int(source_run_id) if source_run_id is not None else None
+            )
+            self._conn.execute(
+                "UPDATE model_versions SET threshold = ?, metrics = ? WHERE id = ?",
+                (threshold, json.dumps(metrics), version_id),
+            )
+            self._conn.commit()
+            model["threshold"] = threshold
+            model["metrics"] = metrics
         return model
 
     def delete_model_version(self, version_id: int) -> dict:

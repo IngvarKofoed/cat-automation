@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from compute.identification import feasibility
-from compute.identification.embed import EmbedCancelled, Embedder
+from compute.identification.embed import EmbedCancelled, Embedder, canonical_geometry, parse_geometry
 from compute.identification.probe import _quality_slug
 
 if TYPE_CHECKING:
@@ -116,12 +116,44 @@ def _tier_by_grade(rows: "list[dict]") -> "dict[int, list[dict]]":
     return tiers
 
 
+def _geometry_kwargs(letterbox: bool, margin: float) -> dict:
+    """The ``Embedder`` kwargs for a geometry, omitting anything already at its default.
+
+    A LEGACY geometry yields ``{}``, so the construction call stays byte-identical to
+    what every caller made before geometry existed. That matters because the embedder is
+    a duck-typed injection seam (``LiveIdentifyManager``'s ``embedder_factory``, the
+    tests' stubs): a legacy model must not start failing merely because some factory
+    predates the parameter. A non-legacy geometry passes only the halves it actually
+    uses, so the kwargs read as the geometry rather than as a full parameter dump.
+    """
+    kwargs: dict = {}
+    if letterbox:
+        kwargs["letterbox"] = True
+    if margin:
+        kwargs["margin"] = margin
+    return kwargs
+
+
+def _model_geometry(model: dict) -> "str | None":
+    """The crop geometry a model version's gallery was built at — ``None`` = legacy.
+
+    Read off ``metrics.geometry`` (where ``build_gallery`` stamps it) rather than a
+    column, matching how ``max_per_cat`` and ``excluded_cat_ids`` — the other per-build
+    parameters — are recorded. Every row written before geometry existed has no such
+    key and correctly reads legacy: that IS what those galleries were built at.
+    """
+    metrics = model.get("metrics")
+    value = metrics.get("geometry") if isinstance(metrics, dict) else None
+    return canonical_geometry(value)
+
+
 def build_gallery(
     store,
     out_dir: str,
     qualities: "tuple[str, ...] | None" = None,
     max_per_cat: "int | None" = None,
     exclude_cat_ids: "tuple[int, ...] | None" = None,
+    geometry: "str | None" = None,
     progress: "Callable[[int, int], bool] | None" = None,
 ) -> dict:
     """Embed the labelled ``identified`` crops into a versioned gallery under ``out_dir``.
@@ -145,6 +177,15 @@ def build_gallery(
     ``store.labeled_cat_motion_floor()`` (``None`` when too few labelled visits), which
     ``Store.events()`` reads back off the active model to classify motion events.
 
+    ``geometry`` selects the crop CONVENTION to build from, and every labelled row whose
+    ``geometry`` stamp differs is dropped — a gallery must be built from ONE convention,
+    because 1-NN over a blend of two is a silently worse feature space with no symptom
+    to notice. ``None`` (the default) is *legacy* (squash resize, no context margin),
+    which every crop cut before the stamp existed follows, so today's behaviour is
+    unchanged; note it means legacy, NOT "no filter" — there is deliberately no way to
+    ask for a mixed build. Crops at another geometry are simply left where they are; the
+    re-cut tool (``python -m compute.tools.recut_crops``) is what moves them.
+
     Cold-start / decode guards mirror ``run_feasibility_probe``: fewer than 2 crops
     OR fewer than 2 distinct cats (before embedding) returns
     ``{'enough': False, 'reason': 'insufficient_labels', ...}``; if decode failures
@@ -155,39 +196,71 @@ def build_gallery(
     """
     quality_label = "all" if qualities is None else _quality_slug(qualities)
     excluded = tuple(sorted({int(c) for c in exclude_cat_ids})) if exclude_cat_ids else ()
+    # Canonicalise + validate the requested geometry BEFORE any store read: an
+    # unparseable descriptor is a caller bug, and failing here beats building a gallery
+    # from whatever happened to match the raw string.
+    letterbox, _margin = parse_geometry(geometry)
+    geometry = canonical_geometry(geometry)
     labels = store.labeled_crops(
         ("identified",), qualities, active_only=True, exclude_cat_ids=excluded or None
     )
+    # Geometry filter first, and in Python rather than SQL: `labeled_crops` returns the
+    # stamp but has no filter for it, and the canonical comparison (`m10` == `m10.0`,
+    # an unknown stamp never matching) is not a `WHERE geometry = ?`. Like the exclusion
+    # below it can drop whole CATS, so it runs before the floor, not after.
+    n_all_geometries = len(labels)
+    labels = [row for row in labels if canonical_geometry(row.get("geometry")) == geometry]
+    n_other_geometry = n_all_geometries - len(labels)
     # Cap BEFORE the cold-start guard and before embedding: the guard should describe what
     # will actually be enrolled, and the dropped crops cost nothing to embed. Capping can
     # never reduce the number of distinct cats (each keeps at least one), so it cannot turn
     # a buildable set into `insufficient_labels` on the cat count. An EXCLUSION can (it is
     # the only build parameter that drops whole cats) — which is why the endpoint's
     # pre-check applies it too, and why the guard below is the second line, not the first.
+    # A GEOMETRY filter can drop cats the same way, and the endpoint pre-check cannot yet
+    # apply it (`count_identified_crops` has no geometry filter), so for that parameter
+    # this guard is the ONLY line — hence the message naming it below.
     n_labelled = len(labels)
     labels = cap_per_cat(labels, max_per_cat)
     n_capped_out = n_labelled - len(labels)
     n_crops = len(labels)
     n_cats = len({row["cat_id"] for row in labels})
     if n_crops < 2 or n_cats < 2:
+        # Name the CAUSE. "Not enough labelled data" is a lie when the operator has
+        # thousands of crops and has merely asked for a geometry almost none are cut at
+        # — the same reasoning behind the exclusion clause, which is why both can appear.
+        hints: "list[str]" = []
+        if n_other_geometry:
+            hints.append(
+                f"{n_other_geometry} labelled crop(s) are cut at a different geometry and "
+                f"were left out of this {geometry or 'legacy'} build — re-cut them "
+                "(python -m compute.tools.recut_crops) or build at the geometry they carry."
+            )
+        if excluded:
+            hints.append(
+                f"Re-include one of the {len(excluded)} excluded cat(s), grade "
+                "representative crops as gallery, or widen the selection."
+            )
+        if not hints:
+            hints.append("Grade representative crops as gallery, or widen the selection.")
         return {
             "enough": False,
             "reason": "insufficient_labels",  # benign cold-start — nothing labelled yet
             "n_crops": n_crops,
             "n_cats": n_cats,
             "quality": quality_label,
+            "geometry": geometry,
             "message": (
                 f"Not enough labelled data yet: {n_crops} crops across {n_cats} cat(s). "
-                + (
-                    f"Re-include one of the {len(excluded)} excluded cat(s), grade "
-                    "representative crops as gallery, or widen the selection."
-                    if excluded
-                    else "Grade representative crops as gallery, or widen the selection."
-                )
+                + " ".join(hints)
             ),
         }
 
-    embedder = Embedder()
+    # Letterbox only, never the margin — hence the discarded `_margin` above, unpacked
+    # solely so an unreadable descriptor fails before the store read. `embed_paths` reads
+    # whole crop FILES, whose pixels already carry whatever margin they were cut at, and
+    # it rejects a non-zero margin outright rather than applying it a second time.
+    embedder = Embedder(**_geometry_kwargs(letterbox, 0.0))
     embedder.prepare()
     emb, kept = embedder.embed_paths([row["crop_path"] for row in labels], progress=progress)
     kept_labels = [labels[i] for i in kept]
@@ -203,6 +276,7 @@ def build_gallery(
             "n_crops": n_crops,
             "n_cats": n_cats,
             "quality": quality_label,
+            "geometry": geometry,
             "message": (
                 f"Only {n_decoded} crops across {n_decoded_cats} cat(s) decoded — "
                 "cannot build a gallery."
@@ -240,6 +314,17 @@ def build_gallery(
         # cannot be compared between two builds. `None` when nothing was excluded, which
         # is also what a version built before the field existed reads as (correct: it was).
         "excluded_cat_ids": list(excluded) or None,
+        # The crop convention these vectors were cut and resized under — the third
+        # member of the (backbone, imgsz, geometry) triple that identifies a feature
+        # space, and what `run_identify` reads back so its QUERIES land in the same one.
+        # `None` = legacy, which is also what a version built before the field reads as
+        # (correct: it was). Stamped here rather than as a column so it travels with the
+        # other per-build parameters.
+        "geometry": geometry,
+        # How much of the labelled set this geometry left behind. Without it a gallery
+        # built at a fresh geometry from the 200 crops re-cut so far is indistinguishable
+        # from one built at legacy from all 3000 — same reasoning as `n_capped_out`.
+        "n_other_geometry": n_other_geometry,
         "n_labelled": n_labelled,
         "n_capped_out": n_capped_out,
         "backbone": embedder.backbone,
@@ -273,6 +358,7 @@ def build_gallery(
         "imgsz": int(embedder.imgsz),
         "threshold": threshold,
         "quality": quality_label,
+        "geometry": geometry,
         "metrics": metrics,
         "out_dir": out_dir,
     }
@@ -336,10 +422,14 @@ def run_identify(
 ) -> dict:
     """Identify not-yet-identified detected frames against ``model``'s gallery.
 
-    Rebuilds an ``Embedder`` from the model's STORED ``backbone`` + ``imgsz`` (never
-    env defaults — a drift would embed queries in a different feature space than the
-    gallery, a silent garbage-match; if that backbone won't load the error
-    propagates and the job fails clearly). Then, over
+    Rebuilds an ``Embedder`` from the model's STORED ``backbone`` + ``imgsz`` + crop
+    ``geometry`` (never env defaults — a drift would embed queries in a different feature
+    space than the gallery, a silent garbage-match; if that backbone won't load the error
+    propagates and the job fails clearly). Geometry comes off ``metrics.geometry``
+    (``_model_geometry``), so a gallery built from letterboxed or margin-expanded crops
+    is queried with crops cut and resized the same way — the one difference from
+    ``build_gallery``'s embedder being that the margin applies HERE, since this side cuts
+    from the frame while the gallery side reads crop files that already carry it. Then, over
     ``store.iter_unidentified(model['id'], since_id, until_id)`` in batches: crop +
     embed each frame to its ``yolo-serial`` box (``Embedder.embed_crops``), match k=1
     against the gallery, and persist ``(frame_id, model_id, cat_id, distance, bbox)``
@@ -377,15 +467,28 @@ def run_identify(
     inserted>}`` — the store's truthful insert count (markers and frames evicted
     mid-pass are excluded), so it never over-reports how many frames were named.
     """
+    model_geometry = _model_geometry(model)
     if embedder is None:
-        embedder = Embedder(model=model["backbone"], imgsz=model["imgsz"])
+        embedder = Embedder(
+            model=model["backbone"],
+            imgsz=model["imgsz"],
+            **_geometry_kwargs(*parse_geometry(model_geometry)),
+        )
         embedder.prepare()
-    elif embedder.backbone != model["backbone"] or embedder.imgsz != model["imgsz"]:
+    elif (
+        embedder.backbone != model["backbone"]
+        or embedder.imgsz != model["imgsz"]
+        # An injected embedder that declares NO geometry is read as legacy — that is
+        # exactly what every factory predating the parameter produces, and it is the
+        # right answer for the models they were built to query.
+        or canonical_geometry(getattr(embedder, "geometry", None)) != model_geometry
+    ):
         raise ValueError(
             "injected embedder does not match the model's feature space: embedder "
-            f"({embedder.backbone!r}, imgsz={embedder.imgsz}) vs model "
-            f"({model['backbone']!r}, imgsz={model['imgsz']}) — matching queries to a "
-            "gallery embedded differently is a silent garbage-match"
+            f"({embedder.backbone!r}, imgsz={embedder.imgsz}, "
+            f"geometry={canonical_geometry(getattr(embedder, 'geometry', None))!r}) vs model "
+            f"({model['backbone']!r}, imgsz={model['imgsz']}, geometry={model_geometry!r}) — "
+            "matching queries to a gallery embedded differently is a silent garbage-match"
         )
     if gallery is None:
         gallery = load_gallery(gallery_path)

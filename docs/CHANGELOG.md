@@ -1257,3 +1257,132 @@ a clean one.
      two entries after 417 so the file no longer ended at its newest. Now strictly monotonic
      222→421. The convention exists because this file is read top-down at session start.
 
+
+422. Run 11's 23 visit errors classified by DOOR consequence, which reframes the whole
+     identification effort: 13 foreign→foreign, 5 resident→resident, 1 resident→foreign,
+     and only **4 foreign→resident** (a stranger let in). The Store Sultan ↔ Store Jihn
+     cell everyone was chasing is 57% of errors and ZERO of the door-relevant ones.
+     Wrong names on the timeline are a quality problem; the safety problem is elsewhere.
+
+423. Validation can now measure STRANGER REJECTION, which nothing could before: every crop
+     the probe scores belongs to a labelled cat, so "how often is an unenrolled cat given
+     one of our names" had no number at all. Each cat is held out of the gallery in turn
+     via the existing `gal_mask`; its visits then score *unknown* as CORRECT. Impersonations
+     split resident vs neighbour — only the first matters at the door.
+     Spec: docs/specs/2026-08-09-open-set-scoring-and-calibration.md.
+
+424. That inverts `_score_visits`' `unscoreable` branch, which previously SKIPPED exactly
+     these visits — so it is an explicit mode, not a consequence of the mask. Held-out
+     residents are scored too and reported apart: that is the "not enrolled yet" case, which
+     is what registering a new cat looks like. The threshold grid is computed ONCE on the
+     unmasked pass and passed in, or each masked pass would sweep its own range and the two
+     curves could not be read against each other.
+
+425. `model_versions.threshold` is now SETTABLE (`POST /api/training/models/{id}/threshold`,
+     plus a Model-page field). It was written once by `build_gallery` and only ever read, so
+     the operating point could not move without a rebuild — and the active model declines
+     0 of 515 visits, i.e. the open-set fail-safe is calibrated off. Applied at read, so a
+     change needs no re-identify and RESTATES all history; the UI says so in as many words.
+
+426. Two provenance stamps ride that write because both outlive the run that justified them:
+     `metrics.threshold_built` (copied from the column only when ABSENT — no existing row has
+     it, so a first override would otherwise destroy the built value) and
+     `threshold_source_run_id`. Bounded `[0, 2]`: unbounded, a mistyped 4.36 for 0.436 puts
+     every cat AND every stranger below the cutoff, silently, across all history.
+
+427. A validation run now forecasts a CAPPED gallery — `cap_per_cat`'s selection as a
+     `gal_mask` over the same matrix, several caps per run — and recalibrates the threshold
+     under each mask. Capping is meant to fix both biases `cap_per_cat` names; reusing the
+     uncapped threshold would answer only the density half. Both columns are reported so
+     which half moved is visible rather than inferred.
+
+428. Crops carry a GEOMETRY: `letterbox` (aspect-preserving pad, at the normalisation-zero
+     mean — black would inject a constant into every vector) and an optional context margin,
+     replacing the anisotropic 224×224 squash that distorted boxes up to 4.8× and differently
+     per frame within one visit. `dataset_items.geometry` stamps it PER CROP; NULL = legacy,
+     which every crop cut before this is. Default stays legacy so promoted galleries keep
+     matching their own queries.
+
+429. Per-crop, not global, because the second geometry change after any frame eviction would
+     otherwise leave two conventions side by side with no record of which is which — and
+     1-NN over a blend of two feature spaces is silently worse matching with no symptom.
+     `build_gallery` therefore SELECTS one convention rather than filtering to "any", and
+     `compute.tools.recut_crops` re-cuts what it can (only rows whose source frame is live)
+     through the new `Store.update_dataset_geometry`.
+
+430. That store method returns the ids it MATCHED, never a count: the tool deletes a crop's
+     old file only for rows that actually moved, and a row a concurrent relabel replaced
+     mid-run no longer owns that path. It is an UPDATE rather than the public
+     delete-then-re-insert, which would drop the label for the gap, reset `labeled_ts`
+     (entry 323 relies on it) and lose `source` — on the one artifact that must not be lost.
+
+431. Geometry joins the job `params` for BOTH kinds, so the two arms of a crop-shape A/B are
+     two jobs rather than one deduped press, and lands in the artifact dir slug. Canonicalised
+     first (`m10` == `m10.0`), or two spellings would dedup apart and claim two dirs for one
+     crop set. `count_identified_crops` gained the same filter, since a pre-check that
+     counted crops the build then discards would wave through a build that finds nothing.
+
+432. Deliberately NOT built: a persisted embedding cache with a `rescore` entry point. Every
+     question here is a mask over a matrix the run already holds, a preprocessing arm needs
+     a fresh embed regardless, and paired comparison comes from the per-visit outcome list —
+     so it bought asking a new cap value later in exchange for a second scoring path to keep
+     byte-identical forever. Reversed mid-spec after review; the earlier claim that it made
+     paired comparison possible was simply wrong.
+
+433. A dedup test built on a fake that returns IMMEDIATELY asserts nothing: dedup only guards
+     against the RUNNING job, so the second press is never deduped whatever the params say.
+     Two of this change's tests passed against the injected regression for that reason and
+     were rebuilt on a gated fake. Entry 411's hollow-test trap, second instance — the tell
+     is the same, a test whose scenario cannot reach the condition it names.
+
+434. NO annotation mode shows a per-crop strip any more: Flagged review's was the last, and
+     the player (entry 291) answers "what does this span hold" better — a 72px thumbnail of
+     a top-down crop is legible only by luck. The per-crop reading a decision rests on
+     survives twice: the grade TALLY on the meta line, and the player's caption, which names
+     each frame's grade and the rep. Also one crop decode per stage, not one per span frame.
+
+435. The capped forecast reports the DENOMINATOR each rate is read off (`n_scored` + a dim
+     `+N` unscoreable), because a cap can flatter — the direction entry 427's docstring
+     denied. A tight cap can leave a cat's every surviving vector inside the visit being
+     held out, so that visit becomes unscoreable and LEAVES the denominator instead of
+     counting wrong: measured 20 visits → 16 and recall 40% → 56% with no gallery change.
+     Compare rows only at equal visit counts; both docstrings corrected.
+
+436. Nulling a threshold now confirms from ALL THREE entry points, not just the Uncalibrated
+     button. A blank field submitted with Enter or Apply reached the identical write — the
+     ordinary slip being select-all, delete, Enter on the way to retyping — and on the active
+     model that names every visit "unknown cat" household-wide. One shared helper, so the
+     three cannot drift about what they warn.
+
+437. `recut_crops` probes for `dataset_items.geometry` before reading it. The column is added
+     by `Store._migrate_schema`, which runs only in `Store.__init__` — and the tool builds a
+     Store only on `--apply`, so its DRY RUN (the first command its own docstring gives) died
+     with a bare `no such column` on any store this build had not yet opened. Probe, not
+     migrate: a dry run keeps its write-nothing contract, and the answer is an instruction.
+
+438. `metrics.threshold_source_run_id` is rewritten on every `set_model_threshold` and nulled
+     when no run is named. It was only ever written, so a later hand-set value carried the
+     earlier run's id — attributing an operating point to grades and exclusions that produced
+     a different one. A stale justification is worse than the absent one the stamp was added
+     to fix. `threshold_built` still copies once, and is unaffected.
+
+439. Two message repairs, both the same class — a readout naming one cause of several. The
+     Validate/Build pre-check now lists EVERY blocker (geometry AND exclusion) via
+     `gallery.build_gallery`'s hints-list shape, instead of a ternary chain that sent the
+     operator to re-cut and re-run before meeting the exclusion that also blocked; and the
+     dimmed-recall stamp names crop shape, the third term `runComparable` already tested.
+
+440. Two review findings left UNFIXED by decision, so they are not re-litigated as new. A
+     letterbox-only flip strands crops whose source frames evicted — `letterbox` is a
+     read-time choice touching no stored pixel, yet the tool needs a live frame to move the
+     stamp; the honest fix is to stop stamping it on a file at all, which is a redesign worth
+     taking BEFORE a second geometry arm ships. And the probe CLI's pre-count print
+     overstates on a mixed-geometry store; the probe's own count is authoritative.
+
+441. Known gaps in the open-set increment, from the review's coverage sweep. The cap ladder
+     and stranger pass are default-ON with their memory cost UNMEASURED — entry 329 measured
+     this exact axis at 2109 → 2439 MB, and this adds four sequential pair-length passes, so
+     one real-dataset run on the compute PC should precede trusting the default. New labels
+     land LEGACY, so a store re-cut to letterbox starts re-splitting immediately; the spec is
+     silent on the write path. And `visit_outcomes.json` has no reader, so the spec's paired
+     comparison ships as data with none of its arithmetic.

@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING
 
 from compute.analysis import get_analyzer
 from compute.analysis.runner import DetectAdapter, run_analysis
-from compute.identification.embed import EmbedCancelled
+from compute.identification.embed import EmbedCancelled, canonical_geometry, parse_geometry
 from compute.identification.gallery import build_gallery, run_identify
 from compute.identification.probe import _quality_slug, run_feasibility_probe
 
@@ -108,22 +108,33 @@ def _run_metrics(result: dict) -> "dict | None":
         metrics["visits"] = result["visits"]
     if result.get("excluded_cat_ids"):
         metrics["excluded_cat_ids"] = result["excluded_cat_ids"]
+    if result.get("geometry"):
+        # Non-legacy only, for the same reason the exclusion is omitted when empty: an
+        # absent key reads as legacy, which is what every run before this meant. Two
+        # geometry arms are only comparable if each row says which one it was.
+        metrics["geometry"] = result["geometry"]
     return metrics or None
 
 
 def _params_note(
-    quals: "tuple[str, ...] | None", cap: "int | None", excluded: "tuple[int, ...] | None"
+    quals: "tuple[str, ...] | None",
+    cap: "int | None",
+    excluded: "tuple[int, ...] | None",
+    geometry: "str | None" = None,
 ) -> str:
     """The parenthesised human label fragment for a build/validation job's params.
 
     Empty when nothing is set, so a default job's label stays the bare kind. The
     exclusion prints as a COUNT here (this string is for the logs); the ids themselves
-    live on the version/run row, which is what a later comparison reads.
+    live on the version/run row, which is what a later comparison reads. ``geometry``
+    prints only when non-legacy — legacy is the default and naming it on every job would
+    be noise.
     """
     parts = (
         ([_quality_slug(quals)] if quals else [])
         + ([f"max {cap}/cat"] if cap else [])
         + ([f"−{len(excluded)} cat(s)"] if excluded else [])
+        + ([geometry] if geometry else [])
     )
     return "" if not parts else " (" + ", ".join(parts) + ")"
 
@@ -247,6 +258,7 @@ class TrainingManager:
         store: "Store",
         qualities: "list | None",
         exclude_cat_ids: "list | None" = None,
+        geometry: "str | None" = None,
     ) -> dict:
         """Enqueue a feasibility validation run over the ``identified`` crops of ``qualities``.
 
@@ -261,9 +273,16 @@ class TrainingManager:
 
         ``exclude_cat_ids`` is the shared cat-exclusion selection (the same list Build
         takes), so a validation run forecasts the gallery that build would produce.
-        ``params`` is therefore the PAIR ``(qualities_or_None, excluded_or_None)`` with the
-        ids SORTED, so unticking two cats in either order is one job — and so the
-        double-click guard cannot collapse two runs that scored different cat sets.
+        ``params`` is therefore the TRIPLE ``(qualities_or_None, excluded_or_None,
+        geometry_or_None)`` with the ids SORTED, so unticking two cats in either order is
+        one job — and so the double-click guard cannot collapse two runs that scored
+        different cat sets.
+
+        ``geometry`` is the crop convention to score (``None`` = legacy), and joins the
+        params for the same reason it joins a build's: two arms of the same grades at
+        different geometries are different work over different crop sets, and the whole
+        point of the comparison is running them back to back — which the double-click
+        guard would otherwise collapse into one.
 
         Returns ``{**status(), "position": int, "deduped": bool}`` — ``position`` is how many
         jobs must finish before this one starts (0 = running now), and ``deduped`` is True
@@ -272,8 +291,9 @@ class TrainingManager:
         """
         quals = tuple(qualities) if qualities else None
         excluded = _norm_excluded(exclude_cat_ids)
-        params = (quals, excluded)
-        label = "feasibility" + _params_note(quals, None, excluded)
+        geom = canonical_geometry(geometry)
+        params = (quals, excluded, geom)
+        label = "feasibility" + _params_note(quals, None, excluded, geom)
         job = _Job(kind="feasibility", params=params, label=label)
         return self._enqueue(store, job)
 
@@ -283,6 +303,7 @@ class TrainingManager:
         qualities: "list | None",
         max_per_cat: "int | None" = None,
         exclude_cat_ids: "list | None" = None,
+        geometry: "str | None" = None,
     ) -> dict:
         """Enqueue a gallery build over the ``identified`` crops of ``qualities``.
 
@@ -301,12 +322,19 @@ class TrainingManager:
         pressing Build again is genuinely different work, and with either outside the key
         the double-click guard would silently drop it. The ids are SORTED, so unticking two
         cats in either order is one job rather than two.
+
+        ``geometry`` is the crop convention to build from (``None`` = legacy: squash
+        resize, margin 0), and joins the params for the SAME reason the cap did — two
+        builds at different geometries are different work over different crop sets, so
+        without it in the key the second press dedups against the first and, worse, both
+        would claim the same artifact dir.
         """
         quals = tuple(qualities) if qualities else None
         cap = int(max_per_cat) if max_per_cat else None
         excluded = _norm_excluded(exclude_cat_ids)
-        params = (quals, cap, excluded)
-        label = "gallery-build" + _params_note(quals, cap, excluded)
+        geom = canonical_geometry(geometry)
+        params = (quals, cap, excluded, geom)
+        label = "gallery-build" + _params_note(quals, cap, excluded, geom)
         job = _Job(kind="gallery-build", params=params, label=label)
         return self._enqueue(store, job)
 
@@ -559,9 +587,10 @@ class TrainingManager:
         on a not-enough-data run it writes NO row and returns the friendly message for the UI.
         Returns the summary dict stashed into ``status().result``.
         """
-        # feasibility params are always the (qualities, exclude_cat_ids) pair built by
-        # `enqueue_feasibility` — unpacked here rather than treated as a bare grades tuple.
-        quals, excluded = job.params
+        # feasibility params are always the (qualities, exclude_cat_ids, geometry) triple
+        # built by `enqueue_feasibility` — unpacked here rather than treated as a bare
+        # grades tuple.
+        quals, excluded, geom = job.params
         ts = int(time.time() * 1000)
         slug = "all" if quals is None else _quality_slug(quals)
         if excluded:
@@ -569,17 +598,25 @@ class TrainingManager:
             # the run's `metrics`. Appended LAST so the slug stays `<grades>[-ex<n>]` and two
             # runs' dir names stay comparable — the same shape the gallery artifact uses.
             slug += f"-ex{len(excluded)}"
+        if geom:
+            # Non-legacy only, matching the gallery artifact's slug: every historical dir
+            # name means legacy, so stamping it would make two identical builds' dirs
+            # differ. Sanitised because it reaches the filesystem.
+            slug += "-" + geom.replace("+", "_")
         out_dir = os.path.join(store.training_root, f"{ts}-{slug}")
 
         def progress(done: int, total: int) -> bool:
             self._set_progress(done, total)
             return not self.stop_event.is_set()
 
+        letterbox, margin = parse_geometry(geom)
         result = self._probe_runner(
             store,
             out_dir,
             qualities=(list(quals) if quals else None),
             exclude_cat_ids=(list(excluded) if excluded else None),
+            letterbox=letterbox,
+            margin=margin,
             progress=progress,
         )
 
@@ -646,10 +683,10 @@ class TrainingManager:
         insert fails (WAL/locked/full) before re-raising, so a failed insert never leaves a dir
         without its row. Returns the summary stashed into ``status().result``.
         """
-        # gallery-build params are always the (qualities, max_per_cat, exclude_cat_ids)
-        # triple built by `enqueue_gallery_build` — unpacked here rather than treated as a
-        # bare grades tuple.
-        quals, cap, excluded = job.params
+        # gallery-build params are always the (qualities, max_per_cat, exclude_cat_ids,
+        # geometry) tuple built by `enqueue_gallery_build` — unpacked here rather than
+        # treated as a bare grades tuple.
+        quals, cap, excluded, geom = job.params
         ts = int(time.time() * 1000)
         slug = "all" if quals is None else _quality_slug(quals)
         if cap:
@@ -660,6 +697,11 @@ class TrainingManager:
             # cap so the slug stays `<ts>-<grades>[-max<cap>][-ex<n>]` and two builds' dir
             # names are comparable.
             slug += f"-ex{len(excluded)}"
+        if geom:
+            # Non-legacy geometry only: legacy is the default and every historical dir
+            # name means it, so stamping it would make old and new dirs look different for
+            # a build that is identical. Sanitised because it reaches the filesystem.
+            slug += "-" + geom.replace("+", "_")
         out_dir = os.path.join(store.models_root, f"{ts}-{slug}")
 
         def progress(done: int, total: int) -> bool:
@@ -672,6 +714,7 @@ class TrainingManager:
             qualities=(list(quals) if quals else None),
             max_per_cat=cap,
             exclude_cat_ids=(list(excluded) if excluded else None),
+            geometry=geom,
             progress=progress,
         )
 

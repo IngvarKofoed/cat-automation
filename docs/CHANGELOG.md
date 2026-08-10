@@ -1386,3 +1386,20 @@ a clean one.
      land LEGACY, so a store re-cut to letterbox starts re-splitting immediately; the spec is
      silent on the write path. And `visit_outcomes.json` has no reader, so the spec's paired
      comparison ships as data with none of its arithmetic.
+
+442. Entry 325's exact trap, SHIPPED this time: entry 435's new cell put a backslash inside
+     an f-string `{}`, a SyntaxError before 3.12 that fails at IMPORT — so `compute.api.app`
+     would not start at all on the 3.11 compute PC, reporting a bare `)` as the error. Built
+     outside the f-string now. `compileall` on this 3.13 dev box accepts it and all 1059
+     tests passed, so nothing local could see it.
+
+443. New `test_python_floor_syntax.py` guards the PYTHON FLOOR, not just this interpreter:
+     it walks every module's f-string replacement fields and rejects the two constructs PEP
+     701 legalised (a backslash, or reuse of the enclosing delimiter). `ast.parse` cannot
+     catch these — on 3.13 they are valid — so the check inspects the fields itself and
+     reports the same violations on any interpreter. Verified by re-injecting entry 442.
+
+444. That guard keeps the delimiter WHOLE (`\"\"\"` ≠ `\"`). Inside a triple-quoted f-string a
+     lone `"` was always legal and probe.py's report builders rely on it, so collapsing the
+     delimiter to one character reported three false positives there — a guard that cried
+     wolf would be deleted, taking the real check with it.

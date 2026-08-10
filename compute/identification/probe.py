@@ -878,12 +878,17 @@ def _caps_section(metrics: dict) -> str:
         # decoration. Matches the runs table's `N +M` shape for the same distinction.
         col = recal or fixed
         n_scored, n_uns = col.get("n_scored"), col.get("n_unscoreable") or 0
+        # Built OUTSIDE the f-string: the fragment needs an escaped double quote, and a
+        # backslash inside `{}` is a SyntaxError before Python 3.12 (PEP 701 lifted it) —
+        # which fails at IMPORT for the whole module, so `compute.api.app` will not start.
+        # Entry 325, second instance: invisible on a 3.13 dev box, fatal on the 3.11
+        # compute PC. `compute.ps1` accepts 3.10+, so this is the constraint, not 3.13.
+        uns_html = f' <span class="sub">+{n_uns}</span>' if n_uns else ""
         rows += (
             f"<tr><td>{'uncapped' if c.get('max_per_cat') is None else c['max_per_cat']}</td>"
             f"<td>{c.get('n_vectors', 0)}</td>"
             f"<td>{c.get('n_cats', 0)}</td>"
-            f"<td>{'—' if n_scored is None else n_scored}"
-            f"{f' <span class=\"sub\">+{n_uns}</span>' if n_uns else ''}</td>"
+            f"<td>{'—' if n_scored is None else n_scored}{uns_html}</td>"
             f"<td>{'—' if thr is None else f'{thr:.3f}'}</td>"
             f"<td>{_pct((recal or {}).get('accuracy'))}</td>"
             f"<td>{_pct((recal or {}).get('unknown_rate'))}</td>"

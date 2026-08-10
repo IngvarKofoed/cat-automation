@@ -110,9 +110,10 @@ def test_update_dataset_geometry_returns_only_the_ids_it_moved(tmp_path):
     real = [r[0] for r in rows]
 
     old0 = f"cat_{cat['id']}/{ids[0]}.jpg"
+    box = "0,0,10,10"  # what `_label` stored, and what the swap compares
     moved = store.update_dataset_geometry([
-        (real[0], "cat_1/new-1.jpg", "letterbox", old0),
-        (999_999, "cat_1/ghost.jpg", "letterbox", old0),  # no such row — not reported
+        (real[0], "cat_1/new-1.jpg", "letterbox", old0, box),
+        (999_999, "cat_1/ghost.jpg", "letterbox", old0, box),  # no such row — not reported
     ])
     assert moved == [real[0]]
 
@@ -131,20 +132,41 @@ def test_update_dataset_geometry_refuses_a_row_whose_path_moved(tmp_path):
     # Rowids are REUSED (INTEGER PRIMARY KEY, no AUTOINCREMENT) and `/api/label/relabel`
     # deletes a visit's rows and re-commits the same frames — so the id the re-cut tool
     # read can belong to a different, freshly labelled row by the time it writes. Matching
-    # the path it actually read is what stops the tool reporting that row as moved and
-    # then unlinking the file the operator's new row points at.
+    # the path it actually read is what stops the tool reporting that row as moved.
     store = _store(tmp_path)
     cat = store.create_cat("A")
     _label(store, cat["id"], 1)
     row_id = store._conn.execute("SELECT id FROM dataset_items").fetchone()[0]
 
     stale = store.update_dataset_geometry([
-        (row_id, "cat_1/new.jpg", "letterbox", "cat_1/some-other-path.jpg"),
+        (row_id, "cat_1/new.jpg", "letterbox", "cat_1/some-other-path.jpg", "0,0,10,10"),
     ])
     assert stale == []
     after = store.labeled_crops(("identified",))[0]
     assert after["geometry"] is None                     # untouched
     assert after["crop_path"].endswith("1.jpg")          # still its own file
+
+
+def test_update_dataset_geometry_refuses_a_row_whose_BOX_moved(tmp_path):
+    # The case the path alone cannot catch: a relabel to the SAME cat re-commits at the
+    # identical path, so id and path both still match a row this run never read. Only the
+    # box separates them — and it is the exact predicate, being what must be unchanged for
+    # the cut pixels to still belong to this row.
+    store = _store(tmp_path)
+    cat = store.create_cat("A")
+    _label(store, cat["id"], 1)
+    row_id = store._conn.execute("SELECT id FROM dataset_items").fetchone()[0]
+    path = store.labeled_crops(("identified",))[0]["crop_path"]
+    rel = f"cat_{cat['id']}/1.jpg"
+    assert path.endswith("1.jpg")
+
+    stale = store.update_dataset_geometry([
+        (row_id, "cat_1/new.jpg", "letterbox", rel, "9,9,90,90"),  # box as READ, now stale
+    ])
+    assert stale == []
+    after = store.labeled_crops(("identified",))[0]
+    assert after["geometry"] is None
+    assert after["crop_path"].endswith("1.jpg")
 
 
 # --- The pre-check counts what the build embeds ---------------------------------------

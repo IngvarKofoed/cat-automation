@@ -233,8 +233,8 @@ def build_gallery(
         if n_other_geometry:
             hints.append(
                 f"{n_other_geometry} labelled crop(s) are cut at a different geometry and "
-                f"were left out of this {geometry or 'legacy'} build — re-cut them "
-                "(python -m compute.tools.recut_crops) or build at the geometry they carry."
+                f"were left out of this {geometry or 'legacy'} build — re-cut them from "
+                "the admin Tools page (Crop shape) or build at the geometry they carry."
             )
         if excluded:
             hints.append(

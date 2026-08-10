@@ -7,8 +7,10 @@ second request while one runs is refused with ``busy`` rather than enqueued) and
 heavy deps (it drives pure ``Store`` methods, so importing this stays torch-free and a
 test exercises the whole lifecycle with a real temp store and no GPU).
 
-Two DATA-DESTRUCTIVE job kinds, both batched so the store lock is released between
-batches (entries 102-105 — never hold it across a whole-store purge):
+Three job kinds, all batched so the store lock is released between batches (entries
+102-105 — never hold it across a whole-store pass). Two are DATA-DESTRUCTIVE; the third
+(``recut``) destroys nothing and is here for the single-job slot and the one shared
+status/cancel/poll surface, not because it is a purge:
 
 - ``nonmotion`` — drop ``motion = 0`` frames with ``id <= until_id`` through the
   eviction accounting path (``Store.purge_nonmotion_batch`` → ``_delete_frame_locked``),
@@ -20,6 +22,10 @@ batches (entries 102-105 — never hold it across a whole-store purge):
 - ``orphan`` — sweep JPEGs under the FRAMES media dir that have no ``frames`` row (the
   changelog-42 leak), via ``Store.iter_media_relpaths`` + ``Store.delete_orphan_batch``.
   Scoped to ``_media_root`` only — the sibling dataset/avatar files are never walked.
+- ``recut`` — move every labelled crop to one crop GEOMETRY, via ``Store.recut_plan`` +
+  ``recut_crops.recut``. Non-destructive: superseded crops are kept, so the move is
+  reversible. It is NOT locked against the training queue here — the endpoint does that,
+  since this module deliberately knows nothing about ``TrainingManager``.
 
 The load-bearing invariant, as in the sibling managers, is the worker ``finally``: it
 records the terminal state and clears ``running`` under ONE lock hold, so a status poll
@@ -88,6 +94,16 @@ class CleanupManager:
     def start_orphan(self, store: "Store") -> dict:
         """Start the orphan-file sweep over the frames media dir. Same return as ``start_nonmotion``."""
         return self._start(store, "orphan", lambda: self._run_orphan(store))
+
+    def start_recut(self, store: "Store", target: "str | None") -> dict:
+        """Start the crop-geometry move to ``target`` (``None`` = legacy). Same return shape.
+
+        The odd one out among the three kinds: it DESTROYS nothing. A move re-points label
+        rows at crops cut under a different convention and keeps every file it supersedes,
+        so it is undoable — it lives here for the single-job slot and the shared
+        status/cancel/poll surface, not because it is a purge.
+        """
+        return self._start(store, "recut", lambda: self._run_recut(store, target))
 
     def cancel(self) -> None:
         """Signal the running job to stop at the next batch boundary; no-op when idle."""
@@ -214,6 +230,37 @@ class CleanupManager:
             "span_recorded": span_recorded,
             "canceled": canceled,
         }
+
+    def _run_recut(self, store: "Store", target: "str | None") -> dict:
+        """Move every movable labelled crop to ``target``, batched, cancellable.
+
+        ``recut_crops`` is imported HERE, not at module scope: it pulls in
+        ``compute.dataset.crops``, whose cv2/numpy work is an analysis extra, and this
+        module is on the lean always-on collector's import path.
+
+        The plan is re-read rather than passed in, so what runs is what the store holds
+        NOW — seconds after the card's own read, which makes its numbers a close forecast
+        rather than a promise; this summary is the authority on what moved.
+
+        ``progress`` is both the report and the cancel signal (``recut`` stops on a falsy
+        return and gives back the partial summary), so a cancel here reports what it did
+        instead of surfacing as an error with no counts.
+        """
+        from compute.tools import recut_crops
+
+        plan = store.recut_plan(target, with_rows=True)
+        todo = [r for r in plan["rows"] if r["move"]]
+        self._set_total(len(todo))
+
+        def progress(done: int, _total: int) -> bool:
+            self._set_done(done)
+            return not self.stop_event.is_set()
+
+        summary = recut_crops.recut(
+            store.update_dataset_geometry, todo, target, store.dataset_root,
+            on_progress=progress,
+        )
+        return {"kind": "recut", "target": target, **summary}
 
     def _run_orphan(self, store: "Store") -> dict:
         """Sweep orphaned media files in batches, releasing the lock between each.

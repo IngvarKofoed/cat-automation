@@ -426,7 +426,9 @@ def test_build_gallery_names_geometry_when_it_is_why_there_is_nothing(tmp_path, 
     assert result["enough"] is False
     assert result["geometry"] == "m10"
     assert "different geometry" in result["message"]
-    assert "recut_crops" in result["message"]
+    # It names the PAGE, not the CLI: the whole point of the Tools page is that this
+    # message no longer dead-ends at an SSH session on the compute PC.
+    assert "Tools page" in result["message"]
 
 
 def test_build_gallery_rejects_an_unreadable_geometry_before_reading_the_store(tmp_path, monkeypatch):
@@ -523,20 +525,28 @@ def _seed_for_recut(tmp_path) -> "tuple[Store, dict, list[int]]":
     return store, cat, frame_ids
 
 
-def test_recut_moves_stamp_and_file_and_removes_the_old_crop(tmp_path):
+def _rows(store, tmp_path, target):
+    """`read_rows` against the seeded store — the read every test below starts from."""
+    conn = recut_crops._connect(str(tmp_path / "index.db"))
+    try:
+        return recut_crops.read_rows(
+            conn, str(tmp_path / "media"), target, store.dataset_root
+        )
+    finally:
+        conn.close()
+
+
+def test_recut_moves_stamp_and_pixels_and_KEEPS_the_superseded_crop(tmp_path):
     store, cat, frame_ids = _seed_for_recut(tmp_path)
     old_paths = [
         os.path.join(store.dataset_root, r["crop_path"]) for r in store.labeled_crops()
     ]
-    conn = recut_crops._connect(str(tmp_path / "index.db"))
-    try:
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), "m10")
-        assert [r["recuttable"] for r in rows] == [True, True, True]
-        summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
-    finally:
-        conn.close()
+    rows = _rows(store, tmp_path, "m10")
+    assert [r["move"] for r in rows] == ["recut"] * 3
+    summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
 
-    assert summary == {"recut": 3, "failed": 0, "rows_updated": 3, "old_files_removed": 3}
+    assert summary["recut"] == 3 and summary["failed"] == 0
+    assert summary["rows_updated"] == 3 and summary["old_files_kept"] == 3
     labelled = store.labeled_crops()
     assert {r["geometry"] for r in labelled} == {"m10"}
     for row in labelled:
@@ -545,23 +555,44 @@ def test_recut_moves_stamp_and_file_and_removes_the_old_crop(tmp_path):
         assert f"cat_{cat['id']}{os.sep}m10{os.sep}" in row["crop_path"]
         # And the margin is genuinely in the pixels: 40x30 box + 10% each side.
         assert cv2.imread(row["crop_path"]).shape[:2] == (36, 48)
-    for old in old_paths:
-        assert not os.path.exists(old)
+    # The superseded crops SURVIVE: that is what makes the move reversible without a
+    # source frame, and it is the whole reason `relink` can exist.
+    assert all(os.path.isfile(p) for p in old_paths)
 
 
-def test_recut_skips_a_crop_whose_source_frame_is_gone(tmp_path):
+def test_a_letterbox_flip_moves_a_crop_WHOSE_SOURCE_FRAME_IS_GONE(tmp_path):
+    # The headline claim. `letterbox` changes no pixel — it is a resize applied at embed
+    # time — so a flip to it needs no frame, and eviction must not strand anything.
     store, _cat, _fids = _seed_for_recut(tmp_path)
-    kept_paths = [os.path.join(store.dataset_root, r["crop_path"]) for r in store.labeled_crops()]
+    before = [cv2.imread(os.path.join(store.dataset_root, r["crop_path"])).shape[:2]
+              for r in store.labeled_crops()]
     store.clear()  # frames go; dataset_items are the precious survivors
 
-    conn = recut_crops._connect(str(tmp_path / "index.db"))
-    try:
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), "m10")
-        assert rows and not any(r["recuttable"] for r in rows)
-        summary = recut_crops.recut(store.update_dataset_geometry, [r for r in rows if r["recuttable"]], "m10", store.dataset_root
-        )
-    finally:
-        conn.close()
+    rows = _rows(store, tmp_path, "letterbox")
+    assert [r["move"] for r in rows] == ["copy"] * 3, "must not need the frame"
+    summary = recut_crops.recut(
+        store.update_dataset_geometry, rows, "letterbox", store.dataset_root
+    )
+
+    assert summary["copied"] == 3 and summary["recut"] == 0 and summary["failed"] == 0
+    labelled = store.labeled_crops()
+    assert {r["geometry"] for r in labelled} == {"letterbox"}
+    assert all(os.path.isfile(r["crop_path"]) for r in labelled)
+    # Same pixels, by construction — only the stamp and the path moved.
+    assert [cv2.imread(r["crop_path"]).shape[:2] for r in labelled] == before
+
+
+def test_a_margin_change_still_needs_the_frame(tmp_path):
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    kept_paths = [os.path.join(store.dataset_root, r["crop_path"]) for r in store.labeled_crops()]
+    store.clear()
+
+    rows = _rows(store, tmp_path, "m10")
+    assert rows and not any(r["move"] for r in rows)
+    assert {r["blocked"] for r in rows} == {"frame_gone"}
+    summary = recut_crops.recut(
+        store.update_dataset_geometry, [r for r in rows if r["move"]], "m10", store.dataset_root
+    )
 
     assert summary["recut"] == 0
     # It keeps its OLD stamp and its OLD file — excluded from builds at the new
@@ -570,19 +601,38 @@ def test_recut_skips_a_crop_whose_source_frame_is_gone(tmp_path):
     assert all(os.path.isfile(p) for p in kept_paths)
 
 
+def test_returning_to_a_geometry_already_visited_relinks_with_no_frame(tmp_path):
+    # What makes an A/B of several crop shapes a sequence of quick hops: the second visit
+    # to an arm writes no pixels at all, and works long after the frames have evicted.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    recut_crops.recut(
+        store.update_dataset_geometry, _rows(store, tmp_path, "m10"), "m10", store.dataset_root
+    )
+    recut_crops.recut(
+        store.update_dataset_geometry, _rows(store, tmp_path, None), None, store.dataset_root
+    )
+    store.clear()  # every source frame is gone before the return hop
+
+    rows = _rows(store, tmp_path, "m10")
+    assert [r["move"] for r in rows] == ["relink"] * 3
+    summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
+
+    assert summary["relinked"] == 3 and summary["recut"] == 0 and summary["copied"] == 0
+    labelled = store.labeled_crops()
+    assert {r["geometry"] for r in labelled} == {"m10"}
+    assert all(cv2.imread(r["crop_path"]).shape[:2] == (36, 48) for r in labelled)
+
+
 def test_recut_leaves_the_row_untouched_when_the_cut_fails(tmp_path):
     store, _cat, frame_ids = _seed_for_recut(tmp_path)
     # Corrupt one source frame's JPEG so its re-cut cannot produce bytes.
     with open(store.path_for(frame_ids[1]), "wb") as fh:
         fh.write(b"not a jpeg")
 
-    conn = recut_crops._connect(str(tmp_path / "index.db"))
-    try:
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), "m10")
-        summary = recut_crops.recut(store.update_dataset_geometry, [r for r in rows if r["recuttable"]], "m10", store.dataset_root
-        )
-    finally:
-        conn.close()
+    rows = _rows(store, tmp_path, "m10")
+    summary = recut_crops.recut(
+        store.update_dataset_geometry, [r for r in rows if r["move"]], "m10", store.dataset_root
+    )
 
     assert summary["recut"] == 2 and summary["failed"] == 1
     by_frame = {r["src_frame_id"]: r for r in store.labeled_crops()}
@@ -593,16 +643,15 @@ def test_recut_leaves_the_row_untouched_when_the_cut_fails(tmp_path):
 
 def test_recut_back_to_legacy_lands_on_the_label_routes_own_path(tmp_path):
     store, cat, _fids = _seed_for_recut(tmp_path)
-    conn = recut_crops._connect(str(tmp_path / "index.db"))
-    try:
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), "m10")
-        recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
-        back = recut_crops.read_rows(conn, str(tmp_path / "media"), None)
-        summary = recut_crops.recut(store.update_dataset_geometry, back, None, store.dataset_root)
-    finally:
-        conn.close()
+    recut_crops.recut(
+        store.update_dataset_geometry, _rows(store, tmp_path, "m10"), "m10", store.dataset_root
+    )
+    back = _rows(store, tmp_path, None)
+    # The legacy file was KEPT by the first move, so coming back is a relink, not a cut.
+    assert [r["move"] for r in back] == ["relink"] * 3
+    summary = recut_crops.recut(store.update_dataset_geometry, back, None, store.dataset_root)
 
-    assert summary["recut"] == 3 and summary["failed"] == 0
+    assert summary["relinked"] == 3 and summary["failed"] == 0
     labelled = store.labeled_crops()
     assert {r["geometry"] for r in labelled} == {None}
     assert all(os.path.isfile(r["crop_path"]) for r in labelled)
@@ -613,24 +662,24 @@ def test_recut_back_to_legacy_lands_on_the_label_routes_own_path(tmp_path):
         assert os.path.dirname(row["crop_path"]).endswith(f"cat_{cat['id']}")
 
 
-def test_recut_never_deletes_the_crop_it_just_wrote_to_the_same_path(tmp_path):
+def test_a_stamp_its_file_does_not_match_is_repaired_not_destroyed(tmp_path):
     # A row can carry a stamp its FILE does not match — a half-applied older run, or a
-    # stamp corrected by hand. Re-cutting it to the geometry its path already encodes
-    # makes the old and new paths identical, and an unguarded "now delete the old file"
-    # would then destroy the crop it had just written, with the row pointing at nothing.
-    store, cat, frame_ids = _seed_for_recut(tmp_path)
+    # stamp corrected by hand. Moving it to the geometry its path already encodes makes
+    # the old and new paths identical; nothing may be destroyed in the process.
+    store, cat, _fids = _seed_for_recut(tmp_path)
     conn = recut_crops._connect(str(tmp_path / "index.db"))
     try:
         conn.execute("UPDATE dataset_items SET geometry = 'm10'")
         conn.commit()
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), None)
-        assert all(r["recuttable"] for r in rows)
-        summary = recut_crops.recut(store.update_dataset_geometry, rows, None, store.dataset_root)
     finally:
         conn.close()
 
-    assert summary["recut"] == 3
-    assert summary["old_files_removed"] == 0  # every "old" path WAS the new one
+    rows = _rows(store, tmp_path, None)
+    assert [r["move"] for r in rows] == ["relink"] * 3  # the legacy file is right there
+    summary = recut_crops.recut(store.update_dataset_geometry, rows, None, store.dataset_root)
+
+    assert summary["relinked"] == 3
+    assert summary["old_files_kept"] == 0  # every "old" path WAS the new one
     labelled = store.labeled_crops()
     assert {r["geometry"] for r in labelled} == {None}
     assert all(os.path.isfile(r["crop_path"]) for r in labelled)
@@ -638,12 +687,53 @@ def test_recut_never_deletes_the_crop_it_just_wrote_to_the_same_path(tmp_path):
     assert all(os.path.dirname(r["crop_path"]).endswith(f"cat_{cat['id']}") for r in labelled)
 
 
+def test_an_unparseable_stored_stamp_routes_to_recut_instead_of_raising(tmp_path):
+    # `canonical_geometry` passes a foreign build's stamp through untouched, so the
+    # routing must treat its margin as unknown rather than feed it to `parse_geometry`
+    # and fail the whole plan over one row.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    conn = recut_crops._connect(str(tmp_path / "index.db"))
+    try:
+        conn.execute("UPDATE dataset_items SET geometry = 'hexagon' WHERE id = (SELECT MIN(id) FROM dataset_items)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = _rows(store, tmp_path, "m10")
+    assert [r["move"] for r in rows] == ["recut"] * 3
+    assert "hexagon" in {r["geometry"] for r in rows}
+
+
+def test_cancel_stops_at_a_batch_boundary_and_RETURNS_the_partial_summary(tmp_path):
+    # A falsy `on_progress` return cancels. Unlike `embed_paths` it must not raise: a
+    # canceled run still has to report what it moved, and an exception discards exactly
+    # that.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    seen = []
+
+    def progress(done, total):
+        seen.append((done, total))
+        return False  # cancel at the very first boundary
+
+    rows = _rows(store, tmp_path, "m10")
+    summary = recut_crops.recut(
+        store.update_dataset_geometry, rows, "m10", store.dataset_root,
+        batch=2, on_progress=progress,
+    )
+
+    assert summary["canceled"] is True
+    assert summary["recut"] == 2 and summary["rows_updated"] == 2
+    assert seen == [(2, 3)]  # called ONCE per batch, not twice
+    stamps = sorted((r["geometry"] or "legacy") for r in store.labeled_crops())
+    assert stamps == ["legacy", "m10", "m10"]  # the third was never reached
+
+
 def test_recut_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
     store, _cat, _fids = _seed_for_recut(tmp_path)
     monkeypatch.setenv(recut_crops._ENV_DIR, str(tmp_path))
     assert recut_crops.main(["recut_crops", "--to", "letterbox+m10"]) == 0
     out = capsys.readouterr().out
-    assert "Dry run" in out and "to re-cut:" in out
+    assert "Dry run" in out and "to move:" in out
     assert {r["geometry"] for r in store.labeled_crops()} == {None}
 
 
@@ -680,24 +770,190 @@ def test_recut_is_idempotent(tmp_path, monkeypatch):
     assert before == after
 
 
-def test_recut_keeps_the_old_file_when_its_row_vanished_mid_run(tmp_path):
-    # `/api/label/relabel` deletes a row and re-commits it, re-materialising a crop at
-    # exactly the legacy path the row came from. If that lands between this tool's read
-    # and its write, the UPDATE matches nothing — and deleting the "old" file anyway
-    # would leave the operator's fresh row pointing at nothing.
+def test_a_row_that_vanished_mid_run_is_not_matched(tmp_path):
+    # `/api/label/relabel` deletes a row and re-commits it. If that lands between this
+    # tool's read and its write, the UPDATE must match nothing.
     store, _cat, _fids = _seed_for_recut(tmp_path)
+    rows = _rows(store, tmp_path, "m10")
+    legacy_paths = [os.path.join(store.dataset_root, r["crop_path"]) for r in rows]
     conn = recut_crops._connect(str(tmp_path / "index.db"))
     try:
-        rows = recut_crops.read_rows(conn, str(tmp_path / "media"), "m10")
-        legacy_paths = [os.path.join(store.dataset_root, r["crop_path"]) for r in rows]
         # Simulate the concurrent re-label: the ids this run holds no longer exist.
         conn.execute("UPDATE dataset_items SET id = id + 1000")
         conn.commit()
-        summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
     finally:
         conn.close()
+    summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
 
     assert summary["rows_updated"] == 0
-    assert summary["old_files_removed"] == 0
     assert all(os.path.isfile(p) for p in legacy_paths)
     assert all(os.path.isfile(r["crop_path"]) for r in store.labeled_crops())
+
+
+def _api(store):
+    from fastapi.testclient import TestClient
+
+    from compute.api.app import create_app
+
+    return TestClient(create_app(store=store, start_collector=False))
+
+
+def test_recut_plan_without_a_target_is_census_only(tmp_path):
+    # A read with no target is a useful question — "what conventions does the labelled set
+    # hold?", the one behind a Build refusing — so it answers rather than 400ing. That is
+    # the OPPOSITE of the run endpoint's reading of the same missing parameter.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    body = _api(store).get("/api/recut/plan").json()
+    assert body["census"] == [{"geometry": None, "count": 3}]
+    assert body["target"] is None and body["movable"] is None
+
+
+def test_recut_plan_splits_movable_by_branch(tmp_path):
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    client = _api(store)
+
+    m10 = client.get("/api/recut/plan", params={"geometry": "letterbox+m10"}).json()
+    assert m10["movable"] == {"recut": 3, "copy": 0, "relink": 0}
+    assert m10["blocked"] == {"frame_gone": 0, "no_box": 0}
+
+    # A margin-0 target needs no pixels: same-margin twin of legacy.
+    lb = client.get("/api/recut/plan", params={"geometry": "letterbox"}).json()
+    assert lb["movable"] == {"recut": 0, "copy": 3, "relink": 0}
+
+
+def test_recut_run_requires_a_geometry_and_takes_the_legacy_sentinel(tmp_path):
+    # Absent means legacy for a READ (Build/Validate) and must NOT here: a forgotten field
+    # would move the whole labelled set. But legacy has to stay reachable, or the operator
+    # can hop onto every arm from the browser and never hop back.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    client = _api(store)
+
+    assert client.post("/api/cleanup/run", json={"kind": "recut"}).status_code == 400
+    assert client.post(
+        "/api/cleanup/run", json={"kind": "recut", "geometry": ""}
+    ).status_code == 400
+    # ...and the CLI's own word resolves to legacy rather than 400ing on an unknown token.
+    plan = client.get("/api/recut/plan", params={"geometry": "legacy"}).json()
+    assert plan["target"] is None and plan["at_target"] == 3
+
+
+class _BusyTraining:
+    """A TrainingManager stand-in that is permanently busy — enough for the lockout."""
+
+    def __init__(self, running=True, queue=()):
+        self._running, self._queue = running, list(queue)
+
+    def status(self):
+        return {"running": self._running, "kind": "gallery-build", "queue": self._queue}
+
+    def stop_all(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+
+def test_recut_is_refused_while_a_training_job_runs_OR_is_queued(tmp_path):
+    # A build embedding the labelled set while a re-cut moves it reads a set that no
+    # longer exists as read, and `_embed_items` skips a missing file in SILENCE — so the
+    # damage is a quietly smaller gallery, not an error. Queued counts too: matching only
+    # `running` lets a job that is about to start slip through.
+    from fastapi.testclient import TestClient
+
+    from compute.api.app import create_app
+
+    for running, queue in ((True, []), (False, [{"kind": "gallery-build"}])):
+        store, _cat, _fids = _seed_for_recut(tmp_path / f"s{running}{len(queue)}")
+        client = TestClient(create_app(
+            store=store, start_collector=False,
+            training_manager=_BusyTraining(running=running, queue=queue),
+        ))
+        resp = client.post("/api/cleanup/run", json={"kind": "recut", "geometry": "m10"})
+        assert resp.status_code == 409, (running, queue)
+        assert "training" in resp.json()["detail"]
+        # ...and nothing moved.
+        assert {r["geometry"] for r in store.labeled_crops()} == {None}
+
+
+def test_validate_is_refused_while_a_recut_runs(tmp_path):
+    # The other half of the lockout, so the two cannot interleave from either direction.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+
+    class _RecutRunning:
+        def status(self):
+            return {"running": True, "kind": "recut", "done": 0, "total": 3,
+                    "error": None, "result": None}
+
+        def stop_all(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+    from fastapi.testclient import TestClient
+
+    from compute.api.app import create_app
+
+    client = TestClient(create_app(
+        store=store, start_collector=False, cleanup_manager=_RecutRunning(),
+    ))
+    resp = client.post("/api/training/feasibility/run", json={})
+    assert resp.status_code == 409 and "re-cut" in resp.json()["detail"]
+
+
+def test_deleting_a_label_removes_EVERY_geometry_variant_of_its_crop(tmp_path):
+    # The invariant `relink` rests on: a crop file may outlive a geometry MOVE, but never
+    # its ROW. A re-cut no longer deletes what it supersedes, so a row owns several files;
+    # if a relabel removed only the current one, the next hop back would `relink` an
+    # orphan cut from the PREVIOUS box — stamp, bbox column and pixels silently
+    # disagreeing, which nothing downstream can detect.
+    from fastapi.testclient import TestClient
+
+    from compute.api.app import create_app
+
+    store, cat, frame_ids = _seed_for_recut(tmp_path)
+    # Visit both arms, so each row owns a legacy file AND an m10 file.
+    recut_crops.recut(
+        store.update_dataset_geometry, _rows(store, tmp_path, "m10"), "m10", store.dataset_root
+    )
+    recut_crops.recut(
+        store.update_dataset_geometry, _rows(store, tmp_path, None), None, store.dataset_root
+    )
+    variants = [
+        os.path.join(store.dataset_root, recut_crops.crop_rel_path(
+            cat["id"], "identified", fid, 1000 + fid, geom))
+        for fid in frame_ids for geom in (None, "m10")
+    ]
+    assert all(os.path.isfile(p) for p in variants), "both arms should be on disk"
+
+    client = TestClient(create_app(store=store, start_collector=False))
+    resp = client.post("/api/label/delete", json={"frame_ids": frame_ids})
+    assert resp.status_code == 200 and resp.json()["deleted"] == 3
+
+    # Every variant is gone — not just the one the rows happened to point at.
+    assert not any(os.path.exists(p) for p in variants)
+    assert store.labeled_crops() == []
+
+
+def test_a_SAME_CAT_relabel_mid_run_is_not_matched_by_the_swap(tmp_path):
+    # The case `crop_path` alone cannot catch. A relabel to the same cat deletes the row
+    # and re-commits at the IDENTICAL legacy path, so id and path both still match — but
+    # the box may have moved (a `reanalyze` sweep overwrites the detector's verdicts).
+    # Without `bbox` in the swap this stamps the fresh row with pixels cut from the
+    # PREVIOUS box: stamp, bbox column and pixels silently disagreeing.
+    store, _cat, _fids = _seed_for_recut(tmp_path)
+    rows = _rows(store, tmp_path, "m10")
+    conn = recut_crops._connect(str(tmp_path / "index.db"))
+    try:
+        # Same id, same crop_path, DIFFERENT box — exactly what a re-decided visit leaves.
+        conn.execute("UPDATE dataset_items SET bbox = '5,5,70,60'")
+        conn.commit()
+    finally:
+        conn.close()
+    summary = recut_crops.recut(store.update_dataset_geometry, rows, "m10", store.dataset_root)
+
+    assert summary["rows_updated"] == 0, "the swap must reject a row whose box moved"
+    # The rows keep the box and the stamp the relabel gave them.
+    labelled = store.labeled_crops()
+    assert {r["geometry"] for r in labelled} == {None}
+    assert all(os.path.isfile(r["crop_path"]) for r in labelled)

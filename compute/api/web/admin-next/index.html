@@ -689,6 +689,21 @@
   // Thresholds and palette mirror the USER dashboard's playback overlay; by the
   // entry-80 convention the two files share no CSS/JS, so this is a deliberate
   // duplicate. Change them together.
+  // The non-legacy crop shapes, shared by the Model page's Build/Validate selector and
+  // the Tools page's re-cut target. VALUES only, deliberately not labels: the two pages
+  // spell LEGACY differently — Model sends '' (its "absent means legacy" read is right for
+  // Build/Validate), Tools sends the API's 'legacy' sentinel, because the run endpoint
+  // rejects an empty geometry so a forgotten field can never move the whole labelled set.
+  // Model's own label for it, "current (squashed)", is also a claim about the store that a
+  // migration makes untrue, so Tools must not inherit it.
+  const GEOMETRY_ARMS = [
+    ['letterbox', 'letterbox'],
+    ['letterbox+m10', 'letterbox + 10% margin'],
+    ['letterbox+m25', 'letterbox + 25% margin'],
+  ];
+  const geometryOptions = () =>
+    GEOMETRY_ARMS.map(([v, label]) => `<option value="${v}">${label}</option>`).join('');
+
   const CLS_LABEL = { 0: 'person', 15: 'cat' };
   const clsLabel = (c) => CLS_LABEL[c] || (c == null ? 'object' : 'cls ' + c);
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -925,13 +940,15 @@
 
   // ---- Route table -------------------------------------------------------
   const ROUTES = [
-    { id: 'start', title: 'Start', sub: 'Operating stage, collection, and housekeeping', mount: mountStart },
+    { id: 'start', title: 'Start', sub: 'Operating stage and collection', mount: mountStart },
     { id: 'tuning', title: 'Motion tuning', sub: 'Trust the motion gate', mount: mountTuning },
     { id: 'frames', title: 'Frame review', sub: 'Inspect frames with everything on them', mount: mountFrames },
     { id: 'annotate', title: 'Annotation', sub: 'Label visits, worst-first', mount: mountAnnotate },
     { id: 'cats', title: 'Cats', sub: 'The household roster', mount: mountCats },
     { id: 'model', title: 'Model building', sub: 'Validate → build → promote', mount: mountModel },
     { id: 'activity', title: 'Activity', sub: 'Recent visits + manual backfill', mount: mountActivity },
+    // Last: maintenance is not part of the daily loop the tabs above read as.
+    { id: 'tools', title: 'Tools', sub: 'Crop shape, disk reclaim, and the store', mount: mountTools },
   ];
   const DEFAULT_ROUTE = 'start';
   const routeById = Object.fromEntries(ROUTES.map(r => [r.id, r]));
@@ -1032,10 +1049,11 @@
         <h3>Collection</h3>
         <div class="row">
           <button id="collectorBtn"></button>
-          <span class="grow"></span>
-          <button id="clearBtn" class="danger">Clear all frames…</button>
         </div>
         <p id="collectorNote" class="hint"></p>
+        <p class="hint">Clearing the store and the disk-reclaim jobs live on
+          <a href="#tools">Tools</a> — a destructive control beside the everyday
+          start/stop button is one mis-click from a wiped buffer.</p>
       </div>
 
       <div class="card">
@@ -1065,28 +1083,6 @@
         </div>
       </div>
 
-      <div class="card">
-        <h3>Cleanup</h3>
-        <div class="row">
-          <div class="grow">
-            <b>Drop non-motion frames</b>
-            <div class="note">The big reclaim (~95% of frames). Records a purge span so tuning knows the window is unmeasurable.</div>
-            <div id="nmJob" class="cleanup-job"></div>
-          </div>
-          <button data-kind="nonmotion" data-act="est">Estimate</button>
-          <button data-kind="nonmotion" data-act="run" class="danger cleanup-run">Drop</button>
-        </div>
-        <div class="row" style="margin-top:14px">
-          <div class="grow">
-            <b>Sweep orphaned files</b>
-            <div class="note">JPEGs on disk with no row (a crash leak). Frames media dir only — never crops.</div>
-            <div id="orJob" class="cleanup-job"></div>
-          </div>
-          <button data-kind="orphan" data-act="est">Estimate</button>
-          <button data-kind="orphan" data-act="run" class="danger cleanup-run">Sweep</button>
-        </div>
-        <p class="hint">Event-scoped purges (ignored / labelled source frames) are deferred — see the plan.</p>
-      </div>
     `;
 
     let alive = true;
@@ -1120,11 +1116,6 @@
       const running = $('#collectorBtn', view).dataset.running === '1';
       try { await api('POST', running ? '/api/collector/stop' : '/api/collector/start'); await refresh(); } catch (_) {}
     });
-    $('#clearBtn', view).addEventListener('click', async () => {
-      if (!confirm('Delete ALL stored frames? Labels, models, and avatars are kept — only the rolling frame buffer is cleared.')) return;
-      try { await api('POST', '/api/clear'); await refresh(); } catch (err) { alert('Clear failed: ' + err.message); }
-    });
-
     // --- Location ---
     $('#locSave', view).addEventListener('click', async () => {
       const lat = parseFloat($('#locLat', view).value), lon = parseFloat($('#locLon', view).value);
@@ -1141,25 +1132,6 @@
       if (loc.latitude == null) { note.className = 'note warn'; note.textContent = 'Not set — the day/night split is unavailable until you set a location.'; }
       else { $('#locLat', view).value = loc.latitude; $('#locLon', view).value = loc.longitude; note.textContent = `Source: ${loc.source}.`; }
     }).catch(() => {});
-
-    // --- Cleanup buttons ---
-    view.querySelectorAll('button[data-kind]').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const kind = btn.dataset.kind, jobEl = $(kind === 'nonmotion' ? '#nmJob' : '#orJob', view);
-        if (btn.dataset.act === 'est') {
-          jobEl.innerHTML = '<span class="note">Estimating…</span>';
-          try {
-            const e = await api('GET', `/api/cleanup/estimate?kind=${kind}`);
-            jobEl.innerHTML = `<span class="note">Would reclaim <b class="mono">${fmtInt(e.count)}</b> files · <b class="mono">${fmtBytes(e.bytes)}</b>${kind === 'nonmotion' ? ' (bytes estimated)' : ''}.</span>`;
-          } catch (err) { jobEl.innerHTML = `<span class="note bad">Estimate failed: ${err.message}</span>`; }
-        } else {
-          const label = kind === 'nonmotion' ? 'Drop all non-motion frames?' : 'Sweep orphaned files?';
-          if (!confirm(label + ' This runs as a background job and cannot be undone.')) return;
-          try { await api('POST', '/api/cleanup/run', { kind }); await refresh(); }
-          catch (err) { jobEl.innerHTML = `<span class="note bad">${err.message}</span>`; }
-        }
-      });
-    });
 
     // --- Poll + render ---
     function renderStats(s) {
@@ -1206,7 +1178,7 @@
       if (showPurge) {
         purge.innerHTML = `<b class="mono">${fmtInt(leftover)}</b> non-motion frames are `
           + 'leftover from keep-all capture. Eviction sheds them first under disk pressure — '
-          + 'or reclaim now via <b>Cleanup → Drop non-motion frames</b> below, which is '
+          + 'or reclaim now via <a href="#tools">Tools → Drop non-motion frames</a>, which is '
           + 'irreversible and makes that window\'s misses permanently unmeasurable.';
       }
 
@@ -1277,25 +1249,6 @@
       $('#collectorNote', view).textContent = (!s.collector_running && s.resume_available)
         ? 'Was collecting when the process last stopped — Resume picks it back up.' : '';
     }
-    function renderCleanup(c) {
-      view.querySelectorAll('button[data-act="run"]').forEach(b => b.disabled = c.running);
-      const target = c.kind === 'orphan' ? '#orJob' : '#nmJob';
-      if (c.running) {
-        const pct = c.total ? Math.floor((c.done / c.total) * 100) + '%' : 'scanning…';
-        $(target, view).innerHTML =
-          `<span class="pill warn">running</span> <span class="mono">${fmtInt(c.done)}${c.total ? ' / ' + fmtInt(c.total) : ''}</span> ${pct}
-           <button id="cleanupCancel">Cancel</button>`;
-        const cancel = $('#cleanupCancel', view);
-        if (cancel) cancel.addEventListener('click', () => api('POST', '/api/cleanup/cancel').catch(() => {}));
-      } else if (c.result) {
-        const r = c.result;
-        const msg = r.kind === 'orphan'
-          ? `swept ${fmtInt(r.deleted)} files (${fmtBytes(r.bytes)})${r.canceled ? ', canceled' : ''}`
-          : `dropped ${fmtInt(r.deleted)} frames${r.canceled ? ', canceled' : ''}`;
-        $(r.kind === 'orphan' ? '#orJob' : '#nmJob', view).innerHTML = `<span class="pill ok">done</span> <span class="note">${msg}</span>`;
-      }
-      if (c.error) $(target, view).innerHTML = `<span class="note bad">${c.error}</span>`;
-    }
     async function renderModel() {
       try {
         const m = await api('GET', '/api/training/models');
@@ -1309,14 +1262,271 @@
       } catch (_) {}
     }
 
+    // The /api/cleanup/status fetch left with the cards that consumed it. The poll itself
+    // stays — it still drives the stage picker, the purge hint and the store stats — and
+    // Start deliberately gains no "a maintenance job is running" line: the purge hint
+    // already links to Tools, and one sentence would put that fetch straight back.
     async function refresh() {
       if (!alive) return;
       try { const s = await api('GET', '/api/stats'); if (alive) renderStats(s); } catch (_) {}
-      try { const c = await api('GET', '/api/cleanup/status'); if (alive) renderCleanup(c); } catch (_) {}
     }
     refresh(); renderModel();
     const timer = setInterval(refresh, 3000);
     return () => { alive = false; clearInterval(timer); };
+  }
+
+  // =======================================================================
+  //  Tools page — maintenance jobs (crop shape, disk reclaim, the store)
+  // =======================================================================
+  //  All three cards share ONE job slot on the server (CleanupManager runs a single
+  //  job, no queue), which is why every run button greys out while any of them runs.
+  function mountTools(view) {
+    view.innerHTML = `
+      <div class="card">
+        <h3>Crop shape</h3>
+        <p class="hint">A crop's <b>shape</b> is how the cat was cut out and resized before
+          the model sees it: how much doorway is kept around the box (the margin), and
+          whether it is letterboxed or squashed to a square. A gallery is built from
+          <b>one</b> shape, so Build and Validate refuse at a shape nothing is cut at yet
+          — this is where you move them.</p>
+        <div id="tCensus" class="note">…</div>
+        <div class="row" style="margin-top:12px">
+          <label class="fld inline">Move to<select id="tGeom">
+            <option value="" selected>Choose a shape…</option>
+            <option value="legacy">legacy (squash, no margin)</option>
+            ${geometryOptions()}
+          </select></label>
+          <span id="tPlan" class="note grow"></span>
+          <button id="tRun" class="danger" disabled>Re-cut…</button>
+        </div>
+        <div id="tJob" class="cleanup-job"></div>
+        <p class="hint">Nothing is deleted: the crops at the old shape are <b>kept</b>, so a
+          move can be walked back — including after the source frames have aged out. The
+          cost is another copy of the labelled set per shape you try, and nothing reclaims
+          it automatically. Your labels are never touched.</p>
+      </div>
+
+      <div class="card">
+        <h3>Reclaim disk</h3>
+        <div class="row">
+          <div class="grow">
+            <b>Drop non-motion frames</b>
+            <div class="note">The big reclaim (~95% of frames). Records a purge span so tuning knows the window is unmeasurable.</div>
+            <div id="nmJob" class="cleanup-job"></div>
+          </div>
+          <button data-kind="nonmotion" data-act="est">Estimate</button>
+          <button data-kind="nonmotion" data-act="run" class="danger cleanup-run">Drop</button>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <div class="grow">
+            <b>Sweep orphaned files</b>
+            <div class="note">JPEGs on disk with no row (a crash leak). Frames media dir only — never crops.</div>
+            <div id="orJob" class="cleanup-job"></div>
+          </div>
+          <button data-kind="orphan" data-act="est">Estimate</button>
+          <button data-kind="orphan" data-act="run" class="danger cleanup-run">Sweep</button>
+        </div>
+        <p class="hint">Both are irreversible. Event-scoped purges (ignored / labelled
+          source frames) are deferred — see the plan.</p>
+      </div>
+
+      <div class="card">
+        <h3>The store</h3>
+        <div class="row">
+          <span class="grow note">Empties the rolling frame buffer. Labels, models, and
+            avatars survive — they are the precious output and live outside it.</span>
+          <button id="clearBtn" class="danger">Clear all frames…</button>
+        </div>
+      </div>
+    `;
+
+    let alive = true;
+    let plan = null;         // the last /api/recut/plan body, or null while unplanned
+    let planSeq = 0;         // drops a slow earlier plan that lands after a newer one
+    const geomEl = $('#tGeom', view);
+    const target = () => geomEl.value;   // '' until a shape is chosen
+
+    // --- The re-cut card ---
+    const movableTotal = (p) =>
+      p && p.movable ? p.movable.recut + p.movable.copy + p.movable.relink : 0;
+
+    function renderPlan() {
+      const el = $('#tPlan', view);
+      if (!target()) { el.textContent = 'Choose a shape to see what would move.'; return; }
+      if (!plan || !plan.movable) { el.textContent = 'Planning…'; return; }
+      const m = plan.movable, b = plan.blocked, total = movableTotal(plan);
+      // The RECUT count is the wait: it decodes a source frame apiece, while a relink is
+      // one row update. A single merged number would hide the difference the operator is
+      // choosing between.
+      const parts = [`<b class="mono">${fmtInt(total)}</b> would move`];
+      if (total) parts.push(`(${fmtInt(m.recut)} re-cut, ${fmtInt(m.copy)} copy, ${fmtInt(m.relink)} relink)`);
+      if (plan.at_target) parts.push(`· <b class="mono">${fmtInt(plan.at_target)}</b> already there`);
+      const blocked = b.frame_gone + b.no_box;
+      if (blocked) {
+        parts.push(`· <b class="mono">${fmtInt(blocked)}</b> cannot move`
+          + ` (${fmtInt(b.frame_gone)} source frame gone, ${fmtInt(b.no_box)} no box)`);
+      }
+      el.innerHTML = parts.join(' ');
+      const miss = $('#tCensusMissing', view);
+      if (miss) miss.remove();
+      if (plan.at_target_missing) {
+        // Stamped at the target with no file behind it: `movable` is 0 and the button
+        // greys out, so the card would otherwise read "done" while a build silently
+        // under-enrols. Reachable by hand-deleting a shape's directory.
+        el.insertAdjacentHTML('beforeend',
+          ` <span id="tCensusMissing" class="note bad">⚠ ${fmtInt(plan.at_target_missing)}`
+          + ' at this shape have no file — a build would skip them.</span>');
+      }
+    }
+
+    function renderCensus() {
+      const el = $('#tCensus', view);
+      if (!plan || !plan.census) { el.textContent = 'Census unavailable.'; return; }
+      if (!plan.census.length) { el.textContent = 'No labelled crops yet.'; return; }
+      el.innerHTML = '<b>The labelled set holds:</b> ' + plan.census
+        .map(c => `<span class="mono">${esc(c.geometry || 'legacy')}</span> × ${fmtInt(c.count)}`)
+        .join(' · ');
+    }
+
+    async function loadPlan() {
+      const seq = ++planSeq;
+      const q = target() ? `?geometry=${encodeURIComponent(target())}` : '';
+      renderPlan();
+      try {
+        const p = await api('GET', '/api/recut/plan' + q);
+        if (!alive || seq !== planSeq) return;   // a newer plan already won
+        plan = p;
+      } catch (err) {
+        if (!alive || seq !== planSeq) return;
+        plan = null;
+        $('#tPlan', view).innerHTML = `<span class="note bad">Plan failed: ${esc(err.message)}</span>`;
+        // RETURN, or the shared tail below re-runs renderPlan(), which sees plan===null
+        // and overwrites this error with "Planning…" in the same tick — leaving a card
+        // stuck on a progress word with no hint the request failed and no retry until
+        // the select is touched again. The button still has to be re-synced.
+        renderCensus(); syncRunBtn();
+        return;
+      }
+      renderCensus(); renderPlan(); syncRunBtn();
+    }
+
+    geomEl.addEventListener('change', () => {
+      geomEl.blur();   // `onKey` drops keystrokes from a SELECT (entries 235/242/298)
+      loadPlan();
+    });
+
+    $('#tRun', view).addEventListener('click', async () => {
+      const label = geomEl.options[geomEl.selectedIndex].textContent.trim();
+      const total = movableTotal(plan);
+      if (!confirm(
+        `Re-cut ${total} crop(s) to "${label}"?\n\n`
+        + 'Your labels are not touched, and the crops at the old shape are kept so this '
+        + 'can be reversed. The cost is another full copy of the labelled set on disk.'
+      )) return;
+      try {
+        await api('POST', '/api/cleanup/run', { kind: 'recut', geometry: target() });
+        awaitingRecut = true;
+        await refresh();
+      } catch (err) {
+        $('#tJob', view).innerHTML = `<span class="note bad">${esc(err.message)}</span>`;
+      }
+    });
+
+    // --- The two reclaim jobs (moved from Start) ---
+    view.querySelectorAll('button[data-kind]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const kind = btn.dataset.kind, jobEl = $(JOB_EL[kind], view);
+        if (btn.dataset.act === 'est') {
+          jobEl.innerHTML = '<span class="note">Estimating…</span>';
+          try {
+            const e = await api('GET', `/api/cleanup/estimate?kind=${kind}`);
+            jobEl.innerHTML = `<span class="note">Would reclaim <b class="mono">${fmtInt(e.count)}</b> files · <b class="mono">${fmtBytes(e.bytes)}</b>${kind === 'nonmotion' ? ' (bytes estimated)' : ''}.</span>`;
+          } catch (err) { jobEl.innerHTML = `<span class="note bad">Estimate failed: ${esc(err.message)}</span>`; }
+        } else {
+          if (!confirm(CONFIRM_LABEL[kind] + ' This runs as a background job and cannot be undone.')) return;
+          try { await api('POST', '/api/cleanup/run', { kind }); await refresh(); }
+          catch (err) { jobEl.innerHTML = `<span class="note bad">${esc(err.message)}</span>`; }
+        }
+      });
+    });
+
+    $('#clearBtn', view).addEventListener('click', async () => {
+      if (!confirm('Delete ALL stored frames? Labels, models, and avatars are kept — only the rolling frame buffer is cleared.')) return;
+      try { await api('POST', '/api/clear'); await refresh(); } catch (err) { alert('Clear failed: ' + err.message); }
+    });
+
+    // --- Job status, shared by all three cards ---
+    // The re-cut button owns its OWN disabled state: the shared sweep below assigns
+    // `b.disabled = c.running` unconditionally, so on every idle poll it would re-enable
+    // a button this card had disabled for having no target or nothing to move — handing
+    // the operator a live danger button and a confirm naming no shape.
+    let jobRunning = false;
+    // Set when WE start a re-cut, cleared once it is no longer running. Not a
+    // running->idle transition: a relink-only move finishes in milliseconds, so the
+    // refresh right after the POST can already see `running: false` and the transition
+    // never happens — leaving the pre-move census on screen, which is exactly the
+    // "nothing happened" reading the re-plan exists to prevent. Found in the browser.
+    let awaitingRecut = false;
+    function syncRunBtn() {
+      $('#tRun', view).disabled = jobRunning || !target() || movableTotal(plan) === 0;
+      // The shape is locked while ANY job runs. Changing it mid-run would re-plan for a
+      // different target and paint its census over a card whose job readout belongs to
+      // the target actually running — and the post-completion re-plan reads the select,
+      // so it would then describe a shape the finished job never moved to.
+      geomEl.disabled = jobRunning;
+    }
+
+    function renderJob(c) {
+      jobRunning = !!c.running;
+      view.querySelectorAll('button[data-act="run"]').forEach(b => b.disabled = jobRunning);
+      syncRunBtn();
+      // Explicit map per kind, never a default-to-one-of-two ternary: a third kind
+      // inheriting another job's readout reports one job's outcome as another's.
+      const runningEl = c.kind ? $(JOB_EL[c.kind] || '', view) : null;
+      if (c.running && runningEl) {
+        const pct = c.total ? Math.floor((c.done / c.total) * 100) + '%' : 'scanning…';
+        runningEl.innerHTML =
+          `<span class="pill warn">running</span> <span class="mono">${fmtInt(c.done)}${c.total ? ' / ' + fmtInt(c.total) : ''}</span> ${pct}
+           <button id="cleanupCancel">Cancel</button>`;
+        const cancel = $('#cleanupCancel', view);
+        if (cancel) cancel.addEventListener('click', () => api('POST', '/api/cleanup/cancel').catch(() => {}));
+      } else if (c.result) {
+        const r = c.result, el = $(JOB_EL[r.kind] || '', view);
+        if (el) el.innerHTML = `<span class="pill ok">done</span> <span class="note">${esc(jobSummary(r))}</span>`;
+      }
+      if (c.error && runningEl) runningEl.innerHTML = `<span class="note bad">${esc(c.error)}</span>`;
+      // A finished re-cut invalidates the plan on screen: leaving the pre-move census up
+      // beside a re-enabled button reads as "nothing happened" and invites a second click.
+      if (awaitingRecut && !jobRunning) { awaitingRecut = false; loadPlan(); }
+    }
+
+    async function refresh() {
+      if (!alive) return;
+      try { const c = await api('GET', '/api/cleanup/status'); if (alive) renderJob(c); } catch (_) {}
+    }
+    loadPlan(); refresh();
+    const timer = setInterval(refresh, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }
+
+  // Which card each job kind reports into, and how its finished summary reads. Explicit
+  // maps rather than two-way ternaries — with three kinds a fall-through silently files
+  // one job's outcome under another's heading (entry 288's class).
+  const JOB_EL = { nonmotion: '#nmJob', orphan: '#orJob', recut: '#tJob' };
+  const CONFIRM_LABEL = {
+    nonmotion: 'Drop all non-motion frames?',
+    orphan: 'Sweep orphaned files?',
+  };
+  function jobSummary(r) {
+    if (r.kind === 'orphan') return `swept ${fmtInt(r.deleted)} files (${fmtBytes(r.bytes)})${r.canceled ? ', canceled' : ''}`;
+    if (r.kind === 'nonmotion') return `dropped ${fmtInt(r.deleted)} frames${r.canceled ? ', canceled' : ''}`;
+    if (r.kind === 'recut') {
+      return `moved ${fmtInt(r.rows_updated)} crops`
+        + ` (${fmtInt(r.recut)} re-cut, ${fmtInt(r.copied)} copied, ${fmtInt(r.relinked)} relinked`
+        + `${r.failed ? ', ' + fmtInt(r.failed) + ' failed' : ''})`
+        + `${r.canceled ? ' — canceled partway' : ''}`;
+    }
+    return 'done';
   }
 
   // =======================================================================
@@ -3856,18 +4066,20 @@
       <div class="card">
         <h3>1 · Validate <span class="note">(optional)</span></h3>
         <div class="row">${qChecks('v')}<label class="fld inline">Crop shape<select id="mGeom">
+          <!-- Legacy keeps ITS OWN option here: this page sends '' for it (an absent
+               geometry reads as legacy, which is right for a read), while Tools sends the
+               'legacy' sentinel because its run endpoint rejects an empty value. Only the
+               ARMS are shared, so the two pages cannot offer different shapes. -->
           <option value="">current (squashed)</option>
-          <option value="letterbox">letterbox</option>
-          <option value="letterbox+m10">letterbox + 10% margin</option>
-          <option value="letterbox+m25">letterbox + 25% margin</option>
+          ${geometryOptions()}
         </select></label><span id="mValNote" class="note grow"></span><button id="mValidate">Validate</button></div>
         <p class="hint"><b>Crop shape</b> is how a crop was cut and resized before the model
           saw it. Validate and Build share this one control, for the same reason they share
           the cat ticks: a gallery is built from ONE shape, so scoring one shape and building
           another would compare numbers that describe different crop sets. Only crops already
-          cut at the chosen shape are used — switching needs a re-cut
-          (<span class="mono">python -m compute.tools.recut_crops --to letterbox+m10 --apply</span>),
-          and until then a non-current shape scores nothing and says so.</p>
+          cut at the chosen shape are used — switching needs a re-cut, which is
+          <a href="#tools">Tools → Crop shape</a>, and until then a shape nothing is cut at
+          scores nothing and says so.</p>
         <p class="hint">Scores the LABELLED CROPS at those grades — how separable the cats are,
           measured with a pretrained DINOv2 + kNN. It reads no gallery, so it comes FIRST: it
           answers "is this data separable enough to build from", and a run belongs to no

@@ -36,6 +36,7 @@ import — ``compute.sh`` launches ``uvicorn --factory ...:create_app``.
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import math
 import os
@@ -394,17 +395,25 @@ class GroupCreateRequest(BaseModel):
 
 
 class CleanupRunRequest(BaseModel):
-    """Body of ``POST /api/cleanup/run``: which purge to start (admin-next P7).
+    """Body of ``POST /api/cleanup/run``: which maintenance job to start (admin-next P7).
 
-    ``kind`` is ``"nonmotion"`` (drop motion=0 frames) or ``"orphan"`` (sweep JPEGs
-    with no frames row). ``before_ts`` (ms epoch, non-motion only) scopes the purge to
-    frames at-or-before that instant — the endpoint resolves it to an ``until_id`` and
-    snapshots the store's id bounds so a whole-store purge (``before_ts`` omitted) can't
-    chase the live collector. Ignored for the orphan sweep.
+    ``kind`` is ``"nonmotion"`` (drop motion=0 frames), ``"orphan"`` (sweep JPEGs with no
+    frames row), or ``"recut"`` (move labelled crops to one geometry). ``before_ts`` (ms
+    epoch, non-motion only) scopes the purge to frames at-or-before that instant — the
+    endpoint resolves it to an ``until_id`` and snapshots the store's id bounds so a
+    whole-store purge (``before_ts`` omitted) can't chase the live collector. Ignored for
+    the other kinds.
+
+    ``geometry`` is recut-only and REQUIRED there, unlike everywhere else it appears:
+    Build and Validate read an absent value as legacy, which is right for a READ, but here
+    it would turn a body that merely forgot the field into an unrequested move of the whole
+    labelled set. Legacy is spelled with the CLI's own word (``"legacy"``) rather than
+    ``""``, so it stays reachable without ever being the accidental default.
     """
 
     kind: str
     before_ts: "int | None" = None
+    geometry: "str | None" = None
 
 
 class CollectorMotionOnlyRequest(BaseModel):
@@ -438,6 +447,12 @@ class StageRequest(BaseModel):
 
     stage: str
 
+
+# The TrainingManager kinds that EMBED labelled crops, and so must not overlap a crop
+# re-cut. `identify`/`visit-identify` are deliberately absent: they read frames and write
+# identities, never touching `dataset_items` crop files, so a whole-store Identify pass
+# has no reason to block a re-cut (nor a re-cut to block it).
+_CROP_EMBED_KINDS = ("feasibility", "gallery-build")
 
 # The annotation tool labels the trustworthy serial-YOLO detections (see the memory
 # note that the batched ``yolo`` oracle over-detects), so the queue defaults to it.
@@ -1364,7 +1379,61 @@ def create_app(
             return {"kind": "nonmotion", "until_id": until_id, **est}
         if kind == "orphan":
             return {"kind": "orphan", **store.orphan_estimate()}
-        raise HTTPException(status_code=400, detail=f"kind must be 'nonmotion' or 'orphan', got {kind!r}")
+        # Deliberately two kinds where /api/cleanup/run takes three: a re-cut's forecast is
+        # a census plus a per-branch breakdown, nothing like this endpoint's
+        # {count, bytes}, so it has its own reader in GET /api/recut/plan.
+        raise HTTPException(
+            status_code=400,
+            detail=f"kind must be 'nonmotion' or 'orphan', got {kind!r} "
+                   "(a re-cut's forecast is GET /api/recut/plan)",
+        )
+
+    def _refuse_during_recut() -> None:
+        # The other half of the recut/training lockout (see POST /api/cleanup/run). A
+        # re-cut re-points every labelled crop, so a run that embedded them mid-move would
+        # score a set that no longer exists as read — and `_embed_items` skips a missing
+        # file silently, so the damage is a quietly-smaller gallery rather than an error.
+        status = cleanup_manager.status()
+        if status.get("running") and status.get("kind") == "recut":
+            raise HTTPException(
+                status_code=409,
+                detail="a crop re-cut is running; it is moving the crops this would embed",
+            )
+
+    def _resolve_recut_geometry(value: "str | None") -> "str | None":
+        # The recut target. REQUIRED, unlike `_resolve_geometry`'s "absent means legacy":
+        # that reading is right for a read (Build/Validate) and wrong for a write, where a
+        # forgotten field would move the whole labelled set. Legacy is therefore spelled
+        # with the CLI's own sentinel — `parse_geometry` cannot carry it (the token is
+        # unknown to it by design), so it is translated BEFORE `_resolve_geometry` sees it,
+        # keeping one spelling across the command and the button.
+        from compute.tools.recut_crops import _LEGACY_WORD
+
+        if value is None or not str(value).strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"geometry is required for kind 'recut' (use {_LEGACY_WORD!r} "
+                       "for the squash/margin-0 convention)",
+            )
+        if str(value).strip().lower() == _LEGACY_WORD:
+            return None
+        return _resolve_geometry(value)
+
+    @app.get("/api/recut/plan")
+    def api_recut_plan(geometry: "str | None" = Query(default=None)):
+        # What a crop-geometry move would do. `geometry` is OPTIONAL here and absent means
+        # CENSUS ONLY — the opposite of the run endpoint's reading of the same missing
+        # parameter, deliberately: a read with no target is a useful question ("what
+        # conventions does the labelled set hold?", the one behind a Build refusing),
+        # while an irreversible write with no target is a mistake.
+        if geometry is None:
+            plan = store.recut_plan(None)
+            return {
+                "target": None, "census": plan["census"],
+                "at_target": None, "at_target_missing": None,
+                "movable": None, "blocked": None,
+            }
+        return store.recut_plan(_resolve_recut_geometry(geometry))
 
     @app.post("/api/cleanup/run")
     def api_cleanup_run(req: CleanupRunRequest):
@@ -1373,9 +1442,36 @@ def create_app(
             result = cleanup_manager.start_nonmotion(store, until_id, since_id)
         elif req.kind == "orphan":
             result = cleanup_manager.start_orphan(store)
+        elif req.kind == "recut":
+            # Locked against the TRAINING queue, which is a separate slot: a build
+            # embedding the labelled set while a re-cut moves it reads a partial set, and
+            # `_embed_items` skips a missing file in SILENCE — a gallery quietly enrolled
+            # from fewer crops than it selected. Advisory, not airtight (the two managers
+            # share no lock, and the CLI bypasses it entirely); the residual harm is
+            # bounded by superseded crops being kept, so a mid-move build reads pixels
+            # that are at least correct for the rows it got.
+            # Narrowed to the kinds that actually EMBED labelled crops, mirroring
+            # `_refuse_during_recut`'s `kind == "recut"` narrowing on the other side.
+            # `identify` / `visit-identify` read frames and write identities; they never
+            # touch `dataset_items` crop files, so blocking a re-cut on a whole-store
+            # Identify pass (which can run for a long time) refuses work for no reason.
+            status = training_manager.status()
+            # The RUNNING kind counts only while it is running (`kind` is sticky after a
+            # job ends), but every QUEUED kind counts unconditionally — it has not started
+            # yet, which is exactly why it must not start into a moving crop set.
+            kinds = ([status.get("kind")] if status.get("running") else [])
+            kinds += [j.get("kind") for j in (status.get("queue") or [])]
+            if any(k in _CROP_EMBED_KINDS for k in kinds):
+                raise HTTPException(
+                    status_code=409,
+                    detail="a training job is running or queued; a re-cut would move the "
+                           "crops it is embedding",
+                )
+            result = cleanup_manager.start_recut(store, _resolve_recut_geometry(req.geometry))
         else:
             raise HTTPException(
-                status_code=400, detail=f"kind must be 'nonmotion' or 'orphan', got {req.kind!r}"
+                status_code=400,
+                detail=f"kind must be 'nonmotion', 'orphan' or 'recut', got {req.kind!r}",
             )
         # A single job at a time; a concurrent request is refused rather than enqueued.
         if not result.get("started"):
@@ -2637,20 +2733,45 @@ def create_app(
         # count removed. crop_path is our own DB value, but realpath-contain it under
         # dataset_root anyway before unlinking (defence in depth), and swallow OSError
         # (an already-gone file is fine).
+        #
+        # EVERY GEOMETRY VARIANT goes, not just the row's current crop_path. A re-cut no
+        # longer deletes the file it supersedes (that is what makes a geometry move
+        # reversible), so a row can own several files: `cat_5/123_456.jpg` alongside
+        # `cat_5/letterbox/123_456.jpg` and so on. Removing only the current one leaves
+        # the others behind with no row — and `recut`'s relink branch trusts that a file
+        # at a target path IS that row's crop there, so the next move would adopt an
+        # orphan cut from a PREVIOUS bbox: stamp, bbox column and pixels silently
+        # disagreeing. Crop files may outlive a geometry move; they must never outlive
+        # their row.
+        #
+        # Globbed rather than enumerated from a list of known conventions, because a
+        # store can hold a stamp this build cannot parse (some other build wrote it) and
+        # that directory has to be swept too.
         root = os.path.realpath(store.dataset_root)
         removed_files = 0
         for item in removed:
             rel = item.get("crop_path")
             if not rel:
                 continue
-            abs_path = os.path.realpath(os.path.join(store.dataset_root, rel))
-            if os.path.commonpath([root, abs_path]) != root:
-                continue
-            try:
-                os.remove(abs_path)
-                removed_files += 1
-            except OSError:
-                pass
+            subdir, base = os.path.split(rel)
+            # The row's own crop_path may already be inside a geometry directory, so take
+            # the CAT directory (the first component) as the search root.
+            cat_dir = subdir.split(os.sep)[0] if subdir else ""
+            # `glob.escape` the parts that come from config/DB: only the "*" we add is
+            # meant to be magic, and a dataset root containing "[" would otherwise make
+            # the pattern match nothing and silently skip the delete.
+            stem = glob.escape(os.path.join(store.dataset_root, cat_dir))
+            candidates = glob.glob(os.path.join(stem, glob.escape(base)))
+            candidates += glob.glob(os.path.join(stem, "*", glob.escape(base)))
+            for abs_candidate in candidates:
+                abs_path = os.path.realpath(abs_candidate)
+                if os.path.commonpath([root, abs_path]) != root:
+                    continue
+                try:
+                    os.remove(abs_path)
+                    removed_files += 1
+                except OSError:
+                    pass
         return removed_files
 
     @app.post("/api/label")
@@ -2872,6 +2993,7 @@ def create_app(
         qualities = list(req.qualities) if req.qualities else None
         excluded = _resolve_exclusions(req.exclude_cat_ids)
         geometry = _resolve_geometry(req.geometry)
+        _refuse_during_recut()
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Fewer than 2 crops or 2 distinct
@@ -2901,8 +3023,8 @@ def create_app(
             hints: "list[str]" = []
             if geometry and n_crops == 0:
                 hints.append(
-                    f"No crops are cut at geometry {geometry!r} yet — re-cut them "
-                    "(compute.tools.recut_crops) or validate at the current one."
+                    f"No crops are cut at geometry {geometry!r} yet — re-cut them from "
+                    "the Tools page (Crop shape) or validate at the current one."
                 )
             if excluded:
                 hints.append(
@@ -3028,6 +3150,7 @@ def create_app(
         qualities = list(req.qualities) if req.qualities else None
         excluded = _resolve_exclusions(req.exclude_cat_ids)
         geometry = _resolve_geometry(req.geometry)
+        _refuse_during_recut()
 
         # Cheap cold-start pre-check on the labelled-crop counts FIRST — before the
         # (seconds-long, torch-importing) ensure_available. Same ordering rationale
@@ -3046,8 +3169,8 @@ def create_app(
             hints: "list[str]" = []
             if geometry and n_crops == 0:
                 hints.append(
-                    f"No crops are cut at geometry {geometry!r} yet — re-cut them "
-                    "(compute.tools.recut_crops) or build at the current one."
+                    f"No crops are cut at geometry {geometry!r} yet — re-cut them from "
+                    "the Tools page (Crop shape) or build at the current one."
                 )
             if excluded:
                 hints.append(

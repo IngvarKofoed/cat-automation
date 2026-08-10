@@ -325,6 +325,43 @@ def test_manager_orphan_end_to_end(tmp_path):
     assert not os.path.exists(orphan)
 
 
+def test_manager_recut_end_to_end(tmp_path):
+    # The third job kind, driven through the manager like its two siblings above. What
+    # this protects is the wiring no other test crosses: `recut_plan`'s target staying in
+    # lockstep with the target handed to `recut_crops.recut` two lines later, and the
+    # progress closure's true/false contract with recut()'s cancel-on-falsy convention.
+    # Every other recut test either drives `recut_crops` directly against a bare Store or
+    # is blocked by a busy-training fake before `start_recut` is reached.
+    #
+    # Targets `letterbox`, whose margin equals legacy's, so the move is a COPY — file I/O
+    # only. That keeps this test cv2-free like the rest of the file; a margin change would
+    # need a decodable frame.
+    store = _store(tmp_path)
+    cat = store.create_cat("A")
+    row_id = store.add(_frame(1, motion=True), recv_ts_ms=1_001)
+    rel = os.path.join(f"cat_{cat['id']}", f"{row_id}_1001.jpg")
+    abs_path = os.path.join(store.dataset_root, rel)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "wb") as fh:
+        fh.write(_JPEG)
+    assert store.add_dataset_items([{
+        "frame_id": row_id, "label_kind": "identified", "cat_id": cat["id"],
+        "quality": "gallery", "bbox": [0, 0, 10, 10], "crop_path": rel,
+    }]) == 1
+
+    mgr = CleanupManager()
+    result = _run_to_completion(mgr, lambda: mgr.start_recut(store, "letterbox"))
+
+    assert result["kind"] == "recut" and result["target"] == "letterbox"
+    assert result["copied"] == 1 and result["recut"] == 0 and result["failed"] == 0
+    assert result["rows_updated"] == 1 and result["canceled"] is False
+    moved = store.labeled_crops(("identified",))[0]
+    assert moved["geometry"] == "letterbox"
+    assert os.path.isfile(moved["crop_path"])
+    # The superseded crop is KEPT — that is what makes the move reversible.
+    assert os.path.isfile(abs_path)
+
+
 def test_manager_refuses_second_job_while_running(tmp_path):
     store = _store(tmp_path)
     _seed(store, n_motion=1, n_still=500)

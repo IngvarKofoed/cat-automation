@@ -1403,3 +1403,95 @@ a clean one.
      lone `"` was always legal and probe.py's report builders rely on it, so collapsing the
      delimiter to one character reported three false positives there — a guard that cried
      wolf would be deleted, taking the real check with it.
+
+445. New admin **Tools** page (last tab) resolves the geometry blocker from the browser: a
+     census of what crop shapes the labelled set holds, a target picker, a per-branch plan,
+     and a cancellable job. The four messages that sent the operator to `compute.tools.recut_crops`
+     now name the page instead. Housekeeping moved here too (non-motion purge, orphan sweep,
+     Clear all frames); Start narrows to stage + collection.
+     Spec: docs/specs/2026-08-10-admin-tools-page.md.
+
+446. Cutting is now the LAST resort, not the only path. `recut` routes each row three ways:
+     **relink** (a file already sits at the target path — move the stamp, touch no pixels),
+     **copy** (another kept file carries the target's MARGIN, so the pixels are right and only
+     the path is wrong), **recut** (decode the frame). Only the last needs a bbox and a live
+     frame, so a `letterbox`-only flip strands nothing — it alters no pixel. For a fixed
+     margin exactly TWO geometries exist (letterbox on/off), so finding a pixel-equal file is
+     two stats, not a directory walk.
+
+447. Superseded crops are KEPT, for the CLI too, so a geometry move is reversible without a
+     source frame — and returning to an arm already visited is a pure relink, long after those
+     frames evicted. That is what makes A/B-ing several crop shapes a sequence of quick hops.
+     Cost: one copy of the labelled set per shape tried, outside the frame store's byte cap,
+     reclaimed only by hand. `old_files_removed` became `old_files_kept`.
+
+448. Keeping them broke an invariant two other paths relied on: a crop file may outlive a
+     geometry MOVE but never its ROW. `_delete_crop_files` removed only the row's current
+     `crop_path`, so a relabel left the other shapes' files orphaned and a later hop would
+     `relink` one cut from the PREVIOUS bbox — stamp, bbox column and pixels disagreeing, with
+     nothing downstream able to notice. It now globs every variant.
+
+449. `update_dataset_geometry`'s compare-and-swap gained `bbox`. Path alone could not catch a
+     relabel to the SAME cat: it re-commits at the identical legacy path, so id and path both
+     still match a row the run never read. The box is the exact predicate — it is what must be
+     unchanged for the cut pixels to still belong to that row. Compared with `IS`, so a NULL
+     box is null-safe rather than matching nothing.
+
+450. `recut`'s `on_progress` is now the cancel signal too (falsy stops), the convention
+     `embed_paths` defines and the managers produce — but it BREAKS and returns the partial
+     summary rather than raising as that one does, since a canceled run still has to report
+     what it moved. Load-bearing consequence: the CLI's own `progress` returned `None`, which
+     is falsy, so it had to start returning True or the CLI would stop after one batch and
+     print it as a clean success.
+
+451. `POST /api/cleanup/run` takes a third kind, `recut`, with `GET /api/recut/plan` as its
+     separate reader (a census plus a per-branch breakdown is nothing like the estimate
+     endpoint's `{count, bytes}`). `geometry` is REQUIRED there — absent means legacy for a
+     READ and would mean an unrequested whole-set move here — so legacy gets the CLI's own
+     `legacy` sentinel, or it becomes the one target reachable onto but never back from.
+     Absent on the PLAN endpoint still means census-only.
+
+452. Re-cut and the training queue now refuse each other (409, both directions). A build
+     embedding the labelled set while a re-cut moves it reads a set that no longer exists as
+     read, and `_embed_items` skips a missing file in SILENCE — a quietly smaller gallery, not
+     an error. Advisory only: the two managers share no lock and the CLI bypasses it, which is
+     acceptable now that superseded crops are kept.
+
+453. Two UI traps the browser pass caught. The census refresh was keyed on a running->idle
+     TRANSITION, which an instant relink job never shows — so the pre-move census sat there
+     reading "nothing happened"; it now keys on a flag set when we start the job. And the
+     re-cut button owns its own `disabled`: `renderCleanup`'s shared sweep assigns
+     `b.disabled = c.running` unconditionally, re-enabling on every idle poll a button the
+     card had disabled for having no target.
+
+454. Chasing a phantom stale census cost most of that browser pass: the browser was serving a
+     CACHED `/admin` from before the edit, so every check ran against the old JS. Verify the
+     page under test is the page on disk (`innerHTML.includes('<a new symbol>')`) before
+     believing any UI symptom — a cache-busting query param is the cheap fix.
+
+455. Review repairs. `relink` now re-checks the target file exists at WRITE time. `_route`
+     decided it at read time and the branch does no I/O, so unlike copy/recut nothing else
+     would notice it had gone — a manual reclaim or a concurrent relabel's variant-delete
+     landing mid-run would stamp the row onto a missing file and report it MOVED, the one
+     outcome the module promises cannot happen. Narrows the window rather than closing it.
+
+456. The recut/training lockout is narrowed to the kinds that actually embed crops
+     (`feasibility`, `gallery-build`), mirroring `_refuse_during_recut`'s own narrowing.
+     `identify`/`visit-identify` read frames and write identities, never touching
+     `dataset_items` files, so a whole-store Identify pass was refusing a re-cut for no
+     reason. A QUEUED embed kind still blocks even when nothing is running yet.
+
+457. Two Tools-page repairs. A failed plan's error was written and then overwritten by
+     "Planning…" in the same tick (no `return` before the shared re-render tail), so the
+     card stuck on a progress word with no hint the request failed. And the crop-shape
+     select is disabled while any job runs — changing it mid-run re-planned a different
+     target over a card whose job readout belonged to the running one, and the
+     post-completion re-plan reads the select, so it then described a shape that job never
+     moved to.
+
+458. `CleanupManager.start_recut` gained the end-to-end test its two sibling kinds already
+     had. Every other recut test drove `recut_crops` directly or was blocked by a busy
+     fake before `start_recut` was reached, so nothing checked the manager's own wiring —
+     `recut_plan`'s target staying in lockstep with the one handed to `recut`, and the
+     progress closure's cancel contract. Targets `letterbox` so the move is a copy, keeping
+     the test cv2-free like the rest of that file.

@@ -6474,21 +6474,32 @@ class Store:
             "source": "labeled",
         }
 
-    def update_dataset_geometry(self, moves: "list[tuple[int, str, str | None, str]]") -> "list[int]":
+    def update_dataset_geometry(
+        self, moves: "list[tuple[int, str, str | None, str, str | None]]"
+    ) -> "list[int]":
         """Re-point label rows at re-cut crop files; return the ids actually updated.
 
         The re-cut tool's write path (``compute/tools/recut_crops.py``): each move is
-        ``(dataset_item_id, new_crop_path, geometry, expected_old_crop_path)``, where the
-        paths are dataset-root-RELATIVE (matching what ``add_dataset_items`` stores) and
-        ``geometry`` is the crop convention its pixels now follow (``None`` = legacy).
+        ``(dataset_item_id, new_crop_path, geometry, expected_old_crop_path,
+        expected_bbox)``, where the paths are dataset-root-RELATIVE (matching what
+        ``add_dataset_items`` stores) and ``geometry`` is the crop convention its pixels
+        now follow (``None`` = legacy).
 
-        The write is a COMPARE-AND-SWAP on ``crop_path``, not a bare id match, because
-        ``dataset_items.id`` is ``INTEGER PRIMARY KEY`` with no ``AUTOINCREMENT``: SQLite
-        hands a deleted rowid straight back to the next insert, and
+        The write is a COMPARE-AND-SWAP on ``(crop_path, bbox)``, not a bare id match,
+        because ``dataset_items.id`` is ``INTEGER PRIMARY KEY`` with no ``AUTOINCREMENT``:
+        SQLite hands a deleted rowid straight back to the next insert, and
         ``/api/label/relabel`` deletes a visit's rows and re-commits the same frames — so
         the id the tool read can belong to a DIFFERENT, freshly-labelled row by the time
-        it writes. Matching on the path it actually read makes such a row fail to match,
-        so it is never reported as moved and its crop file is never unlinked.
+        it writes.
+
+        ``bbox`` is in the swap because ``crop_path`` alone does not separate them: a
+        relabel to the SAME cat re-commits at the identical legacy path, so the id and the
+        path both match a row this run never read, and the move would stamp it with pixels
+        cut from the PREVIOUS box — a row whose stamp, ``bbox`` column and actual pixels
+        disagree, which nothing downstream can detect. The box is the exact predicate: it
+        is what must be unchanged for the cut pixels to still belong to this row. Compared
+        with ``IS`` rather than ``=`` so a NULL box compares null-safely instead of
+        matching nothing.
 
         This exists because the alternative through the existing public API —
         ``delete_dataset_items`` then ``add_dataset_items`` — is not equivalent for a
@@ -6509,17 +6520,17 @@ class Store:
         if not moves:
             return []
         prepared = [
-            (str(path), geom, int(item_id), str(old_path))
-            for item_id, path, geom, old_path in moves
+            (str(path), geom, int(item_id), str(old_path), bbox)
+            for item_id, path, geom, old_path, bbox in moves
         ]
         updated: "list[int]" = []
         with self._lock:
             try:
-                for path, geom, item_id, old_path in prepared:
+                for path, geom, item_id, old_path, bbox in prepared:
                     cur = self._conn.execute(
                         "UPDATE dataset_items SET crop_path = ?, geometry = ?"
-                        " WHERE id = ? AND crop_path = ?",
-                        (path, geom, item_id, old_path),
+                        " WHERE id = ? AND crop_path = ? AND bbox IS ?",
+                        (path, geom, item_id, old_path, bbox),
                     )
                     if cur.rowcount:
                         updated.append(item_id)
@@ -6528,6 +6539,59 @@ class Store:
                 self._conn.rollback()
                 raise
         return updated
+
+    def recut_plan(self, target: "str | None", with_rows: bool = False) -> dict:
+        """What a crop-geometry move to ``target`` would do — the Tools page's plan.
+
+        Returns ``{target, census, at_target, at_target_missing, movable{recut,copy,relink},
+        blocked{frame_gone,no_box}}``, plus ``rows`` when ``with_rows`` — the annotated row
+        dicts ``recut`` consumes. The endpoint drops that key; the cleanup job is its only
+        consumer, and carrying it here is what stops the run path needing its own
+        connection and its own copy of the read.
+
+        ``census`` is target-INDEPENDENT (every stored stamp, commonest first), so it
+        answers "what conventions does the labelled set hold" before a target is chosen —
+        which is the question behind a Build refusing.
+
+        Runs on its OWN short-lived connection, like ``lighting_histogram`` /
+        ``tuning_calendar`` / ``count_unidentified``: it walks every ``dataset_items`` row
+        and stats up to three files per row, and the collector writes continuously through
+        the shared write-locked connection (the starvation entries 102-105 removed).
+
+        ``recut_crops`` is imported INSIDE the method: that module imports ``Store``
+        lazily to keep the dependency one-way, so a module-scope import here would invert
+        it into a cycle.
+        """
+        from compute.tools import recut_crops
+
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            rows = recut_crops.read_rows(
+                conn, self._media_root, target, self._dataset_root
+            )
+        finally:
+            conn.close()
+        out = {
+            "target": target,
+            "census": [
+                {"geometry": geom, "count": count}
+                for geom, count in recut_crops.census(rows)
+            ],
+            "at_target": sum(1 for r in rows if r["at_target"]),
+            "at_target_missing": sum(1 for r in rows if r["at_target_missing"]),
+            "movable": {
+                m: sum(1 for r in rows if r["move"] == m)
+                for m in ("recut", "copy", "relink")
+            },
+            "blocked": {
+                b: sum(1 for r in rows if r["blocked"] == b)
+                for b in ("frame_gone", "no_box")
+            },
+        }
+        if with_rows:
+            out["rows"] = rows
+        return out
 
     def count_identified_crops(
         self,

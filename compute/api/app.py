@@ -309,6 +309,35 @@ class LightingThresholdRequest(BaseModel):
         return v
 
 
+class CropGeometryRequest(BaseModel):
+    """Body of ``POST /api/crop-geometry``: the crop shape NEW labels are cut at
+    (crop-geometry-for-new-labels spec).
+
+    ``geometry`` is REQUIRED-but-nullable, the same shape as
+    ``LightingThresholdRequest``/``ModelThresholdRequest``: explicit ``null`` means
+    LEGACY (squash resize, no context margin), which is a real choice an operator makes
+    — so it must be distinguishable from an empty or stripped body, which should be a
+    422 rather than silently returning every future crop to legacy.
+
+    The VALUE is validated in the route by the same ``_resolve_geometry`` a build and a
+    validation run use, so a descriptor accepted here is one a build can ask for. A
+    non-string is rejected here: pydantic would coerce ``13`` to ``"13"``, which
+    ``parse_geometry`` then reads as an unknown token — a 400 that names the wrong
+    problem.
+    """
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    geometry: "str | None" = Field()
+
+    @field_validator("geometry", mode="before")
+    @classmethod
+    def _reject_non_string(cls, v):
+        if v is not None and not isinstance(v, str):
+            raise ValueError("must be a geometry string or null")
+        return v
+
+
 class ModelThresholdRequest(BaseModel):
     """Body of ``POST /api/training/models/{id}/threshold``: set (or clear) a
     model version's identification threshold (open-set-scoring-and-calibration spec).
@@ -462,6 +491,14 @@ _LABEL_DEFAULT_ORACLE = "yolo-serial"
 # 1:1. Validated in the route (400) before any crop work; the store re-validates the
 # resulting ``label_kind`` as its own safety net.
 _LABEL_DECISIONS = ("identified", "unknown_cat", "not_cat")
+
+# Settings key for the crop shape NEW crops are cut at (crop-geometry-for-new-labels
+# spec). Absent = legacy, which is byte-for-byte what every label did before this existed,
+# so an untouched install changes nothing. Deliberately NOT reset by `clear()`, unlike the
+# id-relative `nonmotion_evicted_through` (entry 305): this is a shape preference, not a
+# statement about frame ids that restart at 1 — and the labelled crops it governs survive a
+# wipe too, so resetting it would silently return new labels to legacy.
+_CROP_GEOMETRY_KEY = "crop_geometry"
 
 
 class CatCreateRequest(BaseModel):
@@ -2676,13 +2713,47 @@ def create_app(
                 )
         return cat_id
 
+    def _stored_crop_geometry() -> "tuple[str | None, float, str | None]":
+        # The crop shape NEW crops are cut at → (geometry, margin, unreadable_raw).
+        # `geometry` is the canonical stamp (None = legacy) and `margin` its pixel half;
+        # `unreadable_raw` is None normally, or the stored string when it could not be
+        # parsed (see the crop-geometry-for-new-labels spec).
+        #
+        # An UNREADABLE value falls back to legacy and is cut + stamped honestly as legacy
+        # — it never guesses at a convention it cannot reproduce, which is the reading
+        # `canonical_geometry` takes for a stored stamp. Labelling deliberately keeps
+        # working rather than failing the request: a labelling session is the operator's
+        # attention, while a legacy-cut crop is recoverable with a re-cut. What must not
+        # happen is silence, so the raw value is returned for every surface to render as
+        # an error instead of as "legacy". Near-unreachable in practice — POST validates
+        # on write — and exists for a value some other build or a hand-edit put there.
+        raw = store.get_setting(_CROP_GEOMETRY_KEY)
+        if not raw:
+            return None, 0.0, None
+        # Lazy like every other `compute.identification.embed` import here (see
+        # `_resolve_geometry`): that module keeps torch out of its module scope, so this is
+        # cheap — inline to match the surrounding discipline.
+        from compute.identification.embed import geometry_descriptor, parse_geometry
+
+        try:
+            letterbox, margin = parse_geometry(raw)
+            # CANONICALISE rather than stamping `raw`: a build compares its target with
+            # `geometry = ?`, so stamping `m10.0` where the build asks `m10` would make
+            # every new crop invisible to it — the exact divergence this setting closes.
+            return geometry_descriptor(letterbox, margin), margin, None
+        except ValueError:
+            return None, 0.0, str(raw)
+
     def _commit_label(decision: str, cat_id: "int | None", frames: "list[LabelFrame]") -> "tuple[int, int]":
         # Materialise each cat crop FIRST then record its row (the store's ordering
         # contract: a crash orphans a harmless crop file, never a row without its crop),
         # and write the dataset_items batch. Assumes the request was already validated
         # by _validate_label. Returns (inserted_rows, crops_written).
         dataset_root = store.dataset_root
-        subdir = f"cat_{cat_id}" if decision == "identified" else "cat_unknown_cat"
+        # ONE read per request, not per frame: a visit is tens of frames and this is the
+        # store's shared write-locked connection. Reading it per frame would also let a
+        # mid-visit setting change split one visit across two conventions.
+        geometry, margin, _unreadable = _stored_crop_geometry()
         rows: "list[dict]" = []
         crops_written = 0
         # One batched frames read for the whole visit (recv_ts + path per frame) instead
@@ -2715,12 +2786,22 @@ def create_app(
             recv_ts, src_path = src
             if not os.path.isfile(src_path):
                 continue  # row still live but its JPEG is gone from disk
-            rel_path = os.path.join(subdir, f"{fr.frame_id}_{recv_ts}.jpg")
+            # Through the SHARED `crop_rel_path` (not a local path rule), so a crop cut
+            # here lands on exactly the path a re-cut to this geometry would have written
+            # — which is what lets a later re-cut `relink` it instead of needing its frame.
+            rel_path = crops.crop_rel_path(cat_id, decision, fr.frame_id, recv_ts, geometry)
             dest_abs = os.path.join(dataset_root, rel_path)
-            if not crops.materialize(src_path, fr.bbox, dest_abs, root=dataset_root):
+            # `margin` is the geometry's PIXEL half; the letterbox half is a read-time
+            # resize the embedder applies, so it reaches the stamp and the path but never
+            # the bytes. A margin cannot fail where a legacy cut would have succeeded — it
+            # only expands a box that `_clamp_box` then trims at the frame edge.
+            if not crops.materialize(
+                src_path, fr.bbox, dest_abs, root=dataset_root, margin=margin
+            ):
                 continue  # crop couldn't be cut (bad box / write error) — skip its row
             crops_written += 1
             row["crop_path"] = rel_path
+            row["geometry"] = geometry
             rows.append(row)
         try:
             inserted = store.add_dataset_items(rows)
@@ -2773,6 +2854,42 @@ def create_app(
                 except OSError:
                     pass
         return removed_files
+
+    @app.get("/api/crop-geometry")
+    def api_crop_geometry_get():
+        # The crop shape NEW labels are cut at. `geometry: null` = legacy. `readable`
+        # false means the STORED value could not be parsed and legacy is being used
+        # instead — surfaced rather than swallowed, since otherwise it is indistinguishable
+        # from a deliberate legacy setting (see `_stored_crop_geometry`).
+        geometry, margin, unreadable = _stored_crop_geometry()
+        return {
+            "geometry": geometry,
+            "margin": margin,
+            "readable": unreadable is None,
+            "stored": unreadable,
+        }
+
+    @app.post("/api/crop-geometry")
+    def api_crop_geometry_set(req: CropGeometryRequest):
+        # Validated by the SAME `_resolve_geometry` a build and a validation run use, so a
+        # value accepted here is one a build can ask for and one this canonicalises
+        # identically — two spellings of one convention can never be stored as two.
+        # Defined further down in this factory; both are plain closures resolved at call
+        # time, and reusing it is the point: a second copy of the validation is how the
+        # setting and the build would come to disagree about what `m10.0` means.
+        resolved = _resolve_geometry(req.geometry)
+        # Stored as the empty string for legacy, never a deleted key: `get_setting`
+        # returns None for both, but writing the choice makes it visible in the settings
+        # table as a decision someone made rather than one never taken.
+        store.set_setting(_CROP_GEOMETRY_KEY, resolved or "")
+        # ECHO the value just validated, like `/api/lighting` and `/api/location` do —
+        # never a fresh read. `set_setting` and `get_setting` take the store lock
+        # separately, and this route runs in Starlette's threadpool, so a second client's
+        # write can land between them: the response would then pair THIS request's geometry
+        # with THAT one's margin, an internally inconsistent answer.
+        from compute.identification.embed import parse_geometry
+
+        return {"geometry": resolved, "margin": parse_geometry(resolved)[1]}
 
     @app.post("/api/label")
     def api_label(req: LabelRequest):

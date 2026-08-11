@@ -78,6 +78,10 @@ import sqlite3
 import sys
 
 from compute.dataset import crops
+# `crop_rel_path` lives in `dataset.crops` (see there): the label-commit path needs the
+# same rule, and the API importing this CLI tool to get it would be backwards layering.
+# Re-exported under this module's own name so existing callers keep resolving.
+from compute.dataset.crops import crop_rel_path
 from compute.identification.embed import (
     canonical_geometry,
     geometry_descriptor,
@@ -125,25 +129,6 @@ def _parse_bbox(text: "str | None") -> "list[float] | None":
     except ValueError:
         return None
     return parts if len(parts) >= 4 else None
-
-
-def crop_rel_path(
-    cat_id: "int | None", label_kind: str, src_frame_id: int, src_recv_ts: int,
-    geometry: "str | None",
-) -> str:
-    """The dataset-root-relative path a crop of this row at ``geometry`` lives at.
-
-    The LEGACY form is byte-for-byte what the label route writes
-    (``cat_<id>/<frame_id>_<recv_ts>.jpg``, or ``cat_unknown_cat/…`` for a catless
-    kind), so re-cutting back to legacy lands on exactly the path a fresh label would
-    have used and the two conventions cannot diverge. A non-legacy geometry gets its own
-    subdirectory named by the descriptor, which keeps each convention's files together
-    and — more importantly — means a re-cut NEVER writes over the crop it is replacing
-    until its row has moved.
-    """
-    subdir = f"cat_{cat_id}" if label_kind == "identified" else "cat_unknown_cat"
-    base = f"{src_frame_id}_{src_recv_ts}.jpg"
-    return os.path.join(subdir, base) if geometry is None else os.path.join(subdir, geometry, base)
 
 
 def margin_twins(margin: float) -> "tuple[str | None, str | None]":

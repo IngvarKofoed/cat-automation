@@ -1547,3 +1547,60 @@ a clean one.
      `_KNN_ROWS` and drives `run_feasibility` itself at five block sizes. Entry 411/433's
      hollow-test trap, third instance — the tell each time is a test that never reaches
      the code it names.
+
+467. New labels are cut and stamped at a persisted `crop_geometry` setting
+     (`GET`/`POST /api/crop-geometry`; the editable control is Tools → Crop shape).
+     `_commit_label` cut with no margin and stamped nothing, so every label landed LEGACY
+     no matter what the labelled set held — a store re-cut to one shape re-split the moment
+     anyone labelled again, entry 441's open gap. Unset still means legacy, so an untouched
+     install is byte-identical. Spec: docs/specs/2026-08-11-crop-geometry-for-new-labels.md.
+
+468. `crop_rel_path` moved from `compute.tools.recut_crops` into `compute.dataset.crops`,
+     which both the commit path and the tool depend on — the API importing a CLI tool was
+     backwards. Load-bearing, not tidying: a fresh crop must land on exactly the path a
+     re-cut to that shape would write, or the re-cut cannot RELINK it and re-cuts from the
+     frame instead, which fails outright once that frame has evicted.
+
+469. The read path CANONICALISES the stored stamp, and an unreadable value falls back to
+     legacy while reporting `readable:false`. A build compares its target with
+     `geometry = ?`, so stamping `m10.0` where a build asks `m10` makes every new crop
+     invisible to it — reported as zero crops, never as an error. Labelling deliberately
+     survives a bad value: a session is the operator's attention, a legacy crop is re-cuttable.
+
+470. "The setting disagrees with the store" means it is not the census's DOMINANT shape,
+     never that other shapes merely exist — a store legitimately holds several at once
+     (today 10 at `letterbox+m25`, 2 legacy), so difference would warn permanently and
+     train the operator to ignore the one readout that matters. Dominance is exactly the
+     condition under which new labels stop joining the set a build enrols.
+
+471. `.note.warn` / `.note.bad` are SAME-ELEMENT rules, so a nested `<span class="warn">`
+     inside a `.note` container styles nothing, and bare `.dim` has no rule at all. Every
+     new readout puts the state on the container's own class list. Entry 287's trap in CSS
+     form; caught only by reading COMPUTED STYLE in the browser (amber `rgb(216,166,87)`,
+     red `rgb(217,100,122)`), which is the check that rule demands.
+
+472. A canonicalisation test that drove `POST /api/crop-geometry` asserted NOTHING: the
+     endpoint canonicalises before storing, so the read path could stamp `raw` verbatim and
+     the test still passed — proven by injecting exactly that. It now writes the
+     non-canonical value the way a hand-edit would and reads the stamp off the committed
+     CROP. Entries 411/433/466's hollow-test trap, fourth instance, same tell.
+
+473. `parse_geometry` now rejects a NON-FINITE margin. `< 0` does not catch inf or nan
+     (both compare False) and `%g` renders them back as `minf`/`mnan`, so such a stamp
+     round-tripped as valid and reached the cutter: margin=inf raises OverflowError inside
+     `_clamp_box`, which `materialize` does NOT catch — a 500 on EVERY label — and nan
+     returns False for every frame, so a label silently writes no rows. Guarded at the
+     parser both the request path and the stored-value read go through, not at one route.
+
+474. The Tools crop-shape select NAMES a stored shape it cannot offer. `POST` accepts any
+     parseable descriptor, not just the three `GEOMETRY_ARMS`, so a value another LAN client
+     set (there is no auth) leaves `selectedIndex` -1 and the control BLANK — and when that
+     value is also the census's dominant shape, the dominance branch prints nothing, so
+     blank was the only signal. Reading blank as "unset" is how an operator would replace a
+     working setting with the exact divergence the card exists to prevent.
+
+475. `POST /api/crop-geometry` ECHOES the value it validated rather than re-reading the
+     store for the margin, matching `/api/lighting` and `/api/location`. `set_setting` and
+     `get_setting` take the store lock separately and the route runs in Starlette's
+     threadpool, so a second client's write landing between them returned this request's
+     geometry paired with that one's margin.

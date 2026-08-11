@@ -957,3 +957,241 @@ def test_a_SAME_CAT_relabel_mid_run_is_not_matched_by_the_swap(tmp_path):
     labelled = store.labeled_crops()
     assert {r["geometry"] for r in labelled} == {None}
     assert all(os.path.isfile(r["crop_path"]) for r in labelled)
+
+
+# --- the crop shape NEW labels are cut at ---------------------------------------
+# See docs/specs/2026-08-11-crop-geometry-for-new-labels.md. The setting these cover is
+# what stops a freshly re-cut store re-splitting the moment the operator labels again
+# (changelog entry 441): before it, `_commit_label` cut with no margin and stamped nothing,
+# so every new label landed legacy no matter what the rest of the labelled set held.
+
+
+def _labelled_store(tmp_path):
+    """A store + API client + one cat + one detected frame, ready to label."""
+    store = _store(tmp_path)
+    cat = store.create_cat("A")
+    fid = _add_frame(store, 1, width=120, height=90)
+    return store, _api(store), cat, fid
+
+
+def _label(client, cat_id, fid, *, route="/api/label"):
+    resp = client.post(route, json={
+        "decision": "identified",
+        "cat_id": cat_id,
+        "frames": [{"frame_id": fid, "bbox": [20, 20, 60, 50], "quality": "gallery"}],
+    })
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_unset_setting_lands_a_label_at_LEGACY(tmp_path):
+    # The no-change guarantee: an install that never touches the setting behaves exactly
+    # as it did before it existed — NULL stamp, flat path, margin 0.
+    store, client, cat, fid = _labelled_store(tmp_path)
+
+    assert _label(client, cat["id"], fid)["crops"] == 1
+    row = store.labeled_crops()[0]
+    assert row["geometry"] is None
+    assert row["crop_path"].endswith(os.path.join(f"cat_{cat['id']}", f"{fid}_1001.jpg"))
+    assert os.path.isfile(row["crop_path"])
+
+
+def test_the_setting_stamps_AND_places_a_new_label(tmp_path):
+    # letterbox is margin-0, so this changes the STAMP and the PATH but not one pixel —
+    # the asymmetry the whole design rests on.
+    store, client, cat, fid = _labelled_store(tmp_path)
+    assert client.post("/api/crop-geometry", json={"geometry": "letterbox"}).status_code == 200
+
+    _label(client, cat["id"], fid)
+    row = store.labeled_crops()[0]
+    assert row["geometry"] == "letterbox"
+    # Under the geometry subdirectory, which is what a later re-cut looks for.
+    assert os.path.join(f"cat_{cat['id']}", "letterbox", f"{fid}_1001.jpg") in row["crop_path"]
+    assert os.path.isfile(row["crop_path"])
+    # Byte-identical to the legacy cut of the same box: only margin touches pixels.
+    legacy = crops.crop_bytes(store.path_for(fid), [20, 20, 60, 50])
+    with open(row["crop_path"], "rb") as fh:
+        assert fh.read() == legacy
+
+
+def test_a_margin_setting_BAKES_the_margin_into_the_new_crop(tmp_path):
+    store, client, cat, fid = _labelled_store(tmp_path)
+    assert client.post(
+        "/api/crop-geometry", json={"geometry": "letterbox+m10"}
+    ).status_code == 200
+
+    _label(client, cat["id"], fid)
+    row = store.labeled_crops()[0]
+    assert row["geometry"] == "letterbox+m10"
+    # 40x30 box + 10% per edge -> 48x36. Read the pixels, not just the stamp: a stamp
+    # without the margin behind it is the silent mismatch the stamp exists to prevent.
+    img = cv2.imdecode(np.fromfile(row["crop_path"], dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert (img.shape[1], img.shape[0]) == (48, 36)
+
+
+def test_a_fresh_label_is_RELINKABLE_by_a_later_recut(tmp_path):
+    # Why `crop_rel_path` is shared rather than re-derived in the commit path. A crop cut
+    # here must land on exactly the path a re-cut to that geometry would have written, or
+    # the re-cut cannot see it and re-cuts from the frame instead — which fails outright
+    # once that frame has evicted.
+    store, client, cat, fid = _labelled_store(tmp_path)
+    client.post("/api/crop-geometry", json={"geometry": "letterbox"})
+    _label(client, cat["id"], fid)
+
+    plan = store.recut_plan("letterbox")
+    assert plan["at_target"] == 1 and plan["at_target_missing"] == 0
+    # And hopping to its margin twin is a COPY (pixel-equal), never a recut needing the frame.
+    assert store.recut_plan(None)["movable"] == {"recut": 0, "copy": 1, "relink": 0}
+
+
+def test_a_RELABEL_follows_the_current_setting_and_drops_the_old_variant(tmp_path):
+    # A re-label is a fresh cut. Preserving each crop's existing stamp instead would let
+    # the store drift away from the setting through ordinary corrections.
+    store, client, cat, fid = _labelled_store(tmp_path)
+    _label(client, cat["id"], fid)                      # lands legacy
+    legacy_path = store.labeled_crops()[0]["crop_path"]
+
+    client.post("/api/crop-geometry", json={"geometry": "letterbox+m10"})
+    _label(client, cat["id"], fid, route="/api/label/relabel")
+
+    row = store.labeled_crops()[0]
+    assert row["geometry"] == "letterbox+m10"
+    assert os.path.isfile(row["crop_path"])
+    # `_delete_crop_files`' variant glob (entry 448) took the superseded file with it, so
+    # no orphan is left for a later relink to adopt with the wrong pixels.
+    assert not os.path.isfile(legacy_path)
+
+
+def test_an_UNREADABLE_setting_falls_back_to_legacy_and_SAYS_SO(tmp_path):
+    # Near-unreachable via the API (POST validates), so this is the hand-edit / other-build
+    # case. Labelling must keep working — a session is the operator's attention, while a
+    # legacy-cut crop is recoverable with a re-cut — but it must never read as a
+    # deliberate legacy setting.
+    store, client, cat, fid = _labelled_store(tmp_path)
+    store.set_setting("crop_geometry", "hexagon")
+
+    body = client.get("/api/crop-geometry").json()
+    assert body == {"geometry": None, "margin": 0.0, "readable": False, "stored": "hexagon"}
+
+    assert _label(client, cat["id"], fid)["crops"] == 1
+    row = store.labeled_crops()[0]
+    # Stamped legacy HONESTLY — never guessed at the convention it could not parse.
+    assert row["geometry"] is None
+    assert os.path.isfile(row["crop_path"])
+
+
+def test_the_setting_round_trips_CANONICALLY_through_the_endpoint(tmp_path):
+    # `m10.0` and `m10` are one convention, and token order is not identity.
+    store, client, _cat, _fid = _labelled_store(tmp_path)
+
+    assert client.post(
+        "/api/crop-geometry", json={"geometry": "m10.0"}
+    ).json()["geometry"] == "m10"
+    assert client.get("/api/crop-geometry").json()["geometry"] == "m10"
+    client.post("/api/crop-geometry", json={"geometry": "m25+letterbox"})
+    assert client.get("/api/crop-geometry").json()["geometry"] == "letterbox+m25"
+
+
+def test_a_NON_CANONICAL_stored_value_still_stamps_canonically(tmp_path):
+    # The read path canonicalises too, and this is the only way to prove it: the endpoint
+    # above canonicalises BEFORE storing, so driving it can never produce a non-canonical
+    # stored value — a test that went through POST would pass against a read path that
+    # stamped `raw` verbatim (verified: it does). Set the raw value the way a hand-edit or
+    # another build would, then read the stamp off the committed CROP.
+    #
+    # It matters because a build compares its target with `geometry = ?`: a crop stamped
+    # `m10.0` is invisible to a build asking `m10`, which reports zero crops rather than an
+    # error — the exact divergence this setting exists to close.
+    store, client, cat, fid = _labelled_store(tmp_path)
+    store.set_setting("crop_geometry", "m25.0+letterbox")
+
+    assert client.get("/api/crop-geometry").json()["geometry"] == "letterbox+m25"
+    _label(client, cat["id"], fid)
+
+    row = store.labeled_crops()[0]
+    assert row["geometry"] == "letterbox+m25"
+    # And the crop sits at the CANONICAL path, so a re-cut to that geometry relinks it.
+    assert os.path.join("letterbox+m25", f"{fid}_1001.jpg") in row["crop_path"]
+    assert store.recut_plan("letterbox+m25")["at_target"] == 1
+
+
+def test_setting_a_bad_or_missing_geometry_is_REFUSED(tmp_path):
+    store, client, _cat, _fid = _labelled_store(tmp_path)
+    client.post("/api/crop-geometry", json={"geometry": "letterbox"})
+
+    assert client.post("/api/crop-geometry", json={"geometry": "hexagon"}).status_code == 400
+    assert client.post("/api/crop-geometry", json={"geometry": "m-5"}).status_code == 400
+    # An EMPTY body is a 422, not a silent return of every future crop to legacy.
+    assert client.post("/api/crop-geometry", json={}).status_code == 422
+    # A number would coerce to "13" and then fail as an unknown token, naming the wrong
+    # problem; rejected at the field instead.
+    assert client.post("/api/crop-geometry", json={"geometry": 13}).status_code == 422
+    # None of the refusals moved the stored value.
+    assert client.get("/api/crop-geometry").json()["geometry"] == "letterbox"
+    # And explicit null IS a real choice: legacy.
+    assert client.post("/api/crop-geometry", json={"geometry": None}).status_code == 200
+    assert client.get("/api/crop-geometry").json()["geometry"] is None
+
+
+def test_the_setting_SURVIVES_clear(tmp_path):
+    # Unlike the id-relative `nonmotion_evicted_through` (entry 305), which must reset
+    # because frame ids restart at 1. This is a shape preference, and the labelled crops it
+    # governs survive a wipe too — resetting it would silently return new labels to legacy.
+    store, client, _cat, _fid = _labelled_store(tmp_path)
+    client.post("/api/crop-geometry", json={"geometry": "letterbox+m25"})
+
+    store.clear()
+
+    assert client.get("/api/crop-geometry").json()["geometry"] == "letterbox+m25"
+
+
+def test_parse_geometry_rejects_a_NON_FINITE_margin(tmp_path):
+    # `< 0` does not reject inf or nan (both compare False) and `%g` renders them back as
+    # `minf`/`mnan`, so before this guard a non-finite margin ROUND-TRIPPED as a valid stamp
+    # and reached the cutter. Consequences traced: margin=inf raises OverflowError inside
+    # `_clamp_box`, which `materialize` does NOT catch (it catches OSError/ValueError) — a
+    # 500 on EVERY label; margin=nan returns False for every frame, so a label silently
+    # writes no rows at all. Both persist until the setting is corrected.
+    for token in ("minf", "mnan", "m1e309", "letterbox+minf"):
+        with pytest.raises(ValueError, match="non-finite margin"):
+            parse_geometry(token)
+    # The negative case keeps its OWN message — a separate contract with its own test.
+    with pytest.raises(ValueError, match="negative margin"):
+        parse_geometry("m-10")
+    # Every legitimate value is untouched.
+    assert parse_geometry("letterbox+m25") == (True, 0.25)
+    assert parse_geometry("m12.5") == (False, 0.125)
+
+
+def test_a_non_finite_geometry_is_REFUSED_and_cannot_reach_a_label(tmp_path):
+    # End to end, through both doors: the request path 400s, and a value already stored
+    # (hand-edit, or written before the guard) reads as unreadable and cuts legacy rather
+    # than crashing the label.
+    store, client, cat, fid = _labelled_store(tmp_path)
+
+    assert client.post("/api/crop-geometry", json={"geometry": "minf"}).status_code == 400
+    assert client.post("/api/crop-geometry", json={"geometry": "mnan"}).status_code == 400
+
+    store.set_setting("crop_geometry", "minf")
+    assert client.get("/api/crop-geometry").json()["readable"] is False
+    # The label still lands, cut legacy — not a 500, and not zero rows.
+    assert _label(client, cat["id"], fid)["crops"] == 1
+    row = store.labeled_crops()[0]
+    assert row["geometry"] is None
+    assert os.path.isfile(row["crop_path"])
+
+
+def test_setting_the_geometry_echoes_a_SELF_CONSISTENT_pair(tmp_path):
+    # The POST response pairs geometry with margin. Reading the margin back from the store
+    # after committing would pair THIS request's geometry with whatever a concurrent write
+    # left behind, so both come from the one validated value instead.
+    store, client, _cat, _fid = _labelled_store(tmp_path)
+    for sent, geom, margin in [
+        ("letterbox", "letterbox", 0.0),
+        ("m10.0", "m10", 0.10),
+        ("letterbox+m25", "letterbox+m25", 0.25),
+        (None, None, 0.0),
+    ]:
+        body = client.post("/api/crop-geometry", json={"geometry": sent}).json()
+        assert body["geometry"] == geom
+        assert body["margin"] == pytest.approx(margin)

@@ -1291,6 +1291,16 @@
           — this is where you move them.</p>
         <div id="tCensus" class="note">…</div>
         <div class="row" style="margin-top:12px">
+          <label class="fld inline">New labels are cut at<select id="tNewGeom">
+            <option value="legacy">legacy (squash, no margin)</option>
+            ${geometryOptions()}
+          </select></label>
+          <span id="tNewGeomNote" class="note grow"></span>
+        </div>
+        <p class="hint">This is the shape a <b>fresh</b> label is cut at, from now on. It
+          changes nothing already stored — bringing existing crops to a shape is the re-cut
+          below. Keep the two agreeing, or new labels stop joining the set you build from.</p>
+        <div class="row" style="margin-top:12px">
           <label class="fld inline">Move to<select id="tGeom">
             <option value="" selected>Choose a shape…</option>
             <option value="legacy">legacy (squash, no margin)</option>
@@ -1343,8 +1353,100 @@
     let alive = true;
     let plan = null;         // the last /api/recut/plan body, or null while unplanned
     let planSeq = 0;         // drops a slow earlier plan that lands after a newer one
+    let newGeom = null;      // the last /api/crop-geometry body, or null until loaded
+    let offList = false;     // the stored shape is valid but not one this select offers
     const geomEl = $('#tGeom', view);
+    const newGeomEl = $('#tNewGeom', view);
     const target = () => geomEl.value;   // '' until a shape is chosen
+
+    // --- The crop-shape SETTING (what a fresh label is cut at) ---
+    // Spells legacy with the same 'legacy' sentinel the re-cut select on this card uses,
+    // so the two adjacent controls cannot be read as meaning different things by it —
+    // mapped to the endpoint's `null` on the way out.
+    const SENTINEL = 'legacy';
+    const toApi = (v) => (v === SENTINEL ? null : v);
+    const fromApi = (g) => (g == null ? SENTINEL : g);
+
+    // `warn`/`bad` are SAME-ELEMENT rules (`.note.warn`, `.note.bad`) — a bare
+    // `<span class="warn">` nested inside a `.note` container styles nothing, which is
+    // entry 287's trap in CSS form. So the state rides the container's own class list.
+    const setNote = (el, cls, html) => { el.className = 'note grow' + cls; el.innerHTML = html; };
+
+    function renderNewGeom() {
+      const el = $('#tNewGeomNote', view);
+      if (!newGeom) { setNote(el, '', ''); return; }
+      if (!newGeom.readable) {
+        // A stored value this build cannot parse. New labels are being cut LEGACY, which
+        // is indistinguishable from a deliberate legacy setting unless it says so.
+        setNote(el, ' bad', `⚠ The stored shape `
+          + `<span class="mono">${esc(newGeom.stored)}</span> is unreadable, so new labels are `
+          + `being cut as legacy. Pick a shape to fix it.`);
+        return;
+      }
+      if (offList) {
+        // Ahead of the dominance check on purpose: an off-list shape may well BE the
+        // dominant one, in which case that branch prints nothing and the blank control
+        // would be the only thing on screen.
+        setNote(el, ' warn', `⚠ New labels are cut at `
+          + `<span class="mono">${esc(newGeom.geometry || SENTINEL)}</span>, which this list`
+          + ` does not offer — so the control above reads blank. Leave it alone to keep that`
+          + ` shape; choosing here replaces it.`);
+        return;
+      }
+      // "Disagrees" is DOMINANCE, not mere difference: a store legitimately holds several
+      // shapes at once, so warning on any second shape would warn permanently and train
+      // the operator to ignore the one readout that matters. Dominance is the condition
+      // under which new labels are NOT joining the set a build will enrol from. `census`
+      // is commonest-first (Store.recut_plan), so its head IS the dominant shape.
+      const dom = plan && plan.census && plan.census.length ? plan.census[0] : null;
+      if (!dom || dom.geometry === newGeom.geometry) { setNote(el, '', ''); return; }
+      setNote(el, ' warn', `⚠ Most labelled crops are at `
+        + `<span class="mono">${esc(dom.geometry || SENTINEL)}</span>`
+        + ` (${fmtInt(dom.count)}), so new labels are not joining the set a build there`
+        + ` enrols. Re-cut below, or change this.`);
+    }
+
+    async function loadNewGeom() {
+      try {
+        const g = await api('GET', '/api/crop-geometry');
+        if (!alive) return;
+        newGeom = g;
+        // `POST /api/crop-geometry` accepts ANY parseable descriptor, not just the three
+        // GEOMETRY_ARMS this select offers, so a value set by another LAN client (there is
+        // no auth) can be perfectly valid and still match no <option> — which leaves
+        // selectedIndex -1 and renders the control BLANK. Reading blank as "nothing is
+        // configured" is how an operator would 'fix' a working setting and create the very
+        // divergence this card exists to prevent, so the mismatch is tracked and named
+        // below. Guarding the assignment is the file's own established pattern for a
+        // select whose value may not be among its options (see `applyFilter`).
+        newGeomEl.value = fromApi(g.geometry);
+        offList = newGeomEl.value !== fromApi(g.geometry);
+      } catch (err) {
+        if (!alive) return;
+        newGeom = null;
+        // Never silent: `loadRuns`-style swallowed errors read as "nothing is set"
+        // (entry 365), and here that would read as a deliberate legacy setting.
+        setNote($('#tNewGeomNote', view), ' bad',
+          `Could not read the setting: ${esc(err.message)}`);
+        return;
+      }
+      renderNewGeom();
+    }
+
+    newGeomEl.addEventListener('change', async () => {
+      newGeomEl.blur();   // `onKey` drops keystrokes from a SELECT (entries 235/242/298)
+      const want = newGeomEl.value;
+      try {
+        await api('POST', '/api/crop-geometry', { geometry: toApi(want) });
+      } catch (err) {
+        // Put the control back on the stored value rather than leaving it showing a shape
+        // that was never saved — the select IS the readout of what new labels get.
+        newGeomEl.value = newGeom ? fromApi(newGeom.geometry) : SENTINEL;
+        setNote($('#tNewGeomNote', view), ' bad', `Could not save: ${esc(err.message)}`);
+        return;
+      }
+      await loadNewGeom();
+    });
 
     // --- The re-cut card ---
     const movableTotal = (p) =>
@@ -1404,10 +1506,12 @@
         // and overwrites this error with "Planning…" in the same tick — leaving a card
         // stuck on a progress word with no hint the request failed and no retry until
         // the select is touched again. The button still has to be re-synced.
-        renderCensus(); syncRunBtn();
+        renderCensus(); syncRunBtn(); renderNewGeom();
         return;
       }
       renderCensus(); renderPlan(); syncRunBtn();
+      // The dominance warning is a function of the census, so it re-renders with it.
+      renderNewGeom();
     }
 
     geomEl.addEventListener('change', () => {
@@ -1504,7 +1608,7 @@
       if (!alive) return;
       try { const c = await api('GET', '/api/cleanup/status'); if (alive) renderJob(c); } catch (_) {}
     }
-    loadPlan(); refresh();
+    loadPlan(); loadNewGeom(); refresh();
     const timer = setInterval(refresh, 3000);
     return () => { alive = false; clearInterval(timer); };
   }
@@ -2480,6 +2584,7 @@
           <span id="aStatus" class="note grow">Loading queue…</span>
           <button id="aReload">Reload</button>
         </div>
+        <div class="note" id="aCropShape" style="margin-top:6px"></div>
       </div>
       <div class="card" id="aOverview" hidden>
         <h3>Labelled visits <span class="note" id="aOvNote"></span></h3>
@@ -3646,6 +3751,38 @@
     }
     async function loadCats() { try { const r = await api('GET', '/api/cats'); if (alive) { cats = r.cats || []; renderRoster(); } } catch (_) {} }
 
+    // A static readout of the shape THIS page's keystrokes are cutting crops at. Editable
+    // only on Tools → Crop shape: the decision belongs beside the census that shows what
+    // the labelled set already holds, and one editable control is what keeps the two from
+    // being changed independently.
+    async function loadCropShape() {
+      const el = $('#aCropShape', view);
+      let g;
+      try {
+        g = await api('GET', '/api/crop-geometry');
+      } catch (err) {
+        // Never render as legacy on a failed read: legacy is a real setting, so silence
+        // here would be a claim rather than an absence of one.
+        el.className = 'note';
+        el.textContent = `Crop shape unknown (${err.message}).`;
+        return;
+      }
+      if (!alive) return;
+      if (!g.readable) {
+        // `.note.bad` is a same-element rule, so the state rides the container's class
+        // list, not a nested span (entry 287's trap in CSS form).
+        el.className = 'note bad';
+        el.innerHTML = `⚠ The crop-shape setting`
+          + ` (<span class="mono">${esc(g.stored)}</span>) is unreadable, so your labels are`
+          + ` being cut as <span class="mono">legacy</span>.`
+          + ` Fix it in <a href="#tools">Tools → Crop shape</a>.`;
+        return;
+      }
+      el.className = 'note';
+      el.innerHTML = `Your labels are cut at <span class="mono">${esc(g.geometry || 'legacy')}</span>`
+        + ` (change it in <a href="#tools">Tools → Crop shape</a>)`;
+    }
+
     // The keys onKey below actually acts on — the set the player's guard consults, so an
     // unbound keystroke can't dismiss it. Kept beside the handler; the two must agree.
     const BOUND_KEYS = new Set(['u', 'x', 'g', 'n', 'p', 'z', 'd', 'Backspace', 'ArrowRight', 'ArrowLeft', ' ']);
@@ -3743,7 +3880,7 @@
       if (mode === 'queue') loadQueue();
     });
 
-    loadCats(); loadFlagCount(); setMode('queue');
+    loadCats(); loadFlagCount(); loadCropShape(); setMode('queue');
     return () => {
       alive = false;
       // The player lives on document.body, so it outlives the view unless closed here.
@@ -4090,6 +4227,7 @@
       <div class="card">
         <h3>2 · Build gallery</h3>
         <div class="row">${qChecks('b')}<label class="fld inline">Max per cat<input id="mCap" type="number" min="1" step="1" placeholder="none"></label><span id="mBuildNote" class="note grow"></span><button id="mBuild" class="primary">Build</button></div>
+        <div id="mGeomWarn" class="note" style="margin-top:6px"></div>
         <p class="hint">Defaults to gallery-grade crops only — protect the gallery; widen to ok/poor to A/B.
           Build embeds the SAME crop set a Validate run at the same grades scored, so those
           numbers forecast this gallery — mismatch the grades and they describe something else.</p>
@@ -4154,6 +4292,48 @@
     // `loadEnrollable` both call it and a `const` declared below them would be in its
     // temporal dead zone if either ran first.
     const getGeometry = () => $('#mGeom', view).value || null;
+
+    // --- Does the shape you are BUILDING at match the shape new labels are cut at? -------
+    // Read-only here — the editable control is Tools → Crop shape — but not silent: the two
+    // disagreeing means the crop set THIS build enrols has stopped growing, which is a
+    // silent failure everywhere else (a build simply reports fewer crops than expected).
+    let newLabelGeom = null;    // the /api/crop-geometry body, or null until loaded/failed
+
+    // `.note.warn` / `.note.bad` are same-element rules, so the state rides this
+    // container's own class list rather than a nested span (entry 287's trap in CSS form).
+    const setGeomWarn = (cls, html) => {
+      const el = $('#mGeomWarn', view);
+      el.className = 'note' + cls;
+      el.innerHTML = html;
+    };
+
+    function renderGeomWarn() {
+      if (!newLabelGeom) { setGeomWarn('', ''); return; }
+      if (!newLabelGeom.readable) {
+        setGeomWarn(' bad', `⚠ The crop-shape setting is unreadable`
+          + ` (<span class="mono">${esc(newLabelGeom.stored)}</span>), so new labels are being`
+          + ` cut as legacy. Fix it in <a href="#tools">Tools → Crop shape</a>.`);
+        return;
+      }
+      if (newLabelGeom.geometry === getGeometry()) { setGeomWarn('', ''); return; }
+      setGeomWarn(' warn', `⚠ New labels are cut at `
+        + `<span class="mono">${esc(newLabelGeom.geometry || 'legacy')}</span>, not the shape`
+        + ` selected here — so this crop set will not grow as you label.`
+        + ` <a href="#tools">Tools → Crop shape</a> changes it.`);
+    }
+
+    async function loadNewLabelGeom() {
+      try {
+        newLabelGeom = await api('GET', '/api/crop-geometry');
+      } catch (err) {
+        // Left null: a failed read must not render as "they agree", which is what an
+        // absent warning means (entry 365 — a swallowed error reading as a clean state).
+        newLabelGeom = null;
+        setGeomWarn(' bad', `Could not read the crop-shape setting: ${esc(err.message)}`);
+        return;
+      }
+      renderGeomWarn();
+    }
 
     // --- Per-cat recall, read off the latest qualifying validation run ------------------
     // Which cat to label next is a per-cat question, and the runs table answers only the
@@ -4475,7 +4655,9 @@
     // swallow the operator's next keyboard action (entries 235/242/298, same cause).
     // Re-fetching the enrol counts is what keeps them describing the SELECTED shape — the
     // grade checkboxes already do this, and geometry scopes the same counts.
-    $('#mGeom', view).addEventListener('change', (e) => { e.target.blur(); loadEnrollable(); });
+    $('#mGeom', view).addEventListener('change', (e) => {
+      e.target.blur(); loadEnrollable(); renderGeomWarn();
+    });
     $('#mBuild', view).addEventListener('click', build);
     $('#mValidate', view).addEventListener('click', validate);
 
@@ -4936,7 +5118,7 @@
     // The roster FIRST: both tables name their excluded cats out of catNames, so rendering
     // them before it lands would print `#7` for a cat that has a perfectly good name.
     loadRoster().then(() => { if (alive) { loadModels(); loadRuns(); } });
-    loadEnrollable(); pollJob();
+    loadEnrollable(); loadNewLabelGeom(); pollJob();
     const timer = setInterval(pollJob, 3000);
     return () => { alive = false; clearInterval(timer); };
   }

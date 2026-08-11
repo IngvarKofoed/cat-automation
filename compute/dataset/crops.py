@@ -166,6 +166,33 @@ def materialize(
         return False
 
 
+def crop_rel_path(
+    cat_id: "int | None", label_kind: str, src_frame_id: int, src_recv_ts: int,
+    geometry: "str | None",
+) -> str:
+    """The dataset-root-relative path a crop of this row at ``geometry`` lives at.
+
+    The LEGACY form is byte-for-byte what the label route writes
+    (``cat_<id>/<frame_id>_<recv_ts>.jpg``, or ``cat_unknown_cat/…`` for a catless
+    kind), so re-cutting back to legacy lands on exactly the path a fresh label would
+    have used and the two conventions cannot diverge. A non-legacy geometry gets its own
+    subdirectory named by the descriptor, which keeps each convention's files together
+    and — more importantly — means a re-cut NEVER writes over the crop it is replacing
+    until its row has moved.
+
+    Lives here rather than in ``compute.tools.recut_crops`` (where it began) because BOTH
+    the label-commit path and the re-cut tool must compose the same path from the same
+    rule: the commit path writing a flat legacy name while the tool expects a geometry
+    subdirectory is what would make a fresh crop invisible to a later ``relink``. This
+    module already owns cutting and writing crops, and both callers depend on it, so the
+    rule belongs at the bottom of that dependency rather than inside a CLI tool the API
+    would otherwise have to import.
+    """
+    subdir = f"cat_{cat_id}" if label_kind == "identified" else "cat_unknown_cat"
+    base = f"{src_frame_id}_{src_recv_ts}.jpg"
+    return os.path.join(subdir, base) if geometry is None else os.path.join(subdir, geometry, base)
+
+
 def normalize_avatar_bytes(data: bytes, max_dim: int = 512) -> "bytes | None":
     """Validate + downscale + re-encode an uploaded avatar image to JPEG bytes.
 

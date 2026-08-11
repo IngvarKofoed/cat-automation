@@ -16,6 +16,7 @@ weights (like YOLO's first run). Swap the backbone with ``CAT_EMBED_MODEL``.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -93,6 +94,18 @@ def parse_geometry(descriptor: "str | None") -> "tuple[bool, float]":
                 percent = float(token[1:])
             except ValueError:
                 raise ValueError(f"bad margin token {token!r} in geometry {descriptor!r}") from None
+            # `< 0` does NOT reject inf or nan (both compare False), and `%g` renders them
+            # back as `minf`/`mnan`, so a non-finite margin round-trips as a "valid" stamp.
+            # It must die here, at the parser both the request path and the stored-value read
+            # go through: with margin=inf `_clamp_box` raises OverflowError, which
+            # `crops.materialize` does not catch — a 500 on EVERY label — and with nan it
+            # returns False for every frame, so a label silently writes no rows at all.
+            # Rejecting is also just this function's own contract: a margin it cannot
+            # reproduce is a convention it cannot reproduce.
+            if not math.isfinite(percent):
+                raise ValueError(
+                    f"non-finite margin token {token!r} in geometry {descriptor!r}"
+                )
             if percent < 0:
                 raise ValueError(f"negative margin token {token!r} in geometry {descriptor!r}")
             margin = percent / 100.0

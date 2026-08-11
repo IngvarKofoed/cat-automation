@@ -1495,3 +1495,55 @@ a clean one.
      `recut_plan`'s target staying in lockstep with the one handed to `recut`, and the
      progress closure's cancel contract. Targets `letterbox` so the move is a copy, keeping
      the test cv2-free like the rest of that file.
+
+459. The feasibility probe runs in FLOAT32 and no longer materialises what it can index
+     around. A real run at ~27k crops died allocating 2.72 GiB inside `_best_threshold`;
+     the labelled set had simply outgrown an O(n²) design nobody had re-measured since
+     entry 329 sized it at n=6000. Four changes, none touching a reported number:
+     float32 throughout, no similarity/`d_knn` twin matrices, blockwise kNN argsort, and
+     row-wise upper-triangle construction in place of `np.triu_indices`.
+
+460. Sizes each one removed, at n=27,011: `triu_indices`' int64 index PAIR is 5.8 GB —
+     larger than the 1.5 GB of distances it addresses, and gathered through twice per cap;
+     `np.argsort(dist, axis=1)` allocates n² int64 (5.8 GB) to keep n×k of it; and
+     `dist = 1.0 - sim` as two statements keeps both matrices alive. The kNN's diagonal is
+     now masked on `dist` itself and restored from a `.copy()` — `np.diagonal` returns a
+     VIEW, so saving without copying restores the `+inf` it just wrote.
+
+461. `_best_threshold`'s candidates are the SAME distances only, never `same ∪ diff`, and
+     that is exact rather than a sampling: between consecutive same-values TPR is flat
+     while TNR is non-increasing, so the optimum always sits at a same-value, and the
+     argmax tie-break agrees because the dominating candidate is the smaller one. `diff`
+     is ~95% of pairs here, so this alone is what the fatal 2.72 GiB allocation was.
+
+462. Measured on synthetic 768-d embeddings with the visit block on, peak RSS: n=3996
+     1335 -> 465 MB, n=7998 5111 -> 1305 MB — a 4.5x smaller n² coefficient, with `auc`,
+     `suggested_threshold` and kNN accuracy identical to 1e-6 (the float32 change). Do NOT
+     read peak RSS above ~3 GB on the dev Mac: at n=12000 the old code ran 36 s against
+     14 s and reported LESS memory than the fit predicts, because macOS compressed pages.
+
+463. Known limit, and the reason this is a reprieve rather than a fix: the design is still
+     O(n²), so the same fit puts ~27k crops at ~13 GB (against ~57 GB before). Whether a
+     run fits is now a question about the compute PC's RAM. The next lever is subsampling
+     the `diff` side — 365M samples estimates a distribution 10M would — but that moves
+     the numbers, so it is not a silent change.
+
+464. Review repairs to the above. `_stats`' `np.asarray(a, dtype=float)` was a no-op while
+     the pair arrays were float64 and became a full COPY the moment they went float32 —
+     ~2.4 GB for the `diff` side at 27k crops, allocated while everything else is still
+     live, i.e. the float32 change partly undoing itself. It now accumulates in float64
+     (`mean(dtype=)`) without touching the array: n=7998 peak 1541 -> 1305 MB.
+
+465. The kNN pass builds `nn` by CONCATENATING its blocks rather than assigning into a
+     pre-sized `np.empty`. A loop that failed to cover every row left uninitialised memory
+     behind, so the same bug read as a wrong `knn.accuracy` on one machine and as nothing
+     at all on another — it survived a deliberate stride injection here because the
+     allocator handed back the previous run's buffer. Miscovering now changes the row
+     count, which raises.
+
+466. That was found by testing the TEST: the first version of the blocking test hand-rolled
+     its own blocked argsort and compared it to numpy, so it asserted a numpy identity and
+     passed against an injected stride bug in the real loop. It now monkeypatches
+     `_KNN_ROWS` and drives `run_feasibility` itself at five block sizes. Entry 411/433's
+     hollow-test trap, third instance — the tell each time is a test that never reaches
+     the code it names.

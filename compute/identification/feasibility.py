@@ -50,17 +50,58 @@ from __future__ import annotations
 import numpy as np
 
 
+# Rows of the distance matrix argsorted at a time for the kNN pass. Bounds that pass's
+# scratch to `_KNN_ROWS × n` int64 instead of the full `n × n` — 110 MB rather than
+# 5.8 GB at 27k crops. Row-independent, so the result is byte-identical to sorting whole.
+_KNN_ROWS = 512
+
+
 def _l2_normalize(e: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(e, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return e / norms
 
 
+def _triu_pairs(per_row, n: int, dtype) -> np.ndarray:
+    """The k=1 upper-triangle pair vector, built row by row.
+
+    ``per_row(r)`` returns row ``r``'s slice (the ``n - r - 1`` entries right of the
+    diagonal); they are laid down in row-major order, which is exactly the order
+    ``np.triu_indices(n, k=1)`` yields — so every pair-length array here stays aligned
+    with every other, positionally, as it was when they shared one index pair.
+
+    Built this way because ``triu_indices`` materialises TWO int64 index arrays to
+    address the result: 16 bytes per pair, against 4 for a float32 distance. At 27k
+    crops that is 5.8 GB of pure addressing for a 1.5 GB answer, and it is what the
+    caps forecast then gathered through twice per cap.
+    """
+    total = n * (n - 1) // 2
+    out = np.empty(total, dtype=dtype)
+    pos = 0
+    for r in range(n - 1):
+        chunk = per_row(r)
+        out[pos:pos + chunk.size] = chunk
+        pos += chunk.size
+    return out
+
+
 def _stats(a: np.ndarray) -> dict:
-    a = np.asarray(a, dtype=float)
+    """Count/mean/std, accumulated in float64 WITHOUT upcasting the array.
+
+    `dtype=float` on the asarray was a no-op while the pair arrays were float64 and
+    became a full copy the moment they went float32 — ~2.4 GB for the `diff` side at 27k
+    crops, allocated while `dist`, `pair_d` and both masks are still live. The accumulator
+    keyword buys the same precision (a float32 sum over 365M values is the reason the
+    upcast looked necessary) for a scalar's worth of memory.
+    """
+    a = np.asarray(a)
     if a.size == 0:
         return {"n": 0, "mean": None, "std": None}
-    return {"n": int(a.size), "mean": float(a.mean()), "std": float(a.std())}
+    return {
+        "n": int(a.size),
+        "mean": float(a.mean(dtype=np.float64)),
+        "std": float(a.std(dtype=np.float64)),
+    }
 
 
 def _pairwise_auc(same: np.ndarray, diff: np.ndarray) -> "float | None":
@@ -83,12 +124,28 @@ def _best_threshold(same: np.ndarray, diff: np.ndarray) -> "tuple[float | None, 
     """Distance threshold maximising balanced accuracy (call a pair 'same' if d ≤ t).
 
     Vectorised sweep over every candidate distance: TPR = same ≤ t, TNR = diff > t,
-    balanced accuracy = ½(TPR + TNR). Returns (threshold, balanced_accuracy)."""
+    balanced accuracy = ½(TPR + TNR). Returns (threshold, balanced_accuracy).
+
+    Candidates are the SAME distances only, never ``same ∪ diff``, and that is exact
+    rather than a sampling: between two consecutive same-values TPR is flat while TNR is
+    non-increasing in ``t``, so balanced accuracy over that interval is maximised at its
+    left end — a same-value. For a candidate below every same-value TPR is 0, so
+    ``bal ≤ ½``, which ``t = max(same)`` (TPR 1) always matches or beats. The optimum is
+    therefore always attained at a same-value, and the argmax ties break identically
+    because the dominating same-value is the SMALLER of the pair and ``argmax`` takes the
+    first over the sorted candidates. (Only a fully degenerate run where ``bal`` is ½
+    everywhere — the two distance multisets identical — could return a different
+    threshold, and every threshold is equally worthless there.)
+
+    ``diff`` is the big side: at 27k crops it is ~95% of the 365M pairs, so including it
+    made ``cand`` — plus the int64 ``tp``/``tn`` and float64 ``bal`` derived from it —
+    ~2.7 GB apiece, which is where a real run died.
+    """
     if same.size == 0 or diff.size == 0:
         return None, None
     same_sorted = np.sort(same)
     diff_sorted = np.sort(diff)
-    cand = np.unique(np.concatenate([same, diff]))
+    cand = np.unique(same_sorted)
     tp = np.searchsorted(same_sorted, cand, side="right")  # same distances ≤ t
     tn = diff.size - np.searchsorted(diff_sorted, cand, side="right")  # diff distances > t
     bal = 0.5 * (tp / same.size + tn / diff.size)
@@ -517,8 +574,6 @@ def _caps_block(
     y: np.ndarray,
     groups: "list[list[int]]",
     group_true: "list[int]",
-    iu: np.ndarray,
-    ju: np.ndarray,
     pair_d: np.ndarray,
     same_pair: np.ndarray,
     cross_pair: np.ndarray,
@@ -554,9 +609,9 @@ def _caps_block(
     for entry in cap_masks:
         mask = np.asarray(entry["mask"], dtype=bool)
         # Transient and freed per iteration: at 12k crops each pair-length array is ~72 MB
-        # (bool) / ~576 MB (float64), which is why the caps are scored one at a time rather
+        # (bool) / ~288 MB (float32), which is why the caps are scored one at a time rather
         # than by materialising every mask's pair set up front.
-        surviving = mask[iu] & mask[ju]
+        surviving = _triu_pairs(lambda r: mask[r + 1:] & mask[r], dist.shape[0], bool)
         same_cross = pair_d[same_pair & cross_pair & surviving]
         diff_surv = pair_d[(~same_pair) & surviving]
         recal_t, recal_bal = _best_threshold(same_cross, diff_surv)
@@ -828,7 +883,13 @@ def run_feasibility(
     ``cat_residents`` is the only one that touches an existing key: each ``cats`` entry
     gains ``is_resident`` when it is supplied, and is left exactly as before when it is not.
     """
-    e = _l2_normalize(np.asarray(embeddings, dtype=np.float64))
+    # float32, NOT float64. Every O(n²) array below inherits this dtype, so the upcast
+    # this used to do doubled the whole run's footprint to buy digits that do not exist:
+    # `Embedder.embed_paths` emits float32, so the extra precision is padding on noise,
+    # ~1e-7 against thresholds quoted to three decimals. Cosine distance near 0 loses
+    # relative precision to cancellation (1 − sim), but at the ~1e-3 same-visit distances
+    # entry 318 measured that is still ~1e-4 relative — orders below anything read here.
+    e = _l2_normalize(np.asarray(embeddings, dtype=np.float32))
     n = e.shape[0]
     ids = np.asarray([int(c) for c in cat_ids])
     if n < 2 or ids.shape[0] != n:
@@ -840,14 +901,32 @@ def run_feasibility(
     y = np.array([idx_of[int(c)] for c in ids])
     n_cats = len(uniq)
 
-    sim = e @ e.T
-    dist = 1.0 - sim
+    # In place: `dist = 1.0 - (e @ e.T)` as two statements keeps the similarity matrix
+    # alive beside the distance one, i.e. a second full n² array for the whole call.
+    dist = e @ e.T
+    np.subtract(1.0, dist, out=dist)
 
-    # kNN leave-one-out: exclude self by masking the diagonal to +inf.
-    d_knn = dist.copy()
-    np.fill_diagonal(d_knn, np.inf)
+    # kNN leave-one-out: exclude self by masking the diagonal to +inf. Done ON `dist`
+    # with the diagonal saved and restored, rather than on a full copy of it — that copy
+    # was another n² array (2.9 GB at 27k crops) live for the rest of the call. The
+    # restore puts back the computed values, not a nominal 0.0: `1 - e·e` is only
+    # approximately zero, and `_score_visits` reads this matrix afterwards.
+    diag = np.diagonal(dist).copy()
+    np.fill_diagonal(dist, np.inf)
     kk = max(1, min(int(k), n - 1))
-    nn = np.argsort(d_knn, axis=1)[:, :kk]
+    # Blockwise because `np.argsort(dist, axis=1)` allocates an n × n INT64 array — 5.8 GB
+    # at 27k crops, the single largest allocation in the old pass, to keep n × kk of it.
+    # Each row is sorted independently, so this is the identical result, ties and all.
+    # Concatenated, NOT assigned into a pre-sized `np.empty`: with that form a loop that
+    # failed to cover every row left uninitialized memory behind, which reads as whatever
+    # the allocator last held — benign on one machine, a wrong `knn.accuracy` on the next,
+    # and untestable either way. Here a miscovering loop yields the wrong ROW COUNT, which
+    # raises. The blocks total n × kk, so concatenating them costs ~1 MB at 27k crops.
+    nn = np.concatenate([
+        np.argsort(dist[start:start + _KNN_ROWS], axis=1)[:, :kk]
+        for start in range(0, n, _KNN_ROWS)
+    ])
+    dist[np.diag_indices(n)] = diag
     pred = np.array([np.bincount(y[nn[i]], minlength=n_cats).argmax() for i in range(n)])
     accuracy = float((pred == y).mean())
 
@@ -859,9 +938,10 @@ def run_feasibility(
     ]
 
     # Same-cat vs different-cat pair distances over the upper triangle (real diagonal 0).
-    iu, ju = np.triu_indices(n, k=1)
-    pair_d = dist[iu, ju]
-    same_pair = y[iu] == y[ju]
+    # Built row by row (see `_triu_pairs`) rather than through `np.triu_indices`, whose
+    # index pair is 5.8 GB at 27k crops — larger than everything it addresses.
+    pair_d = _triu_pairs(lambda r: dist[r, r + 1:], n, dist.dtype)
+    same_pair = _triu_pairs(lambda r: y[r + 1:] == y[r], n, bool)
     same = pair_d[same_pair]
     diff = pair_d[~same_pair]
     auc = _pairwise_auc(same, diff)
@@ -880,7 +960,7 @@ def run_feasibility(
         gid = np.full(n, -1, dtype=np.int64)
         for g_index, G in enumerate(visit_groups):
             gid[G] = g_index
-        cross_pair = gid[iu] != gid[ju]
+        cross_pair = _triu_pairs(lambda r: gid[r + 1:] != gid[r], n, bool)
         same_cross = pair_d[same_pair & cross_pair]
         auc_cross = _pairwise_auc(same_cross, diff)
         threshold_cross, bal_cross = _best_threshold(same_cross, diff)
@@ -952,7 +1032,7 @@ def run_feasibility(
             if cap_masks:
                 group_true = [int(y[G[0]]) for G in visit_groups]
                 result["visits"]["caps"] = _caps_block(
-                    dist, y, visit_groups, group_true, iu, ju, pair_d, same_pair,
+                    dist, y, visit_groups, group_true, pair_d, same_pair,
                     cross_pair, cap_masks, float(threshold_cross), aggregate, n_cats,
                 )
     return result

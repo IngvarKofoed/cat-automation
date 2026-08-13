@@ -36,26 +36,24 @@ forever.
   history when changed (entry 425) — so the name a phone is looking at can genuinely differ
   from the name the server would give the same span a minute later. "Yes" has to mean yes to
   what was on screen.
-- **A contested span refuses Yes, measured from the BOXES** (new). Refused when some
-  undecided frame carries two or more cat boxes at or above `_ANNOTATE_MIN_CONF` — two cats
-  in shot together. Only one box per frame becomes a crop, so a one-tap label over such a
-  span files whichever cat had the larger box each frame under a single name, and nothing
-  downstream could notice. Tailgating is expected at this door (entry 319).
+- **No check second-guesses what the reader sees** (new). The button hides only when the tap
+  has nothing to write — no crop to cut, nothing left undecided, no name on the card, or a
+  name no build will read. Nothing judges how many cats are in the visit.
 
-  **Deliberately not measured from the identity votes.** The first implementation contested
-  whenever two cat names held a below-threshold match anywhere in the span, and that fires
-  on ordinary single-cat visits: the active model declines almost nothing (entry 425), so a
-  30-frame span routinely has a few frames whose nearest neighbour is a lookalike — Store
-  Sultan ↔ Store Jihn is 57% of all errors (entry 422). That is frame-to-frame embedding
-  noise, which `_aggregate_identity` already absorbs by taking a **majority** vote rather
-  than requiring unanimity; treating dissent as a second cat made the guard fire on most
-  real visits and claimed "more than one cat here" from a reading that never counted cats.
-  Found on the real store, not in a fixture — the fixture encoded the wrong assumption.
+  Two guards against a second cat were built and both removed. The first contested when two
+  cat *names* held a below-threshold match anywhere in the span, which fires on ordinary
+  single-cat visits: the active model declines almost nothing (entry 425), so a span
+  routinely holds a few frames whose nearest neighbour is a lookalike (entry 422) — noise
+  `_aggregate_identity` already absorbs by majority vote. The second counted cat *boxes* per
+  frame, and on the real store `yolo-serial` put two boxes ≥0.3 on one cat's head, so it
+  blocked three of the eight newest visits.
 
-  Accepted consequence: two cats that alternate without ever sharing a frame are not
-  caught. A vote-share threshold would not reliably catch them either — at that point the
-  shares are indistinguishable from lookalike noise — so the desk's Labelled review is the
-  backstop rather than a tuned number on a fail-safe.
+  The principle behind dropping the idea rather than tuning it a third time: the person
+  tapping is looking at the frames with the detection box drawn on them, so they count cats
+  better than a recall-first detector at 0.15 does. Overriding them on the one question they
+  can answer by eye was the error — especially while the design refuses to let the phone
+  *pick* a cat precisely because a phone-sized crop is a poor basis for identity. A real
+  tailgate is what the ⚑ is for, with the desk's Labelled review as the backstop.
 - **The server resolves span → frames** (new). A user-facing event clusters *motion* frames
   while an annotation visit clusters *detection-present, undecided* ones
   (`store.py:5312-5315`), so one span can hold zero, one, or several annotation visits. Every
@@ -114,10 +112,10 @@ The modal footer today holds the ⚑ toggle, the conditional "Analyse this visit
 shared `aria-live` readout, and the visit nav (`user/index.html:966-983`). The confirm button
 joins the ⚑ on its existing line, so the footer gains no row:
 
-**`✓ Yes`** appears only when the probe says all three hold: the span has undecided detected
-frames, it carries a *named* identity (`cat_id` non-null — an "unknown cat" aggregate has
-nothing to confirm), and no undecided frame holds two cat boxes. Absent any of the three it
-is not rendered
+**`✓ Yes`** appears only when the probe says all of these hold: the span has undecided
+detected frames, it carries a *named* identity (`cat_id` non-null — an "unknown cat" aggregate has
+nothing to confirm), and it resolves to an active cat. Absent any of those it is not
+rendered
 — never a disabled button, never a silent no-op (entry 283; and entry 287's reminder that a
 `.hidden` toggle on an element with no qualified rule does nothing at all, so visibility gets
 verified by computed style).
@@ -160,7 +158,7 @@ deliberately silent (entry 286), so advancing would leave nothing on screen sayi
 took.
 
 Because it advances, **a failed write must name its own visit.** The reader has already moved
-on, so a 409 (identity diverged, or the span turned out contested) or a transport failure
+on, so a 409 (identity diverged, or the span stopped being labellable) or a transport failure
 cannot report onto the visit-scoped readout — that is entry 228's bug, and entry 288's rule
 that a job must be judged by its own record rather than a shared field. It surfaces on the
 persistent line instead, naming what it was ("Mittens · 06:14 — not saved, that visit
@@ -178,8 +176,8 @@ leaves the visit part-labelled with an undecided tail. `can_confirm` therefore k
 (`Labelled: Mittens · 30 more frames`). Gating on `existing` being empty instead would quietly
 strand every late frame of every confirmed visit, on the visits that lingered longest and so
 carry the most crops. The safety case is unaffected: the re-resolve runs over the whole span
-including the new frames, so a tail in which two cats share a frame turns the span contested
-and the button disappears.
+including the new frames, so a tail that resolves to a different cat is refused by the
+identity check rather than silently folded into the earlier label.
 
 **The probe is per event, not per modal.** Prev/Next repoints the open dialog at another
 visit, which is exactly how entry 228's bug happened — a shared footer control reporting onto
@@ -196,9 +194,9 @@ The gate and the readout, one span-scoped read:
 
 ```
 {can_confirm: bool, cat_id: int|null, cat_name: str|null,
- n_undecided: int, max_cats_in_frame: int,
+ n_undecided: int,
  existing: [{label_kind, cat_id, cat_name, n_frames, mixed}] | [],
- reason: 'ok' | 'no_crop' | 'all_labelled' | 'unnamed' | 'retired' | 'contested'}
+ reason: 'ok' | 'no_crop' | 'all_labelled' | 'unnamed' | 'retired'}
 ```
 
 `n_undecided` counts the frames a tap would write, so the footer can say what it contributes
@@ -211,11 +209,8 @@ confidence floor means a span can hold faint sub-floor verdicts and still land h
 claiming nothing was detected would send the reader to Analyse — which re-runs the detector
 and finds the same faint boxes. It asserts nothing about whether the detector *looked*,
 which is the coverage-vs-verdict distinction of entries 226/279/280, and is why the Analyse
-button stays reachable there. `reason: 'contested'` gets
-its own footer line (`Two cats in one frame — label it later`), since "no button" without a
-reason reads as a bug on the one visit type most worth a human. It names the frame, not the
-cats: a box carries a class, not an identity, so "two cats were in shot" is knowable while
-*which two* is not — `max_cats_in_frame` is the honest shape.
+button stays reachable there.
+
 
 **The 0.3 confidence floor comes along, deliberately.** `_present_frames` admits only frames
 carrying a cat box at or above `_ANNOTATE_MIN_CONF` (`store.py:5230`), so the phone writes
@@ -287,10 +282,6 @@ no undo of its own.
 - **Adding `can_confirm` to `/api/events`.** Rejected for the lazy probe: one visit is open at
   a time, and per-span reads inside `events()` are the exact cost entries 256 and 265 had to
   undo twice.
-- **Labelling only the frames whose own nearest match is the winner**, instead of refusing a
-  contested span. Rejected: it silently splits a visit, leaves the other cat's frames
-  undecided but unreachable from the phone, and leans on the per-frame nearest match — the
-  very signal whose unreliability is why a human is being asked.
 
 ## Implementation strategy
 
@@ -298,7 +289,7 @@ no undo of its own.
 
 - **Single agent, Opus 5.** Two files (`compute/api/app.py`, `compute/api/web/user/index.html`)
   plus tests, and the halves are not separable in practice: the client's per-event probe
-  keying, the auto-advance error path and the contested/409 states are all readings of the same
+  keying, the auto-advance error path and the refusal/409 states are all readings of the same
   contract, and the mandated browser pass needs both ends running anyway.
 - **Nothing here is irreversible** — no schema change (`dataset_items.source` already exists),
   no migration, no `(breaking)` decision — so the fan-out and adversarial-verification cost of

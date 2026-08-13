@@ -1027,7 +1027,7 @@
             <div class="player-stats hidden" id="playerStats"></div>
             <div class="player-actions">
                 <!-- Shown only where it can act: an undecided span, carrying a NAMED
-                     identity, resolving to an active cat, and uncontested (see
+                     identity, resolving to an active cat (see
                      Store.visit_label_state). The visible word is bare "Yes" because the
                      footer has room for nothing longer beside the ⚑ and the nav — the
                      assertion it makes lives in its aria-label and title, which name the
@@ -1469,12 +1469,6 @@
             const held = named.length ? `Labelled: ${named.map(e => e.cat_name).join(', ')}` : '';
             if (st.can_confirm) return { text: held, warn: false };
             switch (st.reason) {
-                case 'contested':
-                    // Says what was measured: two cat boxes in ONE frame. The earlier
-                    // wording ("More than one cat here") was a claim about the visit made
-                    // from identity votes, which on a real store disagree frame to frame
-                    // on a single cat — so it fired on ordinary visits.
-                    return { text: 'Two cats in one frame — label it later', warn: true };
                 case 'all_labelled':
                     return { text: held || 'Already labelled', warn: false };
                 case 'no_crop':

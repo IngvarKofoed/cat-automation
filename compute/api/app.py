@@ -513,10 +513,6 @@ _VISIT_LABEL_REFUSALS = {
     "all_labelled": "every frame in this visit is already labelled",
     "unnamed": "this visit no longer resolves to a named cat",
     "retired": "that cat has been retired, so a label cannot name it",
-    "contested": (
-        "two cats share a frame in this visit, so it needs labelling at the desk"
-        " rather than one tap"
-    ),
 }
 
 # Settings key for the crop shape NEW crops are cut at (crop-geometry-for-new-labels

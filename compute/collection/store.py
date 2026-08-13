@@ -5733,7 +5733,7 @@ class Store:
         refuses must test the same conditions, or the phone offers a tap the server
         then rejects. Returns::
 
-            {can_confirm, reason, identity, contested_cat_ids, has_model,
+            {can_confirm, reason, identity, has_model,
              n_present, n_undecided, existing: [{label_kind, cat_id, cat_name, n_frames}]}
 
         ``identity`` is ``_aggregate_identity``'s result over the span — the SAME voter
@@ -5766,28 +5766,15 @@ class Store:
           picker offers only ``active`` cats, and a retired cat's crops are omitted from
           enrolment (changelog 335) — so confirming one would write a label the operator
           could not have written by hand and no build will ever read.
-        - ``contested`` — some frame in the span holds TWO OR MORE cat boxes at or above
-          ``_ANNOTATE_MIN_CONF``, i.e. two cats were in shot together. Tailgating is
-          expected at this door (changelog 319), and only one box per frame becomes a
-          crop, so a one-tap label over such a span files whichever cat happened to have
-          the larger box each frame under a single name. ``max_cats_in_frame`` reports the
-          count.
 
-          Measured from the BOXES, deliberately not from the identity votes. An earlier
-          version contested whenever two cat names held a below-threshold match anywhere
-          in the span, which on the real store fires on ordinary single-cat visits: the
-          active model declines almost nothing (changelog 425), so a 30-frame span
-          routinely has a few frames whose nearest neighbour is a lookalike — Store Sultan
-          ↔ Store Jihn is 57% of all errors (changelog 422). That is frame-to-frame
-          embedding noise, which ``_aggregate_identity`` already absorbs by taking a
-          MAJORITY vote rather than requiring unanimity; treating dissent as a second cat
-          made the guard fire on most real visits, and claimed "more than one cat here"
-          about a reading that never measured how many cats were there.
-
-          Consequence, accepted: two cats that alternate without ever sharing a frame are
-          not caught. A vote-share test would not reliably catch them either — at that
-          point the shares are indistinguishable from lookalike noise — and the desk's
-          Labelled review is the backstop.
+        Every one of those is "the tap has nothing to write": no crop to cut, nothing left
+        undecided, no name on the card, or a name no build will read. NONE of them second-
+        guesses what the person is looking at. That line is deliberate, and it is why a
+        two-cats-in-the-visit check was removed rather than tuned: the human tapping is
+        looking at the frames with the box drawn on them, so they judge how many cats are
+        there better than a recall-first detector does — which in practice reported two
+        boxes on one cat's head and blocked ordinary visits. If two cats are in shot the
+        answer is the ⚑, and the desk's Labelled review is the backstop.
         """
         # Both outside the lock: `active_model` re-acquires it (the single-lock
         # discipline `annotation_queue_page` follows), and `_present_frames` takes it
@@ -5824,19 +5811,6 @@ class Store:
                     (int(start_id), int(end_id)),
                 ).fetchall()
             }
-            # The span's own detection details, for the two-cats-in-one-frame count below.
-            # A separate span-scoped read rather than a new key on `_present_frames`:
-            # that reader is shared with the annotation queue, which fetches a large
-            # unpaginated window, and a `detail` JSON per frame there is memory the queue
-            # has no use for. `+analyzer` DE-INDEXES that term so the planner takes the
-            # `frame_id` range instead of scanning the analyzer's whole partition — with
-            # no ANALYZE stats it prefers `idx_analysis_analyzer_verdict` otherwise
-            # (changelog 229/265/276/307).
-            detail_rows = self._conn.execute(
-                "SELECT frame_id, detail FROM analysis"
-                " WHERE frame_id BETWEEN ? AND ? AND +analyzer = ?",
-                (int(start_id), int(end_id), oracle),
-            ).fetchall()
             ident_rows: "list" = []
             cat_names: dict = {}
             cat_residents: dict = {}
@@ -5882,26 +5856,6 @@ class Store:
                 span_idents, model["threshold"], cat_names, cat_residents
             )
 
-        # How many cats shared a single frame, at most — the measurement behind
-        # `contested`. Counted over the frames a label would actually WRITE (undecided,
-        # above the floor), so a second cat in a frame nobody is labelling cannot block
-        # the tap. Floored at the same `_ANNOTATE_MIN_CONF` the crop universe uses, or a
-        # phantom 0.2 box would read as a second cat.
-        undecided_ids = {fr["id"] for fr in present if not fr["decided"]}
-        max_cats_in_frame = max(
-            (
-                sum(
-                    1
-                    for b in self._detail_boxes(detail)
-                    if self._box_class(b) == _COCO_CAT_CLASS_ID
-                    and float(b[4]) >= _ANNOTATE_MIN_CONF
-                )
-                for fid, detail in detail_rows
-                if int(fid) in undecided_ids
-            ),
-            default=0,
-        )
-
         if n_present == 0:
             reason = "no_crop"
         elif n_undecided == 0:
@@ -5913,8 +5867,6 @@ class Store:
             # identification whose cat was DELETED. Same answer as retired: there is
             # nothing a label could legitimately name.
             reason = "retired"
-        elif max_cats_in_frame > 1:
-            reason = "contested"
         else:
             reason = "ok"
 
@@ -5922,11 +5874,6 @@ class Store:
             "can_confirm": reason == "ok",
             "reason": reason,
             "identity": identity,
-            # NOT a list of cat ids: a box carries a class, not an identity, so "two cats
-            # were in shot" is knowable while WHICH two is not. Reporting the count is the
-            # honest shape; the earlier `contested_cat_ids` named the cats precisely
-            # because it was measuring identity votes, which is the reading this replaced.
-            "max_cats_in_frame": max_cats_in_frame,
             "has_model": model is not None,
             "n_present": n_present,
             "n_undecided": n_undecided,

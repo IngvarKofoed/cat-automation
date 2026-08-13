@@ -1737,3 +1737,26 @@ a clean one.
      the whole span: a second cat in an already-decided frame mislabels nothing and would
      otherwise strand the undecided tail permanently. The second box is floored at
      `_ANNOTATE_MIN_CONF` too, or a recall-first 0.2 phantom reads as a cat.
+
+498. The two-cats check is GONE, not tuned a third time. Measured on the live store: it
+     blocked 3 of the 8 newest visits, and the frame behind one of them holds a single cat
+     with only its head in shot — `yolo-serial` put two boxes ≥0.3 on that one head. So the
+     box count measured duplicate detections, exactly as the vote version (479/493)
+     measured embedding noise.
+
+499. The principle that replaced it: a refusal may only mean "the tap has nothing to
+     write" — no crop, nothing undecided, no name on the card, a retired cat — and may
+     never overrule what the reader can see. The person tapping is looking at the frames
+     with the detection box drawn on them, so they count cats better than a recall-first
+     detector at 0.15. Overriding them there was the error, and doubly so while the design
+     refuses to let the phone PICK a cat on the grounds that a phone-sized crop is a poor
+     basis for identity.
+
+500. A real tailgate is the ⚑'s job, with the desk's Labelled review as the backstop.
+     Accepted: a careless tap on a two-cat visit files one cat's crops under the other's
+     name. That is a quality problem, not a door-safety one (422), and both guards that
+     tried to prevent it cost more labelling than it ever would.
+
+501. `max_cats_in_frame` and its span-scoped `analysis.detail` read are gone with it, so
+     the probe is one read lighter than it was two commits ago. Nothing else consumed
+     either — the field existed for one afternoon.

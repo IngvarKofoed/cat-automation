@@ -1710,3 +1710,30 @@ a clean one.
      oracle-taking route does. An unregistered name reached `_present_frames` as a
      predicate matching no rows, so a typo read as an honest "no crop to label here"
      rather than a bad request.
+
+493. `contested` is now measured from the BOXES — two cat boxes at or above the floor in
+     one undecided frame — not from identity votes. Entry 479's rule fired on ordinary
+     single-cat visits on the real store: the active model declines almost nothing (425),
+     so a span routinely holds a few frames whose nearest neighbour is a lookalike (422),
+     which is noise `_aggregate_identity` already absorbs by MAJORITY vote.
+
+494. That is the reading the message was always claiming: "two cats in one frame" is
+     measurable, "more than one cat here" was inferred from embedding noise. Only one box
+     per frame becomes a crop, so a real tailgate is what mislabels silently — the case
+     the guard exists for. `contested_cat_ids` became `max_cats_in_frame`: a box carries
+     a class, not an identity, so how many is knowable while WHICH is not.
+
+495. Found only on the real store — the fixture encoded the wrong assumption, and its test
+     asserted a 3-1 vote split was contested while calling that "the shape that looks
+     decided from outside". On real data a 3-1 split is one cat. A guard whose test data
+     comes from the same belief as the guard cannot detect that the belief is wrong.
+
+496. Deliberately NOT a vote-share threshold. Two cats that never share a frame go
+     uncaught, but at that point their shares are indistinguishable from lookalike noise,
+     so the alternative is a tuned number on a fail-safe that still fires on the visits
+     most worth labelling. The desk's Labelled review is the backstop.
+
+497. The box count covers the frames a label would WRITE (undecided, above the floor), not
+     the whole span: a second cat in an already-decided frame mislabels nothing and would
+     otherwise strand the undecided tail permanently. The second box is floored at
+     `_ANNOTATE_MIN_CONF` too, or a recall-first 0.2 phantom reads as a cat.

@@ -514,8 +514,8 @@ _VISIT_LABEL_REFUSALS = {
     "unnamed": "this visit no longer resolves to a named cat",
     "retired": "that cat has been retired, so a label cannot name it",
     "contested": (
-        "more than one cat is identified in this visit, so it needs labelling"
-        " at the desk rather than one tap"
+        "two cats share a frame in this visit, so it needs labelling at the desk"
+        " rather than one tap"
     ),
 }
 

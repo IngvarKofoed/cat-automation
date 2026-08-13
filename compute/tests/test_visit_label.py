@@ -4,10 +4,10 @@
 See docs/specs/2026-08-13-user-app-visit-labelling.md. What earns a test here is the
 set of things that can only go wrong SILENTLY, since the write lands behind the reader:
 
-1. A CONTESTED span (two cats identified in one visit) must be refused.
-   ``_aggregate_identity`` returns one winner and its result cannot distinguish "the
-   other frames were too far" from "the other frames named another cat", so nothing
-   downstream could notice one cat's crops filed under another cat's name.
+1. A CONTESTED span — two cat BOXES in one frame — must be refused, and split identity
+   votes on a single cat must NOT be: only one box per frame becomes a crop, so a real
+   tailgate mislabels silently, while vote disagreement is ordinary model noise that
+   ``_aggregate_identity`` already absorbs by majority.
 2. The probe and the write must refuse under the SAME conditions — the whole reason the
    rule lives in one store method.
 3. A PART-LABELLED span stays confirmable for its undecided remainder: event spans grow
@@ -133,61 +133,110 @@ def _named_visit(store, *, threshold=0.5, dist=0.1, resident=True, n=3):
 # --- 1. the contested guard ------------------------------------------------
 
 
-def test_two_cats_in_one_span_refuses_the_confirmation(tmp_path):
-    """The guard that has no downstream backstop.
+def test_split_identity_votes_on_ONE_cat_do_not_contest(tmp_path):
+    """The false positive this guard was rewritten to remove.
 
-    `_aggregate_identity` picks the cat with the most below-threshold frames and its
-    return says nothing about the runner-up, so a one-tap confirm over the whole span
-    would file the second cat's crops under the winner's name with nothing able to
-    notice. Tailgating is expected at this door (changelog 319).
+    On the real store the active model declines almost nothing (changelog 425), so a
+    single cat's span routinely has a few frames whose nearest neighbour is a lookalike
+    — Store Sultan <-> Store Jihn is 57% of all errors (changelog 422). That is
+    frame-to-frame embedding noise, which `_aggregate_identity` already absorbs by taking
+    a MAJORITY vote; treating dissent as a second cat fired on ordinary visits and
+    claimed "more than one cat here" about a reading that never counted cats.
     """
     store = _store(tmp_path)
     vid = _version(store)
     mittens = store.create_cat("Mittens", is_resident=True)["id"]
     sultan = store.create_cat("Store Sultan", is_resident=False)["id"]
     span = _visit(store, 1_000_000, n=4)
-    _cat_box(store, span)
-    # Mittens wins the vote 3-1 — exactly the shape that looks decided from outside.
+    _cat_box(store, span)                      # ONE cat box per frame throughout
     _name(store, [span[0], span[0] + 1, span[0] + 2], vid, mittens, dist=0.1)
-    _name(store, [span[1]], vid, sultan, dist=0.2)
+    _name(store, [span[1]], vid, sultan, dist=0.2)   # both well below the 0.5 threshold
 
     state = store.visit_label_state("yolo-serial", *span)
 
-    assert state["can_confirm"] is False
-    assert state["reason"] == "contested"
-    assert state["contested_cat_ids"] == sorted([mittens, sultan])
-    # The aggregate still names a winner — which is precisely why the spread is needed.
-    assert state["identity"]["cat_id"] == mittens
-
-
-def test_a_second_cat_above_threshold_is_not_contested(tmp_path):
-    """Only BELOW-threshold votes contest: a far match is the 'too far' case, not a rival.
-
-    Without this the guard would refuse ordinary visits — a single cat's span routinely
-    carries a stray far match from another gallery vector.
-    """
-    store = _store(tmp_path)
-    vid = _version(store, threshold=0.5)
-    mittens = store.create_cat("Mittens", is_resident=True)["id"]
-    sultan = store.create_cat("Store Sultan", is_resident=False)["id"]
-    span = _visit(store, 1_000_000, n=3)
-    _cat_box(store, span)
-    _name(store, [span[0], span[0] + 1], vid, mittens, dist=0.1)
-    _name(store, [span[1]], vid, sultan, dist=0.9)   # above 0.5 — too far to count
-
-    state = store.visit_label_state("yolo-serial", *span)
-
-    assert state["contested_cat_ids"] == []
+    assert state["max_cats_in_frame"] == 1
+    assert state["reason"] == "ok", "one cat with noisy votes must stay confirmable"
     assert state["can_confirm"] is True
     assert state["identity"]["cat_id"] == mittens
 
 
-def test_uncalibrated_model_is_unnamed_not_contested(tmp_path):
-    """A NULL threshold degrades to *unknown cat*, so there is no name to say yes to.
+def test_two_cat_boxes_in_one_frame_refuses_the_confirmation(tmp_path):
+    """Tailgating, measured from the BOXES rather than inferred from names.
 
-    The open-set fail-safe, and it must not be reported as a contest: two cats both
-    'below' nothing is not a rivalry, it is an uncalibrated gallery.
+    Only one box per frame becomes a crop, so a one-tap label over such a span files
+    whichever cat had the larger box each frame under a single name — and nothing
+    downstream could notice.
     """
+    store = _store(tmp_path)
+    vid = _version(store)
+    mittens = store.create_cat("Mittens", is_resident=True)["id"]
+    span = _visit(store, 1_000_000, n=3)
+    _cat_box(store, span)
+    _name(store, range(span[0], span[1] + 1), vid, mittens)
+    # One frame catches both cats in shot.
+    store.write_analysis(
+        span[1], "yolo-serial", True, 0.9,
+        {"boxes": [[0, 0, 10, 10, 0.9, _CAT], [12, 12, 22, 22, 0.7, _CAT]]},
+    )
+
+    state = store.visit_label_state("yolo-serial", *span)
+
+    assert state["max_cats_in_frame"] == 2
+    assert state["reason"] == "contested"
+    assert state["can_confirm"] is False
+
+
+def test_a_faint_second_box_is_not_a_second_cat(tmp_path):
+    """The second box is floored at `_ANNOTATE_MIN_CONF` like the crop universe itself.
+
+    YOLO runs recall-first at 0.15, so a sub-floor box is as likely to be an empty-scene
+    phantom as a cat (changelog 225/404) — counting one would reintroduce the false
+    positive from the other direction.
+    """
+    store = _store(tmp_path)
+    vid = _version(store)
+    mittens = store.create_cat("Mittens", is_resident=True)["id"]
+    span = _visit(store, 1_000_000, n=2)
+    _cat_box(store, span)
+    _name(store, range(span[0], span[1] + 1), vid, mittens)
+    store.write_analysis(
+        span[1], "yolo-serial", True, 0.9,
+        {"boxes": [[0, 0, 10, 10, 0.9, _CAT], [12, 12, 22, 22, 0.2, _CAT]]},
+    )
+
+    state = store.visit_label_state("yolo-serial", *span)
+
+    assert state["max_cats_in_frame"] == 1
+    assert state["reason"] == "ok"
+
+
+def test_a_second_cat_only_in_an_ALREADY_LABELLED_frame_does_not_block(tmp_path):
+    """The count covers the frames a label would WRITE, not the whole span. A frame
+    already decided is not being labelled, so a second cat there cannot mislabel
+    anything — and blocking on it would strand the undecided tail forever.
+    """
+    client, store = _client(tmp_path)
+    span, cat, _vid = _named_visit(store, n=3)
+    store.write_analysis(
+        span[0], "yolo-serial", True, 0.9,
+        {"boxes": [[0, 0, 10, 10, 0.9, _CAT], [12, 12, 22, 22, 0.8, _CAT]]},
+    )
+    assert store.visit_label_state("yolo-serial", *span)["reason"] == "contested"
+
+    # Decide just that frame; the two-cat frame leaves the undecided set.
+    client.post("/api/label", json={
+        "decision": "identified", "cat_id": cat,
+        "frames": [{"frame_id": span[0], "bbox": [0, 0, 10, 10], "quality": "ok"}],
+    })
+
+    state = store.visit_label_state("yolo-serial", *span)
+    assert state["max_cats_in_frame"] == 1
+    assert state["reason"] == "ok"
+
+
+def test_uncalibrated_model_is_unnamed(tmp_path):
+    """A NULL threshold degrades to *unknown cat*, so there is no name to say yes to —
+    the open-set fail-safe, reached before the box count is ever consulted."""
     store = _store(tmp_path)
     vid = _version(store, threshold=None)
     a = store.create_cat("Mittens", is_resident=True)["id"]
@@ -200,7 +249,6 @@ def test_uncalibrated_model_is_unnamed_not_contested(tmp_path):
     state = store.visit_label_state("yolo-serial", *span)
 
     assert state["reason"] == "unnamed"
-    assert state["contested_cat_ids"] == []
 
 
 # --- 2. the reason ladder --------------------------------------------------
@@ -253,7 +301,7 @@ def test_no_model_reads_unnamed_with_no_identity(tmp_path):
         "can_confirm": False,
         "reason": "unnamed",
         "identity": None,
-        "contested_cat_ids": [],
+        "max_cats_in_frame": 1,
         "has_model": False,
         "n_present": 3,
         "n_undecided": 3,
@@ -349,13 +397,11 @@ def test_the_probe_and_the_write_refuse_together(tmp_path):
     already been advanced to the next visit.
     """
     client, store = _client(tmp_path)
-    vid = _version(store)
-    a = store.create_cat("Mittens", is_resident=True)["id"]
-    b = store.create_cat("Store Sultan", is_resident=False)["id"]
-    span = _visit(store, 1_000_000, n=2)
-    _cat_box(store, span)
-    _name(store, [span[0]], vid, a)
-    _name(store, [span[1]], vid, b)
+    span, cat, _vid = _named_visit(store, n=2)
+    store.write_analysis(
+        span[1], "yolo-serial", True, 0.9,
+        {"boxes": [[0, 0, 10, 10, 0.9, _CAT], [12, 12, 22, 22, 0.8, _CAT]]},
+    )
 
     probe = client.get(f"/api/label/visit?start_id={span[0]}&end_id={span[1]}")
     assert probe.status_code == 200
@@ -363,10 +409,11 @@ def test_the_probe_and_the_write_refuse_together(tmp_path):
 
     write = client.post(
         "/api/label/visit",
-        json={"start_id": span[0], "end_id": span[1], "cat_id": a},
+        json={"start_id": span[0], "end_id": span[1], "cat_id": cat},
     )
     assert write.status_code == 409
-    assert "more than one cat" in write.json()["detail"]
+    assert "share a frame" in write.json()["detail"]
+    assert _rows(store) == [], "a refused confirm writes nothing"
 
 
 def test_a_recorded_confirm_clears_an_overlapping_flag(tmp_path):

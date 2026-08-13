@@ -36,13 +36,26 @@ forever.
   history when changed (entry 425) — so the name a phone is looking at can genuinely differ
   from the name the server would give the same span a minute later. "Yes" has to mean yes to
   what was on screen.
-- **A contested span refuses Yes** (new). `_aggregate_identity` votes among below-threshold
-  frames and returns one winner, discarding whether several cats voted (`store.py:4952-4972`)
-  — and its return cannot distinguish "the rest were too far" from "the rest named another
-  cat". Tailgating is expected at this door (entry 319), so the endpoint computes the vote
-  spread itself and refuses when more than one cat has below-threshold votes, with a message
-  that says why. One tap must never file one cat's crops under another's name; the fail-safe
-  is the desk.
+- **A contested span refuses Yes, measured from the BOXES** (new). Refused when some
+  undecided frame carries two or more cat boxes at or above `_ANNOTATE_MIN_CONF` — two cats
+  in shot together. Only one box per frame becomes a crop, so a one-tap label over such a
+  span files whichever cat had the larger box each frame under a single name, and nothing
+  downstream could notice. Tailgating is expected at this door (entry 319).
+
+  **Deliberately not measured from the identity votes.** The first implementation contested
+  whenever two cat names held a below-threshold match anywhere in the span, and that fires
+  on ordinary single-cat visits: the active model declines almost nothing (entry 425), so a
+  30-frame span routinely has a few frames whose nearest neighbour is a lookalike — Store
+  Sultan ↔ Store Jihn is 57% of all errors (entry 422). That is frame-to-frame embedding
+  noise, which `_aggregate_identity` already absorbs by taking a **majority** vote rather
+  than requiring unanimity; treating dissent as a second cat made the guard fire on most
+  real visits and claimed "more than one cat here" from a reading that never counted cats.
+  Found on the real store, not in a fixture — the fixture encoded the wrong assumption.
+
+  Accepted consequence: two cats that alternate without ever sharing a frame are not
+  caught. A vote-share threshold would not reliably catch them either — at that point the
+  shares are indistinguishable from lookalike noise — so the desk's Labelled review is the
+  backstop rather than a tuned number on a fail-safe.
 - **The server resolves span → frames** (new). A user-facing event clusters *motion* frames
   while an annotation visit clusters *detection-present, undecided* ones
   (`store.py:5312-5315`), so one span can hold zero, one, or several annotation visits. Every
@@ -103,7 +116,8 @@ joins the ⚑ on its existing line, so the footer gains no row:
 
 **`✓ Yes`** appears only when the probe says all three hold: the span has undecided detected
 frames, it carries a *named* identity (`cat_id` non-null — an "unknown cat" aggregate has
-nothing to confirm), and the vote is uncontested. Absent any of the three it is not rendered
+nothing to confirm), and no undecided frame holds two cat boxes. Absent any of the three it
+is not rendered
 — never a disabled button, never a silent no-op (entry 283; and entry 287's reminder that a
 `.hidden` toggle on an element with no qualified rule does nothing at all, so visibility gets
 verified by computed style).
@@ -164,8 +178,8 @@ leaves the visit part-labelled with an undecided tail. `can_confirm` therefore k
 (`Labelled: Mittens · 30 more frames`). Gating on `existing` being empty instead would quietly
 strand every late frame of every confirmed visit, on the visits that lingered longest and so
 carry the most crops. The safety case is unaffected: the re-resolve runs over the whole span
-including the new frames, so a tail that is actually a second cat turns the span contested and
-the button disappears.
+including the new frames, so a tail in which two cats share a frame turns the span contested
+and the button disappears.
 
 **The probe is per event, not per modal.** Prev/Next repoints the open dialog at another
 visit, which is exactly how entry 228's bug happened — a shared footer control reporting onto
@@ -182,9 +196,9 @@ The gate and the readout, one span-scoped read:
 
 ```
 {can_confirm: bool, cat_id: int|null, cat_name: str|null,
- n_undecided: int, contested_cat_ids: [int, ...],
+ n_undecided: int, max_cats_in_frame: int,
  existing: [{label_kind, cat_id, cat_name, n_frames, mixed}] | [],
- reason: 'ok' | 'no_detection' | 'all_labelled' | 'unnamed' | 'contested'}
+ reason: 'ok' | 'no_crop' | 'all_labelled' | 'unnamed' | 'retired' | 'contested'}
 ```
 
 `n_undecided` counts the frames a tap would write, so the footer can say what it contributes
@@ -192,11 +206,16 @@ the way admin's stage does (entry 413) instead of asserting a bare success. `exi
 from `labeled_visits` scoped to the same span (`store.py:5727`), which already resolves label
 kind, cat name, and the `mixed` flag.
 
-`reason: 'no_detection'` claims only that no detection verdict exists over the span *today* —
-not that the detector rejected those frames, the coverage-vs-verdict distinction of entries
-226/279/280. That is why the Analyse button stays reachable there. `reason: 'contested'` gets
-its own footer line naming the cats (`Two cats in this visit — mark it for labelling`), since
-"no button" without a reason reads as a bug on the one visit type most worth a human.
+`reason: 'no_crop'` is named for what is MISSING rather than `no_detection`: the queue's
+confidence floor means a span can hold faint sub-floor verdicts and still land here, so
+claiming nothing was detected would send the reader to Analyse — which re-runs the detector
+and finds the same faint boxes. It asserts nothing about whether the detector *looked*,
+which is the coverage-vs-verdict distinction of entries 226/279/280, and is why the Analyse
+button stays reachable there. `reason: 'contested'` gets
+its own footer line (`Two cats in one frame — label it later`), since "no button" without a
+reason reads as a bug on the one visit type most worth a human. It names the frame, not the
+cats: a box carries a class, not an identity, so "two cats were in shot" is knowable while
+*which two* is not — `max_cats_in_frame` is the honest shape.
 
 **The 0.3 confidence floor comes along, deliberately.** `_present_frames` admits only frames
 carrying a cat box at or above `_ANNOTATE_MIN_CONF` (`store.py:5230`), so the phone writes

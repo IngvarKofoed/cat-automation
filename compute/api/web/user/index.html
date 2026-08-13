@@ -1470,7 +1470,11 @@
             if (st.can_confirm) return { text: held, warn: false };
             switch (st.reason) {
                 case 'contested':
-                    return { text: 'More than one cat here — label it later', warn: true };
+                    // Says what was measured: two cat boxes in ONE frame. The earlier
+                    // wording ("More than one cat here") was a claim about the visit made
+                    // from identity votes, which on a real store disagree frame to frame
+                    // on a single cat — so it fired on ordinary visits.
+                    return { text: 'Two cats in one frame — label it later', warn: true };
                 case 'all_labelled':
                     return { text: held || 'Already labelled', warn: false };
                 case 'no_crop':

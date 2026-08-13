@@ -492,6 +492,33 @@ _LABEL_DEFAULT_ORACLE = "yolo-serial"
 # resulting ``label_kind`` as its own safety net.
 _LABEL_DECISIONS = ("identified", "unknown_cat", "not_cat")
 
+# ``dataset_items.source`` values this API writes — the row's PROVENANCE, which the
+# column has carried since day one while nothing ever read it (it defaults to
+# 'detector'). The phone's one-tap confirm gets its own value because it is a genuinely
+# different act: a desk label is made against the full-size crop-beside-frame stage,
+# a confirmation is made against a phone-sized top-down frame with the model's own name
+# already on it. Keeping them separable is what allows an audit in admin, an exclusion
+# from a gallery build, and an A/B of whether this channel helped or hurt.
+_LABEL_SOURCE_DETECTOR = "detector"
+_LABEL_SOURCE_USER_CONFIRM = "user-confirm"
+
+_VISIT_LABEL_SPAN_HINT = "a label applies to one visit, not a range this wide"
+# Why a one-tap confirmation was refused, in the words the phone puts on screen. Keyed by
+# ``Store.visit_label_state``'s own ``reason``, so a rung added there without a sentence
+# here fails loudly (KeyError, and a test pins the two sets equal) instead of reaching a
+# reader as a bare 409. Sentences rather than codes because the client renders `detail`
+# straight onto its failure line, and by then the reader has been advanced past the visit.
+_VISIT_LABEL_REFUSALS = {
+    "no_crop": "no frame in this visit carries a cat crop to label",
+    "all_labelled": "every frame in this visit is already labelled",
+    "unnamed": "this visit no longer resolves to a named cat",
+    "retired": "that cat has been retired, so a label cannot name it",
+    "contested": (
+        "more than one cat is identified in this visit, so it needs labelling"
+        " at the desk rather than one tap"
+    ),
+}
+
 # Settings key for the crop shape NEW crops are cut at (crop-geometry-for-new-labels
 # spec). Absent = legacy, which is byte-for-byte what every label did before this existed,
 # so an untouched install changes nothing. Deliberately NOT reset by `clear()`, unlike the
@@ -752,6 +779,36 @@ class VisitIdentifyRequest(BaseModel):
         return v
 
 
+class VisitLabelRequest(BaseModel):
+    """Body of ``POST /api/label/visit``: confirm ONE visit span's shown identity.
+
+    ``start_id``/``end_id`` are the event's inclusive frame-id bounds, required and
+    width-capped for the same reason ``VisitIdentifyRequest`` requires them.
+
+    ``cat_id`` is the identity the phone was DISPLAYING, not an instruction. The route
+    re-resolves the span's identity and refuses if the two disagree, because the active
+    model's threshold is applied at READ time and restates all history when changed
+    (changelog 425) — so the name on a phone can genuinely differ from the name the server
+    would give the same span a moment later, and "yes" has to mean yes to what was on
+    screen. Which is also why there is no ``decision`` field: this route only ever writes
+    ``identified``, and every case a confirmation cannot express is what the flag is for.
+
+    ``ge=1`` and the ``bool`` guard mirror ``VisitIdentifyRequest`` / ``FlagSpanRequest``:
+    pydantic treats ``bool`` as an int subtype, so without the guard ``true`` coerces to 1.
+    """
+
+    start_id: int = Field(ge=1)
+    end_id: int = Field(ge=1)
+    cat_id: int = Field(ge=1)
+
+    @field_validator("start_id", "end_id", "cat_id", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("must be an id, not a boolean")
+        return v
+
+
 def _parse_box(box: str) -> "list[float]":
     """Parse a ``"x1,y1,x2,y2"`` query string to four floats; raise on bad input.
 
@@ -934,6 +991,43 @@ def _validate_bounds(since_id: "int | None", until_id: "int | None") -> None:
         raise HTTPException(
             status_code=400,
             detail=f"since_id ({since_id}) must be <= until_id ({until_id})",
+        )
+
+
+def _validate_oracle(oracle: str) -> None:
+    """Reject an ``oracle`` that names no registered analyzer, with the same 400 the
+    other oracle-taking routes raise.
+
+    Load-bearing rather than cosmetic: an unknown name reaches ``_present_frames`` as a
+    predicate that simply matches no rows, so the span reads as having no crop to label
+    and the answer is an honest-looking "nothing here" for a typo. Factored out because
+    two routes need it; the older call sites inline the same check.
+    """
+    if oracle not in ANALYZER_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown oracle {oracle!r}; known: {ANALYZER_NAMES}",
+        )
+
+
+def _validate_visit_span(start_id: int, end_id: int, hint: str) -> None:
+    """Ordering + width guard for a PER-VISIT span, where both bounds are required.
+
+    Shared by the two routes the household's phone calls with a span it read off
+    ``GET /api/events`` — ``/api/identify/visit`` and ``/api/label/visit``. Elsewhere in
+    this API an omitted bound means "unbounded"; here presence is enforced by the request
+    model and the width is capped, because a stray or malformed span arriving on a no-auth
+    LAN must not silently widen a per-visit action into a whole-store one. ``hint`` names
+    the caller's own way out of the cap, since a sweep and a label want different advice.
+    """
+    _validate_bounds(start_id, end_id)
+    if end_id - start_id > _MAX_VISIT_SPAN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"span of {end_id - start_id} ids exceeds the per-visit cap "
+                f"({_MAX_VISIT_SPAN}); {hint}"
+            ),
         )
 
 
@@ -2744,11 +2838,22 @@ def create_app(
         except ValueError:
             return None, 0.0, str(raw)
 
-    def _commit_label(decision: str, cat_id: "int | None", frames: "list[LabelFrame]") -> "tuple[int, int]":
+    def _commit_label(
+        decision: str,
+        cat_id: "int | None",
+        frames: "list[LabelFrame]",
+        *,
+        source: str = _LABEL_SOURCE_DETECTOR,
+    ) -> "tuple[int, int]":
         # Materialise each cat crop FIRST then record its row (the store's ordering
         # contract: a crash orphans a harmless crop file, never a row without its crop),
         # and write the dataset_items batch. Assumes the request was already validated
         # by _validate_label. Returns (inserted_rows, crops_written).
+        #
+        # `source` is the row's PROVENANCE, and every caller but the phone's one-tap
+        # confirm leaves it at the default: a desk label made against the full-size
+        # crop-beside-frame stage is the baseline this channel is measured against, so
+        # the two must stay separable in `dataset_items` forever.
         dataset_root = store.dataset_root
         # ONE read per request, not per frame: a visit is tens of frames and this is the
         # store's shared write-locked connection. Reading it per frame would also let a
@@ -2771,7 +2876,7 @@ def create_app(
                 "cat_id": cat_id,
                 "quality": fr.quality,
                 "bbox": fr.bbox,
-                "source": "detector",
+                "source": source,
             }
             if decision == "not_cat":
                 # A detector false positive: a row, but no crop/box/quality to keep.
@@ -2897,6 +3002,82 @@ def create_app(
         cat_id = _validate_label(req)
         inserted, crops_written = _commit_label(req.decision, cat_id, req.frames)
         return {"inserted": inserted, "crops": crops_written}
+
+
+    @app.get("/api/label/visit")
+    def api_label_visit_state(
+        start_id: int = Query(ge=1),
+        end_id: int = Query(ge=1),
+        oracle: str = Query(default=_LABEL_DEFAULT_ORACLE),
+    ):
+        """Can the user app confirm this span in one tap, and what does it already hold?
+
+        The probe behind the playback modal's confirm button (user-app-visit-labelling
+        spec). Read-only; the whole rule lives in ``Store.visit_label_state`` so this and
+        the POST below cannot disagree about when a confirmation is allowed.
+        """
+        _validate_oracle(oracle)
+        _validate_visit_span(start_id, end_id, _VISIT_LABEL_SPAN_HINT)
+        return store.visit_label_state(oracle, start_id, end_id)
+
+    @app.post("/api/label/visit")
+    def api_label_visit(
+        req: VisitLabelRequest, oracle: str = Query(default=_LABEL_DEFAULT_ORACLE)
+    ):
+        """Confirm a visit span's shown identity — the user app's one-tap label.
+
+        Labels EVERY undecided present frame in the span with the one identity, which is
+        what the person tapping perceives as one visit: a user-facing event clusters motion
+        frames while an annotation visit clusters detected undecided ones, so a span can
+        hold several of the latter. Grades stay per annotation visit, so the rows are
+        graded exactly as the desk queue would have graded them.
+        """
+        _validate_oracle(oracle)
+        _validate_visit_span(req.start_id, req.end_id, _VISIT_LABEL_SPAN_HINT)
+        state = store.visit_label_state(oracle, req.start_id, req.end_id)
+        # 409, not 400: the request was well-formed and WAS true when the phone drew the
+        # button — the span's state moved underneath it. `detail` is a sentence rather than
+        # a machine-readable shape because it is rendered straight onto the phone's failure
+        # line (which reads `detail` as a string), and because the reader has already been
+        # advanced past this visit: a code they would have to interpret is no use there.
+        if not state["can_confirm"]:
+            raise HTTPException(status_code=409, detail=_VISIT_LABEL_REFUSALS[state["reason"]])
+        resolved = state["identity"]["cat_id"]
+        if resolved != req.cat_id:
+            now = state["identity"]["cat_name"] or "an unnamed cat"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "this visit no longer reads as the cat that was confirmed"
+                    f" (it now reads as {now})"
+                ),
+            )
+
+        # The span's undecided frames, taken from the SAME reader the desk queue uses so
+        # both label the same universe (`_ANNOTATE_MIN_CONF` floor included) and each
+        # crop's grade is seeded against its own visit's peak box area.
+        frames = [
+            LabelFrame(frame_id=fr["id"], bbox=fr["bbox"], quality=fr["seed_quality"])
+            for visit in store.annotation_visits(oracle, req.start_id, req.end_id)
+            for fr in visit["frames"]
+        ]
+        inserted, crops_written = _commit_label(
+            "identified", resolved, frames, source=_LABEL_SOURCE_USER_CONFIRM
+        )
+        # The flag clears ONLY on a recorded write (changelog 227). `inserted == 0` is the
+        # ordinary aged-out path — the frames left the ring buffer between the probe and
+        # the tap — and flags are never pruned, so dropping the mark here would discard
+        # both the mark and the decision in silence.
+        flag_cleared = 0
+        if inserted:
+            flag_cleared = store.delete_label_flags_overlapping(req.start_id, req.end_id)
+        return {
+            "inserted": inserted,
+            "crops": crops_written,
+            "cat_id": resolved,
+            "cat_name": state["identity"]["cat_name"],
+            "flag_cleared": flag_cleared,
+        }
 
     @app.get("/api/label/labeled")
     def api_label_labeled(
@@ -3422,15 +3603,9 @@ def create_app(
         Where ``/api/identify/run`` assumes its window is already detected, this runs the
         detect half too, which is what turns an ``unanalyzed`` event into a real subject.
         """
-        _validate_bounds(req.start_id, req.end_id)
-        if req.end_id - req.start_id > _MAX_VISIT_SPAN:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"span of {req.end_id - req.start_id} ids exceeds the per-visit cap "
-                    f"({_MAX_VISIT_SPAN}); use a Motion-tuning sweep for a range this wide"
-                ),
-            )
+        _validate_visit_span(
+            req.start_id, req.end_id, "use a Motion-tuning sweep for a range this wide"
+        )
 
         # The deps check follows the HALVES, not the endpoint. Detect always runs, so its
         # analyzer's deps are always required; the embedder's are required only when a

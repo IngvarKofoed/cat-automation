@@ -1604,3 +1604,109 @@ a clean one.
      `get_setting` take the store lock separately and the route runs in Starlette's
      threadpool, so a second client's write landing between them returned this request's
      geometry paired with that one's margin.
+
+476. The user app's playback modal can now LABEL a visit: `Yes` confirms the identity the
+     card already shows, writing `identified` rows for the span's undecided detected
+     frames. The household already steps through visits hunting mislabels, so the
+     confirmation is a byproduct of scrutiny already being spent — the desk keeps every
+     case a yes/no cannot express.
+     Spec: docs/specs/2026-08-13-user-app-visit-labelling.md.
+
+477. The phone never PICKS a cat — no roster, no stranger, no not-a-cat. `⚑ Label later`
+     (shortened from "Mark for labelling" to fit the row) is the whole other half, so the
+     dispute path needed no new machinery. Rejected a picker: it would put identity
+     decisions on a phone-sized top-down crop, which is the reading the desk's full-size
+     crop-beside-frame player exists for.
+
+478. New `Store.visit_label_state` is the SINGLE rule behind both the probe
+     (`GET /api/label/visit`) and the write, so the button can never be drawn for a tap the
+     server then refuses. Reasons, in order: `no_crop`, `all_labelled`, `unnamed`,
+     `retired`, `contested`. Identity comes from `_aggregate_identity` — the same voter
+     `events()` uses — so a confirm cannot name a cat the feed did not show.
+
+479. A CONTESTED span refuses the tap: `_aggregate_identity` returns one winner and its
+     result cannot distinguish "the other frames were too far" from "the other frames named
+     another cat", so the below-threshold vote spread is computed alongside it. Tailgating
+     is expected at this door (entry 319) and one tap must never file one cat's crops under
+     another cat's name. Nothing downstream could notice if it did.
+
+480. `cat_id` in the body is a CONCURRENCY CHECK, not an instruction — the server
+     re-resolves and 409s when the two disagree. The threshold is applied at read time and
+     restates all history when changed (entry 425), so the name a phone displays can
+     genuinely differ from the name the server would give the same span a moment later.
+     "Yes" has to mean yes to what was on screen.
+
+481. A RETIRED cat cannot be confirmed. The feed still shows such a name (a gallery can
+     predate the retirement), but the desk's picker offers only active cats and no build
+     enrols a retired one (entry 335) — so the tap would write a label the operator could
+     not have written by hand and nothing will ever read. Also covers a cat_id whose `cats`
+     row is gone.
+
+482. A PART-LABELLED span stays confirmable for its undecided remainder. Event spans GROW
+     as later motion lands (entry 224), so a cat lingering past a confirmation routinely
+     leaves a tail; gating on "nothing labelled yet" would strand exactly the longest
+     visits, which carry the most crops. Grades stay per annotation visit, so the rows are
+     graded as the desk queue would have graded them.
+
+483. Rows are stamped `source = 'user-confirm'`, the first use of a `dataset_items` column
+     that has defaulted to 'detector' since day one with nothing reading it. A confirmation
+     against a phone-sized frame with the model's own name on it is a different act from a
+     desk label, so the two stay separable — auditable, excludable from a build, and
+     A/B-able later.
+
+484. The tap ADVANCES to the next older visit immediately and the write drains on a serial
+     chain behind it — `_commit_label` cuts one JPEG per frame (~1-2 s per visit, entry
+     297), and a spinner per tap is what would make a 40-visit pass not worth doing. A
+     failed write therefore NAMES its own visit on a non-visit-scoped pill; the ⚑ does not
+     advance, being a reversible toggle whose success is deliberately silent (entry 286).
+
+485. The 0.3 confidence floor comes along, DIVERGING from entry 225's unfloored flagged
+     spans. That exemption rests on a human reviewing the span crop by crop at the desk; a
+     confirm is a blind bulk write where a faint 0.2 box could be an empty scene. Recorded
+     because the precedent points the other way and would otherwise invite a "fix".
+
+486. `_validate_visit_span` now holds the required-both-bounds + 10k-id width cap shared by
+     `/api/identify/visit` and the new route, with a caller-supplied hint. Refusal reasons
+     are a module-level table keyed by `visit_label_state`'s own `reason`, so a rung added
+     there without wording fails loudly instead of reaching a phone as a bare 409.
+
+487. Three defects the verification found, each invisible to the other half. A test asserting
+     the ⚑ survives `inserted: 0` PASSED against an unconditional flag delete — its span had
+     evicted, so the route 409'd at `no_crop` and never reached the flag code; it now removes
+     the JPEGs and keeps the rows, which is the only way to be confirmable and still insert
+     nothing. Entry 411/433/466/472's hollow-test trap, fifth instance, same tell.
+
+488. The other two were browser-only. `renderSaving()` ran AFTER `flashSaved()` and
+     overwrote the green "Saved" with the empty state, so a drained queue looked identical
+     to one that never appeared — the exact thing entry 296 added the flash for. And
+     `flex: none` on the new label-state line pushed the visit nav onto its own row on a
+     wide screen, undoing what `.msg { flex: 1 }` is documented to do; it shrinks with an
+     ellipsis now, full text in `title`.
+
+489. A probe that could not be READ now says so — "the compute PC may be on an older
+     build" — instead of leaving the footer blank, which was indistinguishable from "this
+     visit isn't confirmable". Found by hitting it: `frontend-dev.sh` serves the working
+     tree's HTML against the REAL compute PC's `/api`, so a new frontend over an
+     un-deployed backend 404s the probe and the whole feature read as missing, on a visit
+     that was fine. Entries 164/173/183/365's rule, in a new place.
+
+490. `visit_label_state`'s `existing` keys on the (`src_frame_id`, `src_recv_ts`) PAIR
+     like every sibling reader, not on the id alone. `frames.id` has no AUTOINCREMENT and
+     `clear()` deliberately spares `dataset_items`, so a new visit on a reused id range
+     matched a stale pre-clear row and the phone read "Labelled: OldCat" over a visit
+     nobody had labelled — in the feature whose purpose is finding mislabels. A row whose
+     frame merely EVICTED is still kept: eviction never reuses an id.
+
+491. Three UI-state repairs to the confirm flow, all in the refused-advance case (a
+     confirm on the last loaded visit, where `moveEvent` declines and the visit stays on
+     screen). The ⚑ button now repaints after a confirm clears the flag — stale, its next
+     tap took the ADD branch and re-created the mark (entry 228's class); the button paints
+     its busy state before the hop rather than after the write; and `probeConfirm`'s
+     sequence guard now gates the STATE WRITE, not just the paint, so a slow first probe
+     could no longer overwrite the fresher post-write answer and bring the button back on
+     an already-labelled visit.
+
+492. The new routes validate `oracle` against `ANALYZER_NAMES` as every sibling
+     oracle-taking route does. An unregistered name reached `_present_frames` as a
+     predicate matching no rows, so a typo read as an honest "no crop to label here"
+     rather than a bad request.

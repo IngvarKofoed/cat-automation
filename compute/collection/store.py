@@ -5724,6 +5724,169 @@ class Store:
             hi_i = bisect.bisect_right(ident_fids, v["end_id"])
             v["distance"] = min((float(r[1]) for r in ident_rows[lo_i:hi_i]), default=None)
 
+    def visit_label_state(self, oracle: str, start_id: int, end_id: int) -> dict:
+        """Can the user app confirm this span's identity in one tap, and what does it hold?
+
+        The single rule behind BOTH ``GET`` and ``POST /api/label/visit`` (see the
+        user-app-visit-labelling spec). Living here rather than in each route is the
+        point: the probe that decides whether to draw the button and the write that
+        refuses must test the same conditions, or the phone offers a tap the server
+        then rejects. Returns::
+
+            {can_confirm, reason, identity, contested_cat_ids, has_model,
+             n_present, n_undecided, existing: [{label_kind, cat_id, cat_name, n_frames}]}
+
+        ``identity`` is ``_aggregate_identity``'s result over the span — the SAME voter
+        ``events()`` uses for the chip the phone is looking at, so the button can never
+        confirm a name the feed did not show. ``existing`` is the span's already-written
+        ``dataset_items`` rows grouped by decision, biggest group first; more than one
+        entry is the "mixed" case (two labelling gestures merged into one event span).
+        It is read by ``src_frame_id`` so it survives the frames themselves being
+        evicted, which is what the labels outliving the ring buffer means.
+
+        ``reason`` (and ``can_confirm``, which is ``reason == 'ok'``), tested in order:
+
+        - ``no_crop`` — no frame in the span carries a cat box at or above
+          ``_ANNOTATE_MIN_CONF``, so there is nothing a label could cut a crop from.
+          Named for what is MISSING rather than "no_detection": the floor means a span
+          CAN hold faint sub-floor verdicts and still land here, and telling the
+          operator nothing was detected would send them to Analyse — which re-runs the
+          detector and finds the same faint boxes, a dead end.
+        - ``all_labelled`` — every present frame already has a row. Note the converse
+          is NOT required: a span holding labels AND undecided frames is confirmable
+          for the remainder, because an event's cluster GROWS as later motion lands
+          (changelog 224), so a cat that lingers past a confirmation routinely leaves
+          an undecided tail. Gating on ``existing`` being empty would strand exactly
+          the longest visits, which carry the most crops.
+        - ``unnamed`` — no active model, no identification in the span, or the
+          aggregate resolved to *unknown cat* (a NULL threshold, or every match too
+          far). There is no name on screen to say yes to.
+        - ``retired`` — the span resolves to a RETIRED cat. The feed still shows such a
+          name (a promoted gallery can predate the retirement), but the desk's own
+          picker offers only ``active`` cats, and a retired cat's crops are omitted from
+          enrolment (changelog 335) — so confirming one would write a label the operator
+          could not have written by hand and no build will ever read.
+        - ``contested`` — more than one cat has a below-threshold vote in the span.
+          ``_aggregate_identity`` returns one WINNER and its result cannot distinguish
+          "the other frames were too far" from "the other frames named another cat",
+          so the spread is computed here. Tailgating is expected at this door
+          (changelog 319) and one tap must never file one cat's crops under another
+          cat's name, so a contested span is refused and left to the desk.
+        """
+        # Both outside the lock: `active_model` re-acquires it (the single-lock
+        # discipline `annotation_queue_page` follows), and `_present_frames` takes it
+        # itself. `_present_frames` is the queue's own universe, so `n_undecided` counts
+        # exactly the frames a label would write rows for — floor included.
+        model = self.active_model()
+        present = self._present_frames(oracle, start_id, end_id)
+        n_present = len(present)
+        n_undecided = sum(1 for fr in present if not fr["decided"])
+
+        with self._lock:
+            # Read off idx_dataset_src's leading column, with NO join to `frames`, so a
+            # label whose source frame has been evicted still counts — the labels outliving
+            # the ring buffer is the point of the table.
+            #
+            # But keyed on (src_frame_id, src_recv_ts), the `clear()`-safe PAIR every
+            # sibling reader uses (`_present_frames`, `_resolve_flag`, `labeled_visits`):
+            # `frames.id` has no AUTOINCREMENT, so a `clear()` — which deliberately spares
+            # `dataset_items` — restarts ids at 1, and a new visit landing on a reused id
+            # range would otherwise match a stale pre-clear row and report "Labelled:
+            # OldCat" over a visit nobody ever labelled. The recv_ts comes from
+            # `dataset_items` itself; the live pairs come from the frames still present, and
+            # a row whose frame is simply GONE is kept, since eviction never reuses an id.
+            existing_rows = self._conn.execute(
+                "SELECT d.label_kind, d.cat_id, c.name, d.src_frame_id, d.src_recv_ts"
+                " FROM dataset_items d LEFT JOIN cats c ON c.id = d.cat_id"
+                " WHERE d.src_frame_id BETWEEN ? AND ?",
+                (int(start_id), int(end_id)),
+            ).fetchall()
+            live_ts = {
+                int(fid): recv_ts
+                for fid, recv_ts in self._conn.execute(
+                    "SELECT id, recv_ts FROM frames WHERE id BETWEEN ? AND ?",
+                    (int(start_id), int(end_id)),
+                ).fetchall()
+            }
+            ident_rows: "list" = []
+            cat_names: dict = {}
+            cat_residents: dict = {}
+            cat_active: dict = {}
+            if model is not None:
+                # Byte-for-byte `events()`' identity read, scoped to this one span.
+                ident_rows = self._conn.execute(
+                    "SELECT cat_id, distance FROM identifications"
+                    " WHERE model_version_id = ? AND frame_id BETWEEN ? AND ? AND cat_id IS NOT NULL",
+                    (int(model["id"]), int(start_id), int(end_id)),
+                ).fetchall()
+                cat_rows = self._conn.execute(
+                    "SELECT id, name, is_resident, active FROM cats"
+                ).fetchall()
+                cat_names = {cid: name for cid, name, _res, _act in cat_rows}
+                cat_residents = {cid: bool(res) for cid, _name, res, _act in cat_rows}
+                cat_active = {cid: bool(act) for cid, _name, _res, act in cat_rows}
+
+        # Group in Python now that the rows carry their key: a row whose frame is LIVE must
+        # agree with it on recv_ts (else it is a pre-`clear()` ghost on a reused id); a row
+        # whose frame is absent is kept, its label having outlived the frame.
+        counts: "dict[tuple, list]" = {}
+        for kind, cat_id, name, src_fid, src_ts in existing_rows:
+            live = live_ts.get(int(src_fid))
+            if live is not None and live != src_ts:
+                continue
+            key = (kind, cat_id)
+            if key in counts:
+                counts[key][1] += 1
+            else:
+                counts[key] = [name, 1]
+        existing = [
+            {"label_kind": kind, "cat_id": cat_id, "cat_name": name, "n_frames": n}
+            for (kind, cat_id), (name, n) in sorted(
+                counts.items(), key=lambda kv: (-kv[1][1], kv[0][0] or "")
+            )
+        ]
+
+        identity = None
+        contested: "list[int]" = []
+        if model is not None:
+            span_idents = [(int(cid), float(dist)) for cid, dist in ident_rows]
+            threshold = model["threshold"]
+            identity = self._aggregate_identity(span_idents, threshold, cat_names, cat_residents)
+            if threshold is not None:
+                # The spread `_aggregate_identity` discards. A NULL threshold puts
+                # nothing below it, so there is nothing to contest — that span is
+                # already refused as `unnamed` by the fail-safe.
+                voters = {cid for cid, dist in span_idents if dist <= threshold}
+                if len(voters) > 1:
+                    contested = sorted(voters)
+
+        if n_present == 0:
+            reason = "no_crop"
+        elif n_undecided == 0:
+            reason = "all_labelled"
+        elif identity is None or identity.get("cat_id") is None:
+            reason = "unnamed"
+        elif not cat_active.get(identity["cat_id"], False):
+            # `.get(..., False)` also covers a cat_id with no `cats` row at all — an
+            # identification whose cat was DELETED. Same answer as retired: there is
+            # nothing a label could legitimately name.
+            reason = "retired"
+        elif contested:
+            reason = "contested"
+        else:
+            reason = "ok"
+
+        return {
+            "can_confirm": reason == "ok",
+            "reason": reason,
+            "identity": identity,
+            "contested_cat_ids": contested,
+            "has_model": model is not None,
+            "n_present": n_present,
+            "n_undecided": n_undecided,
+            "existing": existing,
+        }
+
     def labeled_visits(
         self, oracle: str, since_id: "int | None" = None, until_id: "int | None" = None
     ) -> "list[dict]":

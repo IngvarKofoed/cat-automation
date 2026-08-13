@@ -851,6 +851,62 @@
         .btn.marked { background: var(--porch-soft); color: var(--porch); border-color: var(--porch); }
         .btn.marked:hover { filter: none; background: var(--porch-soft); }
 
+        /* ================= confirm the shown identity ================= */
+        /* The one FILLED control in the footer — the ⚑ and the nav stay ghosts — because
+           it is the primary action on a visit whose name is already right. This file has
+           NO bare `.hidden` rule (see the note above #playerAnalyse), so it needs its own
+           or the toggle is a silent no-op and the button shows on every visit. */
+        #playerConfirm.hidden { display: none; }
+        #playerLabelState.hidden { display: none; }
+        /* `flex: 0 1 auto` + `min-width: 0`, NOT `flex: none` and NOT `flex: 1`. It has to
+           SHRINK: at its natural width it pushes the nav onto its own line even on a wide
+           screen, undoing exactly what the `.msg { flex: 1 }` note above is for. But it
+           must not GROW either, or it would take half the free space from `.msg` (both
+           would grow from a 0 basis) and truncate itself while there was room. Truncated
+           text stays readable via the `title` the renderer sets. */
+        #playerLabelState {
+            flex: 0 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--muted);
+            font-size: .85rem;
+        }
+        #playerLabelState.warn { color: var(--porch); }
+
+        /* A label is written BEHIND the reader: a confirm advances to the next visit at
+           once, so this pill is the only thing that can say one is still in flight — and
+           it NAMES the cat and time, because the visit it belongs to has already left the
+           screen ("saving 3…" cannot answer "did my Mittens go through"). Motion is what
+           peripheral vision catches, hence the pulse rather than a grey word.
+           The slot is permanently reserved so the frame never steps under the reader when
+           the pill appears; `.stage { min-height: 0 }` makes the stage absorb the height
+           instead of the dialog overflowing its 94vh cap and clipping the nav. */
+        .saving-slot { display: flex; align-items: center; min-height: 28px; padding: .35rem 1rem 0; }
+        .saving {
+            display: inline-flex;
+            align-items: center;
+            gap: .5rem;
+            font-size: .82rem;
+            font-weight: 600;
+            padding: .15rem .6rem;
+            border-radius: 999px;
+            border: 1px solid var(--porch);
+            color: var(--porch);
+            background: var(--porch-soft);
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .saving.hidden { display: none; }
+        .saving.done { border-color: var(--resident); color: var(--resident); background: var(--resident-bg); }
+        .saving.failed { border-color: var(--neighbour); color: var(--neighbour); background: var(--neighbour-bg); }
+        .saving .pulse { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: none; animation: savepulse 1s ease-in-out infinite; }
+        .saving.done .pulse, .saving.failed .pulse { animation: none; }
+        @keyframes savepulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
         @media (max-width: 480px) {
             .porthole { width: 60px; }
             .event-time { font-size: 1.05rem; }
@@ -950,6 +1006,12 @@
                 <span id="playerChipSlot"></span>
                 <button class="x" id="playerClose" aria-label="Close playback">&times;</button>
             </div>
+            <!-- Reserved slot, never collapsed: a confirm advances the reader to the next
+                 visit immediately, so this is where an in-flight (or failed) label write
+                 reports. It is NOT visit-scoped — that is the whole point. -->
+            <div class="saving-slot">
+                <span class="saving hidden" id="playerSaving" aria-live="polite"><span class="pulse" aria-hidden="true"></span><span id="playerSavingTxt"></span></span>
+            </div>
             <div class="stage" id="playerStage">
                 <div class="player-frame" id="playerFrame">
                     <img id="playerImg" alt="Event frame">
@@ -964,7 +1026,19 @@
             <div class="filmstrip" id="playerFilmstrip"></div>
             <div class="player-stats hidden" id="playerStats"></div>
             <div class="player-actions">
-                <button class="btn ghost" id="playerFlag">Mark for labelling</button>
+                <!-- Shown only where it can act: an undecided span, carrying a NAMED
+                     identity, resolving to an active cat, and uncontested (see
+                     Store.visit_label_state). The visible word is bare "Yes" because the
+                     footer has room for nothing longer beside the ⚑ and the nav — the
+                     assertion it makes lives in its aria-label and title, which name the
+                     cat. It is legible as "Yes" only because the button exists iff the
+                     identity chip in the dialog head above carries that name. -->
+                <button class="btn hidden" id="playerConfirm">Yes</button>
+                <button class="btn ghost" id="playerFlag">Label later</button>
+                <!-- What the span already holds / why there is no Yes. Not aria-live: the
+                     dialog's own aria-label carries the visit's description, and the
+                     readout beside it is the live region. -->
+                <span class="msg hidden" id="playerLabelState"></span>
                 <!-- Shown only on a visit nothing has looked at yet (subject 'unanalyzed').
                      On an already-analysed visit the job would fill no verdicts, and a
                      button that does nothing is worse than no button. -->
@@ -1041,6 +1115,29 @@
         // Several may be in flight — the server's queue is serial and dedups a repeat of the
         // running span, so a second visit is just another job in line.
         const analysing = new Set();
+        // One `visit_label_state` probe result per event object: whether the name on screen
+        // can be confirmed in one tap, and what the span already holds. A WeakMap rather
+        // than a Map because the feed is paged and page-1 reloads replace it wholesale — an
+        // object-keyed Map would hold every event ever loaded alive for the session.
+        const confirmProbe = new WeakMap();
+        // Sentinel for "the probe could not be read", kept apart from `undefined` (never
+        // asked) and from a real result. A frozen object so an identity test is the whole
+        // check and nothing can mistake it for a state payload with fields.
+        const PROBE_FAILED = Object.freeze({ probeFailed: true });
+        // Visits with a confirm write in flight. A SET for the same reason `analysing` is
+        // one, only more so: a confirm ADVANCES to the next visit immediately, so a single
+        // flag would paint "Saving…" onto the visit the reader has just hopped to.
+        const confirming = new Set();
+        // The writes are a queue, not a race (admin's annotation page's discipline): each
+        // one cuts a JPEG per visit frame, so serialising them keeps the store's write lock
+        // from being contended by the reader's own tapping.
+        let confirmChain = Promise.resolve();
+        // In-flight labels, oldest first — each {name, when} — and the last failure. The
+        // failure OUTLIVES the drain on purpose: the visit it belongs to is long gone from
+        // the screen, so nothing else could ever tell the reader the write did not land.
+        let confirmPending = [];
+        let confirmFailure = '';
+        let confirmSavedTimer = null;
         let strangersOnly = false;
         // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
         // motion and motion-only noise — leaving named cats and persons.
@@ -1084,6 +1181,8 @@
         const playerStatsEl = $('playerStats');
         const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
         const playerAnalyseBtn = $('playerAnalyse');
+        const playerConfirmBtn = $('playerConfirm'), playerLabelStateEl = $('playerLabelState');
+        const playerSavingEl = $('playerSaving'), playerSavingTxtEl = $('playerSavingTxt');
         const playerFrameEl = $('playerFrame'), playerBboxEl = $('playerBbox'), playerBboxCapEl = $('playerBboxCap');
 
         // ================= helpers =================
@@ -1306,7 +1405,12 @@
         }
         function renderFlagButton(ev) {
             const on = isFlagged(ev);
-            playerFlagBtn.textContent = on ? 'Marked for labelling ✓' : 'Mark for labelling';
+            // Shortened from "Mark for labelling" so the pair fits one row on a ~360px
+            // phone beside the confirm button and the visit nav. ONE wording everywhere,
+            // never contextual on whether a Yes sits beside it — and deliberately no ✓ on
+            // the marked state, which would collide with the confirm button's own glyph;
+            // the `.marked` accent carries it instead.
+            playerFlagBtn.textContent = on ? '⚑ Marked' : 'Label later';
             playerFlagBtn.classList.toggle('marked', on);
             playerFlagBtn.title = on
                 ? 'This visit is on the labelling list — tap to remove it'
@@ -1316,6 +1420,200 @@
         function setFlagMsg(text, bad) {
             playerFlagMsgEl.textContent = text || '';
             playerFlagMsgEl.classList.toggle('bad', !!bad);
+        }
+
+        // ================= confirm the shown identity =================
+        // "Yes, the name on this card is right" → label the visit's undecided frames with
+        // it (user-app-visit-labelling spec). The phone never PICKS a cat: everything a
+        // confirmation cannot express is what the ⚑ is for. The server owns the whole rule
+        // (Store.visit_label_state) and re-checks it on the write, so this code decides
+        // nothing — it only draws what the probe says and reports what the write did.
+        function renderConfirmButton(ev) {
+            const st = confirmProbe.get(ev);
+            const busy = confirming.has(ev);
+            // Kept visible while ITS OWN write settles, so the control doesn't vanish
+            // under the reader's finger; hidden the moment the probe says it can't act.
+            const show = busy || !!(st && st.can_confirm);
+            playerConfirmBtn.classList.toggle('hidden', !show);
+            if (!show) return;
+            playerConfirmBtn.disabled = busy;
+            playerConfirmBtn.textContent = busy ? 'Saving…' : 'Yes';
+            const name = (st && st.identity && st.identity.cat_name) || '';
+            const n = st ? st.n_undecided : 0;
+            // The visible word is bare "Yes", so the ASSERTION lives here: a screen reader
+            // reaching a button labelled "Yes" gets no context from the word alone.
+            playerConfirmBtn.setAttribute('aria-label',
+                name ? `Yes, this visit is ${name}` : 'Yes, confirm this visit');
+            playerConfirmBtn.title = name
+                ? `Label this visit ${name} — ${n} ${n === 1 ? 'frame' : 'frames'}`
+                : '';
+        }
+        // The footer's one line about what this span holds, and why there may be no Yes.
+        // Every branch is a FACT the probe measured, never a guess: `no_crop` in particular
+        // does not claim nothing was detected (the queue's confidence floor means a span can
+        // hold faint boxes and still land here), because that reading would send the reader
+        // to Analyse, which re-runs the detector and finds the same faint boxes.
+        function confirmStateText(st) {
+            // The probe could not be READ — distinct from every reason below, which are
+            // measurements. Left blank, this is indistinguishable from "this visit simply
+            // isn't confirmable", and the commonest cause is a deployment gap: the dev
+            // proxy serves this file from a working tree while /api goes to a compute PC
+            // that has no such route yet, so the whole feature reads as missing. Naming
+            // that possibility is the rule entries 164/173/183/365 set — a readout must
+            // not report only the benign cause.
+            if (st === PROBE_FAILED) {
+                return { text: 'Couldn’t check this visit — the compute PC may be on an older build', warn: true };
+            }
+            if (!st) return { text: '', warn: false };
+            const named = st.existing.filter(e => e.label_kind === 'identified' && e.cat_name);
+            const held = named.length ? `Labelled: ${named.map(e => e.cat_name).join(', ')}` : '';
+            if (st.can_confirm) return { text: held, warn: false };
+            switch (st.reason) {
+                case 'contested':
+                    return { text: 'More than one cat here — label it later', warn: true };
+                case 'all_labelled':
+                    return { text: held || 'Already labelled', warn: false };
+                case 'no_crop':
+                    return { text: 'No cat crop in this visit to label', warn: false };
+                case 'retired':
+                    return { text: 'That cat is retired — label it later', warn: true };
+                default:
+                    // 'unnamed': no model, or nothing near enough to name. There is simply
+                    // no name on screen to say yes to, which the missing chip already shows.
+                    return { text: held, warn: false };
+            }
+        }
+        function renderLabelState(ev) {
+            const { text, warn } = confirmStateText(confirmProbe.get(ev));
+            playerLabelStateEl.textContent = text;
+            // The element ellipsises when the row is tight, so the full sentence has to
+            // stay reachable somewhere.
+            playerLabelStateEl.title = text;
+            playerLabelStateEl.classList.toggle('hidden', !text);
+            playerLabelStateEl.classList.toggle('warn', warn);
+        }
+        // Probe THIS event, then repaint only if it is still the one on screen. `seq` is
+        // openEvent's own guard: Prev/Next repoints the footer at another visit, and a
+        // slow probe landing afterwards would otherwise offer a Yes for the previous cat.
+        async function probeConfirm(ev, seq) {
+            // A failure is RECORDED, not swallowed. Hiding the button is still the safe
+            // reading of an unknown state, but going silent about it makes "we could not
+            // ask" identical to "the answer was no" — see confirmStateText's note.
+            let st = PROBE_FAILED;
+            try {
+                const sp = new URLSearchParams({ start_id: String(ev.start_id), end_id: String(ev.end_id) });
+                const res = await fetch('/api/label/visit?' + sp.toString());
+                if (res.ok) st = await res.json();
+            } catch (_) { /* keep PROBE_FAILED */ }
+            // The guard gates the STATE WRITE, not just the paint. Two probes can be in
+            // flight for one event — openEvent's, and the re-probe after a confirm — and
+            // if the older lands last it would overwrite the fresher answer in the map:
+            // the post-write "all_labelled" replaced by the pre-write "can_confirm", so
+            // the button returns on a visit that was just labelled and the next tap 409s.
+            if (seq !== playerSeq) return;
+            confirmProbe.set(ev, st);
+            renderConfirmButton(ev);
+            renderLabelState(ev);
+        }
+        // The pill: what is still in flight, or the last failure. Not visit-scoped — the
+        // visit it describes has already left the screen, which is why it names the cat.
+        function renderSaving() {
+            let text = '', cls = '';
+            if (confirmPending.length) {
+                const first = confirmPending[0];
+                text = confirmPending.length === 1
+                    ? `Saving ${first.name} · ${first.when}…`
+                    : `Saving ${first.name} · ${first.when} + ${confirmPending.length - 1} more…`;
+            } else if (confirmFailure) {
+                text = confirmFailure;
+                cls = 'failed';
+            }
+            playerSavingTxtEl.textContent = text;
+            playerSavingEl.className = 'saving' + (text ? '' : ' hidden') + (cls ? ' ' + cls : '');
+            playerSavingEl.title = confirmPending.length > 1
+                ? confirmPending.map(p => `${p.name} · ${p.when}`).join('\n')
+                : '';
+        }
+        // A drained queue CONFIRMS briefly rather than the pill merely vanishing, which
+        // looks identical to one that never appeared. Suppressed when the batch held a
+        // failure, so it can never contradict the line that failure already printed.
+        function flashSaved() {
+            if (confirmFailure) return;
+            playerSavingTxtEl.textContent = 'Saved';
+            playerSavingEl.className = 'saving done';
+            clearTimeout(confirmSavedTimer);
+            confirmSavedTimer = setTimeout(() => { if (!confirmPending.length && !confirmFailure) renderSaving(); }, 2000);
+        }
+        function confirmVisit() {
+            const ev = activityVisible[activitySelectedIndex];
+            if (!ev) return;
+            const st = confirmProbe.get(ev);
+            if (!st || !st.can_confirm || confirming.has(ev)) return;
+            const name = (st.identity && st.identity.cat_name) || 'this cat';
+            const when = formatTime(ev.start_ts);
+            const cat_id = st.identity.cat_id;
+            confirming.add(ev);
+            confirmPending.push({ name, when });
+            confirmFailure = '';
+            renderSaving();
+            // Paint the busy state for THIS visit before the hop, since the hop may be
+            // refused (last loaded visit) and leave it on screen — otherwise the button
+            // reads "Yes" throughout its own write.
+            renderConfirmButton(ev);
+            // Advance FIRST: the write settles behind the reader, which is what makes a
+            // walk through 40 visits worth doing. `moveEvent` owns the end-of-list and
+            // next-page handling, so a confirm on the last loaded visit behaves like a hop.
+            moveEvent(1);
+            const send = async () => {
+                try {
+                    const res = await fetch('/api/label/visit', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ start_id: ev.start_id, end_id: ev.end_id, cat_id }),
+                    });
+                    if (!res.ok) throw new Error(await errorFromResponse(res));
+                    const body = await res.json();
+                    // The probe is stale either way now — re-open re-probes.
+                    confirmProbe.delete(ev);
+                    if (!body.inserted) {
+                        // A 200 that recorded nothing: the frames aged out between the
+                        // probe and the tap. The routine retention path, and the reason
+                        // the ⚑ is left alone by the server — so say what happened.
+                        confirmFailure = `${name} · ${when} — not saved, those frames have aged out`;
+                    } else if (body.flag_cleared) {
+                        // Mirror the server's overlap delete locally so the ⚑ clears
+                        // without refetching the feed.
+                        dropOverlappingFlags(ev);
+                        renderActivityRowFlag(ev);
+                    }
+                } catch (err) {
+                    confirmFailure = `${name} · ${when} — not saved: ${err.message}`;
+                } finally {
+                    confirming.delete(ev);
+                    confirmPending.shift();
+                    // ORDER MATTERS: renderSaving() paints the pill from the queue, so
+                    // calling it after flashSaved() would immediately overwrite the green
+                    // "Saved" with the empty state — leaving a drained queue looking
+                    // identical to one that never appeared, which is the whole reason the
+                    // flash exists. Paint the queue first, then let the flash win.
+                    renderSaving();
+                    if (!confirmPending.length) flashSaved();
+                    // Repaint for whatever is on screen NOW — skipping this leaves
+                    // "Saving…" until the next openEvent. If the hop was REFUSED (a
+                    // confirm on the last loaded visit) this event is still open, and its
+                    // probe was just invalidated, so re-probe rather than leaving the
+                    // footer blank about a visit that now carries a label.
+                    const open = activityVisible[activitySelectedIndex];
+                    if (open === ev) probeConfirm(ev, playerSeq);
+                    // renderFlagButton too, because a recorded confirm CLEARS an
+                    // overlapping flag: without it the footer keeps reading "⚑ Marked"
+                    // over a visit whose flag is gone, and the next tap takes the ADD
+                    // branch — creating the mark the reader meant to remove. Entry 228's
+                    // class, which toggleFlag's own finally already guards against.
+                    if (open) { renderConfirmButton(open); renderLabelState(open); renderFlagButton(open); }
+                }
+            };
+            confirmChain = confirmChain.then(send, send);
         }
 
         // ================= analyse this visit =================
@@ -2026,6 +2324,15 @@
             setFlagMsg('');
             renderFlagButton(ev);
             renderAnalyseButton(ev);
+            // The confirm button + label-state line are drawn from the LAST probe for this
+            // event (nothing, on a first open) and then refreshed when a fresh one lands.
+            // Re-probed on every hop, not cached for the modal: this is the visit-scoped
+            // control that entry-228's bug was about, and `playerSeq` is what stops a slow
+            // probe from offering the previous visit's cat here.
+            renderConfirmButton(ev);
+            renderLabelState(ev);
+            renderSaving();
+            probeConfirm(ev, seq);
 
             // Reset to a loading state so a slow fetch never shows the previous event.
             playerFrames = []; playerImages = []; playerTiles = [];
@@ -2293,6 +2600,7 @@
         playerNextBtn.addEventListener('click', () => moveEvent(1));
         playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
         playerCloseBtn.addEventListener('click', closePlayer);
+        playerConfirmBtn.addEventListener('click', confirmVisit);
         playerFlagBtn.addEventListener('click', toggleFlag);
         playerAnalyseBtn.addEventListener('click', analyseVisit);
 

@@ -812,6 +812,15 @@
             font-size: .8rem;
             line-height: 1;
         }
+        /* ✓ = someone has already decided this visit (skip-handled-visits spec). Muted,
+           not an accent: it is the RESTING state of a worked visit, so it must not compete
+           with the ⚑ beside it, which is an outstanding request. */
+        .label-mark {
+            flex: none;
+            color: var(--muted);
+            font-size: .8rem;
+            line-height: 1;
+        }
         .player-actions {
             display: flex;
             align-items: center;
@@ -836,6 +845,21 @@
            controls — and not in .player-controls, where it read as frame stepping and
            squeezed the scrub slider to ~40px on a phone. */
         .visit-nav { display: flex; align-items: center; gap: .5rem; margin-left: auto; flex: none; }
+        /* "Skip done" rides ON the nav line — it acts on that pair — and shrinks first,
+           since the two buttons and the position readout must never be squeezed. */
+        .skip-toggle {
+            display: flex;
+            align-items: center;
+            gap: .35rem;
+            font-size: .82rem;
+            color: var(--muted);
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .skip-toggle input { margin: 0; }
+        /* A disabled control has to LOOK unavailable: the reason itself is printed in the
+           footer's .msg line, since a phone has no hover to reach a title. */
+        .skip-toggle.off { opacity: .5; cursor: default; }
         /* .player-controls .btn's compact padding is scoped to that row, so it has to be
            restated: at the default .5rem 1rem the pair no longer fits one 480px line. */
         .visit-nav .btn { padding: .4rem .8rem; }
@@ -914,8 +938,17 @@
                the screen's edges, where a thumb reaches them. The readout grows to fill
                the middle so it absorbs its own width changes — the end-of-list suffix
                appears and disappears, and otherwise both arrows would shift each time. */
-            .visit-nav { flex: 1 1 100%; margin-left: 0; justify-content: space-between; }
+            .visit-nav { flex: 1 1 100%; margin-left: 0; justify-content: space-between; flex-wrap: wrap; }
             .visit-pos { flex: 1; text-align: center; }
+            /* "Skip done" rides ABOVE that line rather than on it. It is `nowrap`, so its
+               automatic minimum width is its full text and the flex row can take space from
+               nowhere else — measured at 360px, the two buttons absorbed it and wrapped to
+               two lines each (37px -> 59px tall). Its own row restores their proven shape,
+               which is also what the spec prescribed for this breakpoint.
+               `flex-wrap` belongs to the row, not the item: `flex-basis: 100%` alone cannot
+               break a line in a nowrap container, it only asks for width the buttons then
+               lose — measured, after the first attempt at this fix changed nothing. */
+            .skip-toggle { flex: 1 1 100%; order: -1; }
         }
         @media (prefers-reduced-motion: reduce) {
             * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -1051,6 +1084,14 @@
                      "single left-pointing angle quotation mark" — so the direction is
                      carried by each button's aria-label. -->
                 <div class="visit-nav">
+                    <!-- Skip visits already decided or marked: a NAVIGATION filter, so it
+                         changes no membership and closes nothing (unlike the two header
+                         toggles, which renumber the feed). Off by default — a reader who
+                         never asked must not have visits withheld. -->
+                    <label class="skip-toggle" id="skipDoneLabel">
+                        <input type="checkbox" id="skipDone">
+                        Skip done
+                    </label>
                     <button class="btn ghost" id="playerPrev" disabled aria-label="Newer visit"><span aria-hidden="true">&lsaquo;</span> Newer</button>
                     <span class="visit-pos" id="playerVisitPos">—</span>
                     <button class="btn ghost" id="playerNext" disabled aria-label="Older visit">Older <span aria-hidden="true">&rsaquo;</span></button>
@@ -1142,6 +1183,17 @@
         // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
         // motion and motion-only noise — leaving named cats and persons.
         let showAll = false;
+        // "Skip done" (skip-handled-visits spec): the visit nav hops past visits already
+        // decided or marked. In-memory and off by default, like the two toggles above —
+        // but unlike them it filters NAVIGATION, not membership, so it renumbers nothing.
+        let skipDone = false;
+        // Whether the loaded feed can answer "is this visit labelled" at all — LATCHED
+        // from the page-1 payload's KEY PRESENCE, never from its truthiness: a current
+        // backend answers `labelled: false` on every event of a feed nobody has labelled
+        // yet (the rollout state), so a falsy test would banner a healthy system as an old
+        // build. Latched rather than live because the confirm path WRITES the field: on an
+        // old backend that would create the key and quietly re-enable a half-working skip.
+        let labelsKnown = false;
 
         // player
         const SWIPE_COMMIT_PX = 45;   // horizontal travel that commits a visit hop
@@ -1177,6 +1229,7 @@
         const playerPlayBtn = $('playerPlay'), playerPrevBtn = $('playerPrev'), playerNextBtn = $('playerNext');
         const playerScrubEl = $('playerScrub'), playerCountEl = $('playerCount');
         const playerVisitPosEl = $('playerVisitPos'), playerStageEl = $('playerStage');
+        const skipDoneEl = $('skipDone'), skipDoneLabelEl = $('skipDoneLabel');
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
         const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
@@ -1398,6 +1451,42 @@
             el.setAttribute('aria-hidden', 'true');   // the row's aria-label already says it
             return el;
         }
+        // ================= "already decided" =================
+        // Whether anyone has labelled this visit — from the feed's own `labelled` flag, so
+        // it costs no request and answers synchronously, which the swipe's damping needs.
+        function isLabelled(ev) {
+            return !!ev.labelled;
+        }
+        // What "Skip done" skips: decided OR marked. Deliberately not `all_labelled` — an
+        // event's cluster GROWS as later motion lands, so a confirmed visit routinely
+        // regains an undecided tail and would come back, which is the opposite of what the
+        // checkbox is for.
+        function isHandled(ev) {
+            return isLabelled(ev) || isFlagged(ev);
+        }
+        // A mark landed (or was withdrawn), so what "Skip done" can REACH changed with it —
+        // and it is the neighbours' buttons that move, not this visit's: the search starts at
+        // index ± 1, so labelling the visit on screen changes its own nav not at all, while
+        // labelling the one just left can empty the direction it sits in. Called after every
+        // mirror write; without it a button reads live and then does nothing, which is the
+        // exact failure the enabled-at-a-page-edge decision exists to avoid.
+        // Any "nothing … to do" note is dropped rather than recomputed: it described a search
+        // over the handled state that just changed, and the next press re-derives it.
+        function refreshNavAfterMarkChange() {
+            if (navEndNote.startsWith('nothing')) navEndNote = '';
+            updatePlayerNav();
+        }
+        function labelMark() {
+            const el = document.createElement('span');
+            el.className = 'label-mark';
+            el.textContent = '✓';
+            // Hedged, not "already labelled" flat: a part-labelled span still offers Yes
+            // for its undecided tail, so the flat claim would be contradicted the moment
+            // the reader opens it. What the ✓ asserts is that a decision exists here.
+            el.title = 'Labelled — newer frames may have arrived since';
+            el.setAttribute('aria-hidden', 'true');   // the row's aria-label already says it
+            return el;
+        }
         // Local mirror of the server's overlap rules, so the button and the ⚑ update
         // together without refetching the whole feed after a tap.
         function dropOverlappingFlags(ev) {
@@ -1561,7 +1650,10 @@
             // Advance FIRST: the write settles behind the reader, which is what makes a
             // walk through 40 visits worth doing. `moveEvent` owns the end-of-list and
             // next-page handling, so a confirm on the last loaded visit behaves like a hop.
-            moveEvent(1);
+            // `fromClick` because a confirm IS a press: at a page boundary it must complete
+            // its hop when the page lands, or a walk stalls at every hundredth visit — the
+            // one place the walk is least willing to be interrupted.
+            moveEvent(1, true);
             const send = async () => {
                 try {
                     const res = await fetch('/api/label/visit', {
@@ -1578,11 +1670,18 @@
                         // probe and the tap. The routine retention path, and the reason
                         // the ⚑ is left alone by the server — so say what happened.
                         confirmFailure = `${name} · ${when} — not saved, those frames have aged out`;
-                    } else if (body.flag_cleared) {
-                        // Mirror the server's overlap delete locally so the ⚑ clears
-                        // without refetching the feed.
-                        dropOverlappingFlags(ev);
-                        renderActivityRowFlag(ev);
+                    } else {
+                        // The visit is now decided, so mirror that locally — the ✓ appears
+                        // and "Skip done" steps past it without refetching the feed. Guarded
+                        // on `labelsKnown`: writing the field on a payload that never carried
+                        // it would make the older-build latch look satisfied by this
+                        // session's own confirms, re-enabling a skip that can only see them.
+                        // A `200` with `inserted: 0` (frames aged out) is deliberately NOT
+                        // marked — nothing was recorded, and the branch above says so.
+                        if (labelsKnown) ev.labelled = true;
+                        // Mirror the server's overlap flag delete too, so the ⚑ clears.
+                        if (body.flag_cleared) dropOverlappingFlags(ev);
+                        renderActivityRowMarks(ev);
                     }
                 } catch (err) {
                     confirmFailure = `${name} · ${when} — not saved: ${err.message}`;
@@ -1609,6 +1708,9 @@
                     // branch — creating the mark the reader meant to remove. Entry 228's
                     // class, which toggleFlag's own finally already guards against.
                     if (open) { renderConfirmButton(open); renderLabelState(open); renderFlagButton(open); }
+                    // The visit just written is a NEIGHBOUR of the one now on screen, so with
+                    // "Skip done" on it may have emptied that direction — repaint the nav.
+                    refreshNavAfterMarkChange();
                 }
             };
             confirmChain = confirmChain.then(send, send);
@@ -1675,6 +1777,7 @@
             analysing.add(ev);
             renderAnalyseButton(ev);
             setFlagMsg('');
+            renderSkipToggle();   // restores the older-build notice this cleared (see toggleFlag)
             // Same discipline as the flag toggle: only ever report onto the shared readout
             // while THIS event is the one on screen, since Prev/Next repoints it.
             const stillOpen = () => activityVisible[activitySelectedIndex] === ev;
@@ -1726,8 +1829,8 @@
         }
         // Repaint one card's rail dot, pill and health dot after its subject changed,
         // without rebuilding the rail (which would drop the reader's scroll position —
-        // and the modal is open over it). Mirrors renderActivityRowFlag's shape; the ⚑ it
-        // owns is left alone, since analysing a visit never changes whether it is marked.
+        // and the modal is open over it). Mirrors renderActivityRowMarks's shape; the ✓/⚑
+        // that one owns are left alone, since analysing a visit changes neither.
         function refreshActivityRow(ev) {
             const i = activityVisible.indexOf(ev);
             if (i < 0) return;
@@ -1741,15 +1844,16 @@
             let chipRow = row.querySelector('.chip-row');
             if (!chipRow) {
                 // An un-analysed card always had a pill, so this is defensive — but a card
-                // with no chip row at all is reachable (no pill, no health dot, no ⚑), and
-                // bailing would hide the very result the user asked for.
+                // with no chip row at all is reachable (no pill, no health dot, no marks),
+                // and bailing would hide the very result the user asked for.
                 if (!chip && !health) return;
                 chipRow = document.createElement('div');
                 chipRow.className = 'chip-row';
                 row.querySelector('.event-meta').appendChild(chipRow);
             }
-            // Order is pill, health dot, ⚑ (see the card builder), so a new pill goes
-            // first and a new health dot before any ⚑.
+            // Order is pill, health dot, ✓, ⚑ (see the card builder), so a new pill goes
+            // first and a new health dot before whichever mark comes first (querySelector
+            // over the union returns it in document order).
             const oldChip = chipRow.querySelector('.chip');
             if (oldChip && chip) chipRow.replaceChild(chip, oldChip);
             else if (chip) chipRow.insertBefore(chip, chipRow.firstChild);
@@ -1757,7 +1861,7 @@
             const oldHealth = chipRow.querySelector('.health-dot');
             if (oldHealth && health) chipRow.replaceChild(health, oldHealth);
             else if (oldHealth) oldHealth.remove();
-            else if (health) chipRow.insertBefore(health, chipRow.querySelector('.flag-mark'));
+            else if (health) chipRow.insertBefore(health, chipRow.querySelector('.label-mark, .flag-mark'));
         }
         // Optimistic: the label flips at once (the write takes the store lock and can
         // queue behind the collector), and reverts with a message if the call fails.
@@ -1773,12 +1877,16 @@
             const removed = wasOn ? activityFlags.filter(f => f.end_id >= ev.start_id && f.start_id <= ev.end_id) : null;
             flagBusy = true;
             setFlagMsg('');
+            // Restore the older-build notice this just cleared: it shares that one line, a
+            // plain success prints nothing over it, and the reason would otherwise vanish
+            // for the rest of the visit. Same ordering openEvent uses, same reason.
+            renderSkipToggle();
             if (wasOn) dropOverlappingFlags(ev);
             // Placeholder id is deliberately unusable: NOTHING may key this array by id —
             // both write routes are span-keyed, and every reader here uses start/end only.
             else activityFlags = activityFlags.concat([{ id: -1, ...span, start_ts: ev.start_ts }]);
             renderFlagButton(ev);
-            renderActivityRowFlag(ev);
+            renderActivityRowMarks(ev);
             // Only report onto the shared modal readout while THIS event is still the one on
             // screen: openEvent (Prev/Next) repoints the button + message at another event,
             // and a settling write that repainted them anyway would leave a lie there —
@@ -1823,29 +1931,38 @@
                 // event-scoped, so it is always safe to repaint for the captured event.
                 const open = activityVisible[activitySelectedIndex];
                 if (open) renderFlagButton(open);
-                renderActivityRowFlag(ev);
+                renderActivityRowMarks(ev);
+                // A ⚑ makes a visit handled, or un-marking makes it work again — either way
+                // "Skip done" now reaches a different set (see refreshNavAfterMarkChange).
+                refreshNavAfterMarkChange();
             }
         }
-        // Repaint just this event's card marker, so a tap doesn't rebuild the rail (which
-        // would drop the reader's scroll position while the modal is open).
-        function renderActivityRowFlag(ev) {
+        // Repaint just this event's card markers — ✓ and ⚑ — so a tap doesn't rebuild the
+        // rail (which would drop the reader's scroll position while the modal is open).
+        // BOTH marks in one function, not one each: a confirm can add the ✓ *and* clear an
+        // overlapping ⚑, which is one repaint of one row.
+        function renderActivityRowMarks(ev) {
             const i = activityVisible.indexOf(ev);
             if (i < 0) return;
             const row = railEl.querySelector(`.event-row[data-index="${i}"]`);
             if (!row) return;
-            setRowLabel(row, ev);   // the ⚑ is aria-hidden, so the label carries the state
+            setRowLabel(row, ev);   // both marks are aria-hidden — the label carries them
             let chipRow = row.querySelector('.chip-row');
             if (!chipRow) {
                 // A card can have no chip row at all (no pill, no health dot). Make one
-                // rather than bail, or the ⚑ would only appear after a reload.
-                if (!isFlagged(ev)) return;
+                // rather than bail, or a mark would only appear after a reload.
+                if (!isHandled(ev)) return;
                 chipRow = document.createElement('div');
                 chipRow.className = 'chip-row';
                 row.querySelector('.event-meta').appendChild(chipRow);
             }
-            const existing = chipRow.querySelector('.flag-mark');
-            if (isFlagged(ev)) { if (!existing) chipRow.appendChild(flagMark()); }
-            else if (existing) existing.remove();
+            // ✓ before ⚑, matching the card builder's order.
+            const oldLabel = chipRow.querySelector('.label-mark');
+            const oldFlag = chipRow.querySelector('.flag-mark');
+            if (isLabelled(ev)) { if (!oldLabel) chipRow.insertBefore(labelMark(), oldFlag); }
+            else if (oldLabel) oldLabel.remove();
+            if (isFlagged(ev)) { if (!oldFlag) chipRow.appendChild(flagMark()); }
+            else if (oldFlag) oldFlag.remove();
         }
 
         // ================= router =================
@@ -1897,22 +2014,44 @@
                 const data = await res.json();
                 // A page-1 reload landed while this was in flight; its events replaced
                 // ours, so appending this page would splice a stale window into the feed.
-                if (seq !== activitySeq) return;
+                // A pending hop dies with it — its keyset was computed against the old set.
+                if (seq !== activitySeq) { navPendingHop = false; return; }
                 const older = data.events || [];
                 activityEvents = activityEvents.concat(older);
                 // An empty page means we ran past the oldest retained visit, whatever
                 // the flag says.
                 activityTruncated = older.length ? !!data.truncated : false;
                 appendActivityRows(older);
-                // The player may be open on the last loaded visit: its Older button was
-                // disabled at the end of the list and this page just extended it. Drop
-                // the "loading older…" note with it — the hop it refused now works, so
-                // leaving it up would explain a button that is no longer blocked.
+                // The player may be open at the end of the loaded list, having refused a hop
+                // pending this page. RECOMPUTE rather than simply dropping the "loading
+                // older…" note: with "Skip done" on, the page that just landed can be wholly
+                // handled visits, so the hop it refused may STILL not work — and leaving the
+                // note up would promise a fetch that is over, while clearing it would
+                // explain nothing.
                 if (playerOpen()) {
+                    const wantHop = navPendingHop;
+                    navPendingHop = false;
                     if (navEndNote === NAV_LOADING_NOTE) navEndNote = '';
-                    updatePlayerNav();
+                    if (nextIndex(1) >= 0) {
+                        // A CLICK's refused hop completes here (see moveEvent); a swipe's
+                        // does not — it already eased back, and moving the frame under a
+                        // finger that has left the glass is not what the gesture meant.
+                        if (wantHop) moveEvent(1, true);
+                        else updatePlayerNav();
+                    } else {
+                        // Landed, and still nothing to do among what is loaded. Deliberately
+                        // no chained fetch — one page per press — so this names the state
+                        // instead, and `Older` stays live for the next press.
+                        const filtered = strangersOnly || !showAll;
+                        if (skipDone) navEndNote = filtered ? 'nothing shown to do' : 'nothing loaded to do';
+                        else if (!activityTruncated) navEndNote = filtered ? 'oldest shown' : 'oldest';
+                        updatePlayerNav();
+                    }
                 }
             } catch (err) {
+                // No page, so no hop: a pending intent must not survive to be completed by
+                // some later, unrelated append.
+                navPendingHop = false;
                 if (seq === activitySeq) {
                     showNote(activityErrorEl, `Couldn't load older visits: ${err.message}`);
                     // That note lives on the page BEHIND the playback modal, so a reader who
@@ -2006,6 +2145,16 @@
                 }
                 activityEvents = edata.events || [];
                 activityTruncated = !!edata.truncated;
+                // Latch whether this backend answers "is this visit labelled". KEY presence,
+                // not truthiness — `labelled: false` on every event is the ordinary state of
+                // a feed nobody has labelled yet, and reading that as "no such field" would
+                // banner a healthy system as an older build. An EMPTY feed leaves the latch
+                // untouched: it proves nothing either way, and clearing it would disable the
+                // control every time the store is momentarily empty.
+                if (activityEvents.length) {
+                    labelsKnown = activityEvents.some(ev => 'labelled' in ev);
+                }
+                renderSkipToggle();
                 renderActivity();
                 maybeContinuePaging();
             } catch (err) {
@@ -2117,7 +2266,11 @@
             const health = visitHealth(ev.detection);
             const healthText = health ? ` Detection ${TL_WORD[health]}.` : '';
             const flagText = isFlagged(ev) ? ' Marked for labelling.' : '';
-            return `${healthText}${flagText}`;
+            // Both marks are aria-hidden, so this sentence is the ONLY way either reaches a
+            // screen reader — and it is shared with the dialog's own label, so the row and
+            // the modal can never claim different things about one visit.
+            const labelText = isLabelled(ev) ? ' Already labelled.' : '';
+            return `${healthText}${labelText}${flagText}`;
         }
         function setRowLabel(row, ev) {
             row.setAttribute('aria-label',
@@ -2165,15 +2318,19 @@
             rel.className = 'event-rel';
             rel.textContent = relativeTime(ev.start_ts);
             meta.append(time, rel);
-            // The identity/subject pill, the visit-health dot and the ⚑ share one line.
+            // The identity/subject pill, the visit-health dot, the ✓ and the ⚑ share one
+            // line. The ✓ is drawn HERE and not only by the incremental repaint, so a
+            // reload or an appended page marks visits labelled in an earlier session too.
             const chip = subjectChip(ev);
             const healthEl = healthDot(ev);
+            const labelEl = isLabelled(ev) ? labelMark() : null;
             const flagEl = isFlagged(ev) ? flagMark() : null;
-            if (chip || healthEl || flagEl) {
+            if (chip || healthEl || labelEl || flagEl) {
                 const chipRow = document.createElement('div');
                 chipRow.className = 'chip-row';
                 if (chip) chipRow.appendChild(chip);
                 if (healthEl) chipRow.appendChild(healthEl);
+                if (labelEl) chipRow.appendChild(labelEl);
                 if (flagEl) chipRow.appendChild(flagEl);
                 meta.appendChild(chipRow);
             }
@@ -2215,6 +2372,43 @@
             closePlayer();
             renderActivity();
         });
+        // Deliberately NOT the two handlers above: this changes no membership, so it must
+        // not close the player it lives inside, and must not re-render the rail. What it
+        // changes is which visits the nav can reach — hence only the nav repaints.
+        skipDoneEl.addEventListener('change', () => {
+            skipDone = skipDoneEl.checked;
+            // Blur, or focus stays in an INPUT and the modal's keydown handler drops the
+            // reader's next Space (play/pause) and arrows (scrub) in silence — the trap
+            // the scrub slider already avoids the same way.
+            skipDoneEl.blur();
+            // A stale end-of-list note describes a search that no longer applies.
+            navEndNote = '';
+            updatePlayerNav();
+        });
+        // The checkbox is only meaningful while the feed can answer "is this labelled".
+        // Disabled (and SAID so, visibly — a phone has no hover to reach a title) when the
+        // payload carried no `labelled` key at all: a skip degraded to ⚑-only would silently
+        // under-skip while looking like it works, and the likeliest cause is a compute PC
+        // running an older build than this page.
+        function renderSkipToggle() {
+            // Force it OFF, not merely unchecked: left on, `isHandled` would still skip
+            // flagged visits, which is exactly the half-working ⚑-only skip this guards.
+            if (!labelsKnown) skipDone = false;
+            skipDoneEl.disabled = !labelsKnown;
+            skipDoneLabelEl.classList.toggle('off', !labelsKnown);
+            skipDoneEl.checked = skipDone;
+            skipDoneLabelEl.title = labelsKnown
+                ? 'Older / Newer jump past visits already labelled or marked ⚑'
+                : 'Not available — this page could not read whether visits are labelled';
+            // The reason is printed into a SHARED line, so it cannot be `aria-describedby`'d
+            // from here (the same element carries confirm failures). Fold it into the
+            // control's own accessible name instead, or a screen reader gets
+            // "Skip done, checkbox, disabled" and no why.
+            if (labelsKnown) skipDoneEl.removeAttribute('aria-label');
+            else skipDoneEl.setAttribute('aria-label',
+                'Skip done — unavailable, this page could not read whether visits are labelled');
+            if (!labelsKnown) setFlagMsg('Can’t check labels — the compute PC may be on an older build');
+        }
 
         // ================= playback modal =================
         // Per-frame YOLO detection overlay (playback-yolo-boxes spec): each played frame
@@ -2293,6 +2487,11 @@
             if (i < 0 || i >= activityVisible.length) return;
             const ev = activityVisible[i];
             const seq = ++playerSeq;
+            // The reader has moved, so a hop still waiting on a page is stale — dropped,
+            // never queued (it would land the reader somewhere they did not ask for). Set
+            // AFTER the landing's own moveEvent call reads it, which is why that call passes
+            // the flag it captured rather than re-reading this.
+            navPendingHop = false;
             pausePlayback();
             activitySelectedIndex = i;
             highlightSelectedRow();
@@ -2322,6 +2521,9 @@
             setFlagMsg('');
             renderFlagButton(ev);
             renderAnalyseButton(ev);
+            // AFTER setFlagMsg(''), which would otherwise wipe the older-build reason this
+            // prints into the same line. Per-visit, so the reason survives every hop.
+            renderSkipToggle();
             // The confirm button + label-state line are drawn from the LAST probe for this
             // event (nothing, on a first open) and then refreshed when a fresh one lands.
             // Re-probed on every hop, not cached for the modal: this is the visit-scoped
@@ -2468,55 +2670,93 @@
             // Reset the readout (and clear any end-of-list wording with it), so a stale
             // "oldest loaded" can't greet the next, unrelated visit opened from the feed.
             navEndNote = '';
+            navPendingHop = false;   // nothing to hop to on a closed player
             updatePlayerNav();
             dialogEl.setAttribute('aria-label', 'Event playback');
             abortGesture(false);   // nothing to animate on a hidden dialog
         }
 
         // delta: -1 = newer (up the newest-first feed), +1 = older (further down).
-        function canMove(delta) {
-            if (!activityVisible.length || activitySelectedIndex < 0) return false;
-            const next = activitySelectedIndex + delta;
-            return next >= 0 && next < activityVisible.length;
+        // The index a hop would land on, or -1. ONE search behind all three consumers —
+        // the buttons' disabled state, the swipe's rubber-band damping, and the hop itself
+        // — because with "Skip done" on the answer is no longer `index ± 1` and three
+        // inline derivations would disagree the moment they drifted.
+        function nextIndex(delta) {
+            if (!activityVisible.length || activitySelectedIndex < 0) return -1;
+            for (let i = activitySelectedIndex + delta; i >= 0 && i < activityVisible.length; i += delta) {
+                if (!skipDone || !isHandled(activityVisible[i])) return i;
+            }
+            return -1;
         }
-        function moveEvent(delta) {
+        function canMove(delta) {
+            return nextIndex(delta) >= 0;
+        }
+        // Set by the Older BUTTON when its hop is refused pending a page fetch, and
+        // consumed by loadOlderActivity's landing. A click has no frame under a thumb, so
+        // entry 264's "don't freeze mid-gesture" refusal is a swipe argument only: a button
+        // that visibly does nothing but change a caption, then works on the second press,
+        // is a broken control. A swipe never sets this.
+        let navPendingHop = false;
+        function moveEvent(delta, fromClick = false) {
             if (!activityVisible.length) return;
-            const next = activitySelectedIndex + delta;
-            // Refused. The buttons are disabled at the ends, so only a swipe reaches
-            // here — and a swiper isn't looking at a disabled button, so say which end.
-            // The wording must not assert an absolute that is false, and there are TWO
-            // ways it can be: the feed's scan was capped, and a toggle is hiding events.
-            // The filter case is the COMMON one — `showAll` defaults off, so the noise
-            // kinds are hidden unless asked for — and nav walks the filtered list, so a
-            // hidden newer/older event makes a bare "newest"/"oldest" a lie.
+            const next = nextIndex(delta);
+            if (next >= 0) {
+                navEndNote = '';
+                openEvent(next);
+                return;
+            }
+            // Refused. Say which end, and in words that stay true: the feed's scan may have
+            // been capped, a toggle may be hiding events, and "Skip done" may be stepping
+            // over some. The filter case is the COMMON one — `showAll` defaults off, so the
+            // noise kinds are hidden unless asked for — and nav walks the filtered list, so
+            // a hidden newer/older event makes a bare "newest"/"oldest" a lie.
             const filtered = strangersOnly || !showAll;
-            if (next < 0) {
-                navEndNote = filtered ? 'newest shown' : 'newest';
-                updatePlayerNav();
-                return;
-            }
-            if (next >= activityVisible.length) {
-                // At the end of the LOADED pages, not necessarily of the feed. Kick off
-                // the next page and refuse THIS hop rather than awaiting it: the swipe's
-                // ease-back is the "that didn't take" cue, and holding the frame still
-                // mid-gesture while a fetch runs would read as a freeze. The page lands
-                // in a moment and re-enables the button, so the next hop goes through.
-                if (activityTruncated) {
-                    loadOlderActivity();
+            const older = delta > 0;
+            if (older && activityTruncated) {
+                // At the end of the LOADED pages, not necessarily of the feed. Kick off the
+                // next page. A swipe refuses this hop outright — its ease-back is the "that
+                // didn't take" cue, and holding the frame still mid-gesture while a fetch
+                // runs would read as a freeze — while a click records the intent and the
+                // landing completes it. One page per press either way.
+                loadOlderActivity();
+                // Only claim "loading" if a fetch is actually in flight: loadOlderActivity
+                // bails synchronously when it is already at the store's first frame (and
+                // clears `truncated` doing so), and promising a page nothing will deliver is
+                // the same lie the landing branch was fixed for. It sets `activityPaging`
+                // before its first await, so this reads a decided state.
+                if (activityPaging) {
                     navEndNote = NAV_LOADING_NOTE;
-                } else {
-                    // "shown" already covers a capped feed, so it wins over "loaded".
-                    navEndNote = filtered ? 'oldest shown' : 'oldest';
+                    if (fromClick) navPendingHop = true;
+                    updatePlayerNav();
+                    return;
                 }
-                updatePlayerNav();
-                return;
+                // else: nothing to fetch after all — fall through to the end-of-feed wording
             }
-            navEndNote = '';
-            openEvent(next);
+            if (skipDone) {
+                // Nothing left to DO — which is not the same as nothing left. Scoped to
+                // what is loaded (and to what is shown, when a toggle is hiding events),
+                // because older pages may well hold undecided visits; `Older` staying
+                // enabled is what carries "there is more back there".
+                navEndNote = older
+                    ? (filtered ? 'nothing older shown to do' : 'nothing older to do')
+                    : (filtered ? 'nothing newer shown to do' : 'nothing newer to do');
+            } else if (older) {
+                // "shown" already covers a capped feed, so it wins over "loaded".
+                navEndNote = filtered ? 'oldest shown' : 'oldest';
+            } else {
+                navEndNote = filtered ? 'newest shown' : 'newest';
+            }
+            updatePlayerNav();
         }
         function updatePlayerNav() {
-            playerPrevBtn.disabled = activitySelectedIndex <= 0;
-            playerNextBtn.disabled = activitySelectedIndex < 0 || activitySelectedIndex >= activityVisible.length - 1;
+            playerPrevBtn.disabled = !canMove(-1);
+            // Older is live whenever a hop is reachable OR another page could be fetched.
+            // The second half is new for EVERY reader, box or no box: the button used to
+            // grey out at the last loaded visit, so only a swipe reached the fetch branch
+            // and anyone without a touchscreen was dead-ended at each page edge. With the
+            // skip on, a page of handled visits makes that the normal case.
+            playerNextBtn.disabled = activitySelectedIndex < 0
+                || (!canMove(1) && !activityTruncated);
             if (activitySelectedIndex < 0) {
                 playerVisitPosEl.textContent = '—';
                 return;
@@ -2594,8 +2834,9 @@
         playerStageEl.addEventListener('touchcancel', () => abortGesture(true));
 
         playerPlayBtn.addEventListener('click', togglePlayback);
-        playerPrevBtn.addEventListener('click', () => moveEvent(-1));
-        playerNextBtn.addEventListener('click', () => moveEvent(1));
+        // fromClick: a refused Older records a pending hop the landed page completes.
+        playerPrevBtn.addEventListener('click', () => moveEvent(-1, true));
+        playerNextBtn.addEventListener('click', () => moveEvent(1, true));
         playerScrubEl.addEventListener('input', () => { pausePlayback(); showPlayerFrame(Number(playerScrubEl.value)); });
         playerCloseBtn.addEventListener('click', closePlayer);
         playerConfirmBtn.addEventListener('click', confirmVisit);

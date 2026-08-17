@@ -1802,7 +1802,16 @@ def create_app(
         _validate_bounds(since_id, until_id)
         # min_frames and limit are both clamped inside Store.events (the single source of
         # truth for those clamps), so the route passes them straight through.
-        return store.events(since_id, until_id, min_frames=min_frames, limit=limit)
+        #
+        # `with_labels=True` is this route ONLY (see Store.events): it adds the per-event
+        # `labelled` flag the user app's "Skip done" nav reads, and `cats_overview` /
+        # `door_stats` reuse the same feed without paying a per-span read for it. Not a query
+        # param: the field is small, the admin SPA ignores an unread key, and a client that
+        # asked for the feed WITHOUT it could not tell the missing key from an older
+        # backend's — which is exactly how the user page detects that gap.
+        return store.events(
+            since_id, until_id, min_frames=min_frames, limit=limit, with_labels=True
+        )
 
     @app.get("/api/events/stream")
     async def api_events_stream(request: Request):

@@ -4549,6 +4549,7 @@ class Store:
         min_frames: int = 1,
         limit: int = _MAX_EVENTS,
         with_subject: bool = True,
+        with_labels: bool = False,
     ) -> dict:
         """The user-facing activity feed: motion frames clustered into events, newest-first.
 
@@ -4629,6 +4630,15 @@ class Store:
         keys. For identity-only callers — ``cats_overview`` reuses this feed purely for
         "which cat, when", and computing a subject it never reads is the single most
         expensive part of the call.
+
+        ``with_labels=True`` adds ``labelled`` — whether the span holds a
+        ``dataset_items`` row, i.e. whether anyone has already decided this visit (see
+        the skip-handled-visits spec). Opt-IN, the mirror of ``with_subject``'s opt-out:
+        only the activity feed's own route reads it, while ``cats_overview`` and
+        ``door_stats`` (which pages this call for counts alone) must not pay a per-span
+        read for a key they never look at. A BOOLEAN, not a count — every consumer
+        reduces it to yes-or-no, and ``EXISTS`` stops at a span's first row where
+        ``COUNT`` would walk them all.
         """
         limit = max(1, min(int(limit), _MAX_EVENTS))
         min_frames = max(1, int(min_frames))
@@ -4830,6 +4840,49 @@ class Store:
                     class_conf, peak_area_by_start[event["start_id"]], event["n_frames"], floor,
                     corrupt_by_event[i], swept=bool(subj_by_event[i]),
                 )
+
+        # --- Already-decided flag (skip-handled-visits spec).
+        # Whether each returned event's span holds a `dataset_items` row, so the phone can
+        # step past visits it has already dealt with. Per-span like every read above, and
+        # EXISTS rather than a count: no consumer reads the magnitude, and this stops at a
+        # span's first live row instead of walking every labelled frame in it.
+        #
+        # The JOIN is on the (src_frame_id, src_recv_ts) PAIR, the clear()-safe key every
+        # sibling reader uses (`visit_label_state`, `_present_frames`, `_resolve_flag`):
+        # `frames.id` has no AUTOINCREMENT and `clear()` deliberately spares
+        # `dataset_items`, so on the id alone a stale pre-clear row would mark a brand-new
+        # visit as decided and the nav would skip a visit nobody has ever looked at
+        # (changelog 490). It also drops a label whose source frame has since EVICTED —
+        # unlike `visit_label_state`, which keeps those — and that is the right failure
+        # direction here: a decided visit re-appearing is a nuisance, one silently skipped
+        # is work lost. An event exists only over live frames anyway, so the divergence is
+        # a knife-edge at the eviction boundary.
+        #
+        # Plan, measured on this schema with no ANALYZE (changelog 266): SEARCH d USING
+        # COVERING INDEX idx_dataset_src over the id range, then SEARCH f USING COVERING
+        # INDEX idx_frames_recv_ts — both index-only, and the cost is the span's LABELLED
+        # rows. That is already the right shape, so unlike the scoped scorecard (changelog
+        # 391) this needs no CROSS JOIN pin; the pin was measured to give the identical
+        # plan. Pinned by a TEST regardless (test_events_labelled.py): drive from `frames`
+        # instead and the walk becomes every FRAME in the span probing dataset_items per
+        # row — the visit's whole length rather than its few labels, per span, under the
+        # write lock. Not a full scan, though: SQLite transfers the range through the
+        # `f.id = d.src_frame_id` equality (measured — the overstated version of this
+        # comment claimed a whole-table scan). Changelog 229/265/276/307/385's class, whose
+        # numbers are identical either way, which is how it has recurred five times.
+        if with_labels:
+            with self._lock:
+                labelled_by_event = [
+                    self._conn.execute(
+                        "SELECT 1 FROM dataset_items d JOIN frames f"
+                        " ON f.id = d.src_frame_id AND f.recv_ts = d.src_recv_ts"
+                        " WHERE d.src_frame_id BETWEEN ? AND ? LIMIT 1",
+                        (int(e_lo), int(e_hi)),
+                    ).fetchone() is not None
+                    for e_lo, e_hi in spans
+                ]
+            for i, event in enumerate(events):
+                event["labelled"] = labelled_by_event[i]
 
         # --- Active-model identity join (identification-gallery-activity spec).
         # Annotate each RETURNED event with the active gallery's aggregated identity

@@ -1760,3 +1760,113 @@ a clean one.
 501. `max_cats_in_frame` and its span-scoped `analysis.detail` read are gone with it, so
      the probe is one read lighter than it was two commits ago. Nothing else consumed
      either — the field existed for one afternoon.
+
+502. The user app's playback nav can now SKIP visits already dealt with: "Skip done" in the
+     modal footer makes Older/Newer (and the swipe) land only on visits carrying neither a
+     label nor a ⚑. A NAVIGATION filter, not a list filter — the rail still shows every
+     visit, so `12 / 40` keeps its meaning and a handled visit stays one tap away.
+     Off by default, in-memory. Spec: docs/specs/2026-08-17-user-skip-handled-visits.md.
+
+503. `Store.events` gained `with_labels`, the `with_subject` mirror (entry 257): per event,
+     `labelled`. Only `/api/events` opts in, so `cats_overview` and `door_stats` — which
+     pages this feed 8x for counts alone — pay nothing for a key they never read.
+     A BOOLEAN via `EXISTS`, not a count: every consumer reduces it to yes-or-no, and this
+     stops at a span's first live row instead of walking every labelled frame in it.
+
+504. That read JOINs `frames` on the (`src_frame_id`, `src_recv_ts`) PAIR. On the id alone a
+     stale pre-`clear()` row marks a brand-new visit as decided and the nav skips a visit
+     nobody has ever looked at (entry 490). It also drops a label whose source frame has
+     EVICTED, diverging from `visit_label_state`, which keeps those: the honest direction
+     here is a handled visit re-appearing, never one silently skipped.
+
+505. "Handled" is ANY `dataset_items` row in the span, deliberately not `all_labelled`: a
+     cluster GROWS as later motion lands (entries 224/482), so a confirmed visit routinely
+     regains an undecided tail and would come back — the opposite of the point. Desk
+     decisions (*stranger*, *not a cat*) therefore count as handled too, which is right.
+
+506. The new read's plan is pinned by a test: `d` outer via covering `idx_dataset_src`, `f`
+     via covering `idx_frames_recv_ts`, nothing scanned. Measured with no `ANALYZE` (266),
+     and it corrects the assumption that motivated the pin — driving from `frames` is NOT a
+     full scan: SQLite transfers the range through the `f.id = d.src_frame_id` equality, so
+     it walks the span's FRAMES rather than its few labels. Identical result either way,
+     which is how entries 229/265/276/307/385/391's class keeps recurring.
+
+507. One `nextIndex(delta)` now answers for all three nav consumers — each button's
+     `disabled`, the swipe's rubber-band damping, and the hop itself — where each used to
+     re-derive `index ± 1` inline. The swipe reads it DURING `touchmove`, which is why the
+     labelled state had to travel with the feed rather than be probed per hop: an async
+     answer cannot drive a gesture already under the reader's thumb.
+
+508. `Older` is now enabled whenever another page could be fetched — UNCONDITIONALLY, so
+     this changes NAV behaviour with the feature off. It used to grey out at the last loaded
+     visit, leaving entry 264's fetch branch reachable by swipe alone: a reader without a
+     touchscreen was dead-ended at every page edge. (The rail's ✓ is the other
+     feature-off change: it marks labelled visits whether or not the box is ticked.)
+
+509. A refused `Older` CLICK completes its hop once the page lands; a swipe still refuses.
+     Entry 264's "don't freeze the frame mid-gesture" is a swipe argument and void for a
+     button, where doing nothing but changing a caption reads as broken. The pending intent
+     is DROPPED, never queued, if the modal closed, the reader navigated, or a page-1 reload
+     superseded the fetch. One page per press either way — no chained fetch.
+
+510. New readout state, and it is the feature's STEADY state rather than a corner: a landed
+     page that is wholly handled reads "nothing loaded to do" ("nothing shown to do" while a
+     toggle hides events). Both alternatives are false — "loading older…" when nothing is
+     loading, "nothing older to do" when untouched pages exist — and `Older` staying enabled
+     is what carries "there is more back there".
+
+511. The rail marks a labelled visit with a muted ✓ beside the ⚑, drawn at build time so it
+     shows for earlier sessions' labels too. Both marks are `aria-hidden`, so the sentence
+     goes in `visitAriaExtras`, shared with the dialog's own label (entry 255).
+     `renderActivityRowFlag` became `renderActivityRowMarks` and owns both: a confirm can
+     add the ✓ and clear an overlapping ⚑, which is one repaint of one row.
+
+512. The checkbox DISABLES itself, dims, and says why VISIBLY (the footer's `.msg`, not a
+     `title` — a phone has no hover) when the payload carried no `labelled` key. Detection is
+     key PRESENCE, latched per page-1 load: `labelled: false` on every event is the ordinary
+     pre-labelling state, so a falsy test would banner a healthy system as an older build —
+     and the confirm path's own mirror would otherwise CREATE the key and re-enable a skip
+     that could only see this session's writes.
+
+513. It blurs itself on change — entries 235/242/298's trap, now reachable in this modal,
+     whose keydown handler drops any keystroke targeting an INPUT — and, unlike the two
+     header toggles, closes the player and re-renders NOTHING: it changes what the nav can
+     reach, not what the list contains.
+
+514. Found in the browser: a mirror write must repaint the NAV too. After confirming visit 5
+     and advancing to 6, `Newer` stayed enabled over a neighbour that had just become
+     handled — live-looking and inert, the exact failure entry 508 exists to avoid. The same
+     helper drops any "nothing … to do" note, which described a search over the handled state
+     that the write just changed.
+
+515. Review repair: "Skip done" takes its OWN row below 480px. It is `white-space: nowrap`,
+     so its automatic minimum width is its whole label and the flex row could take space
+     from nowhere else — the two nav buttons absorbed it and wrapped to two lines each
+     (measured 37 -> 59 px tall at 360px). This is also what the spec prescribed for that
+     breakpoint. Missed by the browser pass, which measured 390px only.
+
+516. Review repair: the older-build notice is re-asserted after `toggleFlag` and
+     `analyseVisit` clear the shared footer line. A plain success prints nothing over it, so
+     the one visible statement of why the checkbox is dead vanished on the first tap and
+     stayed gone for the rest of the visit — on the device with no hover to reach a `title`.
+
+517. Review repair: a confirm advances with `fromClick`, so a confirm sitting on a page
+     boundary completes its hop once the page lands, as an `Older` press does. Otherwise a
+     walk stalls at every hundredth visit — the one place it is least willing to be
+     interrupted, since the walk is what the feature is for.
+
+518. Measured the added per-span read rather than quoting only its plan: 0.1 ms per
+     100-event page on a 2M-frame / 666k-verdict / 33k-crop replica with no `ANALYZE`,
+     against 0.4 ms of existing per-span work on the same page. Sub-millisecond under the
+     shared write lock, so it is nowhere near entries 102-105/338's starvation class.
+
+519. Known limit, accepted: `labelled` never refreshes CROSS-CLIENT. `activity_signal`
+     carries no `dataset_items` term (entry 285's reasoning), so a desk requeue leaves a
+     stale ✓ on an open phone feed and "Skip done" steps past that visit until the next feed
+     load. The harmful direction is exactly that one; the benign one (a new label) self-heals
+     the same way. Fix, if it bites: a label revision counter in `activity_signal`.
+
+520. The opt-out invariant is now pinned by a test: `cats_overview` and `door_stats` must
+     issue no `dataset_items` read, since paying for a key they never look at is what
+     `with_labels` exists to prevent — and `door_stats` pages this feed 8x. Verified to fail
+     when `cats_overview` is flipped to opt in.

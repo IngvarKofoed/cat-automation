@@ -22,6 +22,7 @@ actuate. Tests inject a fake backend.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Callable, Protocol
 
@@ -35,6 +36,13 @@ GPIO_OUTPUTS: "tuple[dict, ...]" = (
     {"name": "channel2", "pin": 21, "label": "Channel 2"},
     {"name": "channel3", "pin": 20, "label": "Channel 3"},
 )
+
+# Set CAT_EDGE_GPIO=0 in the environment to skip claiming any pins at all: the
+# driver then reports ``available=False`` (switches inert, night-light self-gates)
+# exactly as on a host without gpiozero. Needed on nodes where no relay board is
+# wired and the pins are taken by other hardware (e.g. GPIO 20/21 are the I2S
+# data lines of the WM8960 audio HAT, and claiming them as outputs silences it).
+_DISABLE_ENV = "CAT_EDGE_GPIO"
 
 # Level each channel comes up at on boot (state is not persisted). HIGH, because
 # the door's relay board is active-low: HIGH = relay released/off, so the pins
@@ -109,6 +117,10 @@ class GpioOutputs:
         self._backend: "PinBackend | None" = None
         self._error: "str | None" = None
         factory = backend_factory or (lambda pins: GpioZeroBackend(pins))
+        if os.environ.get(_DISABLE_ENV, "").strip() == "0":
+            self._error = f"disabled by {_DISABLE_ENV}=0"
+            log.info("GPIO outputs disabled by %s=0; no pins claimed", _DISABLE_ENV)
+            return
         try:
             self._backend = factory([o["pin"] for o in self._outputs])
         except Exception as e:  # noqa: BLE001 - any import/init failure → unavailable

@@ -1974,3 +1974,9 @@ a clean one.
      as the spec put it: needs a design decision. Closed naming waits as long as motion lasts,
      and failed clips retry every tick: both by spec. `open_visit` re-walks the open cluster
      per call — measured 3.9 ms at 30 min, 15 ms at 2 h; a cache needs Clear/eviction care.
+
+541. A deployed edge MUST set `CAT_EDGE_ALSA_DEVICE`: Pi OS makes HDMI (card 0) ALSA's
+     default, and headless `aplay` there fails with "audio open error: Unknown error 524" —
+     every Play refused, the alarm silent. ARCHITECTURE had called the default "the HAT".
+     Set host-locally via a systemd drop-in naming the card by name
+     (`plughw:CARD=wm8960soundcard,DEV=0`), since card indices can shift between boots.

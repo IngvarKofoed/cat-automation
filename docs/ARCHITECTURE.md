@@ -268,8 +268,10 @@ so a crashed compute leaves at most one clip (≤ 6.5 s) finishing, then silence
   is silenced at the door whatever the compute is doing; the compute's own switch
   (off by default) remains the opt-in.
 
-Playback is `aplay -q [-D $CAT_EDGE_ALSA_DEVICE]` on ALSA's default device (the
-HAT); the service user needs ALSA access (the `audio` group). The Config UI's *Sound*
+Playback is `aplay -q [-D $CAT_EDGE_ALSA_DEVICE]` — ALSA's default device unless the
+env var names one. On Pi OS the default is usually HDMI, *not* the HAT, so a deployed
+node must set it (see *Deployment*); the service user needs ALSA access (the `audio`
+group). The Config UI's *Sound*
 section carries the switch and a *Play* button per clip, which works with the
 compute down and writes no alarm-log row (the Pi has no store).
 
@@ -743,6 +745,15 @@ outbound-internet dependency.
     and the web server (Video stream + Control API + Config UI). **No ML
     runtime.**
   - GPIO drives the optional lock relay/servo, speaker, and light.
+  - **Audio device (host-local).** Pi OS makes card 0 (HDMI) ALSA's default; with no
+    display attached `aplay` fails with `audio open error: Unknown error 524`. Point
+    the edge at the HAT with a systemd drop-in, naming the card by NAME since indices
+    can shift between boots — e.g. for the WM8960 HAT,
+    `/etc/systemd/system/cat-edge.service.d/alsa-device.conf`:
+    `[Service]` / `Environment=CAT_EDGE_ALSA_DEVICE=plughw:CARD=wm8960soundcard,DEV=0`
+    (find the name with `aplay -l`). `plughw`, not `hw`, so ALSA converts the format
+    if the card needs it. Host config, like the `CAT_EDGE_GPIO=0` drop-in, so it is
+    not in the repo's unit file.
 - **NVIDIA PC (compute).**
   - Python vision stack (**decision:** PyTorch + an Ultralytics/YOLO detector +
     a re-ID/embedding model), GPU via CUDA.

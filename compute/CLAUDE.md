@@ -15,7 +15,7 @@ Python unit and integration tests use **pytest**. GPU-/model-dependent tests sho
 
 ## Subtree-scoped rules
 
-- **Phase 1 is the feasibility question.** The near-term goal is images out, good background/reference handling, and basic collection + training to answer *"can we tell our cats apart at all?"* Favor a measurable end-to-end pipeline over polish; there is no actuation yet.
+- **Phase 1 is the feasibility question.** The near-term goal is images out, good background/reference handling, and basic collection + training to answer *"can we tell our cats apart at all?"* Favor a measurable end-to-end pipeline over polish. The only actuation is the opt-in foreign-cat sound alarm (`compute/learning/deterrent.py`, off by default); the door, lock and light are untouched.
 - **Protect the gallery.** Build the recognition gallery from *clean, representative* crops of each cat. Route blurry / extreme-angle hard cases to threshold-tuning and validation, **not** into the gallery — folding them in blurs the embedding space and lets a stranger's bad crop match a resident.
 - **Confidence isn't free.** Raw embedding distance is not calibrated confidence; tune the threshold(s) against real collected data rather than trusting a default.
 - **Verification workflow.**

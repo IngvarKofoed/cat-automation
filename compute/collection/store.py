@@ -822,6 +822,41 @@ class Store:
               token        TEXT,               -- identifies the compute allowed to fill it in
               PRIMARY KEY (tz_offset_ms, day)
             );
+            -- `actions` is ARCHITECTURE's *Action* entity made real: one row per thing the
+            -- system DID with an actuator — today one foreign-cat alarm episode (mode 'on')
+            -- or one deliberate test play (mode 'test'). See the foreign-cat-alarm spec.
+            -- An AUDIT LOG, so unlike `label_flags` (a work list) it survives `clear()` and
+            -- eviction, as the labels do: the question it answers is "did it ever sound at
+            -- one of our cats", which must outlive the frames. AUTOINCREMENT so an id is
+            -- never reused. The deciding frame is held as the (`frame_id`, `frame_recv_ts`)
+            -- PAIR, never the id alone: `frames.id` has no AUTOINCREMENT, and a Clear or the
+            -- non-motion purge can hand that id to a different frame, so a reader resolves
+            -- the pair and reads "gone" where the id now names someone else (entries 490/504).
+            -- `end_ts` NULL = still sounding; a row left open by a restart is completed as
+            -- `interrupted` at the next launch.
+            CREATE TABLE IF NOT EXISTS actions (
+              id               INTEGER PRIMARY KEY AUTOINCREMENT,
+              kind             TEXT    NOT NULL,   -- the actuator: 'sound' (the only one so far)
+              mode             TEXT    NOT NULL,   -- 'on' (an alarm episode) | 'test' (a test play)
+              start_ts         INTEGER NOT NULL,   -- ms epoch, compute clock (recv_ts axis)
+              end_ts           INTEGER,            -- NULL while the episode is still sounding
+              verdict          TEXT    NOT NULL,   -- 'neighbour' | 'unknown' | 'test'
+              cat_id           INTEGER,            -- the named neighbour (verdict 'neighbour')
+              n_counted        INTEGER,            -- counted frames in the start window
+              n_votes          INTEGER,            -- the winner's below-threshold votes
+              distance         REAL,               -- the winner's (or nearest) distance
+              model_version_id INTEGER,            -- the gallery the verdict came from
+              threshold        REAL,               -- its threshold at the time
+              frame_id         INTEGER,            -- the deciding frame: id ...
+              frame_recv_ts    INTEGER,            --   ... AND recv_ts, resolved as a pair
+              visit_start_ts   INTEGER,            -- recv_ts of the open visit's first frame at start
+              sound            TEXT,               -- 'test' rows: the clip asked for
+              clips_played     INTEGER NOT NULL DEFAULT 0,
+              clips_failed     INTEGER NOT NULL DEFAULT 0,   -- a 409 (Pi busy) is not a failure
+              ended            TEXT,               -- gone | switched_off | uncalibrated | error | interrupted
+              pi_disabled      INTEGER NOT NULL DEFAULT 0,   -- the Pi refused a play with 423
+              last_error       TEXT
+            );
             """
         )
         self._conn.commit()
@@ -4541,6 +4576,102 @@ class Store:
         spans.sort()
         return spans
 
+    # Rows per page of ``open_visit``'s backward walk. A cat sitting at the door with
+    # continuous motion for minutes is thousands of motion frames, so the walk pages
+    # rather than fetching the whole cluster at once.
+    _OPEN_VISIT_PAGE = 512
+
+    def open_visit(
+        self, since_id: "int | None", now_ms: int, *, gap_ms: int = _VISIT_GAP_MS
+    ) -> "tuple[int, int] | None":
+        """``(start_id, latest_id)`` of the newest motion cluster that is NOT yet closed, or ``None``.
+
+        Exactly the cluster ``closed_visits`` leaves out: the same ``motion = 1 AND id >
+        since_id`` universe, the same recv_ts-gap split (a gap ``> gap_ms`` starts a new
+        cluster), the same cutoff (open iff its newest frame's ``recv_ts >= now_ms -
+        gap_ms``), and the same ``start_id = min(id)`` of its motion frames. ``latest_id``
+        is the store's NEWEST FRAME, motion or not — the alarm step processes the visit's
+        whole id span, which in Tuning includes the non-motion frames inside it.
+
+        Read once a second by the alarm step on the shared connection, so it is built to
+        cost the OPEN cluster, never the backlog behind it: it walks backwards from the
+        newest motion frame off ``idx_frames_motion_recv`` and stops at the first gap. The
+        forward clustering ``closed_visits`` does would read every motion frame since the
+        watermark — which lags by hours while a manual job holds the closed pass off the GPU
+        — and an unbounded read once a second is the entries 102-105 starvation class.
+        ``since_id`` (the worker's watermark) still floors the walk, so the answer matches
+        ``closed_visits``' universe exactly.
+        """
+        floor = int(since_id) if since_id is not None else 0
+        cutoff = int(now_ms) - int(gap_ms)
+        with self._lock:
+            # `+id`: keep the planner on idx_frames_motion_recv (motion equality, recv_ts
+            # order, rowid in the entry) rather than a rowid range + sort. Pinned by a test.
+            newest = self._conn.execute(
+                "SELECT id, recv_ts FROM frames WHERE motion = 1 AND +id > ?"
+                " ORDER BY recv_ts DESC, id DESC LIMIT 1",
+                (floor,),
+            ).fetchone()
+            if newest is None or int(newest[1]) < cutoff:
+                return None
+            start_id = int(newest[0])
+            prev_ts = int(newest[1])
+            cur_ts, cur_id = int(newest[1]), int(newest[0])
+            done = False
+            while not done:
+                rows = self._conn.execute(
+                    # Keyset on (recv_ts, id) descending. `recv_ts <= ?` is the range the
+                    # index seeks on; the OR only trims the equal-timestamp tie.
+                    "SELECT id, recv_ts FROM frames WHERE motion = 1 AND +id > ?"
+                    " AND recv_ts <= ? AND (recv_ts < ? OR id < ?)"
+                    " ORDER BY recv_ts DESC, id DESC LIMIT ?",
+                    (floor, cur_ts, cur_ts, cur_id, self._OPEN_VISIT_PAGE),
+                ).fetchall()
+                for row_id, ts in rows:
+                    if prev_ts - int(ts) > gap_ms:
+                        done = True
+                        break
+                    start_id = min(start_id, int(row_id))
+                    prev_ts = int(ts)
+                    cur_ts, cur_id = int(ts), int(row_id)
+                if len(rows) < self._OPEN_VISIT_PAGE:
+                    done = True
+            (latest,) = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM frames").fetchone()
+        return start_id, int(latest)
+
+    def alarm_frames(
+        self, model_version_id: int, since_ts: int, *, oracle: str = "yolo-serial"
+    ) -> "list[tuple[int, int, int, float]]":
+        """The alarm step's COUNTED frames received at or after ``since_ts``, oldest first.
+
+        A counted frame is one the feed would call a cat AND the gallery has placed: it
+        carries an ``oracle`` present verdict whose (cat-only) max-box score is at or
+        above ``_ANNOTATE_MIN_CONF`` — the floor the feed's subject rule and the
+        annotation queue use, because boxes between the recall-first 0.15 and 0.3 are what
+        the feed files as noise — and an ``identifications`` MATCH row (``cat_id`` not
+        NULL) for ``model_version_id``. Returns ``(frame_id, recv_ts, cat_id, distance)``;
+        the threshold is NOT applied (the caller votes with ``_aggregate_identity``, which
+        applies it, exactly as the feed does).
+
+        Read once a second over a few seconds of frames, so the join order is PINNED
+        (``CROSS JOIN``, which constrains order in SQLite without changing meaning):
+        ``frames`` outer via the ``idx_frames_recv_ts`` seek, then each side probed by its
+        primary key. Left to the planner with no ANALYZE stats it drives from
+        ``idx_analysis_analyzer_verdict`` and walks the oracle's whole partition — the
+        mis-plan of entries 229/265/276/307/385/391. Pinned by a test.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT f.id, f.recv_ts, i.cat_id, i.distance"
+                " FROM frames f CROSS JOIN analysis a CROSS JOIN identifications i"
+                " WHERE f.recv_ts >= ?"
+                " AND a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1 AND a.score >= ?"
+                " AND i.frame_id = f.id AND i.model_version_id = ? AND i.cat_id IS NOT NULL"
+                " ORDER BY f.recv_ts ASC, f.id ASC",
+                (int(since_ts), oracle, _ANNOTATE_MIN_CONF, int(model_version_id)),
+            ).fetchall()
+        return [(int(fid), int(ts), int(cid), float(dist)) for fid, ts, cid, dist in rows]
+
     def events(
         self,
         since_id: "int | None",
@@ -8200,3 +8331,93 @@ class Store:
         eviction and ``clear()`` like the other durable labelled output.
         """
         return os.path.join(self._dataset_root, "avatars", f"cat_{int(cat_id)}.jpg")
+
+    # --- Actions: the actuator log (foreign-cat alarm spec) ---------------------------
+    #
+    # One row per alarm episode or test play. Written when an episode starts, its counters
+    # updated as clips land, completed when it stops. Survives clear() and eviction; the
+    # deciding frame is resolved on the (frame_id, frame_recv_ts) PAIR at read time.
+
+    # Columns a caller may set on insert / update. `id` is assigned; the rest is policy-free
+    # storage — what each means is the alarm step's (compute/learning/deterrent.py) to decide.
+    _ACTION_COLUMNS = (
+        "kind", "mode", "start_ts", "end_ts", "verdict", "cat_id", "n_counted", "n_votes",
+        "distance", "model_version_id", "threshold", "frame_id", "frame_recv_ts",
+        "visit_start_ts", "sound", "clips_played", "clips_failed", "ended", "pi_disabled",
+        "last_error",
+    )
+    _ACTION_LOG_MAX = 100
+
+    def add_action(self, fields: dict) -> int:
+        """Insert one ``actions`` row from ``fields`` (known columns only) and return its id."""
+        cols = [c for c in self._ACTION_COLUMNS if c in fields]
+        unknown = set(fields) - set(self._ACTION_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown action column(s): {sorted(unknown)}")
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO actions ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                [fields[c] for c in cols],
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def update_action(self, action_id: int, fields: dict) -> bool:
+        """Set ``fields`` (known columns only) on one ``actions`` row; False if it is gone."""
+        unknown = set(fields) - set(self._ACTION_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown action column(s): {sorted(unknown)}")
+        if not fields:
+            return True
+        cols = list(fields)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE actions SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
+                [fields[c] for c in cols] + [int(action_id)],
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def close_open_actions(self, ended: str, end_ts: int) -> int:
+        """Complete every row still open (``end_ts`` NULL) as ``ended`` at ``end_ts``.
+
+        The launch-time sweep: an episode's state lives in the worker's memory, so a row
+        left open by a restart can never be completed by the run that opened it. Returns
+        how many rows it closed. Called only by a LIVE app — the CLI tools open the same
+        store, and one of them must never close an episode the running server still owns.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE actions SET end_ts = ?, ended = ? WHERE end_ts IS NULL",
+                (int(end_ts), ended),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def list_actions(self, limit: int = 20) -> "list[dict]":
+        """The newest ``limit`` rows (capped), newest first, each resolved for display.
+
+        Adds ``cat_name`` (NULL when the row names no cat, or the cat is gone) and
+        ``frame_live``: whether the deciding frame still exists AS THAT FRAME — both
+        halves of the (``frame_id``, ``frame_recv_ts``) pair must match a ``frames`` row.
+        On the id alone a reused rowid would show someone else's frame in the very log
+        meant to answer whether a resident was ever hit.
+        """
+        limit = max(1, min(int(limit), self._ACTION_LOG_MAX))
+        cols = ", ".join("a." + c for c in ("id",) + self._ACTION_COLUMNS)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {cols}, c.name,"
+                " EXISTS (SELECT 1 FROM frames f WHERE f.id = a.frame_id AND f.recv_ts = a.frame_recv_ts)"
+                " FROM actions a LEFT JOIN cats c ON c.id = a.cat_id"
+                " ORDER BY a.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        names = ("id",) + self._ACTION_COLUMNS + ("cat_name", "frame_live")
+        out: "list[dict]" = []
+        for row in rows:
+            d = dict(zip(names, row))
+            d["pi_disabled"] = bool(d["pi_disabled"])
+            d["frame_live"] = bool(d["frame_live"])
+            out.append(d)
+        return out

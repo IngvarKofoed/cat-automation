@@ -54,6 +54,13 @@ DEFAULTS = {
         "latitude": 55.676,
         "longitude": 12.568,
     },
+    # The speaker's local switch (see edge/actuators/sound.py). Enabled by default: the
+    # compute's own alarm switch is the off-by-default gate, so a fresh install still
+    # sounds nothing until the admin turns that On. Off here refuses EVERY play — the
+    # compute's and the config page's test button alike — so the door can be silenced at
+    # the Pi whatever the compute is doing. Edited via POST /api/sound and carried through
+    # the whole-config assembly so a camera POST never wipes it.
+    "sound_enabled": True,
 }
 
 

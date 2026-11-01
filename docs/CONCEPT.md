@@ -66,11 +66,13 @@ first — prove the hard thing before automating the door:
 
 - **Phase 1 (now): see and learn.** Get images off the camera, get clipping and
   background/reference handling working, collect and annotate a dataset, and train
-  enough to answer the real question — *can we tell our cats apart at all?* No
-  actuation; the door is untouched.
+  enough to answer the real question — *can we tell our cats apart at all?* The
+  door is untouched. The one actuator built so far is **sound**, and it is opt-in:
+  with its switch On (off by default), a foreign cat at the door sets off an alarm
+  through the Pi's speaker (see *Deterrence*).
 - **Later: act.** Once identification is trustworthy, lean on enter/leave
-  tracking, then add the physical responses (lock, sound, light) together with the
-  access-decision policy they need.
+  tracking, then add the remaining physical responses (lock, light) together with
+  the access-decision policy they need.
 
 Everything below describes the *full* system; goals it hasn't reached yet are
 future phases, not current claims. Because it lives on a trusted home network, the
@@ -142,10 +144,16 @@ built (see *Status & phasing*).
 
 ### 4. Deterrence (sound)
 
-When a foreign cat is at or near the door — especially one that lingers or
-repeatedly tries the flap — the system plays a loud deterrent sound to scare it
-off. Deterrence is calibrated to avoid distressing our own cats and to avoid
-becoming a nuisance (e.g. not firing endlessly at the same stubborn intruder).
+When a foreign cat is at the door — a named neighbour, or a cat the system cannot
+name — the system plays a loud alarm through the Pi's speaker, alternating two
+clips, for **as long as the cat is present**, and stops once it has been gone a few
+seconds. It decides during the visit, not after, so the noise lands while the cat is
+still there. A cat it *recognises* as one of ours never starts it or keeps it going —
+but a resident it fails to recognise (a bad angle, the dark) reads as an unknown cat,
+and an unknown cat does set it off, more often the tighter the recognition threshold.
+It is not rate-limited: a stranger that stays hears it the whole time. It is switched on deliberately, and every alarm is logged —
+when, how long, which cat, and the frame that decided it — so whether it ever sounded
+at a resident is checkable. The speaker can also be silenced at the door itself.
 
 ### 5. Notifications
 
@@ -233,8 +241,9 @@ in its safe default until a first model is trained.
   for one.
 - **A stranger tries the door.** An unknown cat approaches. It's classified as
   foreign, the door locks, and the owner gets a "stranger at the door" alert.
-- **A stranger won't leave.** The foreign cat keeps pawing at the locked flap.
-  After it lingers, the deterrent sound plays and it leaves.
+- **A stranger won't leave.** The foreign cat keeps pawing at the flap. The alarm
+  has been sounding since it was recognised as foreign, and it keeps looping until
+  the cat leaves.
 - **"Is she still out?"** The owner opens the app and sees each cat's current
   in/out status and when they last crossed.
 - **Ambiguous sighting.** A cat is seen but recognition is low-confidence

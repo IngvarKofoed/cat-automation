@@ -40,6 +40,7 @@ import glob
 import logging
 import math
 import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -65,6 +66,7 @@ from compute.collection.store import (
     stage_keeps_all_frames,
 )
 from compute.dataset import crops
+from compute.learning import deterrent
 from compute.learning.runner import TrainingManager
 from shared.motion import MotionParams, lighting_version
 
@@ -475,6 +477,22 @@ class StageRequest(BaseModel):
     """
 
     stage: str
+
+
+class DeterrentModeRequest(BaseModel):
+    """Body of ``POST /api/deterrent``: the foreign-cat alarm switch, ``off`` | ``on``.
+
+    Validated in the route (400 on anything else), like ``StageRequest``. The switch is
+    the compute's ONLY gate on the alarm, in every stage; it is persisted, Off by default.
+    """
+
+    mode: str
+
+
+class DeterrentTestRequest(BaseModel):
+    """Body of ``POST /api/deterrent/test``: the clip to play now (``alarm1`` / ``alarm2``)."""
+
+    sound: str
 
 
 # The TrainingManager kinds that EMBED labelled crops, and so must not overlap a crop
@@ -1204,8 +1222,19 @@ def create_app(
         live_identify_manager = LiveIdentifyManager(
             store,
             is_busy=(lambda: analysis_manager.running or training_manager.running),
+            # The foreign-cat alarm requests its clips through the collector's edge
+            # client (None on a test app, where every clip request then fails, counted).
+            sound=client,
         )
     app.state.live_identify_manager = live_identify_manager
+
+    # Complete any alarm row a restart left open (its episode lived in the old process's
+    # memory, so nothing else ever can). LIVE app only: the CLI tools open the same store,
+    # and one of them must never close an episode the running server still owns.
+    if start_collector:
+        closed = store.close_open_actions(deterrent.ENDED_INTERRUPTED, int(time.time() * 1000))
+        if closed:
+            logger.info("closed %d alarm row(s) left open by a restart as interrupted", closed)
 
     # Restore live-naming at launch — but ONLY on a live app. ``restore`` start()s a GPU
     # worker thread (the compute PC is the dedicated always-on box), which a test app
@@ -1949,6 +1978,72 @@ def create_app(
             "stage": store.get_stage(),
             "motion_only": collector_manager.current_motion_only,
         }
+
+    # --- Foreign-cat alarm (docs/specs/2026-11-01-foreign-cat-alarm.md) ----------------
+    #
+    # The compute's Off/On switch, its readiness (the Pi's speaker through the same edge
+    # client the collector uses, the calibrated gallery, whether it is sounding now), test
+    # plays, and the alarm log. The decision itself runs in the live-naming worker.
+
+    def _deterrent_pi() -> dict:
+        # The Pi's speaker readiness via GET /api/sound, with the short sound timeout so an
+        # unreachable Pi costs this poll ~1 s, not 10. Never raises: what failed is the
+        # answer, because the card must never read On over a Pi that will refuse every play.
+        if client is None or not hasattr(client, "get_sound"):
+            return {"reachable": False, "error": "no Pi connection configured (CAT_PI_URL)"}
+        try:
+            snap = client.get_sound()
+        except Exception as exc:  # noqa: BLE001 - EdgeUnavailable and anything transport-shaped
+            return {"reachable": False, "error": str(exc) or exc.__class__.__name__}
+        return {
+            "reachable": True,
+            "available": bool(snap.get("available")),
+            "enabled": bool(snap.get("enabled")),
+            "sounds": snap.get("sounds") or [],
+            "playing": snap.get("playing"),
+            "last_error": snap.get("last_error"),
+        }
+
+    @app.get("/api/deterrent")
+    def api_deterrent():
+        # Everything the admin card's readiness line needs, in one poll.
+        model = store.active_model()
+        alarm_status = getattr(live_identify_manager, "alarm_status", None)
+        return {
+            "mode": deterrent.get_mode(store),
+            "calibrated": deterrent.is_calibrated(model),
+            "model": (
+                None if model is None else {"id": model["id"], "threshold": model["threshold"]}
+            ),
+            "worker_running": live_identify_manager.running,
+            "pi": _deterrent_pi(),
+            "alarm": alarm_status() if callable(alarm_status) else None,
+        }
+
+    @app.post("/api/deterrent")
+    def api_deterrent_set(req: DeterrentModeRequest):
+        # The switch. Persisted; the worker reads it each tick, so an Off ends a sounding
+        # episode (switched_off) within about a second, and an On is picked up within one
+        # plain interval.
+        if req.mode not in deterrent.MODES:
+            raise HTTPException(status_code=400, detail=f"mode must be one of {list(deterrent.MODES)}")
+        deterrent.set_mode(store, req.mode)
+        return {"mode": deterrent.get_mode(store)}
+
+    @app.post("/api/deterrent/test")
+    def api_deterrent_test(req: DeterrentTestRequest):
+        # Play one clip now, in either mode — a test is deliberate. It still honours the
+        # Pi's refusals, and writes a `test` row either way, so the log proves the whole
+        # compute -> Pi path (or says where it broke).
+        if req.sound not in deterrent.CLIPS:
+            raise HTTPException(status_code=400, detail=f"sound must be one of {list(deterrent.CLIPS)}")
+        return deterrent.play_test_clip(store, client, req.sound, int(time.time() * 1000))
+
+    @app.get("/api/deterrent/log")
+    def api_deterrent_log(limit: int = Query(20, ge=1, le=100)):
+        # The newest alarm rows, each with its deciding frame resolved on the
+        # (frame_id, recv_ts) pair — `frame_live` false means gone, never someone else's.
+        return {"actions": store.list_actions(limit)}
 
     @app.post("/api/live-identify/start")
     def api_live_identify_start():

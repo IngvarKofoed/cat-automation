@@ -27,6 +27,7 @@ import cv2
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from edge.actuators.gpio import GpioOutputs, GpioUnavailable
+from edge.actuators.sound import SoundError, SoundPlayer
 from edge.capture.base import CaptureError, CaptureSource
 from edge.capture.factory import create_source
 from edge.clip.transform import crop, rotate
@@ -301,6 +302,7 @@ def create_app(
     start_watchdog: bool = True,
     start_scheduler: bool = True,
     gpio: "GpioOutputs | None" = None,
+    sound: "SoundPlayer | None" = None,
 ) -> Flask:
     """Build the Flask app.
 
@@ -331,6 +333,12 @@ def create_app(
     off a Pi). Tests inject one wired to a fake backend. An app-owned default is
     closed at exit; an injected one is the caller's to manage. The night-light
     scheduler drives the same ``gpio`` instance.
+
+    ``sound`` is the speaker's clip player (``edge/actuators/sound.py``); it defaults
+    to a real ``SoundPlayer`` over the shipped clips (which reports unavailable where
+    there is no ``aplay``). Tests inject one built on a fake runner. Either way the
+    persisted ``sound_enabled`` switch is pushed into it here, and an app-owned default
+    is closed at exit (stopping a clip mid-play) like ``gpio``.
     """
     factory: SourceFactory = source_factory or create_source
 
@@ -393,6 +401,13 @@ def create_app(
         if _valid_night_light(settings["night_light"])
         else dict(DEFAULTS["night_light"])
     )
+    # The speaker's local switch. A hand-edited non-bool falls back to the default
+    # (enabled) — the compute's own switch, off by default, is the real opt-in.
+    state["sound_enabled"] = (
+        settings["sound_enabled"]
+        if isinstance(settings["sound_enabled"], bool)
+        else DEFAULTS["sound_enabled"]
+    )
     # Push the persisted focus onto the source. A no-op on non-focus backends;
     # on the CSI backend it's applied when the camera opens (see set_focus).
     state["source"].set_focus(focus)
@@ -429,6 +444,9 @@ def create_app(
         # (save_settings overwrites wholesale) preserves it — a camera-only POST can
         # never wipe the schedule. Edited only via POST /api/night-light.
         cfg["night_light"] = dict(state["night_light"])
+        # Same carry for the speaker switch: edited only via POST /api/sound, preserved
+        # through every wholesale rewrite.
+        cfg["sound_enabled"] = state["sound_enabled"]
         return cfg
 
     def read_config() -> GrabConfig:
@@ -476,6 +494,15 @@ def create_app(
     app.gpio = gpio
     if gpio_owned:
         atexit.register(gpio.close)
+
+    # The speaker's clip player. Same ownership rule as gpio: an app-owned default is
+    # closed at exit (which also stops a clip mid-play); an injected one is the caller's.
+    sound_owned = sound is None
+    sound = sound if sound is not None else SoundPlayer()
+    sound.set_enabled(state["sound_enabled"])
+    app.sound = sound
+    if sound_owned:
+        atexit.register(sound.close)
 
     def read_night_light() -> dict:
         # The live night_light config, snapshotted under the lock, handed to the
@@ -853,6 +880,8 @@ def create_app(
             # preserves the schedule through the wholesale file rewrite. Edited only
             # via POST /api/night-light. Copied to avoid aliasing the live state.
             "night_light": dict(state["night_light"]),
+            # Carried likewise (edited only via POST /api/sound).
+            "sound_enabled": state["sound_enabled"],
         }
         for key in _MOTION_VALIDATORS:
             next_config[key] = body[key] if key in body else state[key]
@@ -1012,6 +1041,53 @@ def create_app(
         with lock:
             state["night_light"] = merged
         return jsonify(_night_light_payload())
+
+    # --- Sound: the speaker (docs/specs/2026-11-01-foreign-cat-alarm.md) --------------
+    #
+    # One clip per call; the compute sequences the alarm loop by asking for the next clip
+    # once the previous one has ended. The Pi refuses overlap (409) and refuses every play
+    # while its own switch is off (423), and holds no other policy.
+
+    @app.get("/api/sound")
+    def sound_state():
+        # {available, enabled, sounds: [{name, duration_s}], playing, last_error}.
+        return jsonify(sound.status())
+
+    @app.post("/api/sound")
+    def sound_set():
+        # The local enable switch. Body: {"enabled": bool}. Persisted through the
+        # whole-config assembly point (the file is rewritten wholesale) BEFORE the player
+        # is told, so the live switch and the saved one never disagree after a failed
+        # write. Disabling stops a clip that is sounding right now.
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+            return jsonify(error="body must be an object with a boolean 'enabled'"), 400
+        enabled = body["enabled"]
+        with lock:
+            next_config = _config_snapshot_locked()
+            next_config["sound_enabled"] = enabled
+        try:
+            save_settings(next_config)
+        except OSError as e:
+            return jsonify(error=f"failed to persist sound setting: {e}"), 500
+        with lock:
+            state["sound_enabled"] = enabled
+        sound.set_enabled(enabled)
+        return jsonify(sound.status())
+
+    @app.post("/api/sound/play")
+    def sound_play():
+        # Play one listed clip. Body: {"sound": "<name>"}. 200 {sound, duration_s} once
+        # aplay has survived the settle window; 404 unknown, 423 disabled here, 409 still
+        # playing, 503 no aplay, 502 aplay failed (its stderr tail as the error).
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or not isinstance(body.get("sound"), str):
+            return jsonify(error="body must be an object with a string 'sound'"), 400
+        try:
+            result = sound.play(body["sound"])
+        except SoundError as e:
+            return jsonify(error=str(e)), e.status
+        return jsonify(result)
 
     return app
 

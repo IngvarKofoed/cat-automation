@@ -409,6 +409,23 @@
         </div>
     </div>
 
+    <!-- The speaker. Play calls this Pi's own /api/sound/play, so it works with the
+         compute down; the enable switch refuses EVERY play while off — the compute's
+         alarm included — so the door can be silenced here whatever the compute does. -->
+    <div class="controls">
+        <h2>Sound</h2>
+        <div class="control-group">
+            <label><input type="checkbox" id="soundEnabled"> Sound enabled</label>
+        </div>
+        <p id="soundNote" class="gpio-note hidden"></p>
+        <div class="control-group">
+            <div id="soundList" class="btn-row"></div>
+        </div>
+        <p id="soundStatus" class="gpio-note"></p>
+        <p class="gpio-note">Off here silences the speaker for everything, including the
+            compute's foreign-cat alarm, and cuts a clip that is playing.</p>
+    </div>
+
     <div class="controls">
         <h2>Night light</h2>
         <p id="nlNote" class="gpio-note hidden"></p>
@@ -498,6 +515,10 @@
         const relearnBtn = document.getElementById('relearnBtn');
         const gpioList = document.getElementById('gpioList');
         const gpioNote = document.getElementById('gpioNote');
+        const soundEnabledEl = document.getElementById('soundEnabled');
+        const soundNote = document.getElementById('soundNote');
+        const soundList = document.getElementById('soundList');
+        const soundStatusEl = document.getElementById('soundStatus');
         const nlNote = document.getElementById('nlNote');
         const nlEnabled = document.getElementById('nlEnabled');
         const nlChannel = document.getElementById('nlChannel');
@@ -1534,6 +1555,103 @@
             }
         }
 
+        // ---- Sound (the speaker) ----
+
+        // Render GET/POST /api/sound's {available, enabled, sounds, playing, last_error}.
+        // Play buttons grey out with the REASON shown, rather than failing on click: off
+        // here (the switch) or no aplay on this host (not a Pi). A play from this page
+        // writes no alarm-log row — the Pi has no store; that log is the compute's record.
+        let soundBusy = false;  // a play/toggle request in flight
+        function renderSound(data) {
+            soundEnabledEl.checked = !!data.enabled;
+            soundEnabledEl.disabled = soundBusy;
+            let reason = '';
+            if (!data.available) {
+                reason = 'No aplay on this host — sounds can\'t play here (run on the Pi).';
+            } else if (!data.enabled) {
+                reason = 'Sound is disabled on the Pi — every play is refused, the compute\'s alarm included.';
+            }
+            soundNote.textContent = reason;
+            soundNote.classList.toggle('hidden', !reason);
+            soundList.innerHTML = '';
+            (data.sounds || []).forEach(s => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'gpio-btn' + (data.playing === s.name ? ' active' : '');
+                btn.textContent = `Play ${s.name} (${s.duration_s.toFixed(1)} s)`;
+                btn.disabled = !data.available || !data.enabled || soundBusy || !!data.playing;
+                if (reason) btn.title = reason;
+                btn.addEventListener('click', () => playSound(s.name));
+                soundList.appendChild(btn);
+            });
+            const parts = [data.playing ? `Playing ${data.playing}…` : 'Idle'];
+            if (data.last_error) parts.push(`last error: ${data.last_error}`);
+            soundStatusEl.textContent = parts.join(' — ');
+        }
+
+        async function loadSound() {
+            try {
+                const res = await fetch('/api/sound');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                renderSound(await res.json());
+            } catch (err) {
+                soundList.innerHTML = '';
+                soundNote.textContent = `Sound unavailable: ${err.message}`;
+                soundNote.classList.remove('hidden');
+            }
+        }
+
+        async function playSound(name) {
+            soundBusy = true;
+            try {
+                clearError();
+                const res = await fetch('/api/sound/play', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sound: name })
+                });
+                if (!res.ok) showError(`Sound error: ${await errorFromResponse(res)}`);
+            } catch (err) {
+                showError(`Sound error: ${err.message}`);
+            } finally {
+                soundBusy = false;
+                await loadSound();
+            }
+        }
+
+        soundEnabledEl.addEventListener('change', async () => {
+            const enabled = soundEnabledEl.checked;
+            soundBusy = true;
+            try {
+                clearError();
+                const res = await fetch('/api/sound', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled })
+                });
+                if (!res.ok) showError(`Sound error: ${await errorFromResponse(res)}`);
+            } catch (err) {
+                showError(`Sound error: ${err.message}`);
+            } finally {
+                soundBusy = false;
+                await loadSound();  // re-sync to the persisted switch either way
+            }
+        });
+
+        // Poll the speaker while the page is visible, so a clip the compute starts (or a
+        // clip ending) shows without a reload. Paused with the status poll when hidden.
+        const SOUND_POLL_MS = 1500;
+        let soundTimer = null;
+        function startSoundPolling() {
+            if (soundTimer) return;
+            soundTimer = setInterval(() => { if (!soundBusy) loadSound(); }, SOUND_POLL_MS);
+        }
+        function stopSoundPolling() {
+            if (!soundTimer) return;
+            clearInterval(soundTimer);
+            soundTimer = null;
+        }
+
         // ---- Motion status polling ----
 
         // Poll GET /status a few times a second for the motion indicator,
@@ -1600,8 +1718,8 @@
         }
 
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible') startStatusPolling();
-            else stopStatusPolling();
+            if (document.visibilityState === 'visible') { startStatusPolling(); startSoundPolling(); }
+            else { stopStatusPolling(); stopSoundPolling(); }
         });
 
         // Event listeners
@@ -1618,7 +1736,9 @@
             // Night light after GPIO so its channel <select> has options to
             // populate/select from (see populateNightLightChannels).
             loadGpio().then(loadNightLight);
+            loadSound();
             startStatusPolling();
+            startSoundPolling();
         });
     </script>
 </body>

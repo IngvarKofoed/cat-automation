@@ -1870,3 +1870,107 @@ a clean one.
      issue no `dataset_items` read, since paying for a key they never look at is what
      `with_labels` exists to prevent — and `door_stats` pages this feed 8x. Verified to fail
      when `cats_overview` is flipped to opt in.
+
+521. The FOREIGN-CAT ALARM is built — the system's first actuator, `DETER` → `sound`. With the
+     admin switch On, a named neighbour or an unknown cat at the door loops `alarm1` / `alarm2`
+     through the Pi's ALSA HAT until it has been gone 3 s. Admin Start gains a card (switch,
+     readiness, tests, the last 20 alarms); the Pi's config page a Sound section.
+     Spec: docs/specs/2026-11-01-foreign-cat-alarm.md.
+
+522. The Pi plays ONE clip per call (`POST /api/sound/play`) and the compute sequences the
+     loop, asking for the next clip once the last is due to end. Fail-safe by construction: a
+     dead compute leaves one clip (≤ 6.5 s) finishing, then silence. Codes the alarm acts on:
+     423 disabled on the Pi, 409 still playing (never queued — routine, not a failure).
+     Rejected: the Pi looping the playlist itself, which would need a lease + stop endpoint.
+
+523. Two switches. Compute `deterrent_mode` (default Off) is the opt-in and the ONLY compute
+     gate, in every stage — diverging from ARCHITECTURE's "actuators fire only in running".
+     Pi `sound_enabled` (default on, persisted) refuses EVERY play, its own test button too,
+     and disabling cuts a clip mid-play: the door can be silenced whatever the compute does.
+
+524. Decided DURING the visit, by an alarm step at the start of every live-naming tick; the
+     worker ticks at a fixed 1 s while the switch is On. Hooking the closed-visit pass would
+     sound 5–15 s after the cat left. The step reuses the resident YOLO/DINOv2/gallery, and
+     NEVER yields to manual jobs — a motion-tuning re-run would disarm the door for hours —
+     processing ≤ 30 frames a pass instead. Closed-visit naming waits while a visit is open.
+
+525. Start: ≥ 10 COUNTED frames received in the last 5 s, voted foreign by the feed's own
+     `_aggregate_identity`. Counted = a `yolo-serial` cat box ≥ 0.3 (the feed's noise floor;
+     the recall-first 0.15–0.3 band is phantoms) with a gallery match. An UNCALIBRATED gallery
+     never starts one: there every cat reads unknown, so every resident would trip it.
+
+526. The start window is floored at the PREVIOUS episode's end — a deviation from the spec's
+     rule, which restarts at once: at "gone" the 5 s window still holds 2 s of the departed
+     cat's frames. Measured: one 6 s visit wrote three rows under the literal rule.
+     Pinned by a test verified to fail against it.
+
+527. Gone: no FOREIGN counted frame for 3 s — a resident's within-threshold frames never
+     prolong it, so a resident following a stranger stops the noise. Checked only after a pass
+     that caught up, else unidentified frames would read as an absent cat. Also ends on
+     switch Off, an uncalibrated gallery, or a pass that raised (it must not sound blind).
+
+528. New `actions` table — ARCHITECTURE's Action entity, real for sound: one row per episode
+     or test, kept through `clear()` and eviction as an audit log. The deciding frame is the
+     (`frame_id`, `recv_ts`) PAIR, so a reused id reads "gone" (entries 490/504). Rows a restart
+     left open close as `interrupted` at launch — live app only, so a CLI tool can't close a
+     running server's episode. `visit_start_ts` makes the start latency readable per row.
+
+529. `open_visit` walks BACKWARDS from the newest motion frame, costing the open cluster, not
+     the backlog: the watermark lags hours while a manual job holds the closed pass off.
+     `alarm_frames` pins `frames` as the outer loop (`CROSS JOIN`) — unpinned, with no ANALYZE
+     stats, it walks the oracle's whole partition: entries 229/265/276/307/385/391, seventh
+     instance. Both plans are pinned by tests; measured ~0.1 ms each at 300k frames.
+
+530. The alarm WAVs ship under `edge/actuators/sounds/` re-encoded to 16-bit PCM 44.1 kHz
+     stereo: the originals were 32-bit float and 24-bit, which a HAT's hardware device can
+     reject outright. No clipping (peaks 0.95 / 0.94). The originals in the repo root are left
+     for the user to delete. A clip `wave` cannot read is left OFF the list, never listed bare.
+
+531. `EdgeClient.get_sound` / `play_sound` use a 1 s + 2 s timeout, not the 5 s + 5 s
+     defaults, which would stall the 1 s tick and the Start page's readiness poll behind an
+     unreachable Pi. `play_sound` RETURNS the status rather than raising on non-200: the
+     Pi's codes are the answer the alarm acts on.
+
+532. A backtick inside an HTML comment in admin's view template ENDS the JS template literal
+     — a SyntaxError that blanked the whole admin console; caught only by the browser pass.
+     Also: the stage picker's `button b { display:block }` styles ANY `<b>` in its option text
+     as a title line, so the alarm card's option text carries none.
+
+533. Known limits. In Collecting/Running a still foreign cat makes no frames and reads gone
+     after 3 s (Tuning is immune). No time cap by decision: a static box ≥ 0.3 reading unknown
+     sounds until a switch goes off. Unmeasured on the dev box: per-frame detect + identify
+     cost on the compute PC — if a pass can't keep ~10 fps the step never catches up and
+     "gone" never fires while motion lasts. The card's pass readout is how to measure it.
+
+534. compute/CLAUDE.md no longer says "there is no actuation yet": the one actuation is the
+     opt-in sound alarm (off by default), and the door, lock and light stay untouched — so a
+     session reading the subtree rules first does not assume the alarm code is dead.
+
+535. Review repair, edge: a disable landing inside `play()`'s 0.3 s settle window no longer
+     answers 200 for the clip it just cut. The compute would have counted it played and timed
+     the next clip off a sound that never finished. Now 423, like any play while disabled.
+
+536. Stopping the live-naming worker now ends a sounding alarm as `interrupted`, on the
+     thread's way out. The episode lived only in that worker's memory, so its row read "still
+     sounding" until the next process restart, and a later start resumed it with a wrong length.
+
+537. Closed-visit naming also waits while an alarm is SOUNDING, not only while a visit is
+     open. A stranger sitting still in Tuning sounds with no open visit; naming closed spans
+     between ticks then delayed the next clip and the "gone" stop by seconds. Diverges from
+     the spec's rule, which named only the open visit.
+
+538. With no alarm running, the alarm step starts no further back than the 5 s start window,
+     not at the open visit's first frame. Switched On (or restarted) mid-visit, replaying a
+     10-min visit at 30 frames a pass held the start back ~5 min. Frames older than the window
+     can never start an alarm; the closed pass names them, as it names every other visit.
+
+539. Docs corrected: a resident the gallery DECLINES reads unknown and does set the alarm off.
+     CONCEPT had claimed it never sounds because of our cats. The code follows the spec —
+     unknown is included by decision, so the alarm follows the threshold; the overclaim was
+     the docs'. Only a resident matched WITHIN the threshold is never foreign.
+
+540. Left unfixed from that review. A pass that can't keep up never stops the alarm, and in
+     Tuning — where frames arrive continuously — that means never, not "while motion lasts"
+     as the spec put it: needs a design decision. Closed naming waits as long as motion lasts,
+     and failed clips retry every tick: both by spec. `open_visit` re-walks the open cluster
+     per call — measured 3.9 ms at 30 min, 15 ms at 2 h; a cache needs Clear/eviction care.

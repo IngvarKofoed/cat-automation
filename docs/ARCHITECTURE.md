@@ -250,6 +250,29 @@ behavior locally (e.g. reverting the lock to unlocked if it loses contact with
 the brain — see Offline behavior). If an actuator isn't installed, its endpoints
 are simply absent/no-ops.
 
+**Sound is built** (the first actuator), as three endpoints beside the manual GPIO
+switches. The Pi plays **one clip per call** and holds no policy beyond two refusals;
+the compute sequences any loop by asking for the next clip once the last has ended,
+so a crashed compute leaves at most one clip (≤ 6.5 s) finishing, then silence:
+
+- `GET /api/sound` → `{available, enabled, sounds: [{name, duration_s}], playing,
+  last_error}`. Sounds are the shipped 16-bit PCM WAVs, named by file stem
+  (`alarm1`, `alarm2`); a request names a sound, never a path.
+- `POST /api/sound/play {sound}` → `200 {sound, duration_s}` once `aplay` has
+  survived a ~0.3 s settle window; `423` while sound is disabled on the Pi; `404`
+  unknown name; `409` while the previous clip is still playing (plays never
+  overlap, never queue); `503` no `aplay`; `502` `aplay` failed (its stderr tail).
+- `POST /api/sound {enabled}` — the Pi's **local switch**, persisted with the edge
+  settings, default enabled. Off refuses *every* play — the compute's and the config
+  page's test button alike — and cuts a clip that is playing. It is how the speaker
+  is silenced at the door whatever the compute is doing; the compute's own switch
+  (off by default) remains the opt-in.
+
+Playback is `aplay -q [-D $CAT_EDGE_ALSA_DEVICE]` on ALSA's default device (the
+HAT); the service user needs ALSA access (the `audio` group). The Config UI's *Sound*
+section carries the switch and a *Play* button per clip, which works with the
+compute down and writes no alarm-log row (the Pi has no store).
+
 ## The vision pipeline
 
 The path from raw frames to a decision, and where each stage runs. Note how
@@ -342,8 +365,10 @@ The compute tier maps intents to calls on the **Pi control API**, according to
 which actuators are installed:
 
 - **Door lock:** `DENY_ENTRY` → `lock`, `ALLOW_ENTRY` → `unlock`.
-- **Speaker:** `DETER` → `sound` (rate-limited, tuned to not distress residents
-  or neighbors).
+- **Speaker:** `DETER` → `sound`, **looping while the foreign cat is present**
+  (built — see *The foreign-cat alarm* below): `alarm1`, `alarm2`, alternating,
+  until no foreign frame has been seen for 3 s. No rate limit and no time cap, by
+  decision; the switch is what stops a stuck one.
 - **Light:** `DETER` → `light` (as a visual deterrent) and/or as **illumination**
   to help the night camera. Its exact role is a decision (see Open questions).
 - **None installed:** `DENY_ENTRY`/`DETER` degrade to `RECORD` + `NOTIFY` only —
@@ -357,19 +382,48 @@ never the brain.
 The mapping above applies in the **running** stage. In **tuning** and
 **collecting** (see *Operating stages and the learning loop*) identity isn't
 trusted, so the engine holds actuators at their safe default and only
-records/collects.
+records/collects. **Exception — the sound alarm:** it is gated by its own persisted
+Off/On switch (`deterrent_mode`, default **Off**) in *every* stage, not by the stage;
+the switch is the explicit opt-in.
 
-In the current prototype there is **no actuation at all** — the engine only
-records and collects. The full access-decision policy (how "fail safe" resolves
-an uncertain identity vs. never shutting out a resident, and what to do with
-multiple cats in frame) is deferred to the phase where the lock hardware is
-added; it is not settled here.
+In the current prototype the **only actuation is that sound alarm** — the door is
+untouched, and lock, light and notifications stay unbuilt. The full access-decision
+policy (how "fail safe" resolves an uncertain identity vs. never shutting out a
+resident, and what to do with multiple cats in frame) is deferred to the phase where
+the lock hardware is added; it is not settled here.
+
+### The foreign-cat alarm (built)
+
+The one wired intent today is `DETER` → `sound`, decided **during** the visit rather
+than after it closes (a closed visit is named 5–15 s after the cat left — a "you were
+seen" noise, not a deterrent). It is an **alarm step** inside the live-naming worker,
+which while the switch is On ticks at a fixed 1 s:
+
+- **Process.** Each tick detects + identifies the newest frames (≤ 30) above a
+  high-water mark — the open visit's, or, while an alarm runs, every stored frame.
+  It reuses the worker's resident YOLO / DINOv2 / gallery, and **never yields to
+  manual jobs** (the long motion-tuning re-runs would otherwise disarm the door for
+  hours). While a visit is open or an alarm is sounding, naming closed visits waits.
+- **Start.** ≥ 10 *counted* frames (a `yolo-serial` cat box ≥ 0.3 — the feed's own
+  noise floor — with a gallery match) received in the last 5 s, voted foreign by the
+  feed's `_aggregate_identity`: a named non-resident won, or nothing came within the
+  threshold. Visit boundaries are ignored. Frames received before the previous alarm
+  ended do not count again. An **uncalibrated** gallery never starts one.
+- **Stop.** No *foreign* counted frame for 3 s, the switch Off, the gallery
+  uncalibrated, or a pass that raised. A frame matched to a resident WITHIN the
+  threshold never prolongs it — but one beyond the threshold reads unknown, so foreign,
+  whoever it is: including unknown ties the alarm to the threshold, and a resident the
+  gallery declines sets it off. The `actions` log is how that shows. The playing clip
+  finishes; the compute has no stop call.
+- **Record.** One `actions` row per episode (see *Data model → Action*).
 
 ### Escalation
 
 Consistent with the concept, the door lock is the first line and sound/light are
-escalation: `DENY_ENTRY` fires immediately on a foreign cat; `DETER` fires only
-when a foreign cat *lingers* or repeatedly works the flap, and is rate-limited.
+escalation: `DENY_ENTRY` fires immediately on a foreign cat. **As built**, `DETER`
+→ `sound` does not wait for lingering and is not rate-limited: it starts as soon as
+the recent frames agree the cat is foreign and loops while it is present. Escalation
+order returns as a question when the lock exists.
 
 ## Latency and offline behavior
 
@@ -481,7 +535,14 @@ Core entities (storage-agnostic):
 - **Occupancy** — derived per-resident current state: `in`/`out`,
   `last_transition`.
 - **Action** — something the system did: `type` (lock/unlock/sound/light/notify),
-  `timestamp`, triggering intent/event.
+  `timestamp`, triggering intent/event. **Real for sound** (the `actions` table): one
+  row per alarm episode (`on`) or test play (`test`) — start/end time, clips played and
+  failed, the verdict (`neighbour` + cat, `unknown`, or `test`) and its evidence
+  (counted frames, the winner's votes, the distance), the model version and threshold,
+  the deciding frame as the (`frame_id`, `recv_ts`) **pair**, and how it ended (`gone`
+  / `switched_off` / `uncalibrated` / `error` / `interrupted`, plus whether the Pi
+  refused it as disabled). An audit log: it survives `clear()` and eviction, and a
+  deciding frame whose pair no longer matches reads *gone*.
 - **Notification** — an alert sent to the owner and its delivery state.
 - **Dataset item** — a stored crop for learning: image ref, `source`
   (collection | run-uncertain | correction), the **geometry** it was cut under

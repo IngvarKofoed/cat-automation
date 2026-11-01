@@ -609,6 +609,8 @@ def test_save_settings_then_load_settings_roundtrips(config_path):
             "latitude": 40.0,
             "longitude": -3.0,
         },
+        # Non-default (the default is enabled) for the same reason.
+        "sound_enabled": False,
     }
     settings.save_settings(full)
     assert settings.load_settings() == full

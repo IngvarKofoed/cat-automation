@@ -58,6 +58,13 @@ _ENV_BASE_URL = "CAT_PI_URL"
 _DEFAULT_CONNECT_TIMEOUT = 5.0
 _DEFAULT_READ_TIMEOUT = 5.0
 
+# (connect, read) timeouts for the speaker calls (GET /api/sound, POST /api/sound/play).
+# Far shorter than the defaults above: the alarm step requests clips from the live-naming
+# worker's 1 s tick, and the admin card's readiness poll proxies GET /api/sound — a 5 s +
+# 5 s wait on an unreachable Pi would stall the tick, and the Start page poll behind it.
+# The read leg covers the Pi's ~0.3 s settle window on a play.
+_SOUND_TIMEOUT = (1.0, 2.0)
+
 # Reconnect backoff bounds for iter_stream_reconnecting (seconds).
 _DEFAULT_INITIAL_BACKOFF = 0.5
 _DEFAULT_MAX_BACKOFF = 10.0
@@ -267,11 +274,18 @@ class EdgeClient:
         Raises ``EdgeUnavailable`` on a connection error, a non-200 response, or
         a non-JSON body — the same liveness contract as ``get_status()``.
         """
-        url = f"{self._base_url}/api/config"
+        return self._get_json_object("/api/config", (self._connect_timeout, self._read_timeout))
+
+    def _get_json_object(self, path: str, timeout: "tuple[float, float]") -> dict:
+        """``GET path`` and return its JSON object, under the shared liveness contract.
+
+        Raises ``EdgeUnavailable`` on a connection error, a non-200 response, a non-JSON
+        body, or JSON that is not an object. The one copy of that contract for the Pi's
+        settings-shaped reads (``get_config``, ``get_sound``), so a fix to it lands in both.
+        """
+        url = f"{self._base_url}{path}"
         try:
-            resp = requests.get(
-                url, timeout=(self._connect_timeout, self._read_timeout)
-            )
+            resp = requests.get(url, timeout=timeout)
         except _TRANSPORT_ERRORS as exc:
             raise EdgeUnavailable(f"failed to fetch {url!r}: {exc}") from exc
         try:
@@ -286,6 +300,37 @@ class EdgeClient:
         if not isinstance(obj, dict):
             raise EdgeUnavailable(f"{url!r} returned a non-object JSON body")
         return obj
+
+    def get_sound(self) -> dict:
+        """Fetch ``GET /api/sound`` — the Pi speaker's readiness, with the short sound timeout.
+
+        Returns ``{available, enabled, sounds: [{name, duration_s}], playing, last_error}``
+        as-is. Raises ``EdgeUnavailable`` on a connection error, a non-200 response (a Pi
+        whose build predates the speaker answers 404), or a non-JSON / non-object body.
+        """
+        return self._get_json_object("/api/sound", _SOUND_TIMEOUT)
+
+    def play_sound(self, name: str) -> "tuple[int, dict]":
+        """``POST /api/sound/play {sound: name}`` — one clip — returning ``(status, body)``.
+
+        Unlike the other calls, a non-200 is NOT raised: the Pi's codes are the answer the
+        alarm acts on (409 still playing, 423 disabled on the Pi, 404/502/503 failures), so
+        they are returned for the caller to classify. ``body`` is the JSON object, or ``{}``
+        when there is none. Only a transport failure raises ``EdgeUnavailable``.
+        """
+        url = f"{self._base_url}/api/sound/play"
+        try:
+            resp = requests.post(url, json={"sound": name}, timeout=_SOUND_TIMEOUT)
+        except _TRANSPORT_ERRORS as exc:
+            raise EdgeUnavailable(f"failed to reach {url!r}: {exc}") from exc
+        try:
+            try:
+                obj = resp.json()
+            except ValueError:
+                obj = {}
+            return resp.status_code, obj if isinstance(obj, dict) else {}
+        finally:
+            resp.close()
 
     def iter_stream_reconnecting(
         self,

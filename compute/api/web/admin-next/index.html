@@ -321,6 +321,14 @@
      content that must WRAP — unlike every other qtable cell, which is nowrap by design. */
   .qtable.wtable.mtable { min-width: 900px; }
   .qtable td.thr { white-space: normal; }
+  /* The foreign-cat alarm log (Start page). Its Verdict / Evidence / Ended cells carry a
+     sentence each, so they WRAP like .thr; the thumbnail column is fixed so a row's height
+     is set by the frame, not by how long the error text happens to be. */
+  .qtable.wtable.atable { min-width: 760px; }
+  .qtable.atable td.wrap { white-space: normal; overflow-wrap: anywhere; }
+  .athumb { display: block; width: 88px; height: 56px; object-fit: cover; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--surface-2); }
+  .alarm-sounding { color: var(--bad); font-weight: 600; }
   .thr-row { display: flex; gap: 5px; align-items: baseline; }
   .thr-edit { display: flex; gap: 5px; align-items: center; margin-top: 5px; }
   .thr-edit input { width: 74px; }
@@ -1045,6 +1053,38 @@
           compute started, so older windows still need a manual sweep from Motion tuning.</p>
       </div>
 
+      <div class="card" id="alarmCard">
+        <h3>Foreign-cat alarm</h3>
+        <div class="stage-picker" id="alarmMode">
+          <button data-mode="off">
+            <b>Off</b>
+            <span>Nothing sounds. Visits are still named in the feed as before.</span>
+          </button>
+          <button data-mode="on">
+            <b>On</b>
+            <!-- No <b> in here: the picker styles every b in a button as its block title. -->
+            <span>A named neighbour or an unknown cat at the door loops alarm1 / alarm2 on
+              the Pi until it has been gone 3 s. Any stage.</span>
+          </button>
+        </div>
+        <p id="alarmModeNote" class="note"></p>
+        <div class="wrow"><span class="wk">Pi speaker</span><span id="alarmPi" class="note">…</span></div>
+        <div class="wrow"><span class="wk">Gallery</span><span id="alarmGallery" class="note">…</span></div>
+        <div class="wrow"><span class="wk">Now</span><span id="alarmNow" class="note">…</span></div>
+        <div class="row" style="margin-top:10px">
+          <button id="alarmTest1" data-sound="alarm1">Play alarm1</button>
+          <button id="alarmTest2" data-sound="alarm2">Play alarm2</button>
+          <span id="alarmTestNote" class="note grow"></span>
+        </div>
+        <p class="hint">A test plays in either mode — it is deliberate — through the whole
+          compute → Pi path, and logs a <b>test</b> row below. The Pi still refuses it while
+          a clip is playing or while sound is disabled there.</p>
+        <div id="alarmLog" class="qwrap"></div>
+        <p class="hint">The last 20 alarms and tests. This is where to check whether it ever
+          sounded at one of our cats: each row keeps the verdict that started it and the frame
+          that decided it.</p>
+      </div>
+
       <div class="card">
         <h3>Collection</h3>
         <div class="row">
@@ -1132,6 +1172,181 @@
       if (loc.latitude == null) { note.className = 'note warn'; note.textContent = 'Not set — the day/night split is unavailable until you set a location.'; }
       else { $('#locLat', view).value = loc.latitude; $('#locLon', view).value = loc.longitude; note.textContent = `Source: ${loc.source}.`; }
     }).catch(() => {});
+
+    // --- Foreign-cat alarm ---
+    // Same in-flight discipline as the stage picker: while the POST is out, the poll must not
+    // re-derive the selection from the pre-POST server state.
+    let alarmSubmitting = false, alarmTesting = false, alarmInFlight = false, alarmLogSig = '';
+    $('#alarmMode', view).addEventListener('click', async (e) => {
+      const btn = e.target.closest('button'); if (!btn || btn.disabled) return;
+      $('#alarmMode', view).querySelectorAll('button').forEach(b => b.disabled = true);
+      alarmSubmitting = true;
+      let failed = null;
+      try { await api('POST', '/api/deterrent', { mode: btn.dataset.mode }); }
+      catch (err) { failed = err; }
+      alarmSubmitting = false;
+      await refreshAlarm(true);
+      if (failed) {
+        const n = $('#alarmModeNote', view);
+        n.className = 'note bad'; n.textContent = 'Failed: ' + failed.message;
+      }
+    });
+    const alarmTestBtns = [$('#alarmTest1', view), $('#alarmTest2', view)];
+    alarmTestBtns.forEach(b => b.addEventListener('click', async () => {
+      const note = $('#alarmTestNote', view), sound = b.dataset.sound;
+      alarmTesting = true; alarmTestBtns.forEach(x => x.disabled = true);
+      note.className = 'note'; note.textContent = `Asking the Pi to play ${sound}…`;
+      try {
+        const r = await api('POST', '/api/deterrent/test', { sound });
+        if (r.outcome === 'played') { note.className = 'note'; note.textContent = `Played ${sound} on the Pi (${r.duration_s.toFixed(1)} s).`; }
+        else if (r.outcome === 'busy') { note.className = 'note warn'; note.textContent = 'Not played — the Pi is still playing a clip.'; }
+        else if (r.outcome === 'disabled') { note.className = 'note bad'; note.textContent = 'Not played — sound is disabled on the Pi.'; }
+        else { note.className = 'note bad'; note.textContent = 'Not played — ' + (r.error || 'failed'); }
+      } catch (err) { note.className = 'note bad'; note.textContent = 'Failed: ' + err.message; }
+      alarmTesting = false; alarmTestBtns.forEach(x => x.disabled = false);
+      await refreshAlarm(true);
+    }));
+
+    const ALARM_ENDED = {
+      gone: 'gone', switched_off: 'switched off', uncalibrated: 'gallery uncalibrated',
+      error: 'error — the step could not see', interrupted: 'interrupted by a restart',
+    };
+    function renderAlarm(d) {
+      const picker = $('#alarmMode', view);
+      if (!alarmSubmitting) {
+        picker.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('sel', b.dataset.mode === d.mode); b.disabled = false;
+        });
+      }
+      // The Pi speaker. The card must never read On over a Pi that will refuse every play.
+      const pi = d.pi || {};
+      const blockers = [];
+      let piCls = 'note', piTxt;
+      if (!pi.reachable) {
+        piCls = 'note bad'; piTxt = 'Unreachable — ' + (pi.error || 'no answer'); blockers.push('the Pi does not answer');
+      } else if (!pi.available) {
+        piCls = 'note bad'; piTxt = 'Answers, but has no aplay — it cannot play anything.'; blockers.push('the Pi has no player');
+      } else if (!pi.enabled) {
+        piCls = 'note bad'; piTxt = 'Sound is DISABLED on the Pi — it refuses every play. Re-enable it on the Pi\'s config page.';
+        blockers.push('sound is disabled on the Pi');
+      } else {
+        piTxt = 'Ready · enabled on the Pi · ' + ((pi.sounds || []).map(s => s.name).join(', ') || 'no sounds!')
+          + (pi.playing ? ` · playing ${pi.playing}` : '');
+        if (!(pi.sounds || []).length) { piCls = 'note bad'; blockers.push('the Pi lists no sounds'); }
+      }
+      if (pi.reachable && pi.last_error) { if (piCls === 'note') piCls = 'note warn'; piTxt += ' · last error: ' + pi.last_error; }
+      const pn = $('#alarmPi', view); pn.className = piCls; pn.textContent = piTxt;
+
+      // The gallery. Uncalibrated means every cat reads unknown, so nothing may start one.
+      const gn = $('#alarmGallery', view);
+      if (!d.model) {
+        gn.className = 'note bad'; gn.textContent = 'No gallery promoted — nothing can start an alarm.';
+        blockers.push('no gallery is promoted');
+      } else if (!d.calibrated) {
+        gn.className = 'note bad';
+        gn.textContent = `Version ${d.model.id} is uncalibrated (no threshold) — every cat would read unknown, `
+          + 'so nothing may start an alarm. Set a threshold on Model building.';
+        blockers.push('the gallery is uncalibrated');
+      } else {
+        gn.className = 'note'; gn.textContent = `Version ${d.model.id} · threshold ${d.model.threshold.toFixed(3)}`;
+      }
+      if (!d.worker_running) blockers.push('live naming is not running (the alarm runs inside it)');
+
+      // Right now.
+      const a = d.alarm, nn = $('#alarmNow', view);
+      if (!a) { nn.className = 'note warn'; nn.textContent = 'This compute build reports no alarm state.'; }
+      else if (a.sounding) {
+        const ep = a.episode, who = ep.verdict === 'unknown' ? 'an unknown cat' : (ep.cat_name || `cat #${ep.cat_id}`);
+        nn.className = 'note bad alarm-sounding';
+        nn.textContent = `SOUNDING for ${fmtDuration((Date.now() - ep.started_ms) / 1000)} at ${who}`
+          + ` · ${ep.clips_played} clip${ep.clips_played === 1 ? '' : 's'} played`
+          + (ep.clips_failed ? ` · ${ep.clips_failed} failed` : '')
+          + (ep.pi_disabled ? ' · refused: disabled on the Pi' : '')
+          + (ep.last_error ? ' · last error: ' + ep.last_error : '');
+      } else {
+        let t = 'Quiet';
+        if (a.last_ended) t += ` · last alarm ended ${fmtClock(a.last_end_ms)} (${ALARM_ENDED[a.last_ended] || a.last_ended})`;
+        // The pass summary is what verifies the step keeps up on this hardware: ids per pass,
+        // how long it took, and whether it caught up with the newest frame.
+        if (d.mode === 'on' && a.last_pass && a.last_pass.ids) {
+          t += ` · last pass ${a.last_pass.ids} frames in ${fmtInt(a.last_pass.ms)} ms`
+            + (a.last_pass.caught_up ? ', caught up' : `, ${fmtInt(a.last_pass.behind)} behind`);
+        }
+        nn.className = a.pass_error ? 'note warn' : 'note';
+        if (a.pass_error) t += ' · pass error: ' + a.pass_error;
+        nn.textContent = t;
+      }
+
+      const mn = $('#alarmModeNote', view);
+      if (d.mode !== 'on') { mn.className = 'note'; mn.textContent = 'Off — nothing sounds.'; }
+      else if (blockers.length) { mn.className = 'note bad'; mn.textContent = 'Switched On, but it cannot sound: ' + blockers.join('; ') + '.'; }
+      else { mn.className = 'note'; mn.textContent = 'On — armed.'; }
+      if (!alarmTesting) alarmTestBtns.forEach(x => x.disabled = false);
+    }
+
+    function renderAlarmLog(rows) {
+      const sig = JSON.stringify(rows);
+      if (sig === alarmLogSig) return;  // unchanged: don't rebuild (and re-request) the thumbnails
+      alarmLogSig = sig;
+      const el = $('#alarmLog', view);
+      if (!rows.length) { el.innerHTML = '<p class="note">No alarms or tests yet.</p>'; return; }
+      const body = rows.map(r => {
+        const test = r.mode === 'test';
+        const len = r.end_ts == null
+          ? '<span class="alarm-sounding">sounding…</span>'
+          : (test && !r.clips_played ? '<span class="dim">—</span>' : fmtDuration((r.end_ts - r.start_ts) / 1000));
+        const clips = `${r.clips_played}` + (r.clips_failed ? ` <span class="dim">· ${r.clips_failed} failed</span>` : '');
+        const verdict = test ? `test · ${esc(r.sound || '')}`
+          : r.verdict === 'unknown' ? 'unknown cat' : esc(r.cat_name || `cat #${r.cat_id}`);
+        let evidence = '<span class="dim">—</span>';
+        if (!test) {
+          evidence = `${r.n_counted} frames · ${r.n_votes} votes · d ${r.distance == null ? '—' : r.distance.toFixed(3)}`
+            + ` <span class="dim">(threshold ${r.threshold == null ? '—' : r.threshold.toFixed(3)}, v${r.model_version_id})</span>`;
+          if (r.visit_start_ts != null) evidence += ` · started ${((r.start_ts - r.visit_start_ts) / 1000).toFixed(1)} s after the visit's first frame`;
+        }
+        let ended;
+        if (test) ended = r.clips_played ? 'played' : (r.pi_disabled ? 'disabled on the Pi' : 'not played');
+        else ended = r.end_ts == null ? 'still sounding' : (ALARM_ENDED[r.ended] || esc(r.ended || '—'));
+        if (!test && r.pi_disabled) ended += ' · disabled on the Pi';
+        if (r.last_error) ended += ` · <span class="dim">${esc(r.last_error)}</span>`;
+        const frame = r.frame_id == null ? '<span class="dim">—</span>'
+          : r.frame_live
+            ? `<a href="/media/${r.frame_id}" target="_blank" rel="noopener" title="Open the full frame">`
+              + `<img class="athumb" loading="lazy" src="/media/${r.frame_id}" alt="deciding frame #${r.frame_id}"></a>`
+            : '<span class="dim" title="That frame has aged out of the store (or its id now names another frame)">gone</span>';
+        return `<tr><td>${fmtTs(r.start_ts)}<div class="dim">${fmtClock(r.start_ts)}</div></td><td>${len}</td>`
+          + `<td class="num">${clips}</td><td class="wrap">${verdict}</td><td class="wrap">${evidence}</td>`
+          + `<td class="wrap">${ended}</td><td>${frame}</td></tr>`;
+      }).join('');
+      el.innerHTML = '<table class="qtable wtable atable"><colgroup>'
+        + '<col style="width:110px"><col style="width:64px"><col style="width:60px"><col style="width:110px">'
+        + '<col><col style="width:150px"><col style="width:104px"></colgroup>'
+        + '<thead><tr><th>Started</th><th>Length</th><th>Clips</th><th>Verdict</th><th>Evidence</th>'
+        + '<th>Ended</th><th>Frame</th></tr></thead><tbody>' + body + '</tbody></table>';
+    }
+
+    // Sequence-guarded: a forced refresh after a click must win over a slower poll already in
+    // flight, or that poll lands last and repaints the pre-click state (entry 235's race).
+    let alarmSeq = 0;
+    async function refreshAlarm(force) {
+      if (!alive || (alarmInFlight && !force)) return;
+      const seq = ++alarmSeq;
+      alarmInFlight = true;
+      try {
+        const [d, log] = await Promise.all([api('GET', '/api/deterrent'), api('GET', '/api/deterrent/log?limit=20')]);
+        if (!alive || seq !== alarmSeq) return;
+        renderAlarm(d); renderAlarmLog(log.actions || []);
+      } catch (err) {
+        if (!alive || seq !== alarmSeq) return;
+        // A compute build that predates the alarm 404s here (the dev proxy serves a local
+        // admin against a remote compute — entries 164/173/183): say so, never a blank card.
+        const n = $('#alarmModeNote', view);
+        n.className = 'note bad';
+        n.textContent = String(err.message).startsWith('404')
+          ? 'This compute build has no foreign-cat alarm — pull + restart it.'
+          : 'Could not read the alarm state: ' + err.message;
+      } finally { if (seq === alarmSeq) alarmInFlight = false; }
+    }
 
     // --- Poll + render ---
     function renderStats(s) {
@@ -1268,6 +1483,9 @@
     // already links to Tools, and one sentence would put that fetch straight back.
     async function refresh() {
       if (!alive) return;
+      // Not awaited: /api/deterrent asks the Pi (short timeout), and an unreachable Pi must
+      // not hold the stage/stats readouts back behind it.
+      refreshAlarm();
       try { const s = await api('GET', '/api/stats'); if (alive) renderStats(s); } catch (_) {}
     }
     refresh(); renderModel();

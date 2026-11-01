@@ -63,6 +63,17 @@ from compute.identification.gallery import (
     load_gallery,
     run_identify,
 )
+from compute.learning.deterrent import (
+    ALARM_TICK_S,
+    DETER_MAX_FRAMES,
+    DETER_WINDOW_S,
+    ENDED_ERROR,
+    ENDED_INTERRUPTED,
+    MODE_ON,
+    Alarm,
+    get_mode,
+    is_calibrated,
+)
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -123,15 +134,25 @@ def run_live_identify(
     guard here still keeps a wholly-unexpected tick fault from ever killing the daemon.
     """
     logger.info("live-identify worker started (tick=%.1fs)", tick_seconds)
+    elapsed = 0.0
     while not stop_event.is_set():
-        if stop_event.wait(tick_seconds):
+        # While the foreign-cat alarm switch is On the period is a FIXED 1 s — the wait is
+        # what is left of it after the tick — so the alarm sees new frames, and the "gone"
+        # check runs, about once a second. Off, the plain interval as before.
+        if stop_event.wait(manager._next_wait(elapsed, tick_seconds)):
             break
+        started = time.monotonic()
         try:
             manager._tick(stop_event)
         except Exception:  # pragma: no cover - _tick already contains its own guard
             # _tick catches its own errors into last_error; this is a belt-and-braces
             # net so no path can leave the always-on worker dead with running=True.
             logger.exception("live-identify: tick crashed unexpectedly")
+        elapsed = time.monotonic() - started
+    # An alarm episode lives in this worker's memory: once the thread is gone nothing can
+    # stop it or complete its row, so it ends here, on the way out, as `interrupted` — the
+    # word a restart's launch-time sweep uses for the same situation.
+    manager._alarm_end_safely(ENDED_INTERRUPTED, manager._now_ms())
     logger.info("live-identify worker stopped")
 
 
@@ -173,6 +194,7 @@ class LiveIdentifyManager:
         gallery_loader: "Callable[[str], object]" = load_gallery,
         tick_seconds: float = _DEFAULT_TICK,
         now_ms: "Callable[[], int]" = _default_now_ms,
+        sound=None,
     ) -> None:
         self._store = store
         self._is_busy = is_busy
@@ -229,6 +251,21 @@ class LiveIdentifyManager:
         # error (sticky until the next error, so a returning operator still sees it).
         self._last_tick_ts: "int | None" = None
         self._last_error: "str | None" = None
+
+        # The foreign-cat alarm (compute/learning/deterrent.py). ``sound`` is the Pi
+        # client the clips are requested through (an ``EdgeClient``; None = no Pi, so
+        # every clip request fails and is counted). The episode rules live in ``Alarm``;
+        # this worker owns the GPU half — detecting + identifying the newest frames.
+        self._alarm = Alarm(store, sound)
+        # The alarm step's high-water mark: the highest frame id it has processed. In
+        # memory only (a restart starts at the next open visit), guarded by ``_lock`` and
+        # re-seeded by ``reset_watermark`` exactly as the watermark is.
+        self._alarm_hwm = 0
+        # The previous pass's outcome, read by the next tick's bookkeeping: whether it
+        # raised (an alarm must not keep sounding on a step that can't see), and whether it
+        # caught up with the store (the "gone" check is meaningless otherwise). Worker-only.
+        self._alarm_pass_failed = False
+        self._alarm_caught_up = False
 
     # --- The tick ------------------------------------------------------------------------
 
@@ -313,6 +350,19 @@ class LiveIdentifyManager:
         with self._lock:
             self._last_tick_ts = now
 
+        # The foreign-cat alarm step runs FIRST, before any early return below: its
+        # bookkeeping must run every tick (an alarm stops when the switch goes Off even
+        # with no model promoted), and it never yields to manual jobs. ``gate`` is the
+        # switch being On with a calibrated gallery; then the closed-visit pass below
+        # waits while a visit is open OR an alarm is sounding, because naming one closed
+        # span can take seconds and would stall the trigger, the next clip and the "gone"
+        # check behind housekeeping that is in no hurry. (A sounding alarm with no open
+        # visit is a stranger sitting still in Tuning — the spec's rule named only the
+        # open visit.)
+        gate, open_span = self._alarm_step(stop_event, now)
+        if gate and (open_span is not None or self._alarm.running):
+            return
+
         try:
             model = self._store.active_model()
             if model is None:
@@ -359,6 +409,13 @@ class LiveIdentifyManager:
                     # the worker must yield immediately rather than contend for the rest of
                     # a long tick. Watermark stays at the last fully-processed span.
                     break
+                if gate and i > 0:
+                    # Likewise a visit can OPEN mid-pass: stop and give the next tick's
+                    # alarm step the GPU. (Span 0 was checked by the alarm step itself.)
+                    with self._lock:
+                        current = self._watermark
+                    if self._store.open_visit(current, self._now_ms()) is not None:
+                        break
                 self._detect(self._store, self._analyzer, detect_manager, since_id=lo, until_id=hi)
                 if stop_event.is_set():
                     # detect returns NORMALLY (not raising) when a stop aborts it between
@@ -396,6 +453,187 @@ class LiveIdentifyManager:
             logger.exception("live-identify: tick failed")
             with self._lock:
                 self._last_error = str(exc)
+
+    # --- The foreign-cat alarm step (docs/specs/2026-11-01-foreign-cat-alarm.md) -------
+
+    def _next_wait(self, elapsed: float, tick_seconds: float) -> float:
+        """Seconds the loop waits before the next tick.
+
+        Switch On: what is left of a fixed ``ALARM_TICK_S`` period after a tick that took
+        ``elapsed`` (never more than the plain interval, so a short test interval stays
+        short). Off — or the setting unreadable — the plain interval, as before the alarm.
+        """
+        try:
+            on = get_mode(self._store) == MODE_ON
+        except Exception:  # noqa: BLE001 - a store fault must not kill the loop
+            on = False
+        if not on:
+            return tick_seconds
+        return min(tick_seconds, max(0.0, ALARM_TICK_S - elapsed))
+
+    def _alarm_end_safely(self, reason: str, now: int) -> None:
+        try:
+            self._alarm.end(reason, now)
+        except Exception:  # noqa: BLE001 - the episode is already cleared in memory
+            logger.exception("live-identify: could not record the alarm's end")
+
+    def _alarm_step(self, stop_event: threading.Event, now: int) -> "tuple[bool, tuple[int, int] | None]":
+        """Steps 1-3 of a tick: episode bookkeeping, process the newest frames, maybe start.
+
+        Returns ``(gate, open_span)``. ``gate`` is the switch On with a calibrated gallery
+        — the only state in which frames are processed, an alarm can start, and the
+        closed-visit pass waits for an open visit; ``open_span`` is that open visit, if
+        any. Never raises: a fault in the PASS is recorded so the next tick's bookkeeping
+        ends a running episode as ``error``, and naming carries on below regardless.
+
+        The pass deliberately ignores ``is_busy``. Manual jobs include the ~44-min
+        motion-tuning re-runs, "Identify all" and the phone's "Analyse this visit", all of
+        which run unattended — yielding would silently disarm the door for hours. The pass
+        is bounded at ``DETER_MAX_FRAMES`` instead, as the always-on detection worker,
+        which also never yields to them, already is.
+        """
+        try:
+            mode_on = get_mode(self._store) == MODE_ON
+            model = self._store.active_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("live-identify: alarm step could not read its state")
+            self._alarm_end_safely(ENDED_ERROR, now)
+            self._alarm.record_pass(None, str(exc))
+            return False, None
+        gate = mode_on and is_calibrated(model)
+
+        # 1. Episode bookkeeping: end it, or play the next clip once the last is due to end.
+        try:
+            self._alarm.bookkeeping(
+                mode_on=mode_on,
+                model=model,
+                pass_failed=self._alarm_pass_failed,
+                caught_up=self._alarm_caught_up,
+                now_ms=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - its reads/writes are store calls
+            logger.exception("live-identify: alarm bookkeeping failed")
+            self._alarm_end_safely(ENDED_ERROR, now)
+            with self._lock:
+                self._last_error = str(exc)
+        self._alarm_pass_failed = False
+        if not gate:
+            self._alarm_caught_up = False
+            return False, None
+
+        # 2. Process the newest frames.
+        open_span = None
+        try:
+            open_span, info = self._alarm_process(stop_event, model, now)
+        except EmbedCancelled:
+            self._alarm_caught_up = False  # a stop — not a fault
+            return True, open_span
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("live-identify: alarm pass failed")
+            self._alarm_pass_failed = True
+            self._alarm_caught_up = False
+            self._alarm.record_pass(None, str(exc))
+            with self._lock:
+                self._last_error = str(exc)
+            return True, open_span
+        self._alarm_caught_up = info["caught_up"]
+        self._alarm.record_pass(info, None)
+        if stop_event.is_set():
+            return True, open_span
+
+        # 3. Start, if no alarm is running and the recent counted frames vote foreign.
+        if not self._alarm.running:
+            try:
+                visit_start_ts = (
+                    self._store.frame_recv_ts(open_span[0]) if open_span is not None else None
+                )
+                self._alarm.maybe_start(model, self._now_ms(), visit_start_ts)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("live-identify: alarm start failed")
+                self._alarm_pass_failed = True
+                self._alarm.record_pass(None, str(exc))
+                with self._lock:
+                    self._last_error = str(exc)
+        return True, open_span
+
+    def _alarm_process(
+        self, stop_event: threading.Event, model: dict, now: int
+    ) -> "tuple[tuple[int, int] | None, dict]":
+        """Detect + identify the frames above the high-water mark, at most ``DETER_MAX_FRAMES``.
+
+        With no alarm running, only the OPEN visit's frames: the mark jumps to just below
+        the visit's first frame (the frames between visits are empty scene) or the start
+        window's, whichever is later, and with no open visit nothing is processed. While an alarm runs, every stored frame above the
+        mark, in a visit or not — in Tuning that keeps a stranger sitting still in view.
+        The mark is clamped to the newest frame (ids regress after a Clear or a purge, and
+        a mark left above every frame would silently process nothing) and only advances
+        when no ``reset_watermark`` landed meanwhile.
+
+        Processing is the closed pass's own ``_detect`` then ``_identify``, with the same
+        idempotency, so that pass later skips everything done here. Returns the open
+        visit and a pass summary whose ``caught_up`` says no frame was left above the mark.
+        """
+        with self._lock:
+            epoch, watermark, hwm = self._epoch, self._watermark, self._alarm_hwm
+        running = self._alarm.running
+        open_span = self._store.open_visit(watermark, now)
+        latest = self._store.latest_id()
+        hwm = min(hwm, latest)
+        if not running:
+            if open_span is None:
+                self._set_alarm_hwm(hwm, epoch)
+                return None, {"ids": 0, "ms": 0, "caught_up": True, "behind": 0}
+            start_id, latest = open_span
+            # Jump to the visit's first frame — but no further back than the start window:
+            # only frames received in the last DETER_WINDOW_S can start an alarm, so
+            # replaying a long visit oldest-first (switch turned On, or the worker
+            # restarted, mid-visit) would only delay the start by minutes. The skipped
+            # frames are the closed pass's to name, as every other closed visit's are.
+            window_first, _ = self._store.resolve_ts_range(now - int(DETER_WINDOW_S * 1000), None)
+            floor = start_id - 1 if window_first is None else max(start_id, window_first) - 1
+            hwm = max(hwm, floor)
+        lo = hwm + 1
+        if lo > latest:
+            self._set_alarm_hwm(hwm, epoch)
+            return open_span, {"ids": 0, "ms": 0, "caught_up": True, "behind": 0}
+        hi = min(latest, hwm + DETER_MAX_FRAMES)
+
+        started = time.monotonic()
+        self._ensure_resident(model)
+        if self._analyzer is None:
+            self._analyzer = self._analyzer_factory()
+        self._detect(self._store, self._analyzer, DetectAdapter(stop_event), since_id=lo, until_id=hi)
+        if stop_event.is_set():
+            return open_span, {"ids": 0, "ms": 0, "caught_up": False, "behind": latest - hwm}
+        self._identify(
+            self._store,
+            model,
+            model["gallery_path"],
+            since_id=lo,
+            until_id=hi,
+            embedder=self._resident,
+            gallery=self._resident_gallery,
+            progress=lambda done, total: not stop_event.is_set(),
+        )
+        self._set_alarm_hwm(hi, epoch)
+        return open_span, {
+            "ids": hi - lo + 1,
+            "ms": int((time.monotonic() - started) * 1000),
+            "caught_up": hi >= latest,
+            "behind": latest - hi,
+        }
+
+    def _set_alarm_hwm(self, value: int, epoch: int) -> None:
+        with self._lock:
+            if epoch == self._epoch:
+                self._alarm_hwm = int(value)
+
+    def alarm_status(self) -> dict:
+        """The alarm's snapshot for ``GET /api/deterrent`` (episode, last pass, its error)."""
+        status = self._alarm.status()
+        with self._lock:
+            status["hwm"] = self._alarm_hwm
+        return status
 
     def _advance_watermark(self, value: int, epoch: int) -> bool:
         """Set + persist the watermark, unless a ``reset_watermark`` landed since ``epoch``.
@@ -524,6 +762,9 @@ class LiveIdentifyManager:
             # Bump first and unconditionally: any in-flight tick must be invalidated even in
             # the never-enabled case (cheap, and it keeps the invariant simple).
             self._epoch += 1
+            # The alarm step's high-water mark is re-seeded with it, for the same reason:
+            # left above every post-wipe frame, the step would process nothing, silently.
+            self._alarm_hwm = int(value)
             if self._seed_horizon:
                 return
             self._watermark = int(value)

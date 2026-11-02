@@ -171,7 +171,9 @@ The compute PC serves **two** browser surfaces, split by audience:
   foreign-cat sightings and any deterrents. Alongside the timeline it answers *how
   much* — how often each cat has been through the door lately, by day and after
   dark, and how much of the traffic could not be attributed to anyone. It shows
-  status, events, and stored snapshots — not a live video feed.
+  status, events, and stored snapshots — not a live video feed — and any one visit
+  can be downloaded as a video to keep, which plays on an iPhone with nothing
+  installed.
 - **The admin workbench** — a separate management console where the household is
   taught and the system is tuned: reviewing and correcting identifications,
   annotating images, building and promoting models (see *How the system learns*),
@@ -316,6 +318,7 @@ in its safe default until a first model is trained.
 
 - Recognizing and reacting to non-cat visitors (people, wildlife).
 - Per-cat access rules (e.g. curfews, or keeping one cat in for medication).
-- Live video access and clip capture/replay of door events.
+- Live video access. (Downloading one recorded visit as a video is in scope — see the
+  at-a-glance dashboard.)
 - Health/behavior insights from long-term movement patterns.
 - More than one monitored door or entrance.

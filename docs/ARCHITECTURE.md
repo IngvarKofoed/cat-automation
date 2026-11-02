@@ -42,8 +42,10 @@ These constraints from the concept shape every decision below:
    added, removed, or swapped without touching the brain.
 4. **Trusted LAN, stay local.** Everything runs on a trusted home network
    (firewall + protected Wi-Fi), so the prototype uses **no auth between
-   components** and no user management; camera imagery and history never leave the
-   LAN. The only outbound dependency is the push-notification service. (Auth is a
+   components** and no user management; the system never sends camera imagery or
+   history off the LAN. (A visit clip the household downloads to a phone is theirs —
+   it may go on to iCloud Photos, AirDrop or Messages.) The only outbound dependency
+   is the push-notification service. (Auth is a
    revisit-if-it-ever-leaves-home decision, not an oversight.)
 5. **Uncertainty is first-class.** Every identification carries a confidence;
    thresholds turn low confidence into "unknown," and unknown fails safe.
@@ -123,7 +125,7 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |
 | **Event store & state** | Durable record of cats, sightings, identifications, transitions, actions; derives current occupancy ("who's home"). |
 | **Notifier** | Turns notify intents into push notifications to the owner. |
-| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
+| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. Any visit in the player can be **downloaded as a video**: `GET /api/clip` stitches every stored frame of the visit into an H.264 MP4 timed from each frame's `recv_ts` (so it runs as long as the visit did), encoded on request with `imageio-ffmpeg` — one at a time, at below-normal priority on bounded threads, killed if the phone leaves — and never stored. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
 | **Dataset / annotation / training** | Store collected crops and their labels, serve the annotation queue, and run training jobs that (re)build the gallery/model and promote a new version. Enrollment of a new cat is a focused case of this. |
 | **Model store** | Versioned detection, embedding, and gallery artifacts served to the inference service. |
 
@@ -567,8 +569,11 @@ projection over transitions and can always be rebuilt from them.
 
 **Decision:** start with **SQLite** on the compute tier for the event store
 (single-host, simple, more than fast enough for one door), with a clear path to
-Postgres if needs grow. Media (crops/clips) is stored on the compute tier's
-filesystem, referenced by path/URL from the DB — not inlined as blobs. Retention
+Postgres if needs grow. Media (frames and crops) is stored on the compute tier's
+filesystem, referenced by path/URL from the DB — not inlined as blobs. Clips are
+**not** media here: a visit's video is encoded on demand from its stored frames and
+deleted once sent, because a second store of MP4s would sit outside the byte cap with
+nothing to evict it. Retention
 is bounded (keep recent media for debugging/retraining, age out the rest).
 
 **Retention is a byte cap, and the stage decides what it sheds first.** The frame
@@ -777,6 +782,7 @@ outbound-internet dependency.
 | Frame transport | MJPEG over HTTP (`multipart/x-mixed-replace`) + `GET /frame` stills | PC connects to the Pi; one long-lived response streams the clipped ROI continuously (motion is a separate pulled signal — `GET /status` + per-part `X-Motion` headers); stills as JPEG, or PNG/WebP when lossless is needed. |
 | Storage | SQLite → Postgres if needed | Simple single-host start; clear growth path. |
 | Notifications | ntfy / Pushover / Telegram | Simple push to phone; only outbound dependency. |
+| Visit clip download | `imageio-ffmpeg` (its static ffmpeg + libx264, as a subprocess) | A pip dependency, so no hand-installed ffmpeg; H.264 MP4 plays on an iPhone as-is, and the concat demuxer carries each frame's own timing (OpenCV's `VideoWriter` can't, and its Linux wheels lack H.264). GPL binary — fine for a household install never distributed. |
 | Dashboard + annotation UI | FastAPI backend + a lightweight SPA (Svelte/React); SSE or polling for live status | Main compute-side web app: occupancy, timeline, foreign-cat log, annotation queue, mode + training controls. HTMX + server-rendered Jinja is the simpler Python-only alternative. |
 | Runtime | systemd (Pi), Docker Compose (PC) | Matches each host; easy restarts and updates. |
 
@@ -841,8 +847,9 @@ cat-automation/
   the main lever.
 - **Security & privacy.** Prototype trust model: a single trusted home LAN behind
   the firewall and protected Wi-Fi, not exposed to the internet — so **no auth and
-  no user management** between components in this phase. Imagery and history stay
-  on the LAN; no cloud storage of video. Revisit auth only if the system is ever
+  no user management** between components in this phase. The system never sends
+  imagery or history off the LAN. A visit clip the household downloads to a phone is
+  theirs, and may reach iCloud Photos, AirDrop or Messages from there. Revisit auth only if the system is ever
   exposed beyond the home network.
 - **Observability.** Structured logs and saved clips for every uncertain or
   wrong decision — these double as debugging aid and as retraining data. The

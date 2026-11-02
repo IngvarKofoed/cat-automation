@@ -1266,6 +1266,29 @@ class Store:
             return None
         return os.path.join(self._media_root, row[0])
 
+    def span_frame_paths(self, start_id: int, end_id: int) -> "list[tuple[int, int, str]]":
+        """``(id, recv_ts, absolute_jpeg_path)`` for every frame row in ``[start_id, end_id]``,
+        id ASC — the visit-clip download's read (see
+        docs/specs/2026-11-02-user-visit-clip-download.md).
+
+        ``path_for`` for a whole span: one rowid range read under one lock hold, where a
+        per-id loop would queue behind the collector's inserts once per frame, up to the
+        10 000-id per-visit cap. Like ``path_for`` it leaves file existence to the caller,
+        and the caller stats only AFTER this returns: thousands of stats under the store
+        lock would stall the collector.
+
+        Paths are ABSOLUTE, unlike ``path_for``'s: ffmpeg's concat demuxer resolves a
+        relative entry against the LIST file's directory, not the process's working
+        directory, and the default media root (``./data/collection``) is relative.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, recv_ts, path FROM frames WHERE id >= ? AND id <= ? ORDER BY id",
+                (int(start_id), int(end_id)),
+            ).fetchall()
+        root = os.path.abspath(self._media_root)
+        return [(int(fid), int(ts), os.path.join(root, path)) for fid, ts, path in rows]
+
     def frame_sources(self, frame_ids: "list[int]") -> "dict[int, tuple[int, str]]":
         """``{frame_id: (recv_ts, absolute_jpeg_path)}`` for the ids that are LIVE rows.
 

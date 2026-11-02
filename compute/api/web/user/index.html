@@ -673,6 +673,42 @@
             cursor: pointer;
         }
         .dialog-head .x:hover { background: var(--porch-soft); }
+        /* The ⬇ clip control. Its slot takes the head's free space (the auto margin), so
+           the icon sits right beside the × at the edge; the slot stays even when both its
+           children are hidden, which keeps the × pinned right on a visit with no span.
+           Same circle as the ×. `.hidden` is qualified here because this page has no bare
+           `.hidden` rule (changelog 287). Both circles are `flex: none`: the head is
+           already full on a phone, and shrinkable they were squeezed oval (measured, the ×
+           went 32 → 27px at 390px wide) while the time beside them is the item that can
+           wrap. The pair also sits closer than the head's gap: on a 360px phone the time
+           then still breaks cleanly into date / clock, where the full gap left it ~1px
+           short and broke it across three lines ("02/11-" / "2026," / "06:45:22"). */
+        .dialog-head .clip-slot { margin-left: auto; display: inline-flex; flex: none; }
+        .dialog-head .clip-slot + .x { flex: none; margin-left: -.4rem; }
+        .dialog-head .clip-btn {
+            display: inline-grid;
+            place-items: center;
+            width: 2rem; height: 2rem;
+            padding: 0;
+            background: var(--surface-2);
+            border: 1px solid var(--hairline);
+            border-radius: 999px;
+            color: var(--ink);
+            cursor: pointer;
+            text-decoration: none;
+        }
+        .dialog-head .clip-btn.hidden { display: none; }
+        .dialog-head .clip-btn:hover { background: var(--porch-soft); }
+        .dialog-head .clip-btn svg {
+            width: 1rem; height: 1rem;
+            fill: none; stroke: currentColor; stroke-width: 2.4;
+            stroke-linecap: round; stroke-linejoin: round;
+        }
+        /* Making: the saving pill's pulse, on a rule of its own — `.saving .pulse` is
+           scoped to the pill and would never reach this icon (changelog 287/471). */
+        .dialog-head .clip-btn.making { animation: savepulse 1s ease-in-out infinite; cursor: progress; color: var(--porch); }
+        /* Ready: the accent, the same pairing as a marked ⚑. */
+        .dialog-head .clip-btn.ready { background: var(--porch-soft); border-color: var(--porch); color: var(--porch); }
         /* min-height:0 lets the stage be the dialog column's shrinking item. A flex
            item's default min-height:auto refuses to go below its aspect-ratio-derived
            height, so on a short viewport the footer nav fell past the dialog's
@@ -1037,6 +1073,15 @@
             <div class="dialog-head">
                 <span class="when mono" id="playerWhen">—</span>
                 <span id="playerChipSlot"></span>
+                <!-- Download clip: a two-tap icon. The first tap asks the compute PC to
+                     encode the visit; once it lands the <button> gives way to an
+                     <a download> to the file, so the SAVE is a fresh tap of its own. Its
+                     words go on the footer's message line — this head has no room for
+                     them on a phone. -->
+                <span class="clip-slot">
+                    <button class="clip-btn hidden" id="playerClip" type="button" aria-label="Download clip"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></svg></button>
+                    <a class="clip-btn ready hidden" id="playerClipLink" aria-label="Save clip"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></svg></a>
+                </span>
                 <button class="x" id="playerClose" aria-label="Close playback">&times;</button>
             </div>
             <!-- Reserved slot, never collapsed: a confirm advances the reader to the next
@@ -1113,6 +1158,8 @@
         // regardless, and the visit shows its result on the next natural reload.
         const ANALYSE_POLL_MS = 1500;
         const ANALYSE_POLL_TRIES = 80;
+        // How long a dropped clip's blob outlives its visit — see resetClip.
+        const CLIP_REVOKE_DELAY_MS = 60000;
         const PLAYER_FPS_MS = 200;             // ~5 fps, matches the ~5 fps capture
         const PRELOAD_AHEAD = 16;              // frames preloaded ahead of the current one
         const EVENTS_PAGE = 100;               // visits per feed page; older pages load on scroll
@@ -1179,6 +1226,10 @@
         let confirmPending = [];
         let confirmFailure = '';
         let confirmSavedTimer = null;
+        // The one clip in hand (download-clip spec): {ev, ctrl, phase, url, name, size, msg},
+        // or null. ONE, owned by the visit that was on screen when ⬇ was tapped — leaving
+        // that visit drops it (resetClip), so it can never be offered under another visit.
+        let clipState = null;
         let strangersOnly = false;
         // "Show all" off (default): hide low-signal visits — unrecognized cat-scale
         // motion and motion-only noise — leaving named cats and persons.
@@ -1233,6 +1284,7 @@
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
         const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
+        const playerClipBtn = $('playerClip'), playerClipLinkEl = $('playerClipLink');
         const playerAnalyseBtn = $('playerAnalyse');
         const playerConfirmBtn = $('playerConfirm'), playerLabelStateEl = $('playerLabelState');
         const playerSavingEl = $('playerSaving'), playerSavingTxtEl = $('playerSavingTxt');
@@ -1827,6 +1879,121 @@
                 if (open) renderAnalyseButton(open);
             }
         }
+        // ================= download the visit as a clip =================
+        // ⬇ in the playback header (user-visit-clip-download spec). The first tap asks the
+        // compute PC for the visit as an MP4, encoded on the spot from every stored frame;
+        // when it lands the icon BECOMES an <a download> to the blob, and the second tap
+        // saves it. Two taps on purpose: the save is then a fresh user gesture, so iOS never
+        // treats it as an unprompted download arriving several seconds after the tap.
+        //
+        // The clip belongs to the visit it was made for. Leaving that visit — a hop, a
+        // swipe, closing the modal — aborts the fetch (which is also what tells the server
+        // to kill the encode) and drops the blob (revoked a minute later — see resetClip).
+        // Until the reader leaves, the visit keeps its blob, so a second save needs no new
+        // encode: nothing reports that a download finished, and revoking right after the
+        // tap can cancel it in Safari.
+        function clipMb(bytes) {
+            const mb = bytes / 1e6;
+            if (mb < 0.1) return 'under 0.1 MB';
+            return (mb < 10 ? mb.toFixed(1) : String(Math.round(mb))) + ' MB';
+        }
+        // The server names the file (catdoor-YYYY-MM-DD-HHMMSS.mp4, household clock).
+        function clipNameFrom(res) {
+            const cd = res.headers.get('Content-Disposition') || '';
+            const star = /filename\*=utf-8''([^;]+)/i.exec(cd);
+            if (star) { try { return decodeURIComponent(star[1]); } catch (_) { /* fall through */ } }
+            const plain = /filename="?([^";]+)"?/i.exec(cd);
+            return plain ? plain[1] : 'catdoor-clip.mp4';
+        }
+        function hasClipSpan(ev) { return !!ev && ev.start_id != null && ev.end_id != null; }
+        // Paint the icon for `ev` — idle, making or ready — from clipState, but only if the
+        // clip is THIS visit's. Hidden for a visit with no span (the feed's contract allows
+        // nulls); NOT for one whose frames may have aged out, where the 404's sentence says
+        // more than a missing button would.
+        function renderClipButton(ev) {
+            const c = clipState && clipState.ev === ev ? clipState : null;
+            const making = !!c && c.phase === 'making';
+            const ready = !!c && c.phase === 'ready';
+            const show = hasClipSpan(ev);
+            playerClipBtn.classList.toggle('hidden', !show || ready);
+            playerClipLinkEl.classList.toggle('hidden', !show || !ready);
+            playerClipBtn.disabled = making;
+            playerClipBtn.classList.toggle('making', making);
+            playerClipBtn.setAttribute('aria-label', making ? 'Making clip' : 'Download clip');
+            playerClipBtn.title = making ? 'Making clip…' : 'Download this visit as a video';
+            if (ready) {
+                playerClipLinkEl.href = c.url;
+                playerClipLinkEl.download = c.name;
+                playerClipLinkEl.setAttribute('aria-label', `Save clip, ${clipMb(c.size)}`);
+                playerClipLinkEl.title = `Save ${c.name} (${clipMb(c.size)})`;
+            } else {
+                playerClipLinkEl.removeAttribute('href');
+                playerClipLinkEl.removeAttribute('download');
+            }
+        }
+        // The clip's sentences share the footer line with the flag and confirm readouts,
+        // whose writes may replace them; the icon's state, colour and aria-label still
+        // carry where the clip is, so only the words are lost. Remembered so that leaving
+        // the visit clears the clip's OWN sentence and nobody else's.
+        function setClipMsg(c, text, bad) {
+            c.msg = text;
+            setFlagMsg(text, bad);
+        }
+        async function makeClip() {
+            const ev = activityVisible[activitySelectedIndex];
+            // A clip already in hand is this visit's (another visit's was dropped on the
+            // way here): making → the button is disabled anyway; ready → the link shows.
+            if (!hasClipSpan(ev) || clipState) return;
+            const c = clipState = {
+                ev, ctrl: new AbortController(), phase: 'making', url: null, name: '', size: 0, msg: '',
+            };
+            renderClipButton(ev);
+            setClipMsg(c, 'Making clip…');
+            const fail = (msg) => {
+                clipState = null;
+                renderClipButton(ev);
+                setFlagMsg(msg, true);
+            };
+            try {
+                const sp = new URLSearchParams({ start_id: String(ev.start_id), end_id: String(ev.end_id) });
+                const res = await fetch('/api/clip?' + sp.toString(), { signal: c.ctrl.signal, cache: 'no-store' });
+                if (!res.ok) {
+                    const detail = await errorFromResponse(res);
+                    if (clipState === c) fail(detail);   // the server's own sentence, as-is
+                    return;
+                }
+                const blob = await res.blob();
+                if (clipState !== c) return;
+                c.url = URL.createObjectURL(blob);
+                c.name = clipNameFrom(res);
+                c.size = blob.size;
+                c.phase = 'ready';
+                renderClipButton(ev);
+                // U+FE0E keeps the ⬇ a text glyph rather than an emoji on iOS.
+                setClipMsg(c, `Clip ready (${clipMb(blob.size)}) — tap ⬇︎ to save`);
+            } catch (err) {
+                // Our own abort (the reader left the visit) has already dropped the clip, so
+                // it stays silent. Anything else is the compute PC unreachable, the phone
+                // giving up on the wait, or the app backgrounded mid-fetch.
+                if (clipState !== c) return;
+                fail('Couldn’t reach the compute PC, or the clip took too long.');
+            }
+        }
+        // Drop the clip in hand, whatever its phase. Called when the reader leaves its visit.
+        // The icon and the sentence go at once; the blob itself is revoked a minute LATER,
+        // because tapping Save and then closing or swiping straight away is the natural
+        // sequence, and revoking while Safari is still reading the blob can cancel that
+        // save silently. Nothing can offer it meanwhile — clipState no longer holds it.
+        function resetClip() {
+            const c = clipState;
+            if (!c) return;
+            clipState = null;
+            c.ctrl.abort();
+            if (c.url) { const url = c.url; setTimeout(() => URL.revokeObjectURL(url), CLIP_REVOKE_DELAY_MS); }
+            if (c.msg && playerFlagMsgEl.textContent === c.msg) setFlagMsg('');
+            renderClipButton(c.ev);
+        }
+
         // Repaint one card's rail dot, pill and health dot after its subject changed,
         // without rebuilding the rail (which would drop the reader's scroll position —
         // and the modal is open over it). Mirrors renderActivityRowMarks's shape; the ✓/⚑
@@ -2493,6 +2660,10 @@
             // the flag it captured rather than re-reading this.
             navPendingHop = false;
             pausePlayback();
+            // A clip made for another visit is dropped here, BEFORE anything repaints: this
+            // is the hop (and the swipe's hop), and a clip must never be offered on a visit
+            // it isn't of. Aborting is also what stops the server's encode.
+            if (clipState && clipState.ev !== ev) resetClip();
             activitySelectedIndex = i;
             highlightSelectedRow();
 
@@ -2521,6 +2692,7 @@
             setFlagMsg('');
             renderFlagButton(ev);
             renderAnalyseButton(ev);
+            renderClipButton(ev);
             // AFTER setFlagMsg(''), which would otherwise wipe the older-build reason this
             // prints into the same line. Per-visit, so the reason survives every hop.
             renderSkipToggle();
@@ -2661,6 +2833,7 @@
 
         function closePlayer() {
             pausePlayback();
+            resetClip();   // leaving the visit: abort the fetch, revoke the blob
             modalEl.classList.add('hidden');
             document.body.classList.remove('modal-open');
             activitySelectedIndex = -1;
@@ -2842,6 +3015,7 @@
         playerConfirmBtn.addEventListener('click', confirmVisit);
         playerFlagBtn.addEventListener('click', toggleFlag);
         playerAnalyseBtn.addEventListener('click', analyseVisit);
+        playerClipBtn.addEventListener('click', makeClip);
 
         // Backdrop close: only when BOTH press and release land on the overlay itself
         // (never the dialog) — so a scrub/tile drag that releases over the backdrop

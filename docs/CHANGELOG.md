@@ -1980,3 +1980,43 @@ a clean one.
      every Play refused, the alarm silent. ARCHITECTURE had called the default "the HAT".
      Set host-locally via a systemd drop-in naming the card by name
      (`plughw:CARD=wm8960soundcard,DEV=0`), since card indices can shift between boots.
+
+542. The user app's player can DOWNLOAD a visit as an H.264 MP4: ⬇ beside the ×, a two-tap icon
+     (fetch, then an `<a download>`, so the save is a fresh gesture iOS accepts). `GET /api/clip`
+     encodes every stored frame at real speed with `imageio-ffmpeg`, sends it, deletes it — never
+     stored. Rollout: an existing compute PC needs one manual `pip install -r compute/requirements.txt`.
+     Spec: docs/specs/2026-11-02-user-visit-clip-download.md.
+
+543. A clip is timed off `recv_ts` through a concat-demuxer list, one `duration` per frame, so gaps
+     (motion-only storage, eviction) hold the previous frame instead of speeding the clip up.
+     Above 3000 frames every k-th is kept: bounded encode, still full length. The encode must
+     finish inside the phone's ~1-min give-up, so a 45 s timeout kills it and answers 502.
+
+544. Three ffmpeg settings are load-bearing, all MEASURED. Each list entry carries `option framerate
+     1000`: the 25 fps default snaps timestamps to a 40 ms grid and `-fps_mode vfr` DROPS frames
+     sharing a slot. That base reads to x264 as 1000 fps (High@L6.0 at 720p, a level phones may
+     refuse), so it is told `fps=<the clip's real average>`. And `out_range=tv` in the scale: with
+     `-pix_fmt yuv420p` alone the JPEGs' full-range flag survives, reading `yuvj420p(pc)`.
+
+545. One encode at a time, process-wide, at below-normal priority with the decoder, scale filter and
+     x264 held to 1/1/2 threads — the collector, workers and alarm tick share this CPU. A phone that
+     leaves (aborted fetch) has its encode killed. A request finding the lock held waits up to two
+     disconnect polls (1 s) before its 409: an immediate tap after a hop otherwise met "another
+     clip" about the abandoned one, since the route only sees a disconnect at its next 0.5 s poll.
+
+546. Known limits. The 45 s budget is unmeasured on the compute PC: on the loaded dev box 3000
+     frames took 17-44 s at 1280x720 and 5-19 s at 640x480, the slow end under `nice` — so the cap
+     may need lowering there. A HARD kill of the server mid-encode leaves that clip's temp dir in
+     the OS temp dir (graceful shutdown cleans up). Download from the home-screen app is unverified.
+
+547. Review repair: a request cancelled mid-start (a server shutdown) no longer orphans ffmpeg. The
+     await raised while the worker thread was inside `Popen`, so `finally` saw no process, deleted
+     its workdir and freed the lock with it running. The start is now its own task the route waits
+     out and reaps; an anyio shield does NOT hold against a native `task.cancel()` (measured).
+     That `finally` cleanup now runs off the event loop, since its kill waits up to 5 s.
+
+548. Review repairs, smaller. A thinned clip ends on the visit's own last frame (`[::k]` stopped up
+     to k-1 short). The 45 s deadline counts from the REQUEST, which is what the phone waits on. A
+     phone gone before the encode starts gets none started. An encoder that can't start, or exits 0
+     with no file, is a household 502, not a bare 500. Leaving a visit revokes its blob a minute
+     LATER, so a save tapped just before leaving is not cancelled mid-read.

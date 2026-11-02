@@ -22,3 +22,10 @@ httpx
 # a trusted edge dependency (edge/requirements.txt, the night-light scheduler); imported
 # lazily so the collector runs without it (the split just reports "unavailable" then).
 astral
+# The user app's visit-clip download (GET /api/clip; compute/api/clip.py): the wheel ships a
+# static ffmpeg binary with libx264 for Windows, Linux and macOS, so nobody installs ffmpeg
+# by hand. Run as a subprocess; imported lazily, so without it the route answers 503 naming
+# this file and everything else runs. The binary is GPL — fine for a household install that
+# is never distributed. compute.ps1/compute.sh install this file only when they create the
+# venv, so an existing compute PC needs one manual `pip install -r compute/requirements.txt`.
+imageio-ffmpeg

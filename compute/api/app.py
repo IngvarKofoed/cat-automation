@@ -43,11 +43,13 @@ import os
 import time
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from compute.analysis import ANALYZER_NAMES, get_analyzer
@@ -56,6 +58,7 @@ from compute.analysis.lighting import LIGHTING_ANALYZER, LightingAnalyzer
 from compute.analysis.mog2 import MogAnalyzer
 from compute.analysis.runner import AnalysisManager
 from compute.analysis.suntimes import astral_available, night_classifier
+from compute.api import clip
 from compute.collection.cleanup import CleanupManager
 from compute.collection.collector import CollectorManager
 from compute.collection.store import (
@@ -1045,6 +1048,20 @@ def _validate_visit_span(start_id: int, end_id: int, hint: str) -> None:
         )
 
 
+# ``GET /api/clip``'s refusals. The phone prints `detail` as-is, so each is a household
+# sentence, not engineering text (docs/specs/2026-11-02-user-visit-clip-download.md). The
+# 503 names the missing piece — the "older build / missing package" state of changelog
+# 164/173/183/365 — so a compute PC that hasn't run its venv install doesn't read as
+# "clips don't work".
+_CLIP_TOO_LONG = "This visit is too long to save as one clip."
+_CLIP_AGED_OUT = "This visit's frames have aged out."
+_CLIP_BUSY = "Another clip is still being made — try again in a moment."
+_CLIP_NO_ENCODER = (
+    "The compute PC can't make videos yet — run its pip install of compute/requirements.txt."
+)
+_CLIP_FAILED = "Couldn't make the clip"
+
+
 # Truthy spellings for the autostart env flag. Collection is OFF at launch by
 # default — the operator clicks Start in the browse UI — so a fresh compute run
 # never begins writing to the store until asked. Set CAT_COLLECT_AUTOSTART to one
@@ -1754,6 +1771,122 @@ def create_app(
                 detections=detections, identify=identify, flags=flags,
             )
         return {"frames": frames}
+
+    @app.get("/api/clip")
+    async def api_clip(
+        request: Request,
+        start_id: int = Query(ge=1),
+        end_id: int = Query(ge=1),
+    ):
+        """One visit as an H.264 MP4 download, encoded on request and never stored.
+
+        The user app's ⬇ (docs/specs/2026-11-02-user-visit-clip-download.md). Every stored
+        frame of ``[start_id, end_id]`` — the span the player samples — timed from its own
+        ``recv_ts``, so the clip runs as long as the visit did; see ``compute.api.clip``.
+
+        ``async`` so it can watch for the phone leaving: the store read, the file checks,
+        the encoder start and every wait run off the event loop, and while ffmpeg runs the
+        route polls ``request.is_disconnected()``. A phone that hops to another visit
+        aborts its fetch, and the encode is killed and the lock freed at once — so the next
+        tap never meets "another clip is still being made" about a clip nobody wants.
+
+        One encode at a time (``clip.ENCODE_LOCK``), held from the read to the end of the
+        encode and released on every exit path — NOT while the file is sent. A request
+        finding it held waits up to ``clip._LOCK_GRACE_S`` for an abandoned encode to tear
+        down before answering 409.
+        """
+        # The per-visit span rule `_validate_visit_span` applies (same `_MAX_VISIT_SPAN`),
+        # with the width refusal in the phone's words rather than its engineering text.
+        _validate_bounds(start_id, end_id)
+        if end_id - start_id > _MAX_VISIT_SPAN:
+            raise HTTPException(status_code=400, detail=_CLIP_TOO_LONG)
+        try:
+            exe, modern = await run_in_threadpool(clip.ffmpeg_tool)
+        except clip.EncoderUnavailable:
+            raise HTTPException(status_code=503, detail=_CLIP_NO_ENCODER)
+        if not await clip.acquire_encode_lock():
+            raise HTTPException(status_code=409, detail=_CLIP_BUSY)
+        proc = None
+        workdir = None
+        try:
+            started = time.monotonic()
+            rows = await run_in_threadpool(store.span_frame_paths, start_id, end_id)
+            # Stat OFF the store lock — the read above has released it. Rows whose file is
+            # gone (evicted) are dropped; a file that evicts after this check fails the
+            # encode with a 502, which is rare: eviction takes the oldest frames first.
+            present = await run_in_threadpool(clip.present_frames, rows)
+            if not present:
+                raise HTTPException(status_code=404, detail=_CLIP_AGED_OUT)
+            plan = clip.plan_clip(present)
+            # The read and the stats can take a while on a wide span. A phone that left
+            # meanwhile gets no encode started at all.
+            if await request.is_disconnected():
+                return Response(status_code=499)
+            workdir = await run_in_threadpool(clip.make_workdir)
+            try:
+                proc = await clip.start_encode_supervised(exe, modern, plan, workdir)
+            except clip.ClipError as exc:
+                raise HTTPException(status_code=502, detail=f"{_CLIP_FAILED}: {exc}.")
+            # Counted from the REQUEST's start, not ffmpeg's: the timeout exists to answer
+            # before the phone gives up, and the phone has been waiting since it asked.
+            deadline = started + clip._CLIP_TIMEOUT_S
+            while proc.poll() is None:
+                if await request.is_disconnected():
+                    # Nobody will receive this clip: stop spending CPU on it. The status
+                    # reaches nobody (uvicorn drops a response to a gone client, access-log
+                    # line and all); 499, nginx's "client closed request", says why here.
+                    await run_in_threadpool(clip.discard, proc, workdir)
+                    proc = workdir = None
+                    return Response(status_code=499)
+                if time.monotonic() >= deadline:
+                    await run_in_threadpool(clip.discard, proc, workdir)
+                    proc = workdir = None
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"{_CLIP_FAILED}: it took longer than "
+                        f"{clip._CLIP_TIMEOUT_S:.0f} s.",
+                    )
+                await asyncio.sleep(clip._POLL_S)
+            if proc.returncode != 0:
+                tail = await run_in_threadpool(clip.stderr_tail, workdir)
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{_CLIP_FAILED}: {tail}" if tail
+                    else f"{_CLIP_FAILED} (ffmpeg exited with code {proc.returncode}).",
+                )
+            out = clip.output_path(workdir)
+            size = await run_in_threadpool(
+                lambda: os.path.getsize(out) if os.path.isfile(out) else 0
+            )
+            if not size:
+                raise HTTPException(
+                    status_code=502, detail=f"{_CLIP_FAILED} (ffmpeg wrote no video)."
+                )
+            logger.info(
+                "clip %d-%d: %d of %d stored frames (step %d), %.1f MB in %.1f s",
+                start_id, end_id, len(plan.frames), len(present), plan.step,
+                size / 1e6, time.monotonic() - started,
+            )
+            response = FileResponse(
+                out,
+                media_type="video/mp4",
+                filename=clip.clip_filename(plan.frames[0][1]),
+                headers={"Cache-Control": "no-store"},
+                background=BackgroundTask(clip.discard, None, workdir),
+            )
+            workdir = None  # the response's background task deletes it once sent
+            return response
+        finally:
+            # Whatever is left — an error path, or this task cancelled mid-encode — is
+            # killed and deleted here, and the lock is freed on every exit. Off the loop
+            # (the kill waits up to 5 s for ffmpeg to exit) and shielded, so a cancelled
+            # request still finishes its own cleanup.
+            try:
+                if workdir is not None or (proc is not None and proc.poll() is None):
+                    with anyio.CancelScope(shield=True):
+                        await run_in_threadpool(clip.discard, proc, workdir)
+            finally:
+                clip.ENCODE_LOCK.release()
 
     @app.get("/api/timeline")
     def api_timeline(

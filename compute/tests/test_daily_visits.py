@@ -406,36 +406,177 @@ def test_an_unknown_identity_counts_as_named_for_the_day(tmp_path, cph):
     assert nov3["cats"] == {}
 
 
-def test_no_active_model_walks_nothing_and_names_no_day(tmp_path, cph, monkeypatch):
+def test_no_active_model_still_counts_movement_and_names_no_day(tmp_path, cph):
+    """All movement never waits on a model: the walk runs with no gallery, so every
+    recorded day carries a movement figure, while the named fields stay off it."""
     store = _store(tmp_path)
     seed = _Seed()
     seed.fill(_ts(2026, 11, 1), _now())
     seed.visit(_ts(2026, 11, 3, 9), "a")
+    seed.visit(_ts(2026, 11, 3, 12), "b")
     seed.build(store)
-    calls = []
-    monkeypatch.setattr(store, "events", lambda *a, **kw: calls.append(a))
 
     result = store.daily_visits(now_ms=_now())
-    assert calls == []
     assert result["model"] is None
-    assert _day(result, "2026-11-03")["state"] == "unnamed"
+    nov3 = _day(result, "2026-11-03")
+    assert nov3["state"] == "unnamed"
+    assert nov3["movement_state"] == "full"
+    assert nov3["door_events"] == 2
+    assert nov3["totals"] is None
+    # A recorded day with no events is a real movement zero.
+    assert _day(result, "2026-11-02")["door_events"] == 0
     assert _day(result, "2026-10-01")["state"] == "expired"  # before the store's first frame
-    assert all(d["cats"] == {} for d in result["days"])
+    assert _day(result, "2026-10-01")["movement_state"] == "expired"
+    assert _day(result, "2026-10-01")["door_events"] is None
+    assert all(d["cats"] == {} and d["totals"] is None for d in result["days"])
 
 
-def test_an_uncalibrated_model_walks_nothing(tmp_path, cph, monkeypatch):
+def test_an_uncalibrated_model_counts_movement_but_no_named_figure(tmp_path, cph):
+    """An uncalibrated gallery reads every visit "unknown cat" — so totals must NOT
+    carry that as an Unknown cats count: it describes the build, not the door."""
     store = _store(tmp_path)
-    _add_version(store, threshold=None)
+    vid = _add_version(store, threshold=None)
+    cat = store.create_cat("Mittens", is_resident=True)["id"]
+    seed = _Seed()
+    seed.fill(_ts(2026, 11, 1), _now())
+    seed.visit(_ts(2026, 11, 3, 9), "a")
+    spans = seed.build(store)
+    _name(store, spans["a"], vid, cat)
+
+    result = store.daily_visits(now_ms=_now())
+    assert result["model"]["calibrated"] is False
+    nov3 = _day(result, "2026-11-03")
+    assert nov3["state"] == "unnamed"
+    assert nov3["movement_state"] == "full"
+    assert nov3["door_events"] == 1
+    assert nov3["totals"] is None and nov3["cats"] == {}
+
+
+def test_the_count_walks_with_no_gallery(tmp_path, cph, monkeypatch):
+    """The walk runs without a usable gallery (it used to return early), and still
+    without the subject — All movement reads only the event count."""
+    store = _store(tmp_path)
     seed = _Seed()
     seed.fill(_ts(2026, 11, 1), _now())
     seed.build(store)
     calls = []
-    monkeypatch.setattr(store, "events", lambda *a, **kw: calls.append(a))
+    real = store.events
+
+    def spy(*a, **kw):
+        calls.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(store, "events", spy)
+    store.daily_visits(now_ms=_now())
+    assert calls and all(kw.get("with_subject") is False for kw in calls)
+
+
+# --- the Visits card's lines: totals + door_events ---------------------------
+
+
+def test_totals_count_the_cards_three_named_buckets_per_day(tmp_path, cph):
+    store = _store(tmp_path)
+    vid = _add_version(store, threshold=0.5)
+    ours = store.create_cat("Mittens", is_resident=True)["id"]
+    also = store.create_cat("Saffi", is_resident=True)["id"]
+    nb = store.create_cat("Store Kali", is_resident=False)["id"]
+    seed = _Seed()
+    seed.fill(_ts(2026, 11, 2), _now())
+    seed.visit(_ts(2026, 11, 3, 8), "r1")
+    seed.visit(_ts(2026, 11, 3, 9), "r2")
+    seed.visit(_ts(2026, 11, 3, 10), "n1")
+    seed.visit(_ts(2026, 11, 3, 11), "u1")     # identified, too far → unknown cat
+    seed.visit(_ts(2026, 11, 3, 12), "wind")   # never identified: movement only
+    spans = seed.build(store)
+    _name(store, spans["r1"], vid, ours)
+    _name(store, spans["r2"], vid, also)
+    _name(store, spans["n1"], vid, nb)
+    _name(store, spans["u1"], vid, ours, dist=0.9)
 
     result = store.daily_visits(now_ms=_now())
-    assert calls == []
-    assert result["model"]["calibrated"] is False
-    assert _day(result, "2026-11-03")["state"] == "unnamed"
+    nov3 = _day(result, "2026-11-03")
+    assert nov3["state"] == "full" and nov3["movement_state"] == "full"
+    assert nov3["totals"] == {"resident": 2, "neighbour": 1, "unknown_cat": 1}
+    assert nov3["door_events"] == 5
+    # The Our cats line equals the sum of the residents' own counts for that day.
+    assert nov3["totals"]["resident"] == sum(
+        nov3["cats"][str(c)]["visits"] for c in (ours, also))
+
+
+def test_totals_agree_with_door_stats_over_the_same_visits(tmp_path, cph):
+    """The lines and the card are counted by the same ladder, so over a stretch that
+    falls inside one day the card's figures equal the day's."""
+    store = _store(tmp_path)
+    vid = _add_version(store, threshold=0.5)
+    ours = store.create_cat("Mittens", is_resident=True)["id"]
+    nb = store.create_cat("Store Kali", is_resident=False)["id"]
+    seed = _Seed()
+    seed.fill(_ts(2026, 11, 4), _now())
+    seed.visit(_ts(2026, 11, 4, 10), "a")
+    seed.visit(_ts(2026, 11, 4, 11), "b")
+    seed.visit(_ts(2026, 11, 4, 12), "c")
+    seed.visit(_ts(2026, 11, 4, 13), "d")
+    spans = seed.build(store)
+    _name(store, spans["a"], vid, ours)
+    _name(store, spans["b"], vid, nb)
+    _name(store, spans["c"], vid, nb, dist=0.9)
+
+    now = _now()
+    card = store.door_stats(now_ms=now, hours=(14,))["totals"]["14h"]
+    today = _day(store.daily_visits(now_ms=now), "2026-11-04")
+    assert today["totals"] == {b: card[b] for b in ("resident", "neighbour", "unknown_cat")}
+    assert today["door_events"] == card["door_events"]
+
+
+def test_a_counted_day_with_no_visits_reads_zero_not_missing(tmp_path, cph):
+    store = _store(tmp_path)
+    _add_version(store)
+    seed = _Seed()
+    seed.fill(_ts(2026, 11, 1), _now())
+    seed.build(store)
+
+    nov2 = _day(store.daily_visits(now_ms=_now()), "2026-11-02")
+    assert nov2["state"] == "full"
+    assert nov2["totals"] == {"resident": 0, "neighbour": 0, "unknown_cat": 0}
+    assert nov2["door_events"] == 0
+
+
+def test_an_unnamed_day_keeps_its_movement_figure(tmp_path, cph):
+    """After a promotion, a day the Identify-all pass hasn't reached has no named
+    figure — but All movement still draws it."""
+    store = _store(tmp_path)
+    vid = _add_version(store)
+    cat = store.create_cat("Mittens", is_resident=True)["id"]
+    seed = _Seed()
+    seed.fill(_ts(2026, 11, 1), _now())
+    seed.visit(_ts(2026, 11, 2, 9), "old")
+    seed.visit(_ts(2026, 11, 2, 10), "old2")
+    seed.visit(_ts(2026, 11, 3, 9), "new")
+    spans = seed.build(store)
+    _name(store, spans["new"], vid, cat)
+
+    nov2 = _day(store.daily_visits(now_ms=_now()), "2026-11-02")
+    assert nov2["state"] == "unnamed"
+    assert nov2["totals"] is None
+    assert nov2["movement_state"] == "full"
+    assert nov2["door_events"] == 2
+
+
+def test_a_partial_day_keeps_its_movement_and_totals(tmp_path, cph):
+    store = _store(tmp_path)
+    vid = _add_version(store)
+    cat = store.create_cat("Mittens", is_resident=True)["id"]
+    seed = _Seed()
+    seed.fill(_ts(2026, 10, 1), _ts(2026, 11, 3, 6), every=_HOUR)
+    seed.visit(_ts(2026, 11, 3, 5), "a")
+    seed.fill(_ts(2026, 11, 3, 20), _now(), every=_HOUR)
+    spans = seed.build(store)
+    _name(store, spans["a"], vid, cat)
+
+    nov3 = _day(store.daily_visits(now_ms=_now()), "2026-11-03")
+    assert nov3["state"] == "partial" and nov3["movement_state"] == "partial"
+    assert nov3["totals"]["resident"] == 1
+    assert nov3["door_events"] == 1
 
 
 # --- truncation -------------------------------------------------------------
@@ -477,11 +618,38 @@ def test_truncation_marks_the_stop_day_and_everything_older_uncounted(tmp_path, 
     for d in result["days"]:
         if d["date"] <= stop_day:
             assert d["state"] == "uncounted", d["date"]
+            assert d["movement_state"] == "uncounted", d["date"]
             assert d["cats"] == {}
+            assert d["totals"] is None and d["door_events"] is None
         else:
             assert d["state"] == "full", d["date"]
+            assert d["movement_state"] == "full", d["date"]
     # The newest days carry their counts.
     assert _day(result, "2026-11-04")["cats"]["1"]["visits"] >= 1
+
+
+def test_a_truncated_count_with_no_gallery_marks_movement_uncounted(tmp_path, cph, monkeypatch):
+    """The walk now runs without a gallery, so the page budget can run out there too."""
+    store = _store(tmp_path)
+    seed = _Seed()
+    seed.fill(_ts(2026, 8, 1), _now())
+    seed.build(store)
+    calls = [0]
+
+    def fake_events(*a, **kw):
+        calls[0] += 1
+        ts = _ts(2026, 11, 4, 14) - (calls[0] - 1) * 2 * _HOUR
+        event = _fake_event(100_000 - calls[0], ts)
+        event["identity"] = None
+        return {"events": [event], "truncated": True}
+
+    monkeypatch.setattr(store, "events", fake_events)
+    result = store.daily_visits(now_ms=_now())
+    assert result["truncated"] is True
+    assert _day(result, "2026-10-01")["movement_state"] == "uncounted"
+    assert _day(result, "2026-10-01")["door_events"] is None
+    assert _day(result, "2026-11-04")["movement_state"] == "full"
+    assert _day(result, "2026-11-04")["door_events"] >= 1
 
 
 def test_a_count_that_got_past_the_window_start_leaves_no_day_uncounted(tmp_path, cph, monkeypatch):

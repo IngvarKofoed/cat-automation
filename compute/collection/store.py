@@ -203,6 +203,12 @@ _MAX_STATS_PAGES = 8
 # real store were ~6,500 visits (13 pages), so 90 days is ~20.
 _MAX_DAILY_PAGES = 40
 
+# The Visits card's named-total buckets the daily count keeps per day, for the card's
+# per-line charts (user-door-totals-daily-chart spec): the identity half of
+# ``Store._classify_stats_event``. All movement is the day's ``events`` count beside them;
+# ``unidentified`` is absent because it needs the subject, which this walk skips.
+_DAILY_TOTALS = ("resident", "neighbour", "unknown_cat")
+
 # A run of at least this many consecutive hours with no stored frame marks every local
 # day it touches as only PARTLY recorded on the per-cat daily chart. Measured over 60
 # days of the real store, with runs crossing midnight: ordinary quiet stretches never
@@ -8413,10 +8419,21 @@ class Store:
              model: {id, calibrated, enrolled_cat_ids} | None,
              truncated, stopped_date: "YYYY-MM-DD" | None,
              days: {"YYYY-MM-DD": {cats: {"<cat_id>": {visits, day, night}},
+                                   totals: {resident, neighbour, unknown_cat},
                                    events: int, identified: bool}}}
 
         ``days`` holds only days with at least one event. ``threshold`` is the active
         model's — part of what the API cache is keyed on, never sent to the client.
+
+        **The household lines** (the Visits card's per-line charts; see the
+        user-door-totals-daily-chart spec) come out of the SAME walk: ``totals`` folds the
+        identity half of ``_classify_stats_event`` per day, so Our cats / Neighbours /
+        Unknown cats are counted by the card's own definitions, and ``events`` — every
+        event the feed produces that day, named or not — is All movement. Cat visits is
+        deliberately NOT a field here: the card's ``cat_visits`` also counts
+        unidentified visits, which needs the subject (roughly doubling the walk), so the
+        client draws resident + neighbour + unknown_cat and no field of the card's name
+        is sent meaning something else (CHANGELOG 348's rule).
 
         **Naming** is ``door_stats``'s: a visit counts for a cat when its aggregated
         ``identity`` names that cat, read off the same ``events`` feed, so the chart,
@@ -8438,9 +8455,10 @@ class Store:
         is the day of the oldest visit counted — partly counted, so it and every older
         day become ``uncounted`` rather than drawn as recorded.
 
-        **No usable gallery** (none active, or uncalibrated): returns the empty shape
-        without walking at all — an uncalibrated gallery names nobody, so the walk would
-        only confirm it.
+        **No usable gallery** (none active, or uncalibrated): the walk STILL runs, so All
+        movement never waits on a model — ``events`` is counted regardless, while
+        ``merge_daily`` keeps ``cats`` and ``totals`` off every such day (an uncalibrated
+        gallery names nobody, so they would only assert zeros nobody measured).
         """
         now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
         days = max(1, int(days))
@@ -8467,8 +8485,6 @@ class Store:
             "stopped_date": None,
             "days": {},
         }
-        if model_out is None or not model_out["calibrated"]:
-            return result
 
         local_days = self._local_days(now, days)
         window_start = local_days[0]["start_ts"]
@@ -8491,13 +8507,23 @@ class Store:
             if start_ts < window_start or start_ts > now:
                 continue
             day = local_days[bisect.bisect_right(starts, start_ts) - 1]["date"]
-            rec = per_day.setdefault(day, {"cats": {}, "events": 0, "identified": False})
+            rec = per_day.setdefault(day, {
+                "cats": {},
+                "totals": {b: 0 for b in _DAILY_TOTALS},
+                "events": 0,
+                "identified": False,
+            })
             rec["events"] += 1
             identity = event.get("identity")
             if identity is None:
                 continue
             rec["identified"] = True
-            cat_id = identity.get("cat_id")
+            # The card's own ladder, so a line's day can never be counted by a different
+            # rule from the card's 6 h / 24 h figure. With an identity present it can only
+            # land on one of the three named-total buckets.
+            bucket, cat_id = self._classify_stats_event(event)
+            if bucket in rec["totals"]:
+                rec["totals"][bucket] += 1
             if cat_id is None:
                 continue
             counters = rec["cats"].setdefault(
@@ -8626,34 +8652,58 @@ class Store:
         ``partial``; every other state is drawn as "no figure", never as a quiet day.
         With no usable gallery every recorded day is ``unnamed``: nothing names it, and
         ``full`` with empty ``cats`` would assert a zero nobody measured.
+
+        Each day also carries ``movement_state`` — the same ladder WITHOUT ``unnamed``
+        (``expired > none > uncounted > partial > full``) — because All movement counts
+        every event, named or not, so a day the model hasn't named still has a movement
+        figure. ``totals`` (``{resident, neighbour, unknown_cat}``) is null unless
+        ``state`` has a figure, ``door_events`` null unless ``movement_state`` does; on a
+        counted day each is a number, 0 included, never missing. Only ``cats`` and
+        ``totals`` are gated on a usable gallery — gating ``door_events`` too would
+        leave no count on any no-gallery day, the exact case All movement is for.
         """
         model = counts.get("model")
         usable = model is not None and model.get("calibrated")
         stopped = counts.get("stopped_date")
+        figured = ("full", "partial")
         out_days: "list[dict]" = []
         for d in recording["days"]:
-            rec = counts["days"].get(d["date"]) if usable else None
+            rec = counts["days"].get(d["date"])
             if d["expired"]:
-                state = "expired"
+                movement_state = "expired"
             elif d["none"]:
-                state = "none"
+                movement_state = "none"
+            elif stopped is not None and d["date"] <= stopped:
+                movement_state = "uncounted"
+            elif d["partial"]:
+                movement_state = "partial"
+            else:
+                movement_state = "full"
+            if movement_state in ("expired", "none", "uncounted"):
+                state = movement_state
             elif not usable:
                 state = "unnamed"
-            elif stopped is not None and d["date"] <= stopped:
-                state = "uncounted"
             elif rec is not None and rec["events"] > 0 and not rec["identified"]:
                 state = "unnamed"
-            elif d["partial"]:
-                state = "partial"
             else:
-                state = "full"
+                state = movement_state
+            named = usable and state in figured
             out_days.append({
                 "date": d["date"],
                 "start_ts": d["start_ts"],
                 "end_ts": d["end_ts"],
                 "today": d["today"],
                 "state": state,
-                "cats": dict(rec["cats"]) if rec is not None and state in ("full", "partial") else {},
+                "movement_state": movement_state,
+                "cats": dict(rec["cats"]) if rec is not None and named else {},
+                "totals": (
+                    {b: (rec["totals"][b] if rec is not None else 0) for b in _DAILY_TOTALS}
+                    if named else None
+                ),
+                "door_events": (
+                    (rec["events"] if rec is not None else 0)
+                    if movement_state in figured else None
+                ),
             })
         return {
             "generated_ts": counts["generated_ts"],
@@ -8684,11 +8734,15 @@ class Store:
              truncated,
              days: [{date, start_ts, end_ts, today,
                      state: full|partial|none|expired|unnamed|uncounted,
-                     cats: {"<cat_id>": {visits, day, night}}}]}
+                     movement_state: full|partial|none|expired|uncounted,
+                     cats: {"<cat_id>": {visits, day, night}},
+                     totals: {resident, neighbour, unknown_cat} | None,
+                     door_events: int | None}]}
 
         ``days`` holds exactly ``days`` entries, oldest first, today last. ``cats`` is
         sparse — a cat with no visit that day is absent, which reads as 0 only on a
-        ``full`` or ``partial`` day. ``day``/``night`` come from the injected
+        ``full`` or ``partial`` day. ``totals`` / ``door_events`` back the Visits card's
+        per-line charts (see ``merge_daily``). ``day``/``night`` come from the injected
         ``is_night`` exactly as in ``door_stats``, ``None`` without one. The route adds
         ``split``.
         """

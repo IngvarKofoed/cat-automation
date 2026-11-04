@@ -527,7 +527,10 @@
         }
         .tally-row {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 4.2rem 4.2rem;
+            /* label · 6 h · 24 h · the chevron of the drill-down to that line's daily
+               chart (#visits/door/<line>) — the header row carries an empty one so the
+               figure columns stay aligned under their headings */
+            grid-template-columns: minmax(0, 1fr) 4.2rem 4.2rem .7rem;
             align-items: baseline;
             gap: .5rem;
             padding: .4rem 0;
@@ -554,6 +557,12 @@
            apart so it can't be read as part of the cat tally above it. */
         .tally-row.aside { color: var(--muted); }
         .tally-row.aside .n { font-weight: 600; }
+        /* Each data row is a link to that figure's daily chart, like the cat rows below. */
+        a.tally-row { color: inherit; text-decoration: none; }
+        a.tally-row.aside { color: var(--muted); }
+        a.tally-row:hover .k, a.tally-row:hover .chev { color: var(--ink); }
+        a.tally-row:focus-visible { outline: 2.5px solid var(--porch); outline-offset: 2px; border-radius: 4px; }
+        .tally-row .chev { color: var(--muted); font-size: 1.15rem; line-height: 1; text-align: right; align-self: center; }
         .tally-foot {
             margin: .7rem 0 0;
             font-size: .85rem;
@@ -619,7 +628,7 @@
         .vrows-head span:nth-child(n+3) { text-align: right; }
         @media (max-width: 380px) {
             .vrow, .vrows-head { grid-template-columns: 46px minmax(0, 1fr) 3.2rem 3.2rem .7rem; }
-            .tally-row { grid-template-columns: minmax(0, 1fr) 3.2rem 3.2rem; }
+            .tally-row { grid-template-columns: minmax(0, 1fr) 3.2rem 3.2rem .7rem; }
         }
 
         /* ================= VISITS → one cat (#visits/<id>) =================
@@ -643,6 +652,8 @@
         .vc-head .avatar-fallback { font-size: 1.4rem; }
         .vc-head h1 { margin: 0; font-size: clamp(1.5rem, 5vw, 2rem); line-height: 1.15; }
         .vc-head .cat-tag { display: inline-block; margin-top: .25rem; }
+        /* A door line's header has no avatar: its title, then what the figure counts. */
+        .vc-head .vc-def { margin: .3rem 0 0; color: var(--muted); font-size: .93rem; }
         .vc-main.hidden { display: none; }
         .vc-main.stale .vc-card, .vc-main.stale .vc-summary, .vc-main.stale .vc-sub { opacity: .55; transition: opacity .2s; }
 
@@ -700,12 +711,24 @@
         .vc-tickline { stroke: var(--hairline); stroke-width: 1; shape-rendering: crispEdges; }
         .vc-tick { fill: var(--muted); font-size: 11px; font-family: var(--font-body); font-variant-numeric: tabular-nums; }
         .vc-tick.today { fill: var(--ink); font-weight: 600; }
+        /* The door lines (#visits/door/<line>) draw ONE line instead of bars. It breaks at
+           every no-figure day; a partly recorded day and today get a hollow point, and only
+           the edges touching one are dashed — a floor or an unfinished day must not read
+           as the figure dropping. A figured day with no figured neighbour is a solid dot,
+           so it is never invisible. */
+        .vc-line { fill: none; stroke: var(--vc-bar); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+        .vc-line.dashed { stroke-dasharray: 3 3; stroke-linecap: butt; }
+        .vc-dot { fill: var(--vc-bar); stroke: var(--surface); stroke-width: 2; }
+        .vc-hollow { fill: var(--surface); stroke: var(--vc-bar); stroke-width: 2; }
+        .vc-selrule { stroke: var(--porch); stroke-width: 1.5; }
+        .vc-selpt { fill: var(--vc-bar); stroke: var(--surface); stroke-width: 2; }
         .vc-readout { margin: .65rem 0 0; min-height: 1.5em; font-size: .95rem; font-variant-numeric: tabular-nums; }
         .vc-notes { margin-top: .5rem; color: var(--muted); font-size: .84rem; }
         .vc-notes p { margin: .3rem 0 0; }
         .vc-notes .key { display: inline-block; width: .8rem; height: .8rem; margin-right: .4rem; border-radius: 2px; vertical-align: -1px; }
         .vc-notes .key.nofig { background: color-mix(in srgb, var(--muted) 24%, transparent); }
         .vc-notes .key.partial { background: color-mix(in srgb, var(--vc-bar) 38%, transparent); box-shadow: inset 0 2px 0 var(--vc-bar); }
+        .vc-notes .key.hollow { border-radius: 50%; background: var(--surface); box-shadow: inset 0 0 0 2px var(--vc-bar); }
         .sr-only {
             position: absolute;
             width: 1px; height: 1px;
@@ -1326,10 +1349,11 @@
 
         // ================= state =================
         let route = 'activity';
-        // The cat id of a `#visits/<id>` drill-down, as the raw string after the slash;
-        // null on every other route. `route` stays 'visits' there, so the Visits tab is
-        // the one highlighted.
-        let vcCatId = null;
+        // The drill-down under Visits, as the raw string after `visits/`: a cat id
+        // (`#visits/<id>`, the per-cat chart) or `door/<line>` (`#visits/door/<line>`, a
+        // line of the "At the door" card); null on every other route. `route` stays
+        // 'visits' there, so the Visits tab is the one highlighted.
+        let vcPath = null;
 
         let activityEvents = [], activityVisible = [];
         // Older visits exist beyond what is loaded — the LAST page's `truncated`. Two
@@ -2398,21 +2422,21 @@
 
         // ================= router =================
         function setRoute(r) {
-            // `visits/<cat_id>` is the one sub-route: the per-cat daily chart. Its base
-            // stays the route, so the nav keeps Visits highlighted.
+            // `visits/<cat_id>` and `visits/door/<line>` are the sub-routes: the daily
+            // charts. Their base stays the route, so the nav keeps Visits highlighted.
             const slash = r.indexOf('/');
             const base = slash < 0 ? r : r.slice(0, slash);
             route = ROUTES.includes(base) ? base : 'activity';
-            const wasCat = vcCatId;
-            vcCatId = route === 'visits' && slash >= 0 ? r.slice(slash + 1) : null;
+            const wasPath = vcPath;
+            vcPath = route === 'visits' && slash >= 0 ? r.slice(slash + 1) : null;
             for (const v of document.querySelectorAll('.view')) v.classList.remove('active');
-            $(vcCatId !== null ? 'view-visitcat' : 'view-' + route).classList.add('active');
+            $(vcPath !== null ? 'view-visitcat' : 'view-' + route).classList.add('active');
             for (const a of document.querySelectorAll('.nav a')) {
                 a.classList.toggle('active', a.dataset.route === route);
             }
             // Arriving from a long Visits list would otherwise open the chart scrolled
             // past its own header.
-            if (vcCatId !== null && vcCatId !== wasCat) window.scrollTo(0, 0);
+            if (vcPath !== null && vcPath !== wasPath) window.scrollTo(0, 0);
             onRouteEnter(route);
         }
         function onRouteEnter(r) {
@@ -2420,7 +2444,7 @@
             // scroll-lock) so it can't tick in the background or reappear on return.
             if (r !== 'activity') closePlayer();
             if (r === 'activity') enterActivity();
-            else if (r === 'visits') { if (vcCatId !== null) loadVisitCat(); else loadVisits(); }
+            else if (r === 'visits') { if (vcPath !== null) loadVisitDrill(); else loadVisits(); }
             else if (r === 'cats') loadCats();
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -3464,19 +3488,13 @@
             card.appendChild(tallyRow('', VISIT_WINDOWS.map(k => k.replace('h', ' hours')), 'head'));
             // Cat visits first (the headline), then who they were, then all movement as
             // context. `unidentified` is folded into the footnote rather than shown as a
-            // row: it is a gap in what we know, not a kind of visitor.
-            const rows = [
-                ['Cat visits', t => t.cat_visits],
-                ['Our cats', t => t.resident],
-                ['Neighbours', t => t.neighbour],
-                ['Unknown cats', t => t.unknown_cat],
-            ];
-            for (const [label, pick] of rows) {
-                card.appendChild(tallyRow(label, VISIT_WINDOWS.map(k => pick(data.totals[k]))));
+            // row: it is a gap in what we know, not a kind of visitor. Each row links to
+            // its own daily chart (#visits/door/<slug>).
+            for (const line of DOOR_LINES) {
+                card.appendChild(tallyRow(
+                    line.label, VISIT_WINDOWS.map(k => line.card(data.totals[k])),
+                    line.slug === 'all-movement' ? 'aside' : '', `#visits/door/${line.slug}`));
             }
-            card.appendChild(tallyRow(
-                'All movement at the door',
-                VISIT_WINDOWS.map(k => data.totals[k].door_events), 'aside'));
 
             // The honest remainder: visits we can see but cannot attribute. Quoted for the
             // WIDEST window, where the numbers are biggest and the gap most visible.
@@ -3495,9 +3513,11 @@
             return card;
         }
 
-        function tallyRow(label, values, extra) {
-            const row = document.createElement('div');
+        function tallyRow(label, values, extra, href) {
+            // A data row is a link to that figure's daily chart; the header row is not.
+            const row = document.createElement(href ? 'a' : 'div');
             row.className = 'tally-row' + (extra ? ' ' + extra : '');
+            if (href) row.href = href;
             const k = document.createElement('span');
             k.className = 'k';
             k.textContent = label;
@@ -3508,6 +3528,12 @@
                 n.textContent = v;
                 row.appendChild(n);
             }
+            // The chevron column — empty on the header so the figures stay aligned.
+            const chev = document.createElement('span');
+            chev.className = 'chev';
+            chev.setAttribute('aria-hidden', 'true');
+            if (href) chev.textContent = '›';
+            row.appendChild(chev);
             return row;
         }
 
@@ -3659,17 +3685,53 @@
             expired: 'no longer kept',
             unnamed: 'not named by the current model yet',
             uncounted: 'not counted (it was too busy to count this far back)',
+            // Door lines only: a day whose state promises a figure but whose payload
+            // carries none (a malformed or mismatched payload). Never drawn — or averaged
+            // — as zero.
+            nofigure: 'no count sent for this day',
         };
+        // The "At the door" card's lines, each with its own daily chart at
+        // #visits/door/<slug> (the user-door-totals-daily-chart spec). `card` reads the
+        // Visits payload's window totals; `day` reads one day of the daily payload, and
+        // only on a day whose state has a figure. `named` lines need a usable gallery and
+        // read `state`; All movement reads `movement_state` and never waits on a model.
+        // Cat visits is drawn as Our cats + Neighbours + Unknown cats: the card's own
+        // figure also counts visits nothing has named yet, which the daily count (identity
+        // only, to stay cheap) cannot see, so the two agree except while naming lags.
+        const DOOR_LINES = [
+            { slug: 'cat-visits', label: 'Cat visits', named: true,
+              def: 'Every cat through the door: ours, neighbours, and cats we didn\'t recognise.',
+              // Said on the page, because the definition above reads as the card's figure.
+              note: 'Cat visits nothing has named yet aren\'t in this line, so while naming catches up — mostly after the model changes — it can read lower than Cat visits on the Visits page.',
+              card: t => t.cat_visits, day: t => t.resident + t.neighbour + t.unknown_cat },
+            { slug: 'our-cats', label: 'Our cats', named: true, missing: 'residents',
+              def: 'Visits by our own cats, all together.',
+              card: t => t.resident, day: t => t.resident },
+            { slug: 'neighbours', label: 'Neighbours', named: true, missing: 'neighbours',
+              def: 'Visits by named cats that live elsewhere.',
+              card: t => t.neighbour, day: t => t.neighbour },
+            { slug: 'unknown-cats', label: 'Unknown cats', named: true, missing: 'both',
+              def: 'Cats the model looked at but couldn\'t match to any cat it knows.',
+              card: t => t.unknown_cat, day: t => t.unknown_cat },
+            { slug: 'all-movement', label: 'All movement at the door', named: false,
+              def: 'Everything that set the camera off: cats, people, wind and shadows.',
+              card: t => t.door_events, day: null },
+        ];
         let vcWindow = 60;          // the 30/60/90 choice: holds while the app is open, not across reloads
         let vcData = null;          // the last /api/door-stats/daily payload (every cat, 90 days)
         let vcOverview = null;      // the last /api/cats/overview payload (header + avatar)
         let vcSeq = 0;              // response sequence guard
         let vcDataSeq = 0;          // the request sequence `vcData` came from
         let vcSelDate = null;       // the selected day's ISO date, kept across window switches
-        let vcView = null;          // what the chart on screen is drawn from: {rows, left, slot, sel}
+        let vcView = null;          // what the chart on screen is drawn from: {rows, line, left, slot, ...}
+        // What the page on screen is: {line, noun, caption, notes} — a cat's bars or a
+        // door line. Set by the two renderers; read by the shared summary/readout/notes.
+        let vcSpec = null;
 
-        async function loadVisitCat() {
-            const catId = vcCatId;
+        // Loads either drill-down — a cat's chart or a door line's. Both read the same
+        // 90-day payload, so whichever opens second is served from the server's cache.
+        async function loadVisitDrill() {
+            const path = vcPath;
             const seq = ++vcSeq;
             hideNote(vcErrorEl);
             // Every cat is in one payload, so anything already loaded draws this cat at
@@ -3677,20 +3739,12 @@
             // a warm server cache answers in milliseconds, and dimming that would flicker.
             let staleTimer = null;
             if (vcData && vcOverview) {
-                renderVisitCat();
+                renderVisitDrill();
                 staleTimer = setTimeout(() => vcMainEl.classList.add('stale'), VC_STALE_MS);
             } else {
                 vcHeadEl.classList.add('hidden');
-                vcMainEl.classList.add('hidden');
                 hideNote(vcNoteEl);
-                vcEmptyEl.innerHTML = '';
-                const big = document.createElement('div');
-                big.className = 'big';
-                big.textContent = 'Counting the last 90 days';
-                const text = document.createElement('div');
-                text.textContent = 'A few seconds the first time.';
-                vcEmptyEl.append(big, text);
-                vcEmptyEl.classList.remove('hidden');
+                fillVcEmpty('Counting the last 90 days', 'A few seconds the first time.');
             }
             try {
                 const [dailyRes, catsRes] = await Promise.all([
@@ -3710,10 +3764,10 @@
                     vcOverview = overview;
                     vcDataSeq = seq;
                 }
-                if (seq !== vcSeq || vcCatId !== catId) return;
-                renderVisitCat();
+                if (seq !== vcSeq || vcPath !== path) return;
+                renderVisitDrill();
             } catch (err) {
-                if (seq !== vcSeq || vcCatId !== catId) return;
+                if (seq !== vcSeq || vcPath !== path) return;
                 if (!vcData) vcEmptyEl.classList.add('hidden');
                 showNote(vcErrorEl, err.message);
             } finally {
@@ -3722,25 +3776,44 @@
             }
         }
 
+        function renderVisitDrill() {
+            if ((vcPath || '').startsWith('door/')) renderDoorLine(vcPath.slice('door/'.length));
+            else renderVisitCat();
+        }
+
+        // The drill-down's one empty-state builder, in place of the chart: a headline,
+        // then a sentence or (`back`) a link back to Visits. The header is the caller's.
+        function fillVcEmpty(title, text, back) {
+            vcMainEl.classList.add('hidden');
+            vcEmptyEl.innerHTML = '';
+            const big = document.createElement('div');
+            big.className = 'big';
+            big.textContent = title;
+            let second;
+            if (back) {
+                second = document.createElement('a');
+                second.href = '#visits';
+                second.textContent = 'Back to Visits';
+            } else {
+                second = document.createElement('div');
+                second.textContent = text;
+            }
+            vcEmptyEl.append(big, second);
+            vcEmptyEl.classList.remove('hidden');
+        }
+
+        // The "No such cat" / "No such chart" page, with a way back.
+        function renderVcMissing(title) {
+            vcHeadEl.classList.add('hidden');
+            fillVcEmpty(title, null, true);
+        }
+
         function renderVisitCat() {
-            const id = /^\d+$/.test(vcCatId || '') ? Number(vcCatId) : null;
+            const id = /^\d+$/.test(vcPath || '') ? Number(vcPath) : null;
             const cat = id === null ? null : (vcOverview.cats || []).find(c => c.id === id);
             vcEmptyEl.classList.add('hidden');
             hideNote(vcNoteEl);
-            if (!cat) {
-                vcHeadEl.classList.add('hidden');
-                vcMainEl.classList.add('hidden');
-                vcEmptyEl.innerHTML = '';
-                const big = document.createElement('div');
-                big.className = 'big';
-                big.textContent = 'No such cat';
-                const back = document.createElement('a');
-                back.href = '#visits';
-                back.textContent = 'Back to Visits';
-                vcEmptyEl.append(big, back);
-                vcEmptyEl.classList.remove('hidden');
-                return;
-            }
+            if (!cat) { renderVcMissing('No such cat'); return; }
             renderVcHead(cat);
 
             const model = vcData.model;
@@ -3749,28 +3822,98 @@
             // would be a zero that describes the BUILD, not the cat — so say which, instead.
             const notEnrolled = usable && Array.isArray(model.enrolled_cat_ids)
                 && !model.enrolled_cat_ids.includes(id);
-            if (!usable || notEnrolled) {
+            if (!usable) {
                 vcMainEl.classList.add('hidden');
-                if (!usable) {
-                    fillNoGallery(vcEmptyEl, model, 'Counting a cat\'s visits');
-                } else {
-                    vcEmptyEl.innerHTML = '';
-                    const big = document.createElement('div');
-                    big.className = 'big';
-                    big.textContent = 'Not in the current model';
-                    const text = document.createElement('div');
-                    text.textContent = `The current model doesn't include ${catName(cat)}, so none of this cat's visits can be counted.`;
-                    vcEmptyEl.append(big, text);
-                }
+                fillNoGallery(vcEmptyEl, model, 'Counting a cat\'s visits');
                 vcEmptyEl.classList.remove('hidden');
+                return;
+            }
+            if (notEnrolled) {
+                fillVcEmpty('Not in the current model',
+                    `The current model doesn't include ${catName(cat)}, so none of this cat's visits can be counted.`);
                 return;
             }
             vcMainEl.classList.remove('hidden');
             vcCardEl.classList.toggle('neighbour', !cat.is_resident);
-            renderVcWindow(cat);
+            vcSpec = {
+                line: false,
+                noun: 'visit',
+                caption: `Visits per day for ${catName(cat)}`,
+                notes: [],
+            };
+            renderVcWindow(vcRows(cat.id));
         }
 
         function catName(cat) { return cat.name || `Cat #${cat.id}`; }
+
+        // A line of the "At the door" card, per day — the cat chart's page drawn as a line.
+        function renderDoorLine(slug) {
+            const line = DOOR_LINES.find(l => l.slug === slug);
+            vcEmptyEl.classList.add('hidden');
+            hideNote(vcNoteEl);
+            if (!line) { renderVcMissing('No such chart'); return; }
+            renderLineHead(line);
+
+            // An older compute PC sends days with no `totals`: drawing would put every
+            // line at zero, so say why instead. Keyed on the KEY's presence — a null
+            // value is the ordinary no-figure day.
+            if (!vcData.days.length || vcData.days.some(d => !('totals' in d))) {
+                fillVcEmpty('Can\'t draw this chart yet',
+                    'The compute PC may be on an older build that doesn\'t count these figures per day. Update it and try again.');
+                return;
+            }
+
+            const model = vcData.model;
+            const usable = model !== null && model.calibrated;
+            // The four named lines need a model to name anything; All movement does not.
+            if (line.named && !usable) {
+                vcMainEl.classList.add('hidden');
+                fillNoGallery(vcEmptyEl, model, 'Telling which cats came through');
+                vcEmptyEl.classList.remove('hidden');
+                return;
+            }
+            vcMainEl.classList.remove('hidden');
+            vcCardEl.classList.toggle('neighbour', line.slug === 'neighbours');
+            const noun = line.named ? 'visit' : 'movement';
+            vcSpec = {
+                line: true,
+                noun,
+                caption: `${line.label}: ${noun}s per day`,
+                notes: [line.note, line.missing && usable ? notInModelNote(line.missing, model) : null].filter(Boolean),
+            };
+            renderVcWindow(vcLineRows(line));
+        }
+
+        function renderLineHead(line) {
+            vcHeadEl.innerHTML = '';
+            const who = document.createElement('div');
+            const h = document.createElement('h1');
+            h.textContent = line.label;
+            const def = document.createElement('p');
+            def.className = 'vc-def';
+            def.textContent = line.def;
+            who.append(h, def);
+            vcHeadEl.append(who);
+            vcHeadEl.classList.remove('hidden');
+        }
+
+        // Active roster cats the current model leaves out, named — their visits land on
+        // an unknown cat or, usually, on whichever enrolled cat they most resemble, and a
+        // reader of these lines would not otherwise guess either. Silent when the model
+        // doesn't say which cats it holds (built before `per_cat` existed).
+        function notInModelNote(which, model) {
+            if (!Array.isArray(model.enrolled_cat_ids) || !vcOverview) return null;
+            const enrolled = new Set(model.enrolled_cat_ids);
+            const missing = (vcOverview.cats || []).filter(c => c.active && !enrolled.has(c.id)
+                && (which === 'both' || (which === 'residents') === !!c.is_resident));
+            if (!missing.length) return null;
+            const names = missing.map(catName);
+            const list = names.length === 1 ? names[0]
+                : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+            return names.length === 1
+                ? `${list} isn't in the current model, so its visits are counted as an unknown cat or as whichever cat it most resembles.`
+                : `${list} aren't in the current model, so their visits are counted as unknown cats or as whichever cat each most resembles.`;
+        }
 
         function renderVcHead(cat) {
             vcHeadEl.innerHTML = '';
@@ -3802,29 +3945,47 @@
             const p = vcDateParts(iso);
             return `${p.d} ${VC_MONTHS[p.m - 1]}`;
         }
-        function visitsWord(n) { return n === 1 ? 'visit' : 'visits'; }
+        // "visit"/"visits", or "movement"/"movements" on All movement.
+        function nounWord(n) { return n === 1 ? vcSpec.noun : vcSpec.noun + 's'; }
+        function hasFigure(state) { return state === 'full' || state === 'partial'; }
 
-        // The window's rows for one cat: each day with `n` (its count) only where the day
-        // has a figure — `full` or `partial` — and null everywhere else.
+        // The window's rows for one cat: each day with its state `s` and `n` (its count)
+        // only where the day has a figure — `full` or `partial` — and null everywhere else.
         function vcRows(catId) {
             const key = String(catId);
             return vcData.days.slice(-vcWindow).map(d => {
-                const has = d.state === 'full' || d.state === 'partial';
+                const has = hasFigure(d.state);
                 const c = d.cats ? d.cats[key] : undefined;
-                return { d, n: has ? (c ? c.visits : 0) : null, c: has ? (c || null) : null };
+                return { d, s: d.state, n: has ? (c ? c.visits : 0) : null, c: has ? (c || null) : null };
             });
         }
 
-        function renderVcWindow(cat) {
+        // The window's rows for one door line. All movement reads `movement_state` (no
+        // `unnamed` rung: it counts every event, named or not); the named lines read
+        // `state`. A figured state with no figure sent becomes `nofigure` — so the summary,
+        // the notes and the readout all treat it as no figure, never as 0.
+        function vcLineRows(line) {
+            return vcData.days.slice(-vcWindow).map(d => {
+                let s = line.named ? d.state : d.movement_state;
+                let n = null;
+                if (hasFigure(s)) {
+                    if (line.named) n = d.totals ? line.day(d.totals) : null;
+                    else n = typeof d.door_events === 'number' ? d.door_events : null;
+                    if (n === null) s = 'nofigure';
+                }
+                return { d, s, n, c: null };
+            });
+        }
+
+        function renderVcWindow(rows) {
             for (const b of vcSegEl.querySelectorAll('button')) {
                 b.setAttribute('aria-pressed', String(Number(b.dataset.days) === vcWindow));
             }
-            const rows = vcRows(cat.id);
             if (!rows.some(r => r.d.date === vcSelDate)) vcSelDate = rows[rows.length - 1].d.date;
 
             // Truncation is bannered only when THIS window holds a day it left uncounted:
             // a 30-day view of a count that stopped 70 days back is complete, because it is.
-            if (rows.some(r => r.d.state === 'uncounted')) {
+            if (rows.some(r => r.s === 'uncounted')) {
                 showNote(vcNoteEl,
                     'It was busy enough that we stopped counting partway back, so the ' +
                     'earliest days here have no count.');
@@ -3834,24 +3995,24 @@
 
             renderVcSummary(rows);
             vcChartEl.setAttribute('aria-label',
-                `Visits per day for ${catName(cat)}, last ${vcWindow} days. ` +
+                `${vcSpec.caption}, last ${vcWindow} days. ` +
                 'Use the left and right arrow keys to choose a day.');
-            drawVcChart(rows);
+            drawVcChart(rows, vcSpec.line);
             renderVcNotes(rows);
-            renderVcTable(rows, cat);
+            renderVcTable(rows);
         }
 
         function renderVcSummary(rows) {
             // The average is over FULLY recorded days only, and never today (it is not
             // over): a partial day is a floor and a no-figure day has no number at all,
             // so folding either in would understate the cat.
-            const full = rows.filter(r => r.d.state === 'full' && !r.d.today);
+            const full = rows.filter(r => r.s === 'full' && !r.d.today);
             vcSummaryEl.innerHTML = '';
             if (full.length) {
                 const avg = full.reduce((a, r) => a + r.n, 0) / full.length;
                 const shown = avg >= 10 ? String(Math.round(avg)) : String(Math.round(avg * 10) / 10);
                 const strong = document.createElement('strong');
-                strong.textContent = `About ${shown} ${shown === '1' ? 'visit' : 'visits'} a day`;
+                strong.textContent = `About ${shown} ${nounWord(Number(shown))} a day`;
                 vcSummaryEl.append(strong, document.createTextNode(
                     ` over the ${full.length} fully recorded ${full.length === 1 ? 'day' : 'days'} of the last ${vcWindow}`));
             } else {
@@ -3866,11 +4027,11 @@
             for (const r of rows) {
                 if (r.n === null || r.n <= 0) continue;
                 if (best === null || r.n > best.n
-                    || (r.n === best.n && (r.d.state === 'full' || best.d.state === 'partial'))) best = r;
+                    || (r.n === best.n && (r.s === 'full' || best.s === 'partial'))) best = r;
             }
             if (best) {
-                const atLeast = best.d.state === 'partial' ? 'at least ' : '';
-                parts.push(`Busiest day: ${vcDayLabel(best.d.date)}, ${atLeast}${best.n} ${visitsWord(best.n)}`);
+                const atLeast = best.s === 'partial' ? 'at least ' : '';
+                parts.push(`Busiest day: ${vcDayLabel(best.d.date)}, ${atLeast}${best.n} ${nounWord(best.n)}`);
             }
             parts.push(`as of ${timeOfDay(vcData.generated_ts)}`);
             vcSubEl.textContent = parts.join(' · ');
@@ -3892,7 +4053,7 @@
         }
         function vcTextW(text) { return text.length * 6.2; }  // 11px system sans, generous
 
-        function drawVcChart(rows) {
+        function drawVcChart(rows, line) {
             const width = Math.max(240, Math.round(vcChartEl.clientWidth || 300));
             const max = rows.reduce((m, r) => (r.n !== null && r.n > m ? r.n : m), 0);
             const step = vcNiceStep(max);
@@ -3926,8 +4087,10 @@
                 }, 'vc-nofig'));
                 i = j;
             }
-            const sel = svgEl('rect', { x: 0, y: padTop, width: slot, height: VC_PLOT_H }, 'vc-sel');
-            svg.appendChild(sel);
+            // Bars select with a column band; the line with a hairline rule (drawn over the
+            // line, below its marker), so the band never washes out a 2px stroke.
+            const sel = line ? null : svgEl('rect', { x: 0, y: padTop, width: slot, height: VC_PLOT_H }, 'vc-sel');
+            if (sel) svg.appendChild(sel);
 
             for (const v of ticks) {
                 if (v > 0) {
@@ -3940,7 +4103,8 @@
                 svg.appendChild(label);
             }
 
-            rows.forEach((r, i) => {
+            if (line) drawVcLine(svg, rows, left, slot, y);
+            else rows.forEach((r, i) => {
                 if (r.n === null || r.n <= 0) return;
                 const x = left + i * slot + (slot - barW) / 2;
                 const h = Math.max(1, (r.n / top) * VC_PLOT_H);
@@ -3948,8 +4112,8 @@
                 // Rounded data-end, square at the baseline.
                 const d = `M${x},${base} V${base - h + rad} Q${x},${base - h} ${x + rad},${base - h}`
                     + ` H${x + barW - rad} Q${x + barW},${base - h} ${x + barW},${base - h + rad} V${base} Z`;
-                svg.appendChild(svgEl('path', { d }, r.d.state === 'partial' ? 'vc-bar partial' : 'vc-bar'));
-                if (r.d.state === 'partial') {
+                svg.appendChild(svgEl('path', { d }, r.s === 'partial' ? 'vc-bar partial' : 'vc-bar'));
+                if (r.s === 'partial') {
                     // "At least": the solid cap marks where the recorded count stops.
                     svg.appendChild(svgEl('rect', { x, y: base - h, width: barW, height: Math.min(2, h) }, 'vc-cap'));
                 }
@@ -3958,8 +4122,15 @@
             svg.appendChild(svgEl('line', {
                 x1: left, x2: width - right, y1: base + 0.5, y2: base + 0.5,
             }, 'vc-base'));
-            const mark = svgEl('rect', { x: 0, y: base + 2, width: Math.max(4, slot), height: 2.5, rx: 1 }, 'vc-selmark');
-            svg.appendChild(mark);
+            let mark = null, rule = null, point = null;
+            if (line) {
+                rule = svgEl('line', { x1: 0, x2: 0, y1: padTop, y2: base }, 'vc-selrule');
+                point = svgEl('circle', { cx: 0, cy: 0, r: 5 }, 'vc-selpt');
+                svg.append(rule, point);
+            } else {
+                mark = svgEl('rect', { x: 0, y: base + 2, width: Math.max(4, slot), height: 2.5, rx: 1 }, 'vc-selmark');
+                svg.appendChild(mark);
+            }
 
             // Date ticks: Mondays, weekly — fortnightly at 90 days — plus "today so far"
             // under the last bar. A label that would collide with a kept one is dropped.
@@ -3996,29 +4167,69 @@
                 }, 'vc-tickline'), t);
             }
 
-            vcView = { rows, left, slot, sel, mark };
+            vcView = { rows, line, left, slot, y, sel, mark, rule, point };
             vcSelectIndex(rows.findIndex(r => r.d.date === vcSelDate));
+        }
+
+        // The line form: one stroke per run of consecutive figured days, broken at every
+        // day with no figure (never drawn across one). A partly recorded day and today get
+        // a hollow point, and only the EDGES touching one are dashed — dashing the whole
+        // run would dash nearly all of it every day, since today always ends it. A figured
+        // day with no figured neighbour is a solid dot (hollow if partial/today), so it is
+        // never invisible. No per-day markers otherwise: 90 points on a phone is clutter.
+        function drawVcLine(svg, rows, left, slot, y) {
+            const n = rows.length;
+            const cx = i => left + (i + 0.5) * slot;
+            const hollow = r => r.s === 'partial' || r.d.today;
+            const fig = i => i >= 0 && i < n && rows[i].n !== null;
+            let solid = '', dashed = '';
+            for (let i = 0; i + 1 < n; i++) {
+                if (!fig(i) || !fig(i + 1)) continue;
+                const seg = `M${cx(i)},${y(rows[i].n)} L${cx(i + 1)},${y(rows[i + 1].n)} `;
+                if (hollow(rows[i]) || hollow(rows[i + 1])) dashed += seg;
+                else solid += seg;
+            }
+            if (solid) svg.appendChild(svgEl('path', { d: solid.trim() }, 'vc-line'));
+            if (dashed) svg.appendChild(svgEl('path', { d: dashed.trim() }, 'vc-line dashed'));
+            rows.forEach((r, i) => {
+                if (!fig(i)) return;
+                if (hollow(r)) {
+                    svg.appendChild(svgEl('circle', { cx: cx(i), cy: y(r.n), r: 4 }, 'vc-hollow'));
+                } else if (!fig(i - 1) && !fig(i + 1)) {
+                    svg.appendChild(svgEl('circle', { cx: cx(i), cy: y(r.n), r: 5 }, 'vc-dot'));
+                }
+            });
         }
 
         function vcSelectIndex(i) {
             if (!vcView) return;
-            const { rows, left, slot, sel, mark } = vcView;
+            const { rows, line, left, slot, y, sel, mark, rule, point } = vcView;
             i = Math.max(0, Math.min(rows.length - 1, i));
             vcSelDate = rows[i].d.date;
-            sel.setAttribute('x', left + i * slot);
-            const mw = Math.max(4, slot);
-            mark.setAttribute('x', left + (i + 0.5) * slot - mw / 2);
+            const cx = left + (i + 0.5) * slot;
+            if (line) {
+                rule.setAttribute('x1', Math.round(cx) + 0.5);
+                rule.setAttribute('x2', Math.round(cx) + 0.5);
+                // A filled marker on the line — none on a day with no figure.
+                const r = rows[i];
+                point.style.display = r.n === null ? 'none' : '';
+                if (r.n !== null) { point.setAttribute('cx', cx); point.setAttribute('cy', y(r.n)); }
+            } else {
+                sel.setAttribute('x', left + i * slot);
+                const mw = Math.max(4, slot);
+                mark.setAttribute('x', cx - mw / 2);
+            }
             renderVcReadout(rows[i]);
         }
 
         function vcReadoutText(r) {
             const d = r.d;
             const when = vcDayLabel(d.date) + (d.today ? ' (today so far)' : '');
-            if (r.n === null) return `${when} — ${VC_NO_FIGURE[d.state] || 'no count'}`;
+            if (r.n === null) return `${when} — ${VC_NO_FIGURE[r.s] || 'no count'}`;
             const split = r.c && r.c.day != null && r.c.night != null && r.n > 0
                 ? ` (${r.c.day} by day, ${r.c.night} after dark)` : '';
-            if (d.state === 'partial') return `${when} — partly recorded — at least ${r.n}${split}`;
-            return `${when} — ${r.n} ${visitsWord(r.n)}${split}`;
+            if (r.s === 'partial') return `${when} — partly recorded — at least ${r.n}${split}`;
+            return `${when} — ${r.n} ${nounWord(r.n)}${split}`;
         }
         function renderVcReadout(r) {
             const text = vcReadoutText(r);
@@ -4037,32 +4248,57 @@
                 k.setAttribute('aria-hidden', 'true');
                 return k;
             };
-            if (rows.some(r => r.d.state === 'partial')) {
+            const many = vcSpec.noun + 's';
+            const partial = rows.some(r => r.s === 'partial');
+            if (vcSpec.line) {
+                // The line's form of the lighter bar: a hollow point, and dashes on the
+                // stretch either side of it. Today is drawn that way too (it isn't over),
+                // so the note covers it whenever today's point is on the line.
+                const today = rows.some(r => r.d.today && r.n !== null);
+                if (partial || today) {
+                    const p = document.createElement('p');
+                    const text = partial
+                        ? 'Hollow points, with dashed lines either side, are days only partly recorded, ' +
+                          `so they show at least that many ${many}` + (today ? ' — and today, which isn\'t over yet.' : '.')
+                        : (rows.length > 1 && rows[rows.length - 2].n !== null
+                            ? 'The hollow point at the end, with a dashed line before it, is today, which isn\'t over yet.'
+                            : 'The hollow point at the end is today, which isn\'t over yet.');
+                    p.append(key('hollow'), document.createTextNode(text));
+                    vcNotesEl.appendChild(p);
+                }
+            } else if (partial) {
                 const p = document.createElement('p');
                 p.append(key('partial'), document.createTextNode(
                     'Lighter bars are days only partly recorded, so they show at least that many visits.'));
                 vcNotesEl.appendChild(p);
             }
             const counts = {};
-            for (const r of rows) if (r.n === null) counts[r.d.state] = (counts[r.d.state] || 0) + 1;
+            for (const r of rows) if (r.n === null) counts[r.s] = (counts[r.s] || 0) + 1;
             const parts = [];
             if (counts.none) parts.push(`${counts.none} not recorded (no pictures were kept)`);
             if (counts.expired) parts.push(`${counts.expired} no longer kept`);
             if (counts.unnamed) parts.push(`${counts.unnamed} not named yet (the current model hasn't been run over them — usual for a while after the model changes)`);
             if (counts.uncounted) parts.push(`${counts.uncounted} not counted (too busy to count this far back)`);
+            if (counts.nofigure) parts.push(`${counts.nofigure} with no count sent`);
             if (parts.length) {
                 const p = document.createElement('p');
                 p.append(key('nofig'), document.createTextNode(`Shaded days have no count: ${parts.join('; ')}.`));
                 vcNotesEl.appendChild(p);
             }
+            for (const text of vcSpec.notes) {
+                const p = document.createElement('p');
+                p.textContent = text;
+                vcNotesEl.appendChild(p);
+            }
         }
 
-        function renderVcTable(rows, cat) {
+        function renderVcTable(rows) {
             vcTableEl.innerHTML = '';
             const cap = document.createElement('caption');
-            cap.textContent = `Visits per day for ${catName(cat)}, last ${vcWindow} days`;
+            cap.textContent = `${vcSpec.caption}, last ${vcWindow} days`;
             const head = document.createElement('tr');
-            for (const h of ['Date', 'Visits', 'State']) {
+            const noun = vcSpec.noun.charAt(0).toUpperCase() + vcSpec.noun.slice(1) + 's';
+            for (const h of ['Date', noun, 'State']) {
                 const th = document.createElement('th');
                 th.scope = 'col';
                 th.textContent = h;
@@ -4075,9 +4311,9 @@
                 const tr = document.createElement('tr');
                 const cells = [
                     vcDayLabel(r.d.date) + (r.d.today ? ' (today so far)' : ''),
-                    r.n === null ? '—' : (r.d.state === 'partial' ? `at least ${r.n}` : String(r.n)),
-                    r.n === null ? VC_NO_FIGURE[r.d.state] || 'no count'
-                        : (r.d.state === 'partial' ? 'partly recorded' : 'recorded'),
+                    r.n === null ? '—' : (r.s === 'partial' ? `at least ${r.n}` : String(r.n)),
+                    r.n === null ? VC_NO_FIGURE[r.s] || 'no count'
+                        : (r.s === 'partial' ? 'partly recorded' : 'recorded'),
                 ];
                 for (const c of cells) {
                     const td = document.createElement('td');
@@ -4125,20 +4361,20 @@
             const days = Number(b.dataset.days);
             if (!VC_WINDOWS.includes(days) || days === vcWindow) return;
             vcWindow = days;
-            if (vcData && vcOverview) renderVisitCat();
+            if (vcData && vcOverview) renderVisitDrill();
         });
 
         // The chart is drawn at its real pixel width (so text stays 11px at any width);
         // redraw it when that width changes.
         let vcResizeQueued = false;
         window.addEventListener('resize', () => {
-            if (vcCatId === null || vcResizeQueued || !vcData || vcMainEl.classList.contains('hidden')) return;
+            if (vcPath === null || vcResizeQueued || !vcData || vcMainEl.classList.contains('hidden')) return;
             vcResizeQueued = true;
             requestAnimationFrame(() => {
                 vcResizeQueued = false;
                 // Only the SVG depends on width: re-rendering the page would rebuild the
                 // header's avatar <img> (a refetch and a flicker) on every resize frame.
-                if (vcCatId !== null && vcView && !vcMainEl.classList.contains('hidden')) drawVcChart(vcView.rows);
+                if (vcPath !== null && vcView && !vcMainEl.classList.contains('hidden')) drawVcChart(vcView.rows, vcView.line);
             });
         });
 
@@ -4361,11 +4597,12 @@
         // data is exactly what you want.
         function gentleRefresh() {
             if (window.scrollY > 200) return;
-            // The per-cat daily chart is NOT live: a nudge lands every few seconds while a
-            // cat lingers, and once the server's ten-minute count has expired each one
-            // would be a 90-day walk on the shared write connection. Route entry and the
-            // foreground resume (refreshActiveView, directly) still reload it.
-            if (vcCatId !== null) return;
+            // The daily charts (per cat and per door line) are NOT live: a nudge lands
+            // every few seconds while a cat lingers, and once the server's ten-minute
+            // count has expired each one would be a 90-day walk on the shared write
+            // connection. Route entry and the foreground resume (refreshActiveView,
+            // directly) still reload it.
+            if (vcPath !== null) return;
             refreshActiveView();
         }
 

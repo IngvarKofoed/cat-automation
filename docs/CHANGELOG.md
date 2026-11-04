@@ -2129,3 +2129,41 @@ a clean one.
      counts: past days read `none` at once, but today's bar can show pre-Clear visits for up to
      10 minutes. Under motion-only storage a dead-still night of 7 h reads `partial` — the 7 h
      threshold was measured on exactly that data. And a wind-only day reads `unnamed` (entry 561).
+
+571. Each line of the Visits page's "At the door" card now opens `#visits/door/<line>`: a daily
+     LINE chart of that figure over 30 / 60 / 90 days (60 default), behaving like the cat chart
+     (same day states, window slice, not live); the cat chart keeps its bars.
+     Spec: docs/specs/2026-11-04-user-door-totals-daily-chart.md.
+
+572. The 90-day count now also keeps, per day, `totals {resident, neighbour, unknown_cat}` (the
+     identity half of `_classify_stats_event`) and the day's event count, so one walk and one
+     10-minute cache serve every cat AND every line. Cat visits is summed CLIENT-side, never sent:
+     the card's `cat_visits` also counts unidentified visits, which need the subject (~2x the walk),
+     and a field of that name meaning something else would break entry 348's rule.
+
+573. The count now walks even with NO usable gallery, reversing the per-cat spec's early return,
+     so All movement never waits on a model. Each day gains `movement_state` — the state ladder
+     minus `unnamed` — and `door_events`; only `cats` and `totals` stay gated on a usable gallery.
+     Accepted cost: before a first calibrated model, the cat chart's first open shows "Counting"
+     for the walk's duration before its explanation, instead of at once.
+
+574. The line breaks at every no-figure day and is never drawn across one. A partly recorded day
+     and today get a HOLLOW point, and only the edges touching one are dashed — dashing the whole
+     run would dash nearly all of it every day, since today always ends it. A figured day with no
+     figured neighbour is a solid dot, so it is never invisible.
+
+575. A line page detects an older compute PC by the `totals` KEY's presence (a null value is an
+     ordinary no-figure day) and says so instead of drawing every line at zero. The three named
+     lines that a missing cat distorts name any active cat the model leaves out. Unverified here:
+     the shared count's real-store timing (spec: 6.1 s cold, 0.27 s warm) — dev fixture only.
+
+576. The Cat visits page says it can read lower than the card while naming catches up. The spec's
+     definition ("every cat through the door") reads as the card's `cat_visits`, which also counts
+     unidentified visits this line cannot see (entry 572) — without the note the chart seemed to
+     contradict the row just tapped. A malformed day (figured state, no figure) reads "no count
+     sent", never averaged as 0.
+
+577. Known limits on the lines, left by spec decision. A day whose only events are wind reads
+     `unnamed` on the four named lines ("not named yet") rather than a measured zero — entry 561's
+     limit, now on household lines; telling it apart needs the subject the walk skips. And before
+     a first calibrated model, opening a cat's chart still waits for the full walk (entry 573).

@@ -2915,7 +2915,7 @@ class Store:
     def activity_signal(self) -> dict:
         """A cheap fingerprint of the user-facing feed, for the SSE change-push.
 
-        Returns ``{motion_id, ident_rev, model_id}`` — three counters that move
+        Returns ``{motion_id, ident_rev, model_id, alarm_rev}`` — four counters that move
         exactly when the Activity feed's CONTENT could change, so the events-stream
         endpoint pushes a "refetch" nudge only on a real change instead of every tick:
 
@@ -2931,18 +2931,26 @@ class Store:
           the fact (its frames already moved ``motion_id`` when they arrived).
         - ``model_id`` = the active model version's id → bumps on a promotion/rollback,
           which re-names every event.
+        - ``alarm_rev`` = ``COUNT(*) + COUNT(end_ts)`` over alarm episodes (``actions``
+          rows with ``mode='on'``) → moves once when an episode opens and once when it
+          closes, so a feed whose cat has left stops reading "Sounding now" without a
+          manual reload. Twice per alarm — unlike a verdict counter (changelog 285), which
+          the always-on oracle would move every tick. ``actions`` rows are never deleted
+          (the log survives Clear and eviction), so it never moves backwards.
         """
         with self._lock:
-            motion_id, ident_rev, model_id = self._conn.execute(
+            motion_id, ident_rev, model_id, alarm_rev = self._conn.execute(
                 "SELECT"
                 " (SELECT COALESCE(MAX(id), 0) FROM frames WHERE motion = 1),"
                 " (SELECT COALESCE(MAX(rowid), 0) FROM identifications),"
-                " (SELECT COALESCE(MAX(id), 0) FROM model_versions WHERE status = 'active')"
+                " (SELECT COALESCE(MAX(id), 0) FROM model_versions WHERE status = 'active'),"
+                " (SELECT COUNT(*) + COUNT(end_ts) FROM actions WHERE mode = 'on')"
             ).fetchone()
         return {
             "motion_id": int(motion_id),
             "ident_rev": int(ident_rev),
             "model_id": int(model_id),
+            "alarm_rev": int(alarm_rev),
         }
 
     def analysis_summary(self, analyzer: str) -> dict:
@@ -4704,6 +4712,7 @@ class Store:
         limit: int = _MAX_EVENTS,
         with_subject: bool = True,
         with_labels: bool = False,
+        with_alarms: bool = False,
     ) -> dict:
         """The user-facing activity feed: motion frames clustered into events, newest-first.
 
@@ -4793,6 +4802,14 @@ class Store:
         read for a key they never look at. A BOOLEAN, not a count — every consumer
         reduces it to yes-or-no, and ``EXISTS`` stops at a span's first row where
         ``COUNT`` would walk them all.
+
+        ``with_alarms=True`` adds ``alarms`` — the foreign-cat alarm episodes this visit
+        SET OFF (see the user-visit-alarm-mark spec): the ``actions`` rows (``mode='on'``)
+        whose deciding frame's ``frame_recv_ts`` lies in ``[start_ts, end_ts +
+        _VISIT_GAP_MS]``, in start order, each ``{start_ts, end_ts, ended, verdict,
+        cat_id, cat_name, clips_played, clips_failed, pi_disabled}``. Always present under
+        the opt-in, as an empty list when none. Opt-in for the same reason as
+        ``with_labels``: only the activity route reads it.
         """
         limit = max(1, min(int(limit), _MAX_EVENTS))
         min_frames = max(1, int(min_frames))
@@ -5037,6 +5054,56 @@ class Store:
                 ]
             for i, event in enumerate(events):
                 event["labelled"] = labelled_by_event[i]
+
+        # --- Alarm episodes (user-visit-alarm-mark spec).
+        # Each foreign-cat alarm episode belongs to the ONE visit that set it off: the event
+        # whose window [start_ts, end_ts + _VISIT_GAP_MS] holds the episode's DECIDING frame.
+        # Those windows never overlap — `_gap_split` starts a new cluster only past a gap
+        # strictly greater than _VISIT_GAP_MS, so a cluster's tail window ends before the
+        # next cluster begins — which is what makes the attribution unique. The `+ gap` tail
+        # covers Tuning, where the deciding frame can be a non-motion frame just after the
+        # visit's last motion frame. Matched by TIME, never by `frame_id`: ids are reused
+        # after a Clear (changelog 490/504), recv_ts is not.
+        #
+        # ONE envelope read per page, deliberately not per span (changelog 256's rule is
+        # about the high-cardinality frame/verdict tables): `actions` holds one row per
+        # episode, tens a day at most, so the unindexed read is a few rows whatever the
+        # store's size. Placed before the no-model return below, because an alarm's record
+        # outlives the gallery that decided it.
+        if with_alarms:
+            lo = min(e["start_ts"] for e in events)
+            hi = max(e["end_ts"] for e in events) + _VISIT_GAP_MS
+            with self._lock:
+                alarm_rows = self._conn.execute(
+                    "SELECT a.start_ts, a.end_ts, a.ended, a.verdict, a.cat_id, a.clips_played,"
+                    " a.clips_failed, a.pi_disabled, a.frame_recv_ts, c.name"
+                    " FROM actions a LEFT JOIN cats c ON c.id = a.cat_id"
+                    " WHERE a.mode = 'on' AND a.frame_recv_ts BETWEEN ? AND ?"
+                    " ORDER BY a.start_ts, a.id",
+                    (int(lo), int(hi)),
+                ).fetchall()
+            for event in events:
+                event["alarms"] = []
+            # The candidate is the event with the greatest start_ts <= the deciding frame's
+            # recv_ts; it owns the episode only if the frame also falls inside its tail.
+            by_start = events[::-1]   # `events` is newest-first by (start_ts, start_id)
+            starts = [e["start_ts"] for e in by_start]
+            for (a_start, a_end, ended, verdict, cat_id, played, failed, pi_disabled,
+                 frame_ts, cat_name) in alarm_rows:
+                k = bisect.bisect_right(starts, int(frame_ts)) - 1
+                if k < 0 or int(frame_ts) > by_start[k]["end_ts"] + _VISIT_GAP_MS:
+                    continue   # unattributed: its visit is not on this page (or anywhere)
+                by_start[k]["alarms"].append({
+                    "start_ts": int(a_start),
+                    "end_ts": None if a_end is None else int(a_end),
+                    "ended": ended,
+                    "verdict": verdict,
+                    "cat_id": cat_id,
+                    "cat_name": cat_name,
+                    "clips_played": int(played),
+                    "clips_failed": int(failed),
+                    "pi_disabled": bool(pi_disabled),
+                })
 
         # --- Active-model identity join (identification-gallery-activity spec).
         # Annotate each RETURNED event with the active gallery's aggregated identity

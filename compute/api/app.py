@@ -1971,8 +1971,14 @@ def create_app(
         # param: the field is small, the admin SPA ignores an unread key, and a client that
         # asked for the feed WITHOUT it could not tell the missing key from an older
         # backend's — which is exactly how the user page detects that gap.
+        #
+        # `with_alarms=True` likewise (user-visit-alarm-mark spec): each event's `alarms`,
+        # the foreign-cat alarm episodes that visit set off. The user page marks the card
+        # and adds an Alarm line to the player; admin's feed ignores the key (its Start card
+        # is the alarm view).
         return store.events(
-            since_id, until_id, min_frames=min_frames, limit=limit, with_labels=True
+            since_id, until_id, min_frames=min_frames, limit=limit,
+            with_labels=True, with_alarms=True,
         )
 
     @app.get("/api/events/stream")
@@ -1999,7 +2005,11 @@ def create_app(
                     # Store closing / transient read error — end the stream; the
                     # browser's EventSource reconnects on its own.
                     break
-                key = (sig["motion_id"], sig["ident_rev"], sig["model_id"])
+                # Every signal field must be IN this tuple — a field returned in the dict
+                # but left out here nudges nothing. `alarm_rev` moves when an alarm episode
+                # opens or closes, so the feed's alarm mark appears and its "Sounding now"
+                # goes stale-free without a manual reload.
+                key = (sig["motion_id"], sig["ident_rev"], sig["model_id"], sig["alarm_rev"])
                 if last is not None and key != last:
                     # Only push on a CHANGE after connect — the client already fetched
                     # on load, so the first sample just establishes the baseline.

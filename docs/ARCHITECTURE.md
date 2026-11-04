@@ -125,7 +125,7 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |
 | **Event store & state** | Durable record of cats, sightings, identifications, transitions, actions; derives current occupancy ("who's home"). |
 | **Notifier** | Turns notify intents into push notifications to the owner. |
-| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. Any visit in the player can be **downloaded as a video**: `GET /api/clip` stitches every stored frame of the visit into an H.264 MP4 timed from each frame's `recv_ts` (so it runs as long as the visit did), encoded on request with `imageio-ffmpeg` — one at a time, at below-normal priority on bounded threads, killed if the phone leaves — and never stored. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
+| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. The Activity card of a visit that **set the foreign-cat alarm off** carries a speaker mark (crossed out when it triggered but nothing played), its player an *Alarm* line (how long, how many clips, what the alarm took the cat for), and no feed filter hides it. Any visit in the player can be **downloaded as a video**: `GET /api/clip` stitches every stored frame of the visit into an H.264 MP4 timed from each frame's `recv_ts` (so it runs as long as the visit did), encoded on request with `imageio-ffmpeg` — one at a time, at below-normal priority on bounded threads, killed if the phone leaves — and never stored. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
 | **Dataset / annotation / training** | Store collected crops and their labels, serve the annotation queue, and run training jobs that (re)build the gallery/model and promote a new version. Enrollment of a new cat is a focused case of this. |
 | **Model store** | Versioned detection, embedding, and gallery artifacts served to the inference service. |
 
@@ -419,7 +419,11 @@ which while the switch is On ticks at a fixed 1 s:
   whoever it is: including unknown ties the alarm to the threshold, and a resident the
   gallery declines sets it off. The `actions` log is how that shows. The playing clip
   finishes; the compute has no stop call.
-- **Record.** One `actions` row per episode (see *Data model → Action*).
+- **Record.** One `actions` row per episode (see *Data model → Action*). The user feed
+  attributes each episode to the ONE visit whose window `[start_ts, end_ts + _VISIT_GAP_MS]`
+  holds its deciding frame's `recv_ts` — matched by time, since frame ids are reused after
+  a Clear — and marks that visit. An episode whose visit is not in the feed shows only in
+  the admin log.
 
 ### Escalation
 

@@ -836,6 +836,13 @@
             font-weight: 600;
             font-size: .85rem;
         }
+        /* The Alarm row's value is a phrase, not a number: body font, and right-aligned
+           so a wrapped second line keeps the column's right edge. */
+        .player-stats .v.phrase {
+            font-family: inherit;
+            font-weight: 500;
+            text-align: right;
+        }
 
         /* ================= "mark for labelling" ================= */
         /* The household user's one-tap flag (user-flag-for-labelling spec): a ⚑ beside
@@ -857,6 +864,21 @@
             font-size: .8rem;
             line-height: 1;
         }
+        /* The visit that SET OFF the foreign-cat alarm (user-visit-alarm-mark spec). An
+           inline SVG, deliberately not the 🔊 emoji, which iOS draws as a colour emoji
+           beside the text glyphs. Sized like the ✓/⚑ (same font-size, 1em box). The
+           neighbour coral reads in both themes; a SILENCED alarm (it triggered but nothing
+           played) takes the muted ink and its own slashed glyph, so "judged foreign but
+           heard nothing" never passes for a real chase-off. */
+        .alarm-mark {
+            flex: none;
+            display: inline-flex;
+            color: var(--neighbour);
+            font-size: .8rem;
+            line-height: 1;
+        }
+        .alarm-mark svg { display: block; width: 1em; height: 1em; }
+        .alarm-mark.silenced { color: var(--muted); }
         .player-actions {
             display: flex;
             align-items: center;
@@ -1400,10 +1422,22 @@
         // something sweeps it.
         const NOISE_KINDS = new Set(['unrecognized', 'motion_only']);
         // Whether an event survives the two activity toggles.
+        //   A visit that SET OFF the foreign-cat alarm passes both, whatever its pill says:
+        // the alarm judged it foreign, so hiding it hides exactly the case worth checking —
+        // a resident the alarm went off at ("Hide our cats"), or a Tuning alarm whose
+        // counted frames were all non-motion tail frames, leaving the motion span reading
+        // as noise. The same move as exempting 'unanalyzed' from NOISE_KINDS above.
+        // `isResidentEvent` itself is left alone: its other callers mean "named a resident".
+        // One predicate per toggle, so the filter and the empty-state readout (which asks
+        // what unticking each would reveal) cannot disagree about the exemption.
+        function hiddenByHideCats(ev) {
+            return strangersOnly && !hasAlarm(ev) && isResidentEvent(ev);
+        }
+        function hiddenByNoise(ev) {
+            return !showAll && !hasAlarm(ev) && NOISE_KINDS.has(subjectKind(ev));
+        }
         function passesActivityFilters(ev) {
-            if (strangersOnly && isResidentEvent(ev)) return false;
-            if (!showAll && NOISE_KINDS.has(subjectKind(ev))) return false;
-            return true;
+            return !hiddenByHideCats(ev) && !hiddenByNoise(ev);
         }
         function identityChip(identity) {
             const kind = identityKind(identity);
@@ -1539,6 +1573,96 @@
             el.setAttribute('aria-hidden', 'true');   // the row's aria-label already says it
             return el;
         }
+        // ================= the foreign-cat alarm =================
+        // `ev.alarms` = the alarm episodes THIS visit set off (user-visit-alarm-mark spec),
+        // attributed server-side by the deciding frame's time. An absent key (an older
+        // backend) reads as an empty list — it only leaves marks absent, so unlike "Skip
+        // done" there is no older-build notice.
+        function hasAlarm(ev) {
+            return !!(ev.alarms && ev.alarms.length);
+        }
+        // Silent = nothing has played, and either the episode is over or it is open but
+        // the Pi is refusing (speaker switched off) or playback is failing. An open episode
+        // retries every tick, so an unreachable Pi or a switched-off speaker must not read
+        // as "sounding". `pi_disabled` is sticky once set.
+        function alarmSilent(a) {
+            return a.clips_played === 0 && (a.end_ts != null || a.pi_disabled || a.clips_failed > 0);
+        }
+        // 'sounding' | 'sounded' | 'silenced' | null — first match wins.
+        function alarmState(ev) {
+            if (!hasAlarm(ev)) return null;
+            if (ev.alarms.some(a => a.end_ts == null && !alarmSilent(a))) return 'sounding';
+            if (ev.alarms.some(a => a.clips_played > 0)) return 'sounded';
+            return 'silenced';
+        }
+        const ALARM_TITLE = {
+            sounding: 'Alarm sounding',
+            sounded: 'Alarm sounded at this visit',
+            silenced: 'Alarm triggered, but nothing played',
+        };
+        // Sounding and sounded share one glyph (a speaker with waves); silenced is the
+        // speaker with a slash. The two live states are told apart only in words — the
+        // title, the player line and the spoken label — since a phone has no hover and
+        // "sounding" goes stale too easily to earn a glyph of its own.
+        const ALARM_SVG_ON = '<svg viewBox="0 0 16 16" focusable="false">'
+            + '<path d="M2 5.5h2.6L8.5 2.5v11L4.6 10.5H2z" fill="currentColor"/>'
+            + '<path d="M10.6 5.6a3.4 3.4 0 0 1 0 4.8M12.4 3.8a6 6 0 0 1 0 8.4" fill="none"'
+            + ' stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+        // The same speaker, crossed out by one slash corner to corner.
+        const ALARM_SVG_OFF = ALARM_SVG_ON.replace('</svg>',
+            '<path d="M1.5 1.5l13 13" fill="none" stroke="currentColor" stroke-width="1.6"'
+            + ' stroke-linecap="round"/></svg>');
+        function alarmMark(state) {
+            const el = document.createElement('span');
+            el.className = 'alarm-mark' + (state === 'silenced' ? ' silenced' : '');
+            el.innerHTML = state === 'silenced' ? ALARM_SVG_OFF : ALARM_SVG_ON;
+            el.title = ALARM_TITLE[state];
+            el.setAttribute('aria-hidden', 'true');   // the row's aria-label already says it
+            return el;
+        }
+        // Exactly admin's fmtDuration (the two pages share no JS): the same format is what
+        // lets the household compare a player line against the admin Start card's log.
+        function fmtDuration(sec) {
+            if (sec == null || !isFinite(sec) || sec < 0) return '…';
+            sec = Math.round(sec);
+            if (sec < 60) return sec + 's';
+            const m = Math.floor(sec / 60), s = sec % 60;
+            if (m < 60) return m + 'm' + (s ? ' ' + s + 's' : '');
+            const h = Math.floor(m / 60), mm = m % 60;
+            return h + 'h' + (mm ? ' ' + mm + 'm' : '');
+        }
+        function clipCount(n) { return `${n} clip${n === 1 ? '' : 's'}`; }
+        // One phrase per episode, the first matching rule, each ending with what the alarm
+        // took the cat for. The alarm decides on ~10 frames in 5 s while the card's name
+        // comes from the whole visit, so the two can disagree — and "judged an unknown cat"
+        // under a card saying Mittens is exactly the case worth seeing.
+        function alarmPhrase(a) {
+            const judged = a.verdict === 'unknown' ? 'an unknown cat'
+                : a.verdict === 'neighbour' ? (a.cat_name || `cat #${a.cat_id}`)
+                : a.verdict;
+            const reason = a.pi_disabled ? ' (the Pi’s speaker was off)'
+                : a.clips_failed > 0 ? ' (playback failed)' : '';
+            const open = a.end_ts == null;
+            let what;
+            if (open && alarmSilent(a)) what = 'Triggered, nothing playing' + reason;
+            else if (open) what = 'Sounding now';
+            else if (a.clips_played === 0) what = 'Triggered, nothing played' + reason;
+            // No duration: after a hard kill `end_ts` is the relaunch time, not when the
+            // sound stopped.
+            else if (a.ended === 'interrupted') what = `${clipCount(a.clips_played)}, cut short by a restart`;
+            else {
+                what = `Sounded ${fmtDuration((a.end_ts - a.start_ts) / 1000)} · ${clipCount(a.clips_played)}`;
+                // Without this the duration overstates how long anything played.
+                if (a.pi_disabled) what += ' · then the Pi’s speaker was switched off';
+            }
+            return `${what}, judged ${judged}`;
+        }
+        const ALARM_ARIA = {
+            sounding: ' Alarm sounding.',
+            sounded: ' Alarm sounded.',
+            silenced: ' Alarm triggered but silent.',
+        };
+
         // Local mirror of the server's overlap rules, so the button and the ⚑ update
         // together without refetching the whole feed after a tap.
         function dropOverlappingFlags(ev) {
@@ -1861,7 +1985,7 @@
                     playerChipSlotEl.innerHTML = '';
                     const chip = subjectChip(ev);
                     if (chip) playerChipSlotEl.appendChild(chip);
-                    renderPlayerStats(ev.detection);
+                    renderPlayerStats(ev);
                     renderAnalyseButton(ev);
                 }
                 refreshActivityRow(ev);
@@ -2018,9 +2142,10 @@
                 chipRow.className = 'chip-row';
                 row.querySelector('.event-meta').appendChild(chipRow);
             }
-            // Order is pill, health dot, ✓, ⚑ (see the card builder), so a new pill goes
-            // first and a new health dot before whichever mark comes first (querySelector
-            // over the union returns it in document order).
+            // Order is pill, health dot, alarm mark, ✓, ⚑ (see the card builder), so a new
+            // pill goes first and a new health dot before whichever mark comes first
+            // (querySelector over the union returns it in document order). The alarm mark
+            // must be IN that union, or a card with no ✓/⚑ gets its dot after the alarm.
             const oldChip = chipRow.querySelector('.chip');
             if (oldChip && chip) chipRow.replaceChild(chip, oldChip);
             else if (chip) chipRow.insertBefore(chip, chipRow.firstChild);
@@ -2028,7 +2153,7 @@
             const oldHealth = chipRow.querySelector('.health-dot');
             if (oldHealth && health) chipRow.replaceChild(health, oldHealth);
             else if (oldHealth) oldHealth.remove();
-            else if (health) chipRow.insertBefore(health, chipRow.querySelector('.label-mark, .flag-mark'));
+            else if (health) chipRow.insertBefore(health, chipRow.querySelector('.alarm-mark, .label-mark, .flag-mark'));
         }
         // Optimistic: the label flips at once (the write takes the store lock and can
         // queue behind the collector), and reverts with a message if the call fails.
@@ -2348,9 +2473,12 @@
                 // Events exist but are all filtered out — hint at whichever toggle,
                 // if loosened, would reveal something.
                 if (activityEvents.length) {
-                    const showAllWouldReveal = !showAll && activityEvents.some(ev =>
-                        !(strangersOnly && isResidentEvent(ev)) && NOISE_KINDS.has(subjectKind(ev)));
-                    const hideCatsWouldReveal = strangersOnly && activityEvents.some(isResidentEvent);
+                    // The same per-toggle predicates `passesActivityFilters` uses, so the
+                    // alarm exemption applies here too: an alarm visit is never hidden, so
+                    // it can never be what unticking reveals.
+                    const showAllWouldReveal = activityEvents.some(ev =>
+                        hiddenByNoise(ev) && !hiddenByHideCats(ev));
+                    const hideCatsWouldReveal = activityEvents.some(hiddenByHideCats);
                     if (hideCatsWouldReveal && !showAllWouldReveal) {
                         big = 'Only our own cats here';
                         line = 'Every recent visit was one of our residents — uncheck "Hide our cats".';
@@ -2437,7 +2565,10 @@
             // screen reader — and it is shared with the dialog's own label, so the row and
             // the modal can never claim different things about one visit.
             const labelText = isLabelled(ev) ? ' Already labelled.' : '';
-            return `${healthText}${labelText}${flagText}`;
+            // The alarm mark is aria-hidden too; same order as on the card.
+            const alarm = alarmState(ev);
+            const alarmText = alarm ? ALARM_ARIA[alarm] : '';
+            return `${healthText}${alarmText}${labelText}${flagText}`;
         }
         function setRowLabel(row, ev) {
             row.setAttribute('aria-label',
@@ -2485,18 +2616,24 @@
             rel.className = 'event-rel';
             rel.textContent = relativeTime(ev.start_ts);
             meta.append(time, rel);
-            // The identity/subject pill, the visit-health dot, the ✓ and the ⚑ share one
-            // line. The ✓ is drawn HERE and not only by the incremental repaint, so a
-            // reload or an appended page marks visits labelled in an earlier session too.
+            // The identity/subject pill, the visit-health dot, the alarm mark, the ✓ and
+            // the ⚑ share one line — the alarm is a fact of the visit, so it sits with the
+            // pill and dot, before the two household actions. The ✓ is drawn HERE and not
+            // only by the incremental repaint, so a reload or an appended page marks visits
+            // labelled in an earlier session too. The alarm mark is drawn only here: no tap
+            // in this app changes alarm state, and the feed reload refreshes it.
             const chip = subjectChip(ev);
             const healthEl = healthDot(ev);
+            const alarm = alarmState(ev);
+            const alarmEl = alarm ? alarmMark(alarm) : null;
             const labelEl = isLabelled(ev) ? labelMark() : null;
             const flagEl = isFlagged(ev) ? flagMark() : null;
-            if (chip || healthEl || labelEl || flagEl) {
+            if (chip || healthEl || alarmEl || labelEl || flagEl) {
                 const chipRow = document.createElement('div');
                 chipRow.className = 'chip-row';
                 if (chip) chipRow.appendChild(chip);
                 if (healthEl) chipRow.appendChild(healthEl);
+                if (alarmEl) chipRow.appendChild(alarmEl);
                 if (labelEl) chipRow.appendChild(labelEl);
                 if (flagEl) chipRow.appendChild(flagEl);
                 meta.appendChild(chipRow);
@@ -2631,22 +2768,36 @@
         // conf_mean}; visit-detection-aggregates spec) under the filmstrip, one stat
         // per line. Each value distinguishes "not measured" (null → '—', the visit's
         // motion frames weren't swept) from a measured value (rate 0% = swept, nothing
-        // detected). Hidden entirely for a legacy event with no `detection` field.
-        function renderPlayerStats(det) {
+        // detected). The detection rows are absent for a legacy event with no `detection`
+        // field; the panel shows when there is either detection or an alarm to report.
+        //   The Alarm row (user-visit-alarm-mark spec) appears only for a visit that set
+        // the alarm off. It is ABSENT, not "none", otherwise: an alarm switched Off also
+        // produces no row, so "none" would claim more than the data supports.
+        function renderPlayerStats(ev) {
+            const det = ev.detection;
+            const alarmed = hasAlarm(ev);
             playerStatsEl.innerHTML = '';
-            if (!det) { playerStatsEl.classList.add('hidden'); return; }
+            if (!det && !alarmed) { playerStatsEl.classList.add('hidden'); return; }
             // All three shown as a percentage via the shared detPct (confidences 0–1 → ×100).
-            const row = (label, val, title) => {
+            const row = (label, val, title, extra) => {
                 const k = document.createElement('div'); k.className = 'k'; k.textContent = label; k.title = title;
-                const v = document.createElement('div'); v.className = 'v'; v.textContent = val; v.title = title;
+                const v = document.createElement('div'); v.className = 'v' + (extra ? ' ' + extra : ''); v.textContent = val; v.title = title;
                 playerStatsEl.append(k, v);
             };
-            row('Detection rate', detPct(det.ratio),
-                "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
-            row('Peak confidence', detPct(det.conf_max),
-                'Highest detector confidence across the visit (0–100%). “—” means not measured.');
-            row('Mean confidence', detPct(det.conf_mean),
-                'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
+            if (det) {
+                row('Detection rate', detPct(det.ratio),
+                    "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
+                row('Peak confidence', detPct(det.conf_max),
+                    'Highest detector confidence across the visit (0–100%). “—” means not measured.');
+                row('Mean confidence', detPct(det.conf_mean),
+                    'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
+            }
+            if (alarmed) {
+                row('Alarm', ev.alarms.map(alarmPhrase).join('; '),
+                    'What the foreign-cat alarm did at this visit, and what it took the cat for. '
+                    + 'It decides on a few seconds of frames, so it can disagree with the name on the card.',
+                    'phrase');
+            }
             playerStatsEl.classList.remove('hidden');
         }
 
@@ -2686,7 +2837,7 @@
             playerChipSlotEl.innerHTML = '';
             const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
-            renderPlayerStats(ev.detection);
+            renderPlayerStats(ev);
             // The flag toggle + analyse button reflect THIS event (openEvent is also the
             // Prev/Next hop, which repoints both at another visit).
             setFlagMsg('');

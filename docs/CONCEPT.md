@@ -153,7 +153,8 @@ but a resident it fails to recognise (a bad angle, the dark) reads as an unknown
 and an unknown cat does set it off, more often the tighter the recognition threshold.
 It is not rate-limited: a stranger that stays hears it the whole time. It is switched on deliberately, and every alarm is logged —
 when, how long, which cat, and the frame that decided it — so whether it ever sounded
-at a resident is checkable. The speaker can also be silenced at the door itself.
+at a resident is checkable; the visit that set it off is marked in the at-a-glance
+dashboard. The speaker can also be silenced at the door itself.
 
 ### 5. Notifications
 

@@ -41,7 +41,9 @@ def _store(tmp_path) -> Store:
 
 
 def test_activity_signal_empty_is_all_zero(tmp_path):
-    assert _store(tmp_path).activity_signal() == {"motion_id": 0, "ident_rev": 0, "model_id": 0}
+    assert _store(tmp_path).activity_signal() == {
+        "motion_id": 0, "ident_rev": 0, "model_id": 0, "alarm_rev": 0,
+    }
 
 
 def test_activity_signal_tracks_motion_frames_only(tmp_path):

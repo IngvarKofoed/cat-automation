@@ -2020,3 +2020,40 @@ a clean one.
      phone gone before the encode starts gets none started. An encoder that can't start, or exits 0
      with no file, is a household 502, not a bare 500. Leaving a visit revokes its blob a minute
      LATER, so a save tapped just before leaving is not cancelled mid-read.
+
+549. The user app's Activity card now marks the visit that SET OFF the foreign-cat alarm: a
+     speaker beside the health dot, crossed out when it triggered but nothing played. Its player
+     gains an Alarm line — how long, how many clips, and what the alarm took the cat for, which
+     can differ from the card's name. Spec: docs/specs/2026-11-04-user-visit-alarm-mark.md.
+
+550. `Store.events(with_alarms=True)` — `/api/events` only — gives each episode to the ONE visit
+     whose `[start_ts, end_ts + _VISIT_GAP_MS]` holds its deciding frame's recv_ts. Unique because
+     `_gap_split` splits on a gap strictly over the threshold. Matched by TIME, never frame_id
+     (reused after a Clear). An episode whose visit is off the feed shows only in admin's log —
+     it fails toward no mark, never toward a mark on the wrong visit.
+
+551. Only the visit that SET IT OFF is marked, by decision — not a resident caught in the ~3 s
+     tail, nor a later visit during a long alarm. One envelope read of `actions` per page, not per
+     span: tens of rows a day, so entry 256's rule does not apply. It runs before the no-model
+     return, since an alarm's record outlives the gallery that decided it.
+
+552. Neither user-feed filter hides an alarm visit: the alarm judged it foreign, so hiding a
+     "resident" it went off at hides exactly the case worth checking. Same move as `unanalyzed`'s
+     noise exemption (entry 283), and both empty-state readouts apply it. `isResidentEvent` and
+     the admin feed are unchanged.
+
+553. `activity_signal` gained `alarm_rev` (`COUNT(*) + COUNT(end_ts)` over `mode='on'` rows) and the
+     SSE key tuple carries it — a field only in the dict nudges nothing; a test fails without it.
+     Moves twice per alarm, unlike entry 285's refused verdict counter. Known limit: the nudged
+     reload is skipped with the player open or the feed scrolled down, so "Sounding now" can linger.
+
+554. An OPEN episode with nothing played reads silent once the Pi refuses or playback fails — it
+     retries every tick, so it must not read as sounding. Sounding and sounded share one glyph;
+     only the words (title, player line, spoken label) tell them apart. A missing `alarms` key
+     (older backend) reads as none, with no notice: it only drops marks.
+
+555. Left open by the review, as the spec decides them. "Sounding" can show while nothing plays:
+     `alarm_rev` moves only on open/close, so a Pi refusal or failure landing after the first
+     refetch never nudges, and an episode that played and was THEN switched off reads "Sounding
+     now" (rule 2; `pi_disabled` is sticky, so "still off" is unknowable). And `alarm_rev` COUNTs
+     all of `actions` per SSE poll per client — tens of rows a day, unindexed, never pruned.

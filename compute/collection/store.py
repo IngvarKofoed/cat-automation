@@ -29,7 +29,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable
 
 from compute.analysis import ANALYZER_NAMES  # import-light registry (no ML); single source of oracle ids
@@ -196,6 +196,24 @@ _EVENT_SCAN_FRAMES = 200_000
 # widening ``_MAX_EVENTS`` itself is wrong: that cap exists to bound a *feed response*.
 # 8 × 500 = 4000 visits in the widest window, far past a real day at this door.
 _MAX_STATS_PAGES = 8
+
+# How many ``events`` pages ``daily_visits`` (the per-cat daily chart) walks before
+# reporting ``truncated``: its own budget, not ``_MAX_STATS_PAGES``, because it counts
+# 90 DAYS rather than 24 h. 40 × 500 = 20k visits — measured, the last 60 days on the
+# real store were ~6,500 visits (13 pages), so 90 days is ~20.
+_MAX_DAILY_PAGES = 40
+
+# A run of at least this many consecutive hours with no stored frame marks every local
+# day it touches as only PARTLY recorded on the per-cat daily chart. Measured over 60
+# days of the real store, with runs crossing midnight: ordinary quiet stretches never
+# exceeded 6 empty hours, and every real outage measured 8-143 h. A very quiet night
+# that reaches 7 reads partial — the safe direction (claiming less), accepted not tuned.
+_DAILY_GAP_HOURS = 7
+
+# The per-hour existence probe behind the daily chart's recording states. ~2,200 run per
+# request, uncached, on a store with no ANALYZE stats — so its plan (a seek on
+# idx_frames_recv_ts) is pinned by a test, the lesson of entries 229/265/276/307/385/391.
+_HOUR_PROBE_SQL = "SELECT 1 FROM frames WHERE recv_ts >= ? AND recv_ts < ? LIMIT 1"
 
 # Widest frame-id span a single "mark for labelling" flag may cover. A flag comes from a
 # client posting ONE activity event's [start_id, end_id], so any real value is tens to a
@@ -8267,34 +8285,9 @@ class Store:
             result["cats"] = self._stats_cat_records(roster, per_cat, keys, result["totals"], is_night)
             return result
 
-        events: "list[dict]" = []
-        truncated = False
-        until_id: "int | None" = None
-        pages = 0
-        while pages < _MAX_STATS_PAGES:
-            page = self.events(since_id, until_id, limit=_MAX_EVENTS)
-            rows = page["events"]
-            events.extend(rows)
-            pages += 1
-            if not page["truncated"]:
-                break
-            if not rows:
-                # Truncated with nothing to key the next page off (reachable when a
-                # scan-capped window's only cluster is popped — CHANGELOG 271). Paging
-                # cannot continue, so say so rather than re-requesting the same bound.
-                truncated = True
-                break
-            until_id = min(e["start_id"] for e in rows) - 1
-            if until_id < since_id:
-                # The page reached the window's own floor, so nothing is left to count
-                # and `truncated` must stay False — the flag means "older visits in this
-                # window went uncounted", and over-claiming it would put a "figures are
-                # incomplete" warning on a complete reading. (Without this the next call
-                # would ask for an inverted range, get nothing, and take the branch
-                # above.)
-                break
-        else:
-            truncated = True
+        events, truncated = self._walk_events(
+            since_id, max_pages=_MAX_STATS_PAGES, with_subject=True
+        )
         result["truncated"] = truncated
 
         for event in events:
@@ -8317,6 +8310,393 @@ class Store:
 
         result["cats"] = self._stats_cat_records(roster, per_cat, keys, result["totals"], is_night)
         return result
+
+    def _walk_events(
+        self, since_id: int, *, max_pages: int, with_subject: bool
+    ) -> "tuple[list[dict], bool]":
+        """Every ``events`` record from ``since_id`` to now, newest first → ``(events, truncated)``.
+
+        The keyset walk ``door_stats`` and ``daily_visits`` share: each page asks for
+        ``until_id`` = oldest loaded ``start_id`` − 1, as the frontend feed pages, so no
+        visit is lost to the partial-oldest-cluster drop ``events`` performs when its
+        frame scan caps (the next page's bound excludes only the KEPT oldest event, so a
+        dropped cluster is re-read). ``truncated`` is True when older visits at or after
+        ``since_id`` went unread — the ``max_pages`` budget was spent, or a page claimed
+        truncation with nothing to key the next one off.
+
+        ``with_subject`` is passed straight to ``events``: ``door_stats``' totals ladder
+        reads the subject, a per-cat count reads only ``identity`` and skips the feed's
+        most expensive annotation (the ``cats_overview`` precedent, CHANGELOG 257).
+        """
+        events: "list[dict]" = []
+        truncated = False
+        until_id: "int | None" = None
+        pages = 0
+        while pages < max_pages:
+            page = self.events(since_id, until_id, limit=_MAX_EVENTS, with_subject=with_subject)
+            rows = page["events"]
+            events.extend(rows)
+            pages += 1
+            if not page["truncated"]:
+                break
+            if not rows:
+                # Truncated with nothing to key the next page off (reachable when a
+                # scan-capped window's only cluster is popped — CHANGELOG 271). Paging
+                # cannot continue, so say so rather than re-requesting the same bound.
+                truncated = True
+                break
+            until_id = min(e["start_id"] for e in rows) - 1
+            if until_id < since_id:
+                # The page reached the window's own floor, so nothing is left to count
+                # and `truncated` must stay False — the flag means "older visits in this
+                # window went uncounted", and over-claiming it would put a "figures are
+                # incomplete" warning on a complete reading. (Without this the next call
+                # would ask for an inverted range, get nothing, and take the branch
+                # above.)
+                break
+        else:
+            truncated = True
+        return events, truncated
+
+    # --- User-dashboard per-cat daily chart (user-cat-daily-visits-chart spec) ----
+
+    @staticmethod
+    def local_date(ts_ms: int) -> str:
+        """The compute PC's own calendar date of ``ts_ms`` (``"YYYY-MM-DD"``).
+
+        THE day rule for the per-cat daily chart: ``_local_days`` buckets by it and the
+        API's count cache is keyed on it, so the two cannot drift apart around midnight.
+        """
+        return datetime.fromtimestamp(ts_ms / 1000.0).date().isoformat()
+
+    @staticmethod
+    def _local_days(now_ms: int, days: int) -> "list[dict]":
+        """The ``days`` local calendar days ending today, oldest first.
+
+        Each is ``{date, start_ts, end_ts, today}``: local midnight to the next local
+        midnight, except today, which ends at ``now_ms``. Days are the compute PC's OWN
+        calendar days — naive ``datetime.timestamp()`` reads the OS zone, which works on
+        Windows without the ``tzdata`` package — so a DST switch inside the window makes
+        that day 23 or 25 hours long instead of shifting every earlier day by an hour,
+        which is what one fixed offset would do.
+        """
+        today = date.fromisoformat(Store.local_date(now_ms))
+        out: "list[dict]" = []
+        for back in range(days - 1, -1, -1):
+            d = date.fromordinal(today.toordinal() - back)
+            nxt = date.fromordinal(d.toordinal() + 1)
+            start = int(datetime(d.year, d.month, d.day).timestamp() * 1000)
+            end = int(datetime(nxt.year, nxt.month, nxt.day).timestamp() * 1000)
+            out.append({
+                "date": d.isoformat(),
+                "start_ts": start,
+                "end_ts": now_ms if back == 0 else end,
+                "today": back == 0,
+            })
+        return out
+
+    def daily_visit_counts(
+        self,
+        *,
+        days: int = 90,
+        is_night: "Callable[[int], bool] | None" = None,
+        now_ms: "int | None" = None,
+    ) -> dict:
+        """The COUNTING half of ``daily_visits``: one walk of the feed, every cat, per day.
+
+        This is the slow half (one keyset walk of ``events`` over the window, an
+        estimated ~8 s for 90 days on the real store) and the half the API caches; the
+        recording half (``daily_recording``) is cheap and recomputed per request. The
+        two are joined by ``merge_daily``. Returns::
+
+            {generated_ts, window_days, threshold,
+             model: {id, calibrated, enrolled_cat_ids} | None,
+             truncated, stopped_date: "YYYY-MM-DD" | None,
+             days: {"YYYY-MM-DD": {cats: {"<cat_id>": {visits, day, night}},
+                                   events: int, identified: bool}}}
+
+        ``days`` holds only days with at least one event. ``threshold`` is the active
+        model's — part of what the API cache is keyed on, never sent to the client.
+
+        **Naming** is ``door_stats``'s: a visit counts for a cat when its aggregated
+        ``identity`` names that cat, read off the same ``events`` feed, so the chart,
+        Visits, Cats and Activity can never name a visit differently (CHANGELOG 341).
+        Retired cats are included — the active gallery can still name one.
+
+        **Which day.** A visit belongs to the local day of its ``start_ts`` (the
+        ``door_stats`` rule), so one straddling midnight counts once. The walk's floor is
+        resolved from the window's start minus one hour and visits starting before the
+        window are discarded: a visit already under way at the floor would otherwise be
+        clipped by ``since_id`` and land, wrongly, on the window's first day.
+
+        ``identified`` records whether ANY of the day's events carried an ``identity``
+        (named or unknown). It costs nothing, and it is what ``unnamed`` reads: names are
+        per model and the live worker never names past visits, so after a promotion every
+        day not yet reached by an Identify all pass would otherwise read as zero.
+
+        **Truncation.** When the ``_MAX_DAILY_PAGES`` budget runs out, ``stopped_date``
+        is the day of the oldest visit counted — partly counted, so it and every older
+        day become ``uncounted`` rather than drawn as recorded.
+
+        **No usable gallery** (none active, or uncalibrated): returns the empty shape
+        without walking at all — an uncalibrated gallery names nobody, so the walk would
+        only confirm it.
+        """
+        now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        days = max(1, int(days))
+        model = self.active_model()
+        threshold = model["threshold"] if model is not None else None
+        model_out = None
+        if model is not None:
+            per_cat = (model.get("metrics") or {}).get("per_cat")
+            enrolled = (
+                sorted({int(r["cat_id"]) for r in per_cat if r.get("cat_id") is not None})
+                if isinstance(per_cat, list) else None
+            )
+            model_out = {
+                "id": model["id"],
+                "calibrated": threshold is not None,
+                "enrolled_cat_ids": enrolled,
+            }
+        result: dict = {
+            "generated_ts": now,
+            "window_days": days,
+            "threshold": threshold,
+            "model": model_out,
+            "truncated": False,
+            "stopped_date": None,
+            "days": {},
+        }
+        if model_out is None or not model_out["calibrated"]:
+            return result
+
+        local_days = self._local_days(now, days)
+        window_start = local_days[0]["start_ts"]
+        since_id, _ = self.resolve_ts_range(window_start - 3_600_000, None)
+        if since_id is None:
+            # Nothing stored at or after the floor: nothing to count. NOT an unbounded
+            # events() read, which would count the newest visits in the whole store.
+            return result
+
+        events, truncated = self._walk_events(
+            since_id, max_pages=_MAX_DAILY_PAGES, with_subject=False
+        )
+        starts = [d["start_ts"] for d in local_days]
+        per_day: "dict[str, dict]" = {}
+        oldest_ts: "int | None" = None
+        for event in events:
+            start_ts = event["start_ts"]
+            if oldest_ts is None or start_ts < oldest_ts:
+                oldest_ts = start_ts
+            if start_ts < window_start or start_ts > now:
+                continue
+            day = local_days[bisect.bisect_right(starts, start_ts) - 1]["date"]
+            rec = per_day.setdefault(day, {"cats": {}, "events": 0, "identified": False})
+            rec["events"] += 1
+            identity = event.get("identity")
+            if identity is None:
+                continue
+            rec["identified"] = True
+            cat_id = identity.get("cat_id")
+            if cat_id is None:
+                continue
+            counters = rec["cats"].setdefault(
+                str(int(cat_id)),
+                {
+                    "visits": 0,
+                    "day": 0 if is_night is not None else None,
+                    "night": 0 if is_night is not None else None,
+                },
+            )
+            counters["visits"] += 1
+            if is_night is not None:
+                counters["night" if is_night(start_ts) else "day"] += 1
+
+        result["days"] = per_day
+        if truncated:
+            result["truncated"] = True
+            if oldest_ts is None:
+                # Nothing read at all (a first page that claimed truncation with no
+                # rows): every day is uncounted, which "stopped at today" says.
+                result["stopped_date"] = local_days[-1]["date"]
+            elif oldest_ts >= window_start:
+                # Where counting stopped: the day of the oldest visit read. It was only
+                # partly counted, so it and everything older read `uncounted`.
+                result["stopped_date"] = local_days[
+                    bisect.bisect_right(starts, min(oldest_ts, now)) - 1
+                ]["date"]
+            # else: the walk got below the window's start (into the floor's spare hour)
+            # before the budget ran out, so every visit IN the window was read: the walk
+            # was cut short, but no day is uncounted (and the page banners only on those).
+        return result
+
+    def daily_recording(self, *, days: int = 90, now_ms: "int | None" = None) -> dict:
+        """The RECORDING half of ``daily_visits``: which days the store actually holds.
+
+        Cheap and never cached, so a Clear or an eviction shows at once. Hour-granular —
+        one indexed existence probe per hour off ``idx_frames_recv_ts``, never a walk of
+        every frame, since a Tuning day can hold 750k of them. The probes cover the window
+        plus the ``_DAILY_GAP_HOURS`` before it, so a gap that began before the window is
+        measured whole. Runs on its OWN short-lived WAL read connection, off the shared
+        write lock (the ``lighting_histogram`` move), since ~2,200 probes are a lot of
+        lock round-trips against the collector.
+
+        Returns ``{generated_ts, store_oldest_ts, days: [{date, start_ts, end_ts, today,
+        expired, none, partial}]}``, oldest first:
+
+        - ``expired`` — the whole day is older than the oldest retained frame;
+        - ``none`` — no stored frame in the day;
+        - ``partial`` — a run of ``_DAILY_GAP_HOURS`` or more consecutive empty hours
+          touches the day. Runs are measured continuously, NOT cut at midnight (cutting
+          missed two real overnight outages), and a run still open at now counts, so an
+          outage happening right now marks today.
+
+        A heuristic biased toward claiming less: an outage under the threshold still
+        reads complete, and a very quiet night that reaches it reads ``partial``.
+        """
+        now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        days = max(1, int(days))
+        local_days = self._local_days(now, days)
+        hour = 3_600_000
+        first = local_days[0]["start_ts"] - _DAILY_GAP_HOURS * hour
+        bounds: "list[tuple[int, int]]" = []
+        h = first
+        while h < now:
+            bounds.append((h, min(h + hour, now)))
+            h += hour
+
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            oldest_ts = conn.execute("SELECT MIN(recv_ts) FROM frames").fetchone()[0]
+            empty = [
+                conn.execute(_HOUR_PROBE_SQL, (lo, hi)).fetchone() is None
+                for lo, hi in bounds
+            ]
+        finally:
+            conn.close()
+
+        # Hours inside any run of >= _DAILY_GAP_HOURS consecutive empty hours.
+        in_gap = [False] * len(bounds)
+        i = 0
+        while i < len(bounds):
+            if not empty[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(bounds) and empty[j]:
+                j += 1
+            if j - i >= _DAILY_GAP_HOURS:
+                for k in range(i, j):
+                    in_gap[k] = True
+            i = j
+
+        out: "list[dict]" = []
+        for d in local_days:
+            lo, hi = d["start_ts"], d["end_ts"]
+            # The probe hours overlapping [lo, hi). Day bounds are local midnights, so in a
+            # half-hour-offset zone they need not sit on a probe boundary — hence floor /
+            # ceil rather than assuming each day is exactly 24 (or 23/25) whole probes.
+            k0 = (lo - first) // hour
+            k1 = min(len(bounds), -(-(hi - first) // hour))
+            hours = range(max(0, k0), k1)
+            out.append({
+                **d,
+                "expired": oldest_ts is not None and hi <= int(oldest_ts),
+                "none": all(empty[k] for k in hours),
+                "partial": any(in_gap[k] for k in hours),
+            })
+        return {
+            "generated_ts": now,
+            "store_oldest_ts": int(oldest_ts) if oldest_ts is not None else None,
+            "days": out,
+        }
+
+    @staticmethod
+    def merge_daily(counts: dict, recording: dict) -> dict:
+        """Join a (possibly cached) ``daily_visit_counts`` with a fresh ``daily_recording``.
+
+        The day list and ``store_oldest_ts`` come from the recording half (always
+        current); the counts are looked up by date, so a count from earlier the same day
+        lines up exactly. Each day gets ONE state, first matching rule wins::
+
+            expired > none > uncounted > unnamed > partial > full
+
+        A missing cat in ``cats`` reads as zero ONLY when the state is ``full`` or
+        ``partial``; every other state is drawn as "no figure", never as a quiet day.
+        With no usable gallery every recorded day is ``unnamed``: nothing names it, and
+        ``full`` with empty ``cats`` would assert a zero nobody measured.
+        """
+        model = counts.get("model")
+        usable = model is not None and model.get("calibrated")
+        stopped = counts.get("stopped_date")
+        out_days: "list[dict]" = []
+        for d in recording["days"]:
+            rec = counts["days"].get(d["date"]) if usable else None
+            if d["expired"]:
+                state = "expired"
+            elif d["none"]:
+                state = "none"
+            elif not usable:
+                state = "unnamed"
+            elif stopped is not None and d["date"] <= stopped:
+                state = "uncounted"
+            elif rec is not None and rec["events"] > 0 and not rec["identified"]:
+                state = "unnamed"
+            elif d["partial"]:
+                state = "partial"
+            else:
+                state = "full"
+            out_days.append({
+                "date": d["date"],
+                "start_ts": d["start_ts"],
+                "end_ts": d["end_ts"],
+                "today": d["today"],
+                "state": state,
+                "cats": dict(rec["cats"]) if rec is not None and state in ("full", "partial") else {},
+            })
+        return {
+            "generated_ts": counts["generated_ts"],
+            "window_days": len(out_days),
+            "store_oldest_ts": recording["store_oldest_ts"],
+            "model": model,
+            "truncated": bool(counts.get("truncated")),
+            "days": out_days,
+        }
+
+    def daily_visits(
+        self,
+        *,
+        days: int = 90,
+        is_night: "Callable[[int], bool] | None" = None,
+        now_ms: "int | None" = None,
+    ) -> dict:
+        """Per-cat visits per local day over the last ``days`` days — the per-cat chart.
+
+        Backs the user dashboard's per-cat daily chart (``#visits/<cat_id>``; see the
+        user-cat-daily-visits-chart spec). The counting half is ``daily_visit_counts``,
+        the recording half ``daily_recording``, joined by ``merge_daily`` — split so the
+        API can cache the slow count while recomputing recording on every request.
+        Returns::
+
+            {generated_ts, window_days, store_oldest_ts,
+             model: {id, calibrated, enrolled_cat_ids: [..] | None} | None,
+             truncated,
+             days: [{date, start_ts, end_ts, today,
+                     state: full|partial|none|expired|unnamed|uncounted,
+                     cats: {"<cat_id>": {visits, day, night}}}]}
+
+        ``days`` holds exactly ``days`` entries, oldest first, today last. ``cats`` is
+        sparse — a cat with no visit that day is absent, which reads as 0 only on a
+        ``full`` or ``partial`` day. ``day``/``night`` come from the injected
+        ``is_night`` exactly as in ``door_stats``, ``None`` without one. The route adds
+        ``split``.
+        """
+        now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+        return self.merge_daily(
+            self.daily_visit_counts(days=days, is_night=is_night, now_ms=now),
+            self.daily_recording(days=days, now_ms=now),
+        )
 
     @staticmethod
     def _classify_stats_event(event: dict) -> "tuple[str, int | None]":

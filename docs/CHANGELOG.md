@@ -2057,3 +2057,75 @@ a clean one.
      refetch never nudges, and an episode that played and was THEN switched off reads "Sounding
      now" (rule 2; `pi_disabled` is sticky, so "still off" is unknowable). And `alarm_rev` COUNTs
      all of `actions` per SSE poll per client — tens of rows a day, unindexed, never pruned.
+
+556. Tapping a cat on the user app's Visits page opens `#visits/<cat_id>`: a bar chart of that
+     cat's visits per local day over 30 / 60 / 90 days (60 by default), with a daily average over
+     fully recorded days only and a tap-or-drag day readout. A drill-down, not a destination: the
+     Visits tab stays highlighted. Spec: docs/specs/2026-11-04-user-cat-daily-visits-chart.md.
+
+557. `GET /api/door-stats/daily` always answers 90 days for EVERY cat, from one keyset walk of the
+     same `events()` feed Visits counts (`with_subject=False`), so the chart can never name a visit
+     differently from Visits, Cats or Activity. The window is a client-side slice: switching is a
+     pure re-render, and a day reads the same in every window.
+
+558. That count is kept in memory 10 minutes, single-flight, keyed on (local date, active model id,
+     threshold) — taken from what the walk ACTUALLY read, so a promotion mid-walk can't file it
+     under the old model. The `split` is cached WITH the counts (a location set inside the ten
+     minutes must not pair `available: true` with counts made without it). Rejected: a persisted
+     per-day memo — every rename path would need the exact invalidation `calendar_days` took.
+
+559. Every day carries one state, first match wins: expired > none > uncounted > unnamed > partial
+     > full. A missing cat reads as zero ONLY on full/partial; the four no-figure states draw as one
+     muted full-height band, never a short bar. Recording states are recomputed per request
+     (`Store.daily_recording`, its own WAL read connection), so a Clear or eviction shows at once.
+
+560. `partial` = a run of >= 7 consecutive empty hours touching the day, measured ACROSS midnight
+     (hour-granular existence probes, never a frame walk). Cutting at midnight missed real
+     overnight outages (11 h from 19:00 is 5 + 6 on either side). An outage under 7 h reads full;
+     a very quiet night reaching 7 reads partial — the claim-less direction, accepted not tuned.
+
+561. `unnamed` = the day has visits and NONE carries an identity under the active model: after a
+     promotion past days read about zero until Identify all reaches them, and the cache would show
+     that pass's moving front as a trend. Known limits: a half-reached day reads full with a lower
+     count, and a recorded day whose only events are wind triggers also reads unnamed.
+
+562. Days are the compute PC's OWN local calendar days (naive `datetime.timestamp()`, which works on
+     Windows without `tzdata`), not a browser offset: the window spans DST switches, and one fixed
+     offset would shift every earlier day by an hour. The DST day is 23 or 25 hours long.
+
+563. The walk's floor is resolved an hour before the window and visits starting before it are
+     dropped, or one under way at midnight is clipped by `since_id` onto the first day. A spent
+     page budget (`_MAX_DAILY_PAGES` = 40) sets `truncated` and makes the stop day and everything
+     older `uncounted`; the page banners only on an uncounted day in its own window.
+
+564. `door_stats`' keyset loop is now `Store._walk_events(since_id, max_pages, with_subject)`,
+     shared with the daily count, carrying entries 271 and 350's rules once. No behaviour change
+     to Visits; its tests pass unmodified.
+
+565. The chart page is deliberately NOT live: SSE nudges and the fallback poll skip it, while route
+     entry and foreground resume reload it. A nudge lands every few seconds while a cat lingers,
+     and with the cache expired each would be a 90-day walk on the shared write connection.
+
+566. A `.sr-only` class on a `<table>` does not hide it from layout: a table never shrinks below its
+     content width, so `width: 1px` still widened the page into a sideways scroll (552 px on a
+     390 px phone at 90 days). The class goes on a wrapping div.
+
+567. Known limit: the cold count runs on the shared write connection (entry 354), at most once per
+     10 minutes per model; the spec estimates ~8 s on the real store. Measured only on a 7k-frame
+     dev fixture here — the real-store timing, and the spec's dated checks, need the compute PC.
+
+568. Review repairs, store side. The hourly recording probe is a named constant whose plan — a seek
+     on `idx_frames_recv_ts` — is pinned by a test (verified to fail against a de-indexed `+recv_ts`):
+     ~2,200 run per request, uncached, and the result is identical either way. `Store.local_date`
+     is now THE day rule, used by both the day buckets and the API cache key.
+
+569. Review repairs, page side. A good daily payload is kept even when the reader has moved to
+     another cat (only the paint is dropped — it serves every cat, and a cold count is seconds);
+     a resize redraws the SVG alone, not the header's avatar; an overview failure is named as one.
+     "Not recorded" no longer claims nothing was collected: under motion-only storage a still
+     day stores nothing either.
+
+570. Left open by that review, as the spec decides them. A Clear does not invalidate the cached
+     counts: past days read `none` at once, but today's bar can show pre-Clear visits for up to
+     10 minutes. Under motion-only storage a dead-still night of 7 h reads `partial` — the 7 h
+     threshold was measured on exactly that data. And a wind-only day reads `unnamed` (entry 561).

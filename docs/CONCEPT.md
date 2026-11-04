@@ -171,7 +171,8 @@ The compute PC serves **two** browser surfaces, split by audience:
   Mittens still out?"); a timeline of enter/leave events; and a log of
   foreign-cat sightings and any deterrents. Alongside the timeline it answers *how
   much* — how often each cat has been through the door lately, by day and after
-  dark, and how much of the traffic could not be attributed to anyone. It shows
+  dark, and day by day over the last few months, and how much of the traffic could
+  not be attributed to anyone. It shows
   status, events, and stored snapshots — not a live video feed — and any one visit
   can be downloaded as a video to keep, which plays on an iPhone with nothing
   installed.

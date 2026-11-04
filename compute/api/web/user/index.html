@@ -564,8 +564,9 @@
         .vrows { display: flex; flex-direction: column; gap: .6rem; }
         .vrow {
             display: grid;
-            /* avatar · who · the same two number columns as .tally-row */
-            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem;
+            /* avatar · who · the same two number columns as .tally-row · the chevron of
+               the drill-down to the cat's daily chart */
+            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem .7rem;
             align-items: center;
             gap: .5rem;
             padding: .7rem .9rem;
@@ -600,9 +601,13 @@
         /* A measured zero is a real reading, so it is a digit — dimmed, never an em
            dash, which everywhere else on these dashboards means "not measured". */
         .vrow .n.zero { color: var(--muted); font-weight: 600; }
+        /* Each row is a link to that cat's daily chart (#visits/<id>). */
+        a.vrow { color: inherit; text-decoration: none; transition: border-color .15s; }
+        a.vrow:hover { border-color: color-mix(in srgb, var(--porch) 50%, var(--hairline)); }
+        .vrow .chev { color: var(--muted); font-size: 1.25rem; line-height: 1; text-align: right; }
         .vrows-head {
             display: grid;
-            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem;
+            grid-template-columns: 46px minmax(0, 1fr) 4.2rem 4.2rem .7rem;
             gap: .5rem;
             padding: 0 .9rem .3rem;
             font-size: .72rem;
@@ -613,8 +618,102 @@
         }
         .vrows-head span:nth-child(n+3) { text-align: right; }
         @media (max-width: 380px) {
-            .tally-row, .vrow, .vrows-head { grid-template-columns: 46px minmax(0, 1fr) 3.2rem 3.2rem; }
+            .vrow, .vrows-head { grid-template-columns: 46px minmax(0, 1fr) 3.2rem 3.2rem .7rem; }
             .tally-row { grid-template-columns: minmax(0, 1fr) 3.2rem 3.2rem; }
+        }
+
+        /* ================= VISITS → one cat (#visits/<id>) =================
+           One bar per local day in the cat's own identity colour. Every day that has no
+           figure (not recorded / no longer kept / not named yet / not counted) is ONE
+           muted full-height band, so it can never be read as a short bar — a quiet day
+           and a day nobody measured must not look alike. A partly recorded day is a
+           lighter bar with a solid cap: "at least this many". */
+        .back-link {
+            display: inline-block;
+            margin-bottom: .5rem;
+            color: var(--muted);
+            font-weight: 600;
+            font-size: .93rem;
+            text-decoration: none;
+        }
+        .back-link:hover { color: var(--ink); }
+        .vc-head { display: flex; align-items: center; gap: .85rem; margin-bottom: 1.1rem; }
+        .vc-head.hidden { display: none; }
+        .vc-head .avatar-wrap { width: 56px; height: 56px; flex: none; }
+        .vc-head .avatar-fallback { font-size: 1.4rem; }
+        .vc-head h1 { margin: 0; font-size: clamp(1.5rem, 5vw, 2rem); line-height: 1.15; }
+        .vc-head .cat-tag { display: inline-block; margin-top: .25rem; }
+        .vc-main.hidden { display: none; }
+        .vc-main.stale .vc-card, .vc-main.stale .vc-summary, .vc-main.stale .vc-sub { opacity: .55; transition: opacity .2s; }
+
+        .seg {
+            display: inline-flex;
+            gap: 2px;
+            padding: 3px;
+            margin-bottom: 1rem;
+            background: var(--surface-2);
+            border: 1px solid var(--hairline);
+            border-radius: 999px;
+        }
+        .seg button {
+            border: 0;
+            background: transparent;
+            color: var(--muted);
+            font-weight: 600;
+            font-size: .88rem;
+            padding: .3rem .85rem;
+            border-radius: 999px;
+            cursor: pointer;
+        }
+        .seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+
+        .vc-summary { margin: 0; font-size: 1rem; }
+        .vc-summary strong { font-family: var(--font-display); font-size: 1.3rem; }
+        .vc-sub { margin: .15rem 0 1rem; color: var(--muted); font-size: .86rem; }
+
+        .vc-card {
+            --vc-bar: var(--resident);
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: .9rem .9rem .8rem;
+        }
+        .vc-card.neighbour { --vc-bar: var(--neighbour); }
+        .vc-chart {
+            /* pan-y: a vertical drag still scrolls the page; a horizontal one scrubs. */
+            touch-action: pan-y;
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: pointer;
+            border-radius: 6px;
+        }
+        .vc-chart svg { display: block; width: 100%; overflow: visible; }
+        .vc-grid { stroke: var(--hairline); stroke-width: 1; shape-rendering: crispEdges; }
+        .vc-base { stroke: color-mix(in srgb, var(--muted) 60%, transparent); stroke-width: 1; shape-rendering: crispEdges; }
+        .vc-bar { fill: var(--vc-bar); }
+        .vc-bar.partial { fill-opacity: .38; }
+        .vc-cap { fill: var(--vc-bar); }
+        .vc-nofig { fill: var(--muted); fill-opacity: .17; }
+        .vc-sel { fill: var(--porch); fill-opacity: .24; }
+        .vc-selmark { fill: var(--porch); }
+        .vc-tickline { stroke: var(--hairline); stroke-width: 1; shape-rendering: crispEdges; }
+        .vc-tick { fill: var(--muted); font-size: 11px; font-family: var(--font-body); font-variant-numeric: tabular-nums; }
+        .vc-tick.today { fill: var(--ink); font-weight: 600; }
+        .vc-readout { margin: .65rem 0 0; min-height: 1.5em; font-size: .95rem; font-variant-numeric: tabular-nums; }
+        .vc-notes { margin-top: .5rem; color: var(--muted); font-size: .84rem; }
+        .vc-notes p { margin: .3rem 0 0; }
+        .vc-notes .key { display: inline-block; width: .8rem; height: .8rem; margin-right: .4rem; border-radius: 2px; vertical-align: -1px; }
+        .vc-notes .key.nofig { background: color-mix(in srgb, var(--muted) 24%, transparent); }
+        .vc-notes .key.partial { background: color-mix(in srgb, var(--vc-bar) 38%, transparent); box-shadow: inset 0 2px 0 var(--vc-bar); }
+        .sr-only {
+            position: absolute;
+            width: 1px; height: 1px;
+            padding: 0; margin: -1px;
+            overflow: hidden;
+            clip: rect(0 0 0 0);
+            white-space: nowrap;
+            border: 0;
         }
 
         /* ================= footer ================= */
@@ -1070,6 +1169,37 @@
             <div id="visitsBody"></div>
         </section>
 
+        <!-- ============ VISITS → one cat (#visits/<cat_id>) ============
+             A drill-down, not a destination: the Visits tab stays highlighted and there
+             is no nav entry of its own. -->
+        <section id="view-visitcat" class="view">
+            <a class="back-link" href="#visits">‹ Visits</a>
+            <div class="vc-head hidden" id="vcHead"></div>
+            <div class="note error hidden" id="vcError"></div>
+            <div class="note warn hidden" id="vcNote"></div>
+            <div class="empty hidden" id="vcEmpty"></div>
+            <div class="vc-main hidden" id="vcMain">
+                <div class="seg" id="vcSeg" role="group" aria-label="How many days to show">
+                    <button type="button" data-days="30" aria-pressed="false">30 days</button>
+                    <button type="button" data-days="60" aria-pressed="true">60 days</button>
+                    <button type="button" data-days="90" aria-pressed="false">90 days</button>
+                </div>
+                <p class="vc-summary" id="vcSummary"></p>
+                <p class="vc-sub" id="vcSub"></p>
+                <div class="vc-card" id="vcCard">
+                    <!-- One focusable control: tap or drag to pick a day, ← / → to step.
+                         The SVG inside is aria-hidden; the table below carries the data. -->
+                    <div class="vc-chart" id="vcChart" tabindex="0" role="group"></div>
+                    <p class="vc-readout" id="vcReadout" aria-live="polite"></p>
+                    <div class="vc-notes" id="vcNotes"></div>
+                    <!-- The sr-only box wraps the table rather than sitting on it: a table
+                         never shrinks below its content width, so `width: 1px` on the
+                         table itself still widened the page into a sideways scroll. -->
+                    <div class="sr-only"><table id="vcTable"></table></div>
+                </div>
+            </div>
+        </section>
+
         <!-- ============ CATS ============ -->
         <section id="view-cats" class="view">
             <div class="view-head">
@@ -1196,6 +1326,10 @@
 
         // ================= state =================
         let route = 'activity';
+        // The cat id of a `#visits/<id>` drill-down, as the raw string after the slash;
+        // null on every other route. `route` stays 'visits' there, so the Visits tab is
+        // the one highlighted.
+        let vcCatId = null;
 
         let activityEvents = [], activityVisible = [];
         // Older visits exist beyond what is loaded — the LAST page's `truncated`. Two
@@ -1297,6 +1431,11 @@
         const feedFootEl = $('feedFoot'), feedSentinelEl = $('feedSentinel');
         const catsErrorEl = $('catsError'), catsModelNoteEl = $('catsModelNote'), catsBodyEl = $('catsBody');
         const visitsErrorEl = $('visitsError'), visitsNoteEl = $('visitsNote'), visitsBodyEl = $('visitsBody');
+        const vcHeadEl = $('vcHead'), vcErrorEl = $('vcError'), vcNoteEl = $('vcNote');
+        const vcEmptyEl = $('vcEmpty'), vcMainEl = $('vcMain'), vcSegEl = $('vcSeg');
+        const vcSummaryEl = $('vcSummary'), vcSubEl = $('vcSub'), vcCardEl = $('vcCard');
+        const vcChartEl = $('vcChart'), vcReadoutEl = $('vcReadout');
+        const vcNotesEl = $('vcNotes'), vcTableEl = $('vcTable');
         const modalEl = $('playerModal'), dialogEl = $('playerDialog');
         const playerImgEl = $('playerImg'), playerWhenEl = $('playerWhen'), playerChipSlotEl = $('playerChipSlot');
         const playerPlayBtn = $('playerPlay'), playerPrevBtn = $('playerPrev'), playerNextBtn = $('playerNext');
@@ -2259,12 +2398,21 @@
 
         // ================= router =================
         function setRoute(r) {
-            route = ROUTES.includes(r) ? r : 'activity';
+            // `visits/<cat_id>` is the one sub-route: the per-cat daily chart. Its base
+            // stays the route, so the nav keeps Visits highlighted.
+            const slash = r.indexOf('/');
+            const base = slash < 0 ? r : r.slice(0, slash);
+            route = ROUTES.includes(base) ? base : 'activity';
+            const wasCat = vcCatId;
+            vcCatId = route === 'visits' && slash >= 0 ? r.slice(slash + 1) : null;
             for (const v of document.querySelectorAll('.view')) v.classList.remove('active');
-            $('view-' + route).classList.add('active');
+            $(vcCatId !== null ? 'view-visitcat' : 'view-' + route).classList.add('active');
             for (const a of document.querySelectorAll('.nav a')) {
                 a.classList.toggle('active', a.dataset.route === route);
             }
+            // Arriving from a long Visits list would otherwise open the chart scrolled
+            // past its own header.
+            if (vcCatId !== null && vcCatId !== wasCat) window.scrollTo(0, 0);
             onRouteEnter(route);
         }
         function onRouteEnter(r) {
@@ -2272,7 +2420,7 @@
             // scroll-lock) so it can't tick in the background or reappear on return.
             if (r !== 'activity') closePlayer();
             if (r === 'activity') enterActivity();
-            else if (r === 'visits') loadVisits();
+            else if (r === 'visits') { if (vcCatId !== null) loadVisitCat(); else loadVisits(); }
             else if (r === 'cats') loadCats();
         }
         window.addEventListener('hashchange', () => setRoute(location.hash.slice(1)));
@@ -3254,9 +3402,7 @@
             if (!named) {
                 const empty = document.createElement('div');
                 empty.className = 'empty';
-                empty.innerHTML = data.model === null
-                    ? '<div class="big">Not telling cats apart yet</div><div>Visits are counted above, but naming them needs a recognition model — build one in the Admin console.</div>'
-                    : '<div class="big">The model can\'t name cats yet</div><div>The current model has too little data to be calibrated, so every visit stays “unknown cat”. Label more visits and build again.</div>';
+                fillNoGallery(empty, data.model, 'Visits are counted above, but naming them');
                 visitsBodyEl.appendChild(empty);
                 return;
             }
@@ -3281,6 +3427,24 @@
                     'Neighbours', 'Named cats that visit but live elsewhere.',
                     neighbours, overview, data));
             }
+        }
+
+        // Why nothing can be named: no model at all, or one too thin to be calibrated.
+        // Shared by Visits and the per-cat chart so the two explain it in the same words;
+        // `lead` is the half of the first sentence that differs between them.
+        function fillNoGallery(el, model, lead) {
+            el.innerHTML = '';
+            const big = document.createElement('div');
+            big.className = 'big';
+            const text = document.createElement('div');
+            if (model === null) {
+                big.textContent = 'Not telling cats apart yet';
+                text.textContent = `${lead} needs a recognition model — build one in the Admin console.`;
+            } else {
+                big.textContent = 'The model can\'t name cats yet';
+                text.textContent = 'The current model has too little data to be calibrated, so every visit stays “unknown cat”. Label more visits and build again.';
+            }
+            el.append(big, text);
         }
 
         function windowLabel(key) { return `last ${key.replace('h', ' hours')}`; }
@@ -3368,6 +3532,7 @@
                 s.textContent = key.replace('h', ' hours');
                 head.appendChild(s);
             }
+            head.appendChild(document.createElement('span'));  // the chevron column
 
             const rows = document.createElement('div');
             rows.className = 'vrows';
@@ -3386,8 +3551,10 @@
         }
 
         function visitRow(cat, info, data) {
-            const row = document.createElement('div');
+            // A link to the cat's daily chart — resident or neighbour alike.
+            const row = document.createElement('a');
             row.className = 'vrow';
+            row.href = `#visits/${cat.cat_id}`;
 
             row.appendChild(visitAvatar(cat, info));
 
@@ -3409,6 +3576,11 @@
                 n.textContent = visits;
                 row.appendChild(n);
             }
+            const chev = document.createElement('span');
+            chev.className = 'chev';
+            chev.setAttribute('aria-hidden', 'true');
+            chev.textContent = '›';
+            row.appendChild(chev);
             return row;
         }
 
@@ -3467,6 +3639,508 @@
             wrap.append(img, fallback);
             return wrap;
         }
+
+        // ================= VISITS → one cat (#visits/<cat_id>) =================
+        // "Is that normal for her": one cat's visits per local day over the last 30, 60 or
+        // 90 days. GET /api/door-stats/daily counts EVERY cat over 90 days in one walk of
+        // the same feed Visits counts, and the server keeps it ten minutes — so the window
+        // toggle is a pure re-render, a day reads the same in every window, and hopping
+        // between cats costs nothing. Every day carries a `state`; only `full` and
+        // `partial` have a figure, and a missing cat reads as zero only on those.
+        const VC_WINDOWS = [30, 60, 90];
+        const VC_PLOT_H = 150;                 // bar area height, px
+        const VC_AXIS_H = 26;                  // x-axis band under the baseline, px
+        const VC_STALE_MS = 300;               // dim a kept render only if the refetch is slow
+        const VC_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const VC_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        // The no-figure states: drawn as one shared muted band, told apart only in words.
+        const VC_NO_FIGURE = {
+            none: 'not recorded',
+            expired: 'no longer kept',
+            unnamed: 'not named by the current model yet',
+            uncounted: 'not counted (it was too busy to count this far back)',
+        };
+        let vcWindow = 60;          // the 30/60/90 choice: holds while the app is open, not across reloads
+        let vcData = null;          // the last /api/door-stats/daily payload (every cat, 90 days)
+        let vcOverview = null;      // the last /api/cats/overview payload (header + avatar)
+        let vcSeq = 0;              // response sequence guard
+        let vcDataSeq = 0;          // the request sequence `vcData` came from
+        let vcSelDate = null;       // the selected day's ISO date, kept across window switches
+        let vcView = null;          // what the chart on screen is drawn from: {rows, left, slot, sel}
+
+        async function loadVisitCat() {
+            const catId = vcCatId;
+            const seq = ++vcSeq;
+            hideNote(vcErrorEl);
+            // Every cat is in one payload, so anything already loaded draws this cat at
+            // once; the refetch then replaces it. Only a slow refetch dims what is shown —
+            // a warm server cache answers in milliseconds, and dimming that would flicker.
+            let staleTimer = null;
+            if (vcData && vcOverview) {
+                renderVisitCat();
+                staleTimer = setTimeout(() => vcMainEl.classList.add('stale'), VC_STALE_MS);
+            } else {
+                vcHeadEl.classList.add('hidden');
+                vcMainEl.classList.add('hidden');
+                hideNote(vcNoteEl);
+                vcEmptyEl.innerHTML = '';
+                const big = document.createElement('div');
+                big.className = 'big';
+                big.textContent = 'Counting the last 90 days';
+                const text = document.createElement('div');
+                text.textContent = 'A few seconds the first time.';
+                vcEmptyEl.append(big, text);
+                vcEmptyEl.classList.remove('hidden');
+            }
+            try {
+                const [dailyRes, catsRes] = await Promise.all([
+                    fetch('/api/door-stats/daily'),
+                    fetch('/api/cats/overview'),
+                ]);
+                if (!dailyRes.ok) throw new Error(`Couldn't load the daily counts: ${await errorFromResponse(dailyRes)}`);
+                if (!catsRes.ok) throw new Error(`Couldn't load the cats: ${await errorFromResponse(catsRes)}`);
+                const daily = await dailyRes.json();
+                const overview = await catsRes.json();
+                // The payload is the same for every cat, so a good one is KEPT even when the
+                // reader has moved on (a cold count is seconds of work) — unless a newer
+                // request's data already landed. Only the painting is dropped: a reply for a
+                // cat the reader has since left never paints over what they are looking at.
+                if (seq > vcDataSeq) {
+                    vcData = daily;
+                    vcOverview = overview;
+                    vcDataSeq = seq;
+                }
+                if (seq !== vcSeq || vcCatId !== catId) return;
+                renderVisitCat();
+            } catch (err) {
+                if (seq !== vcSeq || vcCatId !== catId) return;
+                if (!vcData) vcEmptyEl.classList.add('hidden');
+                showNote(vcErrorEl, err.message);
+            } finally {
+                clearTimeout(staleTimer);
+                if (seq === vcSeq) vcMainEl.classList.remove('stale');
+            }
+        }
+
+        function renderVisitCat() {
+            const id = /^\d+$/.test(vcCatId || '') ? Number(vcCatId) : null;
+            const cat = id === null ? null : (vcOverview.cats || []).find(c => c.id === id);
+            vcEmptyEl.classList.add('hidden');
+            hideNote(vcNoteEl);
+            if (!cat) {
+                vcHeadEl.classList.add('hidden');
+                vcMainEl.classList.add('hidden');
+                vcEmptyEl.innerHTML = '';
+                const big = document.createElement('div');
+                big.className = 'big';
+                big.textContent = 'No such cat';
+                const back = document.createElement('a');
+                back.href = '#visits';
+                back.textContent = 'Back to Visits';
+                vcEmptyEl.append(big, back);
+                vcEmptyEl.classList.remove('hidden');
+                return;
+            }
+            renderVcHead(cat);
+
+            const model = vcData.model;
+            const usable = model !== null && model.calibrated;
+            // The model names nobody, or was built without this cat: either way every bar
+            // would be a zero that describes the BUILD, not the cat — so say which, instead.
+            const notEnrolled = usable && Array.isArray(model.enrolled_cat_ids)
+                && !model.enrolled_cat_ids.includes(id);
+            if (!usable || notEnrolled) {
+                vcMainEl.classList.add('hidden');
+                if (!usable) {
+                    fillNoGallery(vcEmptyEl, model, 'Counting a cat\'s visits');
+                } else {
+                    vcEmptyEl.innerHTML = '';
+                    const big = document.createElement('div');
+                    big.className = 'big';
+                    big.textContent = 'Not in the current model';
+                    const text = document.createElement('div');
+                    text.textContent = `The current model doesn't include ${catName(cat)}, so none of this cat's visits can be counted.`;
+                    vcEmptyEl.append(big, text);
+                }
+                vcEmptyEl.classList.remove('hidden');
+                return;
+            }
+            vcMainEl.classList.remove('hidden');
+            vcCardEl.classList.toggle('neighbour', !cat.is_resident);
+            renderVcWindow(cat);
+        }
+
+        function catName(cat) { return cat.name || `Cat #${cat.id}`; }
+
+        function renderVcHead(cat) {
+            vcHeadEl.innerHTML = '';
+            // visitAvatar keys off the Visits record's shape (`cat_id`), which the overview
+            // spells `id`.
+            const avatar = visitAvatar({ cat_id: cat.id, name: cat.name }, cat);
+            const who = document.createElement('div');
+            const h = document.createElement('h1');
+            h.textContent = catName(cat);
+            const tag = document.createElement('div');
+            tag.className = 'cat-tag ' + (cat.is_resident ? 'resident' : 'neighbour');
+            tag.textContent = cat.is_resident ? 'Resident' : 'Neighbour';
+            who.append(h, tag);
+            vcHeadEl.append(avatar, who);
+            vcHeadEl.classList.remove('hidden');
+        }
+
+        // A day as the compute PC named it ("2026-10-25"), read from the ISO date itself
+        // — never through the browser's clock, which could put it on a neighbouring day.
+        function vcDateParts(iso) {
+            const [y, m, d] = iso.split('-').map(Number);
+            return { y, m, d, wd: new Date(Date.UTC(y, m - 1, d)).getUTCDay() };
+        }
+        function vcDayLabel(iso) {
+            const p = vcDateParts(iso);
+            return `${VC_WEEKDAYS[p.wd]} ${p.d} ${VC_MONTHS[p.m - 1]}`;
+        }
+        function vcShortDate(iso) {
+            const p = vcDateParts(iso);
+            return `${p.d} ${VC_MONTHS[p.m - 1]}`;
+        }
+        function visitsWord(n) { return n === 1 ? 'visit' : 'visits'; }
+
+        // The window's rows for one cat: each day with `n` (its count) only where the day
+        // has a figure — `full` or `partial` — and null everywhere else.
+        function vcRows(catId) {
+            const key = String(catId);
+            return vcData.days.slice(-vcWindow).map(d => {
+                const has = d.state === 'full' || d.state === 'partial';
+                const c = d.cats ? d.cats[key] : undefined;
+                return { d, n: has ? (c ? c.visits : 0) : null, c: has ? (c || null) : null };
+            });
+        }
+
+        function renderVcWindow(cat) {
+            for (const b of vcSegEl.querySelectorAll('button')) {
+                b.setAttribute('aria-pressed', String(Number(b.dataset.days) === vcWindow));
+            }
+            const rows = vcRows(cat.id);
+            if (!rows.some(r => r.d.date === vcSelDate)) vcSelDate = rows[rows.length - 1].d.date;
+
+            // Truncation is bannered only when THIS window holds a day it left uncounted:
+            // a 30-day view of a count that stopped 70 days back is complete, because it is.
+            if (rows.some(r => r.d.state === 'uncounted')) {
+                showNote(vcNoteEl,
+                    'It was busy enough that we stopped counting partway back, so the ' +
+                    'earliest days here have no count.');
+            } else {
+                hideNote(vcNoteEl);
+            }
+
+            renderVcSummary(rows);
+            vcChartEl.setAttribute('aria-label',
+                `Visits per day for ${catName(cat)}, last ${vcWindow} days. ` +
+                'Use the left and right arrow keys to choose a day.');
+            drawVcChart(rows);
+            renderVcNotes(rows);
+            renderVcTable(rows, cat);
+        }
+
+        function renderVcSummary(rows) {
+            // The average is over FULLY recorded days only, and never today (it is not
+            // over): a partial day is a floor and a no-figure day has no number at all,
+            // so folding either in would understate the cat.
+            const full = rows.filter(r => r.d.state === 'full' && !r.d.today);
+            vcSummaryEl.innerHTML = '';
+            if (full.length) {
+                const avg = full.reduce((a, r) => a + r.n, 0) / full.length;
+                const shown = avg >= 10 ? String(Math.round(avg)) : String(Math.round(avg * 10) / 10);
+                const strong = document.createElement('strong');
+                strong.textContent = `About ${shown} ${shown === '1' ? 'visit' : 'visits'} a day`;
+                vcSummaryEl.append(strong, document.createTextNode(
+                    ` over the ${full.length} fully recorded ${full.length === 1 ? 'day' : 'days'} of the last ${vcWindow}`));
+            } else {
+                vcSummaryEl.textContent =
+                    `None of the last ${vcWindow} days was fully recorded, so there is no daily average.`;
+            }
+
+            const parts = [];
+            let best = null;
+            // Ties go to a fully recorded day over a partial one ("at least"), then to the
+            // most recent — the rows run oldest first, so a later equal row replaces.
+            for (const r of rows) {
+                if (r.n === null || r.n <= 0) continue;
+                if (best === null || r.n > best.n
+                    || (r.n === best.n && (r.d.state === 'full' || best.d.state === 'partial'))) best = r;
+            }
+            if (best) {
+                const atLeast = best.d.state === 'partial' ? 'at least ' : '';
+                parts.push(`Busiest day: ${vcDayLabel(best.d.date)}, ${atLeast}${best.n} ${visitsWord(best.n)}`);
+            }
+            parts.push(`as of ${timeOfDay(vcData.generated_ts)}`);
+            vcSubEl.textContent = parts.join(' · ');
+        }
+
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        function svgEl(tag, attrs, cls) {
+            const el = document.createElementNS(SVG_NS, tag);
+            for (const k in attrs) el.setAttribute(k, attrs[k]);
+            if (cls) el.setAttribute('class', cls);
+            return el;
+        }
+        // ~3 clean gridline steps (1/2/5 × 10^k) up to the window's busiest day.
+        function vcNiceStep(max) {
+            const raw = Math.max(1, max) / 3;
+            const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+            for (const m of [1, 2, 5, 10]) if (m * pow >= raw) return Math.max(1, m * pow);
+            return 10 * pow;
+        }
+        function vcTextW(text) { return text.length * 6.2; }  // 11px system sans, generous
+
+        function drawVcChart(rows) {
+            const width = Math.max(240, Math.round(vcChartEl.clientWidth || 300));
+            const max = rows.reduce((m, r) => (r.n !== null && r.n > m ? r.n : m), 0);
+            const step = vcNiceStep(max);
+            const top = Math.max(step, Math.ceil(max / step) * step);
+            const ticks = [];
+            for (let v = 0; v <= top; v += step) ticks.push(v);
+
+            const padTop = 8;
+            const left = Math.max(...ticks.map(v => vcTextW(String(v)))) + 8;
+            const right = 2;
+            const n = rows.length;
+            const slot = (width - left - right) / n;
+            const base = padTop + VC_PLOT_H;
+            const height = base + VC_AXIS_H;
+            const y = v => base - (v / top) * VC_PLOT_H;
+            // Bars stay thin and leave a gap to their neighbours; at 90 days on a phone the
+            // slot is ~3 px and the gap collapses to almost nothing, which the spec accepts.
+            const barW = slot > 4 ? Math.min(24, slot - 2) : Math.max(1, slot - 0.6);
+
+            const svg = svgEl('svg', {
+                width, height, viewBox: `0 0 ${width} ${height}`, 'aria-hidden': 'true', focusable: 'false',
+            });
+
+            // No-figure days: one muted band per run of consecutive days, full height.
+            for (let i = 0; i < n;) {
+                if (rows[i].n !== null) { i++; continue; }
+                let j = i;
+                while (j < n && rows[j].n === null) j++;
+                svg.appendChild(svgEl('rect', {
+                    x: left + i * slot, y: padTop, width: (j - i) * slot, height: VC_PLOT_H,
+                }, 'vc-nofig'));
+                i = j;
+            }
+            const sel = svgEl('rect', { x: 0, y: padTop, width: slot, height: VC_PLOT_H }, 'vc-sel');
+            svg.appendChild(sel);
+
+            for (const v of ticks) {
+                if (v > 0) {
+                    svg.appendChild(svgEl('line', {
+                        x1: left, x2: width - right, y1: Math.round(y(v)) + 0.5, y2: Math.round(y(v)) + 0.5,
+                    }, 'vc-grid'));
+                }
+                const label = svgEl('text', { x: left - 6, y: y(v) + 4, 'text-anchor': 'end' }, 'vc-tick');
+                label.textContent = String(v);
+                svg.appendChild(label);
+            }
+
+            rows.forEach((r, i) => {
+                if (r.n === null || r.n <= 0) return;
+                const x = left + i * slot + (slot - barW) / 2;
+                const h = Math.max(1, (r.n / top) * VC_PLOT_H);
+                const rad = Math.min(4, barW / 2, h);
+                // Rounded data-end, square at the baseline.
+                const d = `M${x},${base} V${base - h + rad} Q${x},${base - h} ${x + rad},${base - h}`
+                    + ` H${x + barW - rad} Q${x + barW},${base - h} ${x + barW},${base - h + rad} V${base} Z`;
+                svg.appendChild(svgEl('path', { d }, r.d.state === 'partial' ? 'vc-bar partial' : 'vc-bar'));
+                if (r.d.state === 'partial') {
+                    // "At least": the solid cap marks where the recorded count stops.
+                    svg.appendChild(svgEl('rect', { x, y: base - h, width: barW, height: Math.min(2, h) }, 'vc-cap'));
+                }
+            });
+
+            svg.appendChild(svgEl('line', {
+                x1: left, x2: width - right, y1: base + 0.5, y2: base + 0.5,
+            }, 'vc-base'));
+            const mark = svgEl('rect', { x: 0, y: base + 2, width: Math.max(4, slot), height: 2.5, rx: 1 }, 'vc-selmark');
+            svg.appendChild(mark);
+
+            // Date ticks: Mondays, weekly — fortnightly at 90 days — plus "today so far"
+            // under the last bar. A label that would collide with a kept one is dropped.
+            // Widths are MEASURED (the SVG is in the document by now): an estimate wide
+            // enough to be safe dropped the last month's ticks at 90 days on a phone.
+            vcChartEl.innerHTML = '';
+            vcChartEl.appendChild(svg);
+            const textW = (el, fallback) => {
+                try { return el.getComputedTextLength() || vcTextW(fallback); } catch { return vcTextW(fallback); }
+            };
+            const labelY = base + 18;
+            const todayText = rows[n - 1].d.today ? 'today so far' : vcShortDate(rows[n - 1].d.date);
+            const todayLabel = svgEl('text', { x: width - right, y: labelY, 'text-anchor': 'end' }, 'vc-tick today');
+            todayLabel.textContent = todayText;
+            svg.appendChild(todayLabel);
+            const kept = [[width - right - textW(todayLabel, todayText) - 4, width - right]];
+            const mondays = [];
+            rows.forEach((r, i) => { if (vcDateParts(r.d.date).wd === 1) mondays.push(i); });
+            const every = vcWindow >= 90 ? 2 : 1;
+            for (let k = mondays.length - 1, c = 0; k >= 0; k--, c++) {
+                if (c % every) continue;
+                const i = mondays[k];
+                const cx = left + (i + 0.5) * slot;
+                const text = vcShortDate(rows[i].d.date);
+                const t = svgEl('text', { x: cx, y: labelY, 'text-anchor': 'middle' }, 'vc-tick');
+                t.textContent = text;
+                svg.appendChild(t);
+                const w = textW(t, text);
+                const box = [cx - w / 2 - 4, cx + w / 2 + 4];
+                if (box[0] < 0 || kept.some(([a, b]) => box[0] < b && box[1] > a)) { t.remove(); continue; }
+                kept.push(box);
+                svg.insertBefore(svgEl('line', {
+                    x1: Math.round(cx) + 0.5, x2: Math.round(cx) + 0.5, y1: base + 1, y2: base + 5,
+                }, 'vc-tickline'), t);
+            }
+
+            vcView = { rows, left, slot, sel, mark };
+            vcSelectIndex(rows.findIndex(r => r.d.date === vcSelDate));
+        }
+
+        function vcSelectIndex(i) {
+            if (!vcView) return;
+            const { rows, left, slot, sel, mark } = vcView;
+            i = Math.max(0, Math.min(rows.length - 1, i));
+            vcSelDate = rows[i].d.date;
+            sel.setAttribute('x', left + i * slot);
+            const mw = Math.max(4, slot);
+            mark.setAttribute('x', left + (i + 0.5) * slot - mw / 2);
+            renderVcReadout(rows[i]);
+        }
+
+        function vcReadoutText(r) {
+            const d = r.d;
+            const when = vcDayLabel(d.date) + (d.today ? ' (today so far)' : '');
+            if (r.n === null) return `${when} — ${VC_NO_FIGURE[d.state] || 'no count'}`;
+            const split = r.c && r.c.day != null && r.c.night != null && r.n > 0
+                ? ` (${r.c.day} by day, ${r.c.night} after dark)` : '';
+            if (d.state === 'partial') return `${when} — partly recorded — at least ${r.n}${split}`;
+            return `${when} — ${r.n} ${visitsWord(r.n)}${split}`;
+        }
+        function renderVcReadout(r) {
+            const text = vcReadoutText(r);
+            const dash = text.indexOf(' — ');
+            vcReadoutEl.innerHTML = '';
+            const b = document.createElement('b');
+            b.textContent = text.slice(0, dash);
+            vcReadoutEl.append(b, document.createTextNode(text.slice(dash)));
+        }
+
+        function renderVcNotes(rows) {
+            vcNotesEl.innerHTML = '';
+            const key = cls => {
+                const k = document.createElement('span');
+                k.className = 'key ' + cls;
+                k.setAttribute('aria-hidden', 'true');
+                return k;
+            };
+            if (rows.some(r => r.d.state === 'partial')) {
+                const p = document.createElement('p');
+                p.append(key('partial'), document.createTextNode(
+                    'Lighter bars are days only partly recorded, so they show at least that many visits.'));
+                vcNotesEl.appendChild(p);
+            }
+            const counts = {};
+            for (const r of rows) if (r.n === null) counts[r.d.state] = (counts[r.d.state] || 0) + 1;
+            const parts = [];
+            if (counts.none) parts.push(`${counts.none} not recorded (no pictures were kept)`);
+            if (counts.expired) parts.push(`${counts.expired} no longer kept`);
+            if (counts.unnamed) parts.push(`${counts.unnamed} not named yet (the current model hasn't been run over them — usual for a while after the model changes)`);
+            if (counts.uncounted) parts.push(`${counts.uncounted} not counted (too busy to count this far back)`);
+            if (parts.length) {
+                const p = document.createElement('p');
+                p.append(key('nofig'), document.createTextNode(`Shaded days have no count: ${parts.join('; ')}.`));
+                vcNotesEl.appendChild(p);
+            }
+        }
+
+        function renderVcTable(rows, cat) {
+            vcTableEl.innerHTML = '';
+            const cap = document.createElement('caption');
+            cap.textContent = `Visits per day for ${catName(cat)}, last ${vcWindow} days`;
+            const head = document.createElement('tr');
+            for (const h of ['Date', 'Visits', 'State']) {
+                const th = document.createElement('th');
+                th.scope = 'col';
+                th.textContent = h;
+                head.appendChild(th);
+            }
+            const thead = document.createElement('thead');
+            thead.appendChild(head);
+            const tbody = document.createElement('tbody');
+            for (const r of rows) {
+                const tr = document.createElement('tr');
+                const cells = [
+                    vcDayLabel(r.d.date) + (r.d.today ? ' (today so far)' : ''),
+                    r.n === null ? '—' : (r.d.state === 'partial' ? `at least ${r.n}` : String(r.n)),
+                    r.n === null ? VC_NO_FIGURE[r.d.state] || 'no count'
+                        : (r.d.state === 'partial' ? 'partly recorded' : 'recorded'),
+                ];
+                for (const c of cells) {
+                    const td = document.createElement('td');
+                    td.textContent = c;
+                    tr.appendChild(td);
+                }
+                tbody.appendChild(tr);
+            }
+            vcTableEl.append(cap, thead, tbody);
+        }
+
+        // Picking a day: the bars are far too thin to tap, so the whole plot is hit-tested
+        // by x into full-height day columns (no-figure days included). Tap selects; a drag
+        // scrubs. Pointer capture keeps a scrub alive past the chart's edge.
+        function vcIndexAt(clientX) {
+            const svg = vcChartEl.querySelector('svg');
+            if (!svg || !vcView) return -1;
+            const x = clientX - svg.getBoundingClientRect().left;
+            return Math.floor((x - vcView.left) / vcView.slot);
+        }
+        let vcScrubbing = false;
+        vcChartEl.addEventListener('pointerdown', (e) => {
+            if (!vcView || (e.pointerType === 'mouse' && e.button !== 0)) return;
+            vcScrubbing = true;
+            try { vcChartEl.setPointerCapture(e.pointerId); } catch { /* not capturable */ }
+            vcSelectIndex(vcIndexAt(e.clientX));
+        });
+        vcChartEl.addEventListener('pointermove', (e) => {
+            if (vcScrubbing) vcSelectIndex(vcIndexAt(e.clientX));
+        });
+        for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            vcChartEl.addEventListener(type, () => { vcScrubbing = false; });
+        }
+        vcChartEl.addEventListener('keydown', (e) => {
+            if (!vcView || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+            e.preventDefault();
+            const i = vcView.rows.findIndex(r => r.d.date === vcSelDate);
+            vcSelectIndex(i + (e.key === 'ArrowLeft' ? -1 : 1));
+        });
+
+        // The window toggle re-renders from the payload already loaded: no fetch, no wait.
+        vcSegEl.addEventListener('click', (e) => {
+            const b = e.target.closest('button[data-days]');
+            if (!b) return;
+            const days = Number(b.dataset.days);
+            if (!VC_WINDOWS.includes(days) || days === vcWindow) return;
+            vcWindow = days;
+            if (vcData && vcOverview) renderVisitCat();
+        });
+
+        // The chart is drawn at its real pixel width (so text stays 11px at any width);
+        // redraw it when that width changes.
+        let vcResizeQueued = false;
+        window.addEventListener('resize', () => {
+            if (vcCatId === null || vcResizeQueued || !vcData || vcMainEl.classList.contains('hidden')) return;
+            vcResizeQueued = true;
+            requestAnimationFrame(() => {
+                vcResizeQueued = false;
+                // Only the SVG depends on width: re-rendering the page would rebuild the
+                // header's avatar <img> (a refetch and a flicker) on every resize frame.
+                if (vcCatId !== null && vcView && !vcMainEl.classList.contains('hidden')) drawVcChart(vcView.rows);
+            });
+        });
 
         // ================= CATS view =================
         async function loadCats() {
@@ -3687,6 +4361,11 @@
         // data is exactly what you want.
         function gentleRefresh() {
             if (window.scrollY > 200) return;
+            // The per-cat daily chart is NOT live: a nudge lands every few seconds while a
+            // cat lingers, and once the server's ten-minute count has expired each one
+            // would be a 90-day walk on the shared write connection. Route entry and the
+            // foreground resume (refreshActiveView, directly) still reload it.
+            if (vcCatId !== null) return;
             refreshActiveView();
         }
 

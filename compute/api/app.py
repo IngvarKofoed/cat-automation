@@ -40,6 +40,7 @@ import glob
 import logging
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -108,6 +109,15 @@ _EVENTS_PAGE = 100
 # param: the page is a fixed household glance, and a caller-chosen window would let the
 # widest one grow without bound (the store reads the widest once — see Store.door_stats).
 _DOOR_STATS_HOURS = (6, 24)
+
+# The per-cat daily chart (user-cat-daily-visits-chart spec): how many local days the
+# server counts, and how long one count is served before it is redone. Always the widest
+# window the page offers (90) — 30/60/90 is a client-side slice, so switching window is a
+# re-render that never waits and a day reads the same in every window. Ten minutes is the
+# chosen trade between a cold count (~8 s on the real store, a walk on the shared write
+# connection) and how stale "today so far" may get.
+_DAILY_VISITS_DAYS = 90
+_DAILY_CACHE_TTL_S = 600
 
 # Config via environment variables (the edge's style; the compute tier has no
 # config store yet). CAT_PI_URL is read by EdgeClient itself, not here.
@@ -2043,26 +2053,85 @@ def create_app(
         # /api/label/regime-coverage: with no location or no astral it reports
         # `available: False` + a reason and the store leaves every day/night None, rather
         # than guessing a boundary and returning confidently-wrong columns.
-        coords = store.get_location()
-        available = False
-        reason = None
-        is_night = None
-        location = None
-        if coords is None:
-            reason = "location_unset"
-        elif not astral_available():
-            reason = "astral_unavailable"
-        else:
-            lat, lon = coords
-            is_night = night_classifier(lat, lon)
-            available = True
-            location = {"latitude": lat, "longitude": lon}
+        is_night, split = _door_stats_split()
         result = store.door_stats(hours=_DOOR_STATS_HOURS, is_night=is_night)
-        result["split"] = (
-            {"available": True, "location": location}
-            if available
-            else {"available": False, "reason": reason}
-        )
+        result["split"] = split
+        return result
+
+    def _door_stats_split():
+        # `(is_night | None, split)` for the Visits page and its per-cat daily chart, so
+        # the two can never gate the day/night split differently: with no location or no
+        # astral, `available: False` + a reason and no classifier (every day/night None).
+        coords = store.get_location()
+        if coords is None:
+            return None, {"available": False, "reason": "location_unset"}
+        if not astral_available():
+            return None, {"available": False, "reason": "astral_unavailable"}
+        lat, lon = coords
+        return night_classifier(lat, lon), {
+            "available": True, "location": {"latitude": lat, "longitude": lon},
+        }
+
+    # The per-cat daily chart's count cache: ONE entry, the newest count, keyed on what it
+    # was counted under — (local date, active model id, threshold). The lock makes it
+    # single-flight: a request arriving while a count runs waits for that count and is
+    # then served from it, rather than starting a second walk.
+    daily_cache: "dict" = {"key": None, "at": 0.0, "counts": None, "split": None}
+    daily_lock = threading.Lock()
+
+    @app.get("/api/door-stats/daily")
+    def api_door_stats_daily():
+        # The user app's per-cat daily chart (`#visits/<cat_id>`; see the
+        # user-cat-daily-visits-chart spec): every cat's visits per local day over the
+        # last 90 days. No parameters — the client asks for one cat and one window by
+        # slicing this, so every cat and every window is served by one count.
+        #
+        # What is cached is the COUNTS plus the `split` they were counted with, together:
+        # a location set inside the ten minutes must never pair `available: true` with
+        # day/night columns counted without it. The RECORDING half (which days the store
+        # holds) is recomputed on every request — it is cheap, and a Clear or an eviction
+        # must show at once — and merged by date.
+        #
+        # Deliberately NOT refreshed by the SSE nudge (the page ignores it): a nudge lands
+        # every few seconds while a cat lingers, and an expired cache would make each one a
+        # 90-day walk on the shared write connection (the CHANGELOG 354 concern, multiplied).
+        now_ms = int(time.time() * 1000)
+        with daily_lock:
+            model = store.active_model()
+            key = (
+                Store.local_date(now_ms),
+                model["id"] if model else None,
+                model["threshold"] if model else None,
+            )
+            fresh = (
+                daily_cache["counts"] is not None
+                and daily_cache["key"] == key
+                and time.monotonic() - daily_cache["at"] < _DAILY_CACHE_TTL_S
+            )
+            if not fresh:
+                is_night, split = _door_stats_split()
+                counts = store.daily_visit_counts(
+                    days=_DAILY_VISITS_DAYS, is_night=is_night, now_ms=now_ms
+                )
+                model_out = counts["model"]
+                # Keyed on what the count ACTUALLY read (its own model + threshold), not
+                # on the pre-read above: a promotion landing mid-walk then files the
+                # entry under the new model rather than mislabelling it as the old one's.
+                daily_cache.update(
+                    key=(
+                        Store.local_date(counts["generated_ts"]),
+                        model_out["id"] if model_out else None,
+                        counts["threshold"],
+                    ),
+                    at=time.monotonic(),
+                    counts=counts,
+                    split=split,
+                )
+            counts = daily_cache["counts"]
+            split = daily_cache["split"]
+        recording = store.daily_recording(days=_DAILY_VISITS_DAYS, now_ms=now_ms)
+        result = store.merge_daily(counts, recording)
+        result["split"] = split
         return result
 
     @app.post("/api/collector/start")

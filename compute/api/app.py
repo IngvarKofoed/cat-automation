@@ -1237,6 +1237,16 @@ def create_app(
     cleanup_manager = cleanup_manager if cleanup_manager is not None else CleanupManager()
     app.state.cleanup_manager = cleanup_manager
 
+    # Complete any alarm row a restart left open (its episode lived in the old process's
+    # memory, so nothing else ever can). LIVE app only: the CLI tools open the same store,
+    # and one of them must never close an episode the running server still owns. Runs
+    # BEFORE the live-identify worker is built: its alarm seeds the previous-episode floor
+    # from the newest row's end, which an open row would leave unset.
+    if start_collector:
+        closed = store.close_open_actions(deterrent.ENDED_INTERRUPTED, int(time.time() * 1000))
+        if closed:
+            logger.info("closed %d alarm row(s) left open by a restart as interrupted", closed)
+
     # The always-on live-identify worker. Built AFTER the analysis + training managers
     # because it must yield the shared GPU/DB-connection to either while a manual job
     # runs — ``is_busy`` reads both managers' ``running`` (a @property on each, so no
@@ -1254,14 +1264,6 @@ def create_app(
             sound=client,
         )
     app.state.live_identify_manager = live_identify_manager
-
-    # Complete any alarm row a restart left open (its episode lived in the old process's
-    # memory, so nothing else ever can). LIVE app only: the CLI tools open the same store,
-    # and one of them must never close an episode the running server still owns.
-    if start_collector:
-        closed = store.close_open_actions(deterrent.ENDED_INTERRUPTED, int(time.time() * 1000))
-        if closed:
-            logger.info("closed %d alarm row(s) left open by a restart as interrupted", closed)
 
     # Restore live-naming at launch — but ONLY on a live app. ``restore`` start()s a GPU
     # worker thread (the compute PC is the dedicated always-on box), which a test app

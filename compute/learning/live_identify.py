@@ -117,6 +117,11 @@ def _default_now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _idle_pass(caught_up: bool, behind: int) -> dict:
+    """The alarm pass summary when nothing was processed — the same shape as a real pass."""
+    return {"ids": 0, "ms": 0, "detect_ms": 0, "identify_ms": 0, "caught_up": caught_up, "behind": behind}
+
+
 def run_live_identify(
     manager: "LiveIdentifyManager",
     stop_event: threading.Event,
@@ -547,7 +552,17 @@ class LiveIdentifyManager:
                 visit_start_ts = (
                     self._store.frame_recv_ts(open_span[0]) if open_span is not None else None
                 )
-                self._alarm.maybe_start(model, self._now_ms(), visit_start_ts)
+                # Behind, the frontier is the last frame this pass processed: every frame
+                # still to come lies after it, so it bounds what an absence may say.
+                frontier_ms = None
+                if not info["caught_up"]:
+                    with self._lock:
+                        hwm = self._alarm_hwm
+                    frontier_ms = self._store.frame_recv_ts(hwm)
+                self._alarm.maybe_start(
+                    model, self._now_ms(), visit_start_ts,
+                    caught_up=info["caught_up"], frontier_ms=frontier_ms,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("live-identify: alarm start failed")
                 self._alarm_pass_failed = True
@@ -582,29 +597,37 @@ class LiveIdentifyManager:
         if not running:
             if open_span is None:
                 self._set_alarm_hwm(hwm, epoch)
-                return None, {"ids": 0, "ms": 0, "caught_up": True, "behind": 0}
+                return None, _idle_pass(True, 0)
             start_id, latest = open_span
-            # Jump to the visit's first frame — but no further back than the start window:
-            # only frames received in the last DETER_WINDOW_S can start an alarm, so
-            # replaying a long visit oldest-first (switch turned On, or the worker
-            # restarted, mid-visit) would only delay the start by minutes. The skipped
-            # frames are the closed pass's to name, as every other closed visit's are.
+            # Jump to the visit's first frame — but no further back than DETER_WINDOW_S
+            # before now: replaying a long visit oldest-first (switch turned On, or the
+            # worker restarted, mid-visit) would only delay the start by minutes. The
+            # skipped frames are the closed pass's to name, as every other closed visit's
+            # are. Known limit, accepted (alarm-presence-vote spec): the presence vote
+            # reaches back further than this, so frames skipped here — after a switch-on or
+            # restart mid-presence, or whenever the step lags the camera by more than
+            # DETER_WINDOW_S — are absent from that vote.
             window_first, _ = self._store.resolve_ts_range(now - int(DETER_WINDOW_S * 1000), None)
             floor = start_id - 1 if window_first is None else max(start_id, window_first) - 1
             hwm = max(hwm, floor)
         lo = hwm + 1
         if lo > latest:
             self._set_alarm_hwm(hwm, epoch)
-            return open_span, {"ids": 0, "ms": 0, "caught_up": True, "behind": 0}
+            return open_span, _idle_pass(True, 0)
         hi = min(latest, hwm + DETER_MAX_FRAMES)
 
+        # The pass is timed whole (`ms`) and per half, so where its ~1 s fixed cost goes —
+        # detection or identification — is readable from /api/deterrent. Each half is
+        # truncated to whole ms off the same clock, so the two never sum past `ms`.
         started = time.monotonic()
         self._ensure_resident(model)
         if self._analyzer is None:
             self._analyzer = self._analyzer_factory()
+        detect_started = time.monotonic()
         self._detect(self._store, self._analyzer, DetectAdapter(stop_event), since_id=lo, until_id=hi)
+        detect_ended = time.monotonic()
         if stop_event.is_set():
-            return open_span, {"ids": 0, "ms": 0, "caught_up": False, "behind": latest - hwm}
+            return open_span, _idle_pass(False, latest - hwm)
         self._identify(
             self._store,
             model,
@@ -615,10 +638,13 @@ class LiveIdentifyManager:
             gallery=self._resident_gallery,
             progress=lambda done, total: not stop_event.is_set(),
         )
+        ended = time.monotonic()
         self._set_alarm_hwm(hi, epoch)
         return open_span, {
             "ids": hi - lo + 1,
-            "ms": int((time.monotonic() - started) * 1000),
+            "ms": int((ended - started) * 1000),
+            "detect_ms": int((detect_ended - detect_started) * 1000),
+            "identify_ms": int((ended - detect_ended) * 1000),
             "caught_up": hi >= latest,
             "behind": latest - hi,
         }

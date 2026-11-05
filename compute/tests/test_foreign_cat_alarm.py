@@ -136,22 +136,56 @@ def test_alarm_frames_counts_only_floored_identified_frames(tmp_path):
     assert store.alarm_frames(1, BASE + 100) == [(ids[5], BASE + 500, 6, 0.9)]
 
 
-def test_alarm_frames_plan_drives_from_frames(tmp_path):
+def test_alarm_frames_until_ts_bounds_the_read_inclusively(tmp_path):
+    store = _store(tmp_path)
+    seq = [0]
+    ids = [_add(store, BASE + i * 100, True, seq) for i in range(5)]
+    for fid in ids:
+        _verdict(store, fid, 0.8); _ident(store, fid, 1, 5, 0.2)
+    got = store.alarm_frames(1, BASE + 100, until_ts=BASE + 300)
+    assert [fid for fid, *_ in got] == ids[1:4]
+    assert store.alarm_frames(1, BASE + 100) == store.alarm_frames(1, BASE + 100, until_ts=BASE + 400)
+
+
+@pytest.mark.parametrize("until", [False, True])
+def test_alarm_frames_plan_drives_from_frames(tmp_path, until):
     # Left to the planner (no ANALYZE stats), this join drives from the oracle's whole
     # analysis partition — the mis-plan entries 229/265/276/307/385/391 kept hitting.
+    # Re-pinned with the presence vote's 2-minute bound and the replay's upper bound: the
+    # read is now ~1,400 rows a tick during a long presence, so the seek must hold.
     store = _store(tmp_path)
     sql = (
         "SELECT f.id, f.recv_ts, i.cat_id, i.distance"
         " FROM frames f CROSS JOIN analysis a CROSS JOIN identifications i"
-        " WHERE f.recv_ts >= ?"
+        " WHERE f.recv_ts >= ?" + (" AND f.recv_ts <= ?" if until else "") +
         " AND a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1 AND a.score >= ?"
         " AND i.frame_id = f.id AND i.model_version_id = ? AND i.cat_id IS NOT NULL"
         " ORDER BY f.recv_ts ASC, f.id ASC"
     )
-    plan = _plan(store, sql, (0, "yolo-serial", 0.3, 1))
+    params = (0,) + ((10**13,) if until else ()) + ("yolo-serial", 0.3, 1)
+    plan = _plan(store, sql, params)
     assert "idx_frames_recv_ts" in plan[0], plan
     assert all("idx_analysis_analyzer_verdict" not in p for p in plan), plan
     assert all("TEMP B-TREE" not in p for p in plan), plan
+
+
+def test_alarm_frames_sql_is_the_pinned_text(tmp_path, monkeypatch):
+    # The plan test above pins SQL text it writes out itself; this pins that alarm_frames
+    # still issues exactly that text, so the two cannot drift apart.
+    store = _store(tmp_path)
+    seen = []
+    real = store._conn
+
+    class Spy:
+        def execute(self, sql, params=()):
+            seen.append(sql)
+            return real.execute(sql, params)
+
+    monkeypatch.setattr(store, "_conn", Spy())
+    store.alarm_frames(1, 0)
+    store.alarm_frames(1, 0, until_ts=5)
+    assert seen[0].endswith("ORDER BY f.recv_ts ASC, f.id ASC") and "f.recv_ts <= ?" not in seen[0]
+    assert " WHERE f.recv_ts >= ? AND f.recv_ts <= ? AND a.frame_id = f.id" in seen[1]
 
 
 # =====================================================================================
@@ -193,6 +227,42 @@ def test_close_open_actions_completes_only_open_rows(tmp_path):
     rows = {r["id"]: r for r in store.list_actions()}
     assert (rows[open_id]["ended"], rows[open_id]["end_ts"]) == ("interrupted", BASE + 10)
     assert (rows[done_id]["ended"], rows[done_id]["end_ts"]) == ("gone", BASE + 5)
+
+
+def test_actions_carry_the_trigger(tmp_path):
+    store = _store(tmp_path)
+    store.add_action({"kind": "sound", "mode": "on", "start_ts": BASE, "verdict": "unknown",
+                      "trigger": "takeover"})
+    store.add_action({"kind": "sound", "mode": "on", "start_ts": BASE + 1, "verdict": "unknown"})
+    rows = store.list_actions()
+    assert [r["trigger"] for r in rows] == [None, "takeover"]     # newest first; older rows read NULL
+    assert [r["trigger"] for r in store.alarm_actions_between(BASE, BASE + 1)] == ["takeover", None]
+    assert store.alarm_actions_between(BASE + 2, BASE + 9) == []
+
+
+def test_trigger_column_is_added_to_an_existing_actions_table(tmp_path):
+    # A store from before the column: the probe-and-ALTER migration adds it, and the rows
+    # already there read NULL — "older rows show none" in the admin log.
+    import sqlite3
+
+    db = tmp_path / "index.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,"
+        " mode TEXT NOT NULL, start_ts INTEGER NOT NULL, end_ts INTEGER, verdict TEXT NOT NULL,"
+        " cat_id INTEGER, n_counted INTEGER, n_votes INTEGER, distance REAL,"
+        " model_version_id INTEGER, threshold REAL, frame_id INTEGER, frame_recv_ts INTEGER,"
+        " visit_start_ts INTEGER, sound TEXT, clips_played INTEGER NOT NULL DEFAULT 0,"
+        " clips_failed INTEGER NOT NULL DEFAULT 0, ended TEXT,"
+        " pi_disabled INTEGER NOT NULL DEFAULT 0, last_error TEXT)"
+    )
+    conn.execute("INSERT INTO actions (kind, mode, start_ts, verdict) VALUES ('sound', 'on', 1, 'unknown')")
+    conn.commit()
+    conn.close()
+    store = _store(tmp_path)
+    cols = {r[1] for r in store._conn.execute("PRAGMA table_info(actions)").fetchall()}
+    assert "trigger" in cols
+    assert store.list_actions()[0]["trigger"] is None
 
 
 def test_action_columns_are_whitelisted(tmp_path):
@@ -320,6 +390,16 @@ class Door:
         if tick:
             self.mgr._tick(self.stop)
 
+    def mixed_second(self, whats, motion=True, tick=True):
+        """One simulated second holding ``whats`` frame by frame (10 entries)."""
+        assert len(whats) == 10
+        for i, what in enumerate(whats):
+            fid = _add(self.store, self.now + i * 100, motion, self.seq)
+            self.truth[fid] = what
+        self.now += 1000
+        if tick:
+            self.mgr._tick(self.stop)
+
     def rows(self):
         return [r for r in self.store.list_actions() if r["mode"] == "on"]
 
@@ -347,8 +427,12 @@ def test_neighbour_visit_loops_alternating_clips_and_stops_when_gone(tmp_path):
     [row] = door.rows()
     assert (row["verdict"], row["cat_id"], row["cat_name"]) == ("neighbour", door.tom, "Tom")
     assert row["ended"] == "gone" and row["end_ts"] is not None
-    # Starts after the first second of Tom (10 counted frames), ~1 s here.
-    assert row["start_ts"] - first_tom_ts <= 1_000
+    # At 10 counted frames a second the takeover net's 20 frames, all foreign, land after
+    # the second second of Tom — the same tick the presence vote's 1 s hold is met. Both
+    # paths are met; the row follows the presence vote, which calls Tom foreign, so it reads
+    # `presence` (20 counted: the whole presence, which is also the net's whole window).
+    assert row["start_ts"] - first_tom_ts <= 2_000
+    assert row["trigger"] == deterrent.TRIGGER_PRESENCE and row["n_counted"] == 20
     assert row["visit_start_ts"] == first_tom_ts
     # Stops within 3 s of the last foreign frame, plus at most one tick.
     assert 3_000 <= row["end_ts"] - last_tom_ts <= 4_000
@@ -393,7 +477,10 @@ def test_unknown_cat_sets_it_off(tmp_path):
         door.second(door.stranger())
     [row] = door.rows()
     assert (row["verdict"], row["cat_id"]) == ("unknown", None)
-    assert row["distance"] == pytest.approx(0.9) and row["n_votes"] == 0
+    # A lone stranger: the presence vote calls it unknown, so the row is the presence's —
+    # nothing within the threshold, so no votes — even though the net was met too.
+    assert row["trigger"] == deterrent.TRIGGER_PRESENCE
+    assert row["distance"] == pytest.approx(0.9) and row["n_votes"] == 0 and row["n_counted"] == 20
 
 
 def test_resident_visit_adds_no_row(tmp_path):
@@ -615,6 +702,119 @@ def test_pass_summary_reports_what_it_processed(tmp_path):
     assert last["ids"] == 10 and last["caught_up"] is True and last["behind"] == 0
 
 
+def test_a_sparse_foreign_presence_starts_on_the_presence_vote(tmp_path):
+    # Three counted frames a second (the rest below the feed's 0.3 floor) never reach the
+    # takeover net's 20 in 5 s, so the presence vote, held 1 s of camera time, fires.
+    door = Door(tmp_path)
+    noise = door.tom_at(score=0.2)
+    pattern = [door.tom_at(), noise, noise, door.tom_at(), noise, noise, door.tom_at(), noise, noise, noise]
+    first_ts = door.now
+    for _ in range(6):
+        door.mixed_second(pattern)
+    [row] = door.rows()
+    assert row["trigger"] == deterrent.TRIGGER_PRESENCE
+    assert (row["verdict"], row["cat_id"]) == ("neighbour", door.tom)
+    assert row["n_counted"] >= deterrent.DETER_MIN_FRAMES and row["n_votes"] == row["n_counted"]
+    # 10 counted frames by the 4th second (3 a second), then a 1 s hold.
+    assert row["start_ts"] - first_ts <= 5_000
+
+
+def test_a_resident_presence_with_a_lookalike_window_does_not_start(tmp_path):
+    # The failure the presence vote exists for: a long resident visit in which, for a few
+    # seconds, a lookalike neighbour edges ahead of the last 5 s. The old rule fired; the
+    # whole presence still names Mittens, so nothing starts.
+    door = Door(tmp_path)
+    for _ in range(10):
+        door.second(door.mittens_at())                   # 100 Mittens frames
+    lookalike = [door.tom_at()] * 6 + [door.mittens_at()] * 4
+    for _ in range(6):
+        door.mixed_second(lookalike)                     # 60% Tom over these 6 s
+    for _ in range(4):
+        door.second()
+    # The old rule's last 5 s held 30 Tom to 20 Mittens from the 5th second and fired
+    # (replayed in test_alarm_replay.py); the presence holds 100 + 24 Mittens to 36 Tom.
+    assert door.rows() == []
+
+
+def test_a_stranger_tailgating_a_resident_is_caught_by_the_takeover_net(tmp_path):
+    # Mittens in first, a stranger straight behind her in the same presence: the presence
+    # vote hands the stranger's frames to Mittens, the takeover net does not.
+    door = Door(tmp_path)
+    for _ in range(15):
+        door.second(door.mittens_at())                   # 150 Mittens frames
+    for _ in range(4):
+        door.second(door.stranger())
+    # 4 s in, the last 5 s still hold a second of Mittens: 40 of 50, under the 90% share.
+    assert door.rows() == []
+    door.second(door.stranger())                         # now 50 of 51 are foreign
+    [row] = door.rows()
+    assert row["trigger"] == deterrent.TRIGGER_TAKEOVER
+    assert (row["verdict"], row["cat_id"]) == ("unknown", None)
+
+
+def test_the_previous_alarm_floor_is_seeded_from_the_log(tmp_path):
+    door = Door(tmp_path)
+    store = door.store
+    assert deterrent.Alarm(store, None)._last_end_ms is None          # no episode yet
+    store.add_action({"kind": "sound", "mode": "on", "start_ts": BASE, "verdict": "unknown",
+                      "end_ts": BASE + 9_000, "ended": "gone"})
+    store.add_action({"kind": "sound", "mode": "test", "start_ts": BASE + 20_000,
+                      "verdict": "test", "end_ts": BASE + 22_000})
+    seeded = deterrent.Alarm(store, None)
+    assert seeded._last_end_ms == BASE + 9_000                        # tests do not count
+    assert seeded.status()["last_ended"] == "gone"                    # never an end with no reason
+    # An episode still open reads None: on a live app the launch sweep closes it first.
+    store.add_action({"kind": "sound", "mode": "on", "start_ts": BASE + 30_000, "verdict": "unknown"})
+    assert deterrent.Alarm(store, None)._last_end_ms is None
+    store.close_open_actions("interrupted", BASE + 31_000)
+    assert deterrent.Alarm(store, None)._last_end_ms == BASE + 31_000
+
+
+def _restart_after_gone(door, seed=True):
+    """Tom 4 s -> alarm; 3 empty seconds -> gone; restart; Tom back within 5 s of his last
+    frame, so his old frames are in the same presence. Returns the rows after one new second."""
+    for _ in range(4):
+        door.second(door.tom_at())
+    for _ in range(3):
+        door.second()
+    [row] = door.rows()
+    assert row["ended"] == "gone"
+    store = door.store
+    if not seed:
+        store.last_alarm_end = lambda: None  # the memory-only floor of before
+    door.mgr = LiveIdentifyManager(
+        store, is_busy=lambda: False, detect=door._detect, identify=door._identify,
+        analyzer_factory=lambda: object(), embedder_factory=_Embedder,
+        gallery_loader=lambda path: object(), now_ms=lambda: door.now, sound=door.pi,
+    )
+    if seed:
+        assert door.mgr._alarm._last_end_ms == row["end_ts"]
+    door.second(door.tom_at())
+    return door.rows()
+
+
+def test_a_restart_does_not_recount_the_last_episodes_stranger(tmp_path):
+    # The presence vote reaches back 2 minutes, so after a restart the floor has to come
+    # from the log. Control first: with the floor unseeded, the same door DOES restart the
+    # alarm on the departed episode's frames — so the seeded case below is not passing
+    # merely because the scenario never reached that condition.
+    assert len(_restart_after_gone(Door(tmp_path / "control"), seed=False)) == 2
+    assert len(_restart_after_gone(Door(tmp_path / "seeded"))) == 1
+
+
+def test_pass_summary_splits_detection_from_identification(tmp_path):
+    door = Door(tmp_path)
+    door.second(door.tom_at())
+    last = door.mgr.alarm_status()["last_pass"]
+    assert {"detect_ms", "identify_ms"} <= set(last)
+    assert last["detect_ms"] + last["identify_ms"] <= last["ms"]
+    door.second()  # nothing open: the idle summary carries the same keys
+    for _ in range(3):
+        door.second()
+    idle = door.mgr.alarm_status()["last_pass"]
+    assert idle["ids"] == 0 and idle["detect_ms"] == 0 and idle["identify_ms"] == 0
+
+
 # =====================================================================================
 #  The test button
 # =====================================================================================
@@ -656,3 +856,41 @@ def test_play_test_clip_without_a_pi_client(tmp_path):
     store = _store(tmp_path)
     res = deterrent.play_test_clip(store, None, "alarm1", BASE)
     assert res["outcome"] == "failed" and "CAT_PI_URL" in res["error"]
+
+
+def test_an_old_foreign_presence_cannot_start_an_alarm_while_the_pass_is_behind(tmp_path):
+    # Tom visited with the switch Off; the closed-visit pass named his frames. A minute
+    # later the switch is On and a new visit opens with more frames than one pass takes,
+    # none of the first 30 counted yet. The step is BEHIND, but its frontier is a minute
+    # past Tom's newest frame — nothing still to come can continue that presence, so it is
+    # stale. Without the frontier, "behind" meant "never stale" and Tom's minute-old
+    # presence met its hold in camera time and sounded at whoever had just arrived.
+    door = Door(tmp_path, mode="off")
+    for _ in range(4):
+        door.second(door.tom_at())
+    for _ in range(60):
+        door.second()                                    # a quiet minute; Tom is named
+    assert len(door.store.alarm_frames(door.model_id, 0)) == 40
+    deterrent.set_mode(door.store, "on")
+    for _ in range(4):
+        door.second(EMPTY, motion=True, tick=False)      # a new visit, nothing counted yet
+    door.mgr._tick(door.stop)
+    assert door.mgr.alarm_status()["last_pass"]["caught_up"] is False
+    assert door.rows() == []
+
+
+def test_an_empty_door_costs_only_the_short_probe(tmp_path):
+    # With the switch On the step runs every second all day. Once nothing counted lies
+    # within DETER_WINDOW_S of the frontier the vote is stale, so the two-minute read (and
+    # the roster) is skipped: only the few-seconds probe is paid.
+    door = Door(tmp_path)
+    for _ in range(4):
+        door.second(door.mittens_at())
+    for _ in range(8):
+        door.second()
+    reads = []
+    real = door.store.alarm_frames
+    door.store.alarm_frames = lambda mid, since, **kw: (reads.append(since), real(mid, since, **kw))[1]
+    door.second()
+    window_ms = int(deterrent.DETER_WINDOW_S * 1000)
+    assert reads and all(since >= door.now - window_ms - 1_000 for since in reads), reads

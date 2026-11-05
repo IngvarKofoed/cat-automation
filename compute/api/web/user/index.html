@@ -1796,9 +1796,10 @@
         }
         function clipCount(n) { return `${n} clip${n === 1 ? '' : 's'}`; }
         // One phrase per episode, the first matching rule, each ending with what the alarm
-        // took the cat for. The alarm decides on ~10 frames in 5 s while the card's name
-        // comes from the whole visit, so the two can disagree — and "judged an unknown cat"
-        // under a card saying Mittens is exactly the case worth seeing.
+        // took the cat for. The alarm decides mid-visit, on what it has seen of the cat so
+        // far (or on the last 5 s, when a stranger follows one of ours in), while the card's
+        // name comes from the whole visit, so the two can disagree — and "judged an unknown
+        // cat" under a card saying Mittens is exactly the case worth seeing.
         function alarmPhrase(a) {
             const judged = a.verdict === 'unknown' ? 'an unknown cat'
                 : a.verdict === 'neighbour' ? (a.cat_name || `cat #${a.cat_id}`)

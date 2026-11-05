@@ -879,7 +879,8 @@ class Store:
               clips_failed     INTEGER NOT NULL DEFAULT 0,   -- a 409 (Pi busy) is not a failure
               ended            TEXT,               -- gone | switched_off | uncalibrated | error | interrupted
               pi_disabled      INTEGER NOT NULL DEFAULT 0,   -- the Pi refused a play with 423
-              last_error       TEXT
+              last_error       TEXT,
+              trigger          TEXT                -- the start path: 'presence' | 'takeover'; NULL before it existed
             );
             """
         )
@@ -908,6 +909,11 @@ class Store:
             # new-geometry crops side by side with no record of which is which, and a
             # later `build_gallery` would blend feature conventions silently.
             "dataset_items": [("geometry", "TEXT")],
+            # `actions.trigger` says which start path fired an alarm — the presence vote or
+            # the takeover net (docs/specs/2026-11-05-alarm-presence-vote.md). The net has no
+            # labelled data behind it, so how often it fires, and on what, is how its numbers
+            # get checked. Rows written before it (and test plays) read NULL.
+            "actions": [("trigger", "TEXT")],
         }
         with self._lock:
             for table, columns in wanted.items():
@@ -4695,9 +4701,17 @@ class Store:
         return start_id, int(latest)
 
     def alarm_frames(
-        self, model_version_id: int, since_ts: int, *, oracle: str = "yolo-serial"
+        self,
+        model_version_id: int,
+        since_ts: int,
+        *,
+        until_ts: "int | None" = None,
+        oracle: str = "yolo-serial",
     ) -> "list[tuple[int, int, int, float]]":
         """The alarm step's COUNTED frames received at or after ``since_ts``, oldest first.
+
+        ``until_ts`` (inclusive) bounds the read above, for the replay tool
+        (``compute.tools.alarm_replay``); the worker reads up to the newest frame.
 
         A counted frame is one the feed would call a cat AND the gallery has placed: it
         carries an ``oracle`` present verdict whose (cat-only) max-box score is at or
@@ -4708,22 +4722,25 @@ class Store:
         the threshold is NOT applied (the caller votes with ``_aggregate_identity``, which
         applies it, exactly as the feed does).
 
-        Read once a second over a few seconds of frames, so the join order is PINNED
+        Read once a second over up to two minutes of frames (~1,400 rows during a long
+        presence), so the join order is PINNED
         (``CROSS JOIN``, which constrains order in SQLite without changing meaning):
         ``frames`` outer via the ``idx_frames_recv_ts`` seek, then each side probed by its
         primary key. Left to the planner with no ANALYZE stats it drives from
         ``idx_analysis_analyzer_verdict`` and walks the oracle's whole partition — the
         mis-plan of entries 229/265/276/307/385/391. Pinned by a test.
         """
+        upper = "" if until_ts is None else " AND f.recv_ts <= ?"
+        params: list = [int(since_ts)] + ([] if until_ts is None else [int(until_ts)])
         with self._lock:
             rows = self._conn.execute(
                 "SELECT f.id, f.recv_ts, i.cat_id, i.distance"
                 " FROM frames f CROSS JOIN analysis a CROSS JOIN identifications i"
-                " WHERE f.recv_ts >= ?"
+                " WHERE f.recv_ts >= ?" + upper +
                 " AND a.frame_id = f.id AND a.analyzer = ? AND a.verdict = 1 AND a.score >= ?"
                 " AND i.frame_id = f.id AND i.model_version_id = ? AND i.cat_id IS NOT NULL"
                 " ORDER BY f.recv_ts ASC, f.id ASC",
-                (int(since_ts), oracle, _ANNOTATE_MIN_CONF, int(model_version_id)),
+                params + [oracle, _ANNOTATE_MIN_CONF, int(model_version_id)],
             ).fetchall()
         return [(int(fid), int(ts), int(cid), float(dist)) for fid, ts, cid, dist in rows]
 
@@ -8868,7 +8885,7 @@ class Store:
         "kind", "mode", "start_ts", "end_ts", "verdict", "cat_id", "n_counted", "n_votes",
         "distance", "model_version_id", "threshold", "frame_id", "frame_recv_ts",
         "visit_start_ts", "sound", "clips_played", "clips_failed", "ended", "pi_disabled",
-        "last_error",
+        "last_error", "trigger",
     )
     _ACTION_LOG_MAX = 100
 
@@ -8917,6 +8934,34 @@ class Store:
             )
             self._conn.commit()
             return cur.rowcount
+
+    def last_alarm_end(self) -> "tuple[int, str | None] | None":
+        """``(end_ts, ended)`` of the newest alarm episode (``mode='on'``), or ``None``.
+
+        Seeds the alarm's previous-episode floor at start-up. ``None`` too while that row
+        is still open — on a live app the launch sweep (``close_open_actions``) runs first.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT end_ts, ended FROM actions WHERE mode = 'on' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None or row[0] is None else (int(row[0]), row[1])
+
+    def alarm_actions_between(self, since_ts: int, until_ts: int) -> "list[dict]":
+        """Every alarm episode (``mode='on'``) that STARTED in ``[since_ts, until_ts]``, oldest first.
+
+        The replay tool's read (``compute.tools.alarm_replay``): the real alarms it lays
+        beside the replayed ones. Raw rows — none of ``list_actions``' display resolution,
+        and no 100-row cap, since a replay range can hold more than the log shows.
+        """
+        cols = ("id",) + self._ACTION_COLUMNS
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {', '.join(cols)} FROM actions"
+                " WHERE mode = 'on' AND start_ts >= ? AND start_ts <= ? ORDER BY start_ts, id",
+                (int(since_ts), int(until_ts)),
+            ).fetchall()
+        return [dict(zip(cols, row)) for row in rows]
 
     def list_actions(self, limit: int = 20) -> "list[dict]":
         """The newest ``limit`` rows (capped), newest first, each resolved for display.

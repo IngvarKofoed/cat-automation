@@ -1268,9 +1268,14 @@
         if (a.last_ended) t += ` · last alarm ended ${fmtClock(a.last_end_ms)} (${ALARM_ENDED[a.last_ended] || a.last_ended})`;
         // The pass summary is what verifies the step keeps up on this hardware: ids per pass,
         // how long it took, and whether it caught up with the newest frame.
+        // The detect / identify split says which half a slow pass spends its time in (older
+        // compute builds report no split, so it is shown only when present).
         if (d.mode === 'on' && a.last_pass && a.last_pass.ids) {
-          t += ` · last pass ${a.last_pass.ids} frames in ${fmtInt(a.last_pass.ms)} ms`
-            + (a.last_pass.caught_up ? ', caught up' : `, ${fmtInt(a.last_pass.behind)} behind`);
+          const lp = a.last_pass;
+          t += ` · last pass ${lp.ids} frames in ${fmtInt(lp.ms)} ms`
+            + (lp.detect_ms != null && lp.identify_ms != null
+              ? ` (detect ${fmtInt(lp.detect_ms)} + identify ${fmtInt(lp.identify_ms)})` : '')
+            + (lp.caught_up ? ', caught up' : `, ${fmtInt(lp.behind)} behind`);
         }
         nn.className = a.pass_error ? 'note warn' : 'note';
         if (a.pass_error) t += ' · pass error: ' + a.pass_error;
@@ -1296,8 +1301,11 @@
           ? '<span class="alarm-sounding">sounding…</span>'
           : (test && !r.clips_played ? '<span class="dim">—</span>' : fmtDuration((r.end_ts - r.start_ts) / 1000));
         const clips = `${r.clips_played}` + (r.clips_failed ? ` <span class="dim">· ${r.clips_failed} failed</span>` : '');
-        const verdict = test ? `test · ${esc(r.sound || '')}`
-          : r.verdict === 'unknown' ? 'unknown cat' : esc(r.cat_name || `cat #${r.cat_id}`);
+        // `takeover` when the net overrode the presence vote, else `presence`; rows from
+        // before the column existed carry none and show none.
+        const verdict = (test ? `test · ${esc(r.sound || '')}`
+          : r.verdict === 'unknown' ? 'unknown cat' : esc(r.cat_name || `cat #${r.cat_id}`))
+          + (!test && r.trigger ? `<div class="dim">${esc(r.trigger)}</div>` : '');
         let evidence = '<span class="dim">—</span>';
         if (!test) {
           evidence = `${r.n_counted} frames · ${r.n_votes} votes · d ${r.distance == null ? '—' : r.distance.toFixed(3)}`

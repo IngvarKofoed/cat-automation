@@ -2167,3 +2167,84 @@ a clean one.
      `unnamed` on the four named lines ("not named yet") rather than a measured zero — entry 561's
      limit, now on household lines; telling it apart needs the subject the walk skips. And before
      a first calibrated model, opening a cat's chart still waits for the full walk (entry 573).
+
+578. The foreign-cat alarm's START rule now votes over the cat's whole PRESENCE and must stay
+     foreign 1 s, replacing the 5 s sliding window that gave a long resident visit a fresh draw
+     every second (one lookalike-led window set it off). A presence is the run of counted frames
+     with no gap over 5 s, reaching back at most 2 minutes. Stop rule, switches, clip loop and
+     processing step are unchanged. Spec: docs/specs/2026-11-05-alarm-presence-vote.md.
+
+579. Every start window is CAMERA time, measured from the newest counted frame's `recv_ts`: a
+     pass takes 1-4 s with a cat in view, so wall-clock windows lost ~2 s of frames and a
+     tick-counted hold would cost a whole pass. Wall-clock age speaks only when the pass reports
+     `caught_up` — the gone check's own condition — which also lets a short visit's hold finish.
+
+580. A TAKEOVER net beside it: ≥ 20 counted frames in the last 5 s, ≥ 90% foreign by
+     `is_foreign`, starts at once. It is the one case a whole-presence vote is blind to — a
+     stranger following one of ours in. Its record never names a resident: when within-threshold
+     resident matches win its window's vote, the verdict is `unknown`.
+
+581. `deterrent.start_decision` is the WHOLE start rule as a pure function; the worker and the
+     new read-only `compute.tools.alarm_replay` both call it. A missed stranger writes no
+     `actions` row, so the replay is the only way to see a miss. It refuses (non-zero exit) on a
+     truncated feed walk, or a range with no visits or no counted frames under the active model,
+     rather than print an empty "no added misses".
+
+582. Its prefix tallies reproduce `_aggregate_identity` exactly, including the tie neither count
+     nor distance breaks: the voter's `min` over an insertion-ordered dict picks the cat FIRST
+     below the threshold. Pinned on every prefix of random sequences built to tie.
+
+583. `actions.trigger` records when the net OVERRODE the vote: `takeover` only if the presence
+     vote did not call the cat foreign at that tick; every other start reads `presence`, with the
+     presence's verdict and evidence. When an alarm starts is unchanged — the first tick either
+     path is met. Rejected: labelling by check order, since a lone neighbour at ~10 fps meets
+     both paths on one tick and the column would stop singling out tailgates. NULL on older rows.
+
+584. The previous-alarm floor is SEEDED from the newest `mode='on'` row's `end_ts` when the
+     worker is built: a 2-minute lookback would otherwise let a restart recount the last episode's
+     stranger. Load-bearing order: the launch sweep that closes open rows now runs BEFORE the
+     worker is constructed — an open newest row seeds no floor.
+
+585. Known limit, accepted by spec: entry 538's catch-up floor still applies with no alarm
+     running, so frames the step skipped (switched On or restarted mid-presence, or lagging the
+     camera by over 5 s) are absent from the presence vote. Widening it brings back 538's
+     minutes-long replays at switch-on; the follow-up delay spec is where to revisit it.
+
+586. The replay judges "ours" by the CARD (the whole-visit vote), not labels, and counts a visit
+     alarmed only if the start was decided by its `end_ts` — later starts are listed as late.
+     Its idle-tick skip is proven decision-identical to ticking every second. Delay is printed
+     over foreign visits (the spec's goal figure) and over all alarmed visits.
+
+587. Two of this change's own tests were HOLLOW as first written — entries 411/433/466/472/487's
+     trap again. The restart test left a > 5 s gap, so the presence split with or without the
+     seeded floor; it now runs an unseeded control that must re-alarm. The lookalike test's
+     4 s never outvoted the OLD window either; widened to 6 s, which the old rule does fire on.
+
+588. Admin's alarm log shows the trigger under the verdict, and its pass readout splits the time
+     into `detect_ms` + `identify_ms` (never summing past `ms`) — enough to aim the follow-up
+     processing-delay spec at the half the ~1 s fixed cost goes to, not at its cause.
+
+589. Review repair: staleness and the hold are measured to the step's processing FRONTIER —
+     now when caught up, the last processed frame's `recv_ts` when behind — replacing the spec's
+     `caught_up` flag. "Behind = never stale" let a foreign presence up to 2 min old (switch
+     turned On, or frames named later) meet its hold in camera time and sound at the NEXT cat
+     to arrive. Frames still to come lie after the frontier, so they cannot continue it.
+
+590. `maybe_start` first probes the last DETER_WINDOW_S before the frontier and stops when it is
+     empty — the vote is stale then. The step runs every second all day with the switch On, and
+     the two-minute read plus the roster were paid even at an empty door, on the shared lock
+     (entries 102-105/338). Two reads while a cat is present; one tiny one otherwise.
+
+591. The replay reads counted frames a presence-bound EARLY and on to the end of the last visit
+     that starts in the range: cut at the midnights, a presence under way at the first was voted
+     on its tail alone (a lookalike-led remainder read as a new-rule alarm on "ours"), and a
+     visit straddling the last lost its frames. Starts decided before the range are not reported.
+
+592. After a restart the alarm status reports how the previous episode ended (`last_ended`) beside
+     the seeded `last_end_ms`, read from the same row — not an end time with no reason.
+
+593. Two review findings left UNFIXED by decision. `visit_start_ts` stays the FEED visit's start,
+     which is what the admin log labels it as; a presence spanning several feed visits therefore
+     reads a short latency. And the column stays named `trigger`, as the spec names it: SQLite
+     takes the keyword as an identifier, and Postgres does not reserve it.
+

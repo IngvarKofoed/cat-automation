@@ -100,6 +100,11 @@ class _FakeStore:
     def set_setting(self, key, value):
         self.settings[key] = value
 
+    def last_alarm_end(self):
+        # The alarm seeds its previous-episode floor from the log at construction; this
+        # fake has no actions log, so there is no previous episode.
+        return None
+
 
 class _FakeDetect:
     """Records each ``[since_id, until_id]`` detect call and the analyzer/manager it got,

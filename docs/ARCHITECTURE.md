@@ -408,11 +408,31 @@ which while the switch is On ticks at a fixed 1 s:
   It reuses the worker's resident YOLO / DINOv2 / gallery, and **never yields to
   manual jobs** (the long motion-tuning re-runs would otherwise disarm the door for
   hours). While a visit is open or an alarm is sounding, naming closed visits waits.
-- **Start.** ≥ 10 *counted* frames (a `yolo-serial` cat box ≥ 0.3 — the feed's own
-  noise floor — with a gallery match) received in the last 5 s, voted foreign by the
-  feed's `_aggregate_identity`: a named non-resident won, or nothing came within the
-  threshold. Visit boundaries are ignored. Frames received before the previous alarm
-  ended do not count again. An **uncalibrated** gallery never starts one.
+- **Start.** One pure function, `deterrent.start_decision`, shared by the worker and the
+  read-only replay tool (`compute.tools.alarm_replay`), over *counted* frames (a
+  `yolo-serial` cat box ≥ 0.3 — the feed's own noise floor — with a gallery match). Every
+  window is measured in **camera time**, from the newest counted frame's `recv_ts`, so a
+  pass lagging the camera never reads its own delay as the cat's behaviour. An absence is
+  measured to the step's processing **frontier** (now when caught up, else the last frame
+  processed): every frame still to come lies after it, so a presence whose newest frame is
+  over 5 s behind it is stale even while the pass is behind. Two paths;
+  either one met starts it:
+  - *Presence vote.* The feed's `_aggregate_identity` over the cat's whole **presence** —
+    its run of counted frames with no gap over 5 s (not the feed's 2 s visit), reaching
+    back at most 2 minutes — calls it foreign (a named non-resident won, or nothing came
+    within the threshold) on ≥ 10 frames, and has stayed foreign for **1 s** of camera
+    time. A long resident visit therefore no longer gets a fresh draw every second.
+  - *Takeover net.* ≥ 20 counted frames in the 5 s up to the newest, ≥ 90% of them
+    foreign by the stop rule's own test; starts at once. It catches a stranger following
+    one of ours into the same presence, whose frames the presence vote would hand to the
+    resident; it never names a resident as its target.
+  The row records the presence vote whenever it calls the cat foreign at that tick — a lone
+  neighbour at ~10 fps meets both paths at once — and `takeover` only when the net started
+  an alarm the vote would not have. Neither counts frames received before the previous alarm ended — a floor seeded from the
+  log at start-up, so a restart cannot recount the last stranger. An **uncalibrated**
+  gallery never starts one. Frames the step skipped (switched On or restarted mid-visit, or
+  lagging the camera by over 5 s) are absent from the vote — an accepted limit. A missed
+  stranger writes no row, so the replay is the only way to see a miss.
 - **Stop.** No *foreign* counted frame for 3 s, the switch Off, the gallery
   uncalibrated, or a pass that raised. A frame matched to a resident WITHIN the
   threshold never prolongs it — but one beyond the threshold reads unknown, so foreign,
@@ -430,7 +450,7 @@ which while the switch is On ticks at a fixed 1 s:
 Consistent with the concept, the door lock is the first line and sound/light are
 escalation: `DENY_ENTRY` fires immediately on a foreign cat. **As built**, `DETER`
 → `sound` does not wait for lingering and is not rate-limited: it starts as soon as
-the recent frames agree the cat is foreign and loops while it is present. Escalation
+its start rule calls the cat foreign and loops while it is present. Escalation
 order returns as a question when the lock exists.
 
 ## Latency and offline behavior
@@ -545,8 +565,11 @@ Core entities (storage-agnostic):
 - **Action** — something the system did: `type` (lock/unlock/sound/light/notify),
   `timestamp`, triggering intent/event. **Real for sound** (the `actions` table): one
   row per alarm episode (`on`) or test play (`test`) — start/end time, clips played and
-  failed, the verdict (`neighbour` + cat, `unknown`, or `test`) and its evidence
-  (counted frames, the winner's votes, the distance), the model version and threshold,
+  failed, the verdict (`neighbour` + cat, `unknown`, or `test`), whether the takeover net
+  overrode the presence vote (`trigger`: `takeover`, else `presence`; NULL on older rows) and
+  the evidence of the recorded verdict (counted frames, the winner's votes — a takeover's
+  foreign frames — and the distance), the model
+  version and threshold,
   the deciding frame as the (`frame_id`, `recv_ts`) **pair**, and how it ended (`gone`
   / `switched_off` / `uncalibrated` / `error` / `interrupted`, plus whether the Pi
   refused it as disabled). An audit log: it survives `clear()` and eviction, and a

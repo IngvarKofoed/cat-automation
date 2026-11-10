@@ -2,25 +2,32 @@
 
 Run on the compute PC. A missed stranger writes no ``actions`` row, so "the new rule adds
 no misses" is invisible in the alarm log: this replay is the only way to check it, now and
-whenever the start rule's numbers are retuned (docs/specs/2026-11-05-alarm-presence-vote.md).
+whenever the start rule's numbers are retuned (docs/specs/2026-11-05-alarm-presence-vote.md,
+docs/specs/2026-11-10-one-visit-for-feed-and-alarm.md).
 
 It replays two rules over one continuous timeline of COUNTED frames (``Store.alarm_frames``
 under the active model) at 1 s ticks, at two tick phases, with no processing delay:
 
-- **today** — the rule the presence vote replaced, frozen here as the baseline: at least
-  ``DETER_MIN_FRAMES`` counted frames in the last ``DETER_WINDOW_S`` of wall clock, voted
-  foreign by ``Store._aggregate_identity``;
-- **new** — ``deterrent.start_decision``, the very function the live worker calls.
+- **today** — the shipped presence rule, frozen here as the baseline: the counted frames
+  after the last gap over 5 s, reaching back 2 minutes, voted foreign by
+  ``Store._aggregate_identity`` and held 1 s of camera time, plus the takeover net;
+- **new** — ``deterrent.start_decision``, the very function the live worker calls: the
+  same vote over the household VISIT so far (bridged, as the feed's), held
+  ``ALARM_HOLD_S``.
 
-Both run through the same episode mechanics: the gone rule (no foreign counted frame, by
-``deterrent.is_foreign``, for ``ALARM_GONE_S``) and the floor at each episode's end. Each
-start goes to the feed visit whose ``[start_ts, end_ts + _VISIT_GAP_MS]`` holds its deciding
-frame — the feed's own attribution rule — and counts as alarming that visit only if it was
-decided at or before the visit's ``end_ts``: a start after the cat left is no catch, and is
-listed as late. "Ours" is the visit's CARD (its whole-visit vote), not a label.
+Visits are the feed's, bridged across the WHOLE range regardless of the saved bridge start
+date (``bridge_since_ms=0``): the replay simulates and stores nothing, so there is no past
+to protect. Both rules run through the same episode mechanics: the gone rule (no foreign
+counted frame, by ``deterrent.is_foreign``, for ``ALARM_GONE_S``) and the floor at each
+episode's end. Each start goes to the feed visit whose ``[start_ts, end_ts + _VISIT_GAP_MS]``
+holds its deciding frame — the feed's own attribution rule — and counts as alarming that visit
+only if it was decided at or before the visit's ``end_ts``: a start after the cat left is no
+catch, and is listed as late. "Ours" is the visit's CARD (its whole-visit vote), not a label.
+A visit under way at the range's first midnight is reported whole, from its true start.
 
 It reports what the rules decide, not when the pipeline would have heard it: processing
-delay is out of scope by design.
+delay is out of scope by design, so neither the frontier nor the gone check's measuring to
+it can show here.
 
 It calls no ``Store`` method that writes (the reads are ``active_model``, ``list_cats``,
 ``resolve_ts_range``, ``_walk_events``, ``alarm_frames`` and ``alarm_actions_between``), as
@@ -52,7 +59,14 @@ from datetime import date, datetime, timedelta
 
 from compute.collection.store import Store, _VISIT_GAP_MS
 from compute.learning import deterrent
-from compute.learning.deterrent import StartDecision, is_foreign, start_decision
+from compute.learning.deterrent import (
+    TRIGGER_PRESENCE,
+    TRIGGER_TAKEOVER,
+    StartDecision,
+    is_foreign,
+    prefix_winners,
+    start_decision,
+)
 from compute.tools.diagnose_misses import _build_store, _resolve_root
 
 RULES = ("today", "new")
@@ -101,8 +115,8 @@ class Report:
     visits: "list[Visit]" = field(default_factory=list)
     n_counted: int = 0
     starts: "list[Start]" = field(default_factory=list)
-    presence_longest_ms: int = 0
-    presence_over_cap: int = 0
+    visit_longest_ms: int = 0
+    visits_over_cap: int = 0
     real_actions: "list[dict]" = field(default_factory=list)
     days: "list[dict]" = field(default_factory=list)
     names: dict = field(default_factory=dict)
@@ -136,6 +150,17 @@ class Report:
 # --- the frozen baseline ------------------------------------------------------------
 
 
+# The shipped presence rule's numbers (alarm-presence-vote spec), frozen HERE rather than
+# read from `deterrent`, so retuning the live rule can never move its own baseline.
+_BASE_WINDOW_MS = 5_000           # takeover window and staleness
+_BASE_PRESENCE_GAP_MS = 5_000     # a presence splits on a counted-frame gap over this
+_BASE_MAX_MS = 120_000            # how far back a presence reaches
+_BASE_HOLD_MS = 1_000             # the hold, camera time
+_BASE_MIN_FRAMES = 10
+_BASE_TAKEOVER_MIN_FRAMES = 20
+_BASE_TAKEOVER_SHARE = 0.9
+
+
 def baseline_decision(
     frames: "list[tuple[int, int, int, float]]",
     now_ms: int,
@@ -144,40 +169,104 @@ def baseline_decision(
     threshold: "float | None",
     names: dict,
     residents: dict,
+    *,
+    visit_start_ts: "int | None" = None,
 ) -> "StartDecision | None":
-    """The start rule the presence vote replaced, frozen: the last ``DETER_WINDOW_S``.
+    """The shipped presence rule (1 s hold, 5 s presence), frozen as the baseline.
 
-    At least ``DETER_MIN_FRAMES`` counted frames received in ``[max(now − DETER_WINDOW_S,
-    floor), now]``, and ``_aggregate_identity`` over them names a neighbour or nobody. The
-    deciding frame is the newest. ``frontier_ms`` is accepted for a common signature and
-    unused — this rule measured its window off the wall clock.
+    ``deterrent.start_decision`` as it stood before the one-visit-for-feed-and-alarm spec,
+    copied with its constants: the presence is the counted frames after the last gap over
+    5 s, reaching back 2 minutes and floored at the previous alarm's end; its vote must
+    have stayed foreign 1 s of camera time to the frontier; the takeover net starts at once
+    on ≥ 20 frames in the last 5 s, ≥ 90% foreign. ``visit_start_ts`` is accepted for a
+    common signature and unused — this rule knew nothing of visits.
     """
-    del frontier_ms
-    if threshold is None:
+    del visit_start_ts
+    if threshold is None or not frames:
         return None
-    lo = int(now_ms) - int(deterrent.DETER_WINDOW_S * 1000)
+    lo = int(now_ms) - _BASE_MAX_MS
     if floor_ms is not None:
         lo = max(lo, int(floor_ms))
-    window = [f for f in frames if lo <= f[1] <= now_ms]
-    if len(window) < deterrent.DETER_MIN_FRAMES:
+    frames = [f for f in frames if lo <= f[1] <= now_ms]
+    if not frames:
+        return None
+    newest = frames[-1][1]
+    eff = newest if frontier_ms is None else max(int(frontier_ms), newest)
+    if eff - newest > _BASE_WINDOW_MS:
+        return None
+
+    i = len(frames)
+    while i > 0 and frames[i - 1][1] >= newest - _BASE_WINDOW_MS:
+        i -= 1
+    window = frames[i:]
+    foreign: "list[tuple[int, int, int, float]]" = []
+    takeover_met = False
+    if len(window) >= _BASE_TAKEOVER_MIN_FRAMES:
+        foreign = [f for f in window if is_foreign(f[2], f[3], threshold, residents)]
+        takeover_met = len(foreign) / len(window) >= _BASE_TAKEOVER_SHARE
+
+    p = len(frames) - 1
+    while p > 0 and frames[p][1] - frames[p - 1][1] <= _BASE_PRESENCE_GAP_MS:
+        p -= 1
+    presence = frames[p:]
+    idents = [(cid, dist) for _f, _t, cid, dist in presence]
+    run_start: "int | None" = None
+    if len(presence) >= _BASE_MIN_FRAMES:
+        for k, w in enumerate(prefix_winners(idents, threshold)):
+            if k + 1 >= _BASE_MIN_FRAMES and (w is None or not residents.get(w, False)):
+                if run_start is None:
+                    run_start = k
+            else:
+                run_start = None
+    vote_foreign = run_start is not None
+    hold_met = vote_foreign and eff - presence[run_start][1] >= _BASE_HOLD_MS
+
+    if not (takeover_met or hold_met):
+        return None
+    frame_id, frame_ts, _c, _d = frames[-1]
+    if vote_foreign:
+        agg = Store._aggregate_identity(idents, threshold, names, residents)
+        if agg is not None and not (agg["cat_id"] is not None and agg["is_resident"]):
+            return StartDecision(
+                TRIGGER_PRESENCE,
+                "unknown" if agg["cat_id"] is None else "neighbour",
+                agg["cat_id"], agg["cat_name"],
+                len(presence), agg["n_frames_voted"], agg["distance"], frame_id, frame_ts,
+            )
+    if not takeover_met:
         return None
     agg = Store._aggregate_identity(
         [(cid, dist) for _f, _t, cid, dist in window], threshold, names, residents
     )
-    if agg is None or (agg["cat_id"] is not None and agg["is_resident"]):
-        return None
-    frame_id, frame_ts, _c, _d = window[-1]
+    if agg is not None and agg["cat_id"] is not None and not agg["is_resident"]:
+        verdict, cat_id, distance = "neighbour", agg["cat_id"], agg["distance"]
+    else:
+        verdict, cat_id = "unknown", None
+        distance = min(f[3] for f in foreign)
     return StartDecision(
-        "window", "unknown" if agg["cat_id"] is None else "neighbour", agg["cat_id"],
-        agg["cat_name"], len(window), agg["n_frames_voted"], agg["distance"], frame_id, frame_ts,
+        TRIGGER_TAKEOVER, verdict, cat_id, names.get(cat_id) if cat_id is not None else None,
+        len(window), len(foreign), distance, frame_id, frame_ts,
     )
 
 
 _DECIDERS = {"today": baseline_decision, "new": start_decision}
-_LOOKBACK_MS = {
-    "today": int(deterrent.DETER_WINDOW_S * 1000),
-    "new": int(deterrent.ALARM_PRESENCE_MAX_S * 1000),
-}
+_LOOKBACK_MS = {"today": _BASE_MAX_MS, "new": int(deterrent.ALARM_PRESENCE_MAX_S * 1000)}
+
+
+def _vote_floor(rule: str, t: int, floor: "int | None") -> int:
+    """The oldest ``recv_ts`` ``rule`` may vote on at tick ``t`` — each rule's own bound."""
+    if rule == "new":
+        return deterrent.vote_floor(t, floor)
+    lo = t - _LOOKBACK_MS[rule]
+    return lo if floor is None else max(lo, floor)
+
+
+def visit_start_at(visit_starts: "list[int]", ts: int) -> "int | None":
+    """The start of the visit holding a frame at ``ts``: the latest visit starting at or
+    before it (``Store.visit_start``'s rule, over the replay's bridged visits), or ``None``
+    when no visit starts that early."""
+    k = bisect.bisect_right(visit_starts, ts) - 1
+    return visit_starts[k] if k >= 0 else None
 
 
 # --- the replay ---------------------------------------------------------------------
@@ -206,6 +295,7 @@ def simulate(
     threshold: float,
     names: dict,
     residents: dict,
+    visit_starts: "list[int]",
 ) -> "list[tuple[int, StartDecision]]":
     """Drive one rule at one phase over the timeline → ``[(decided_at_ms, decision)]``.
 
@@ -213,11 +303,12 @@ def simulate(
     received by a tick is known at it, so the frontier is always the tick). A running episode
     ends at the first tick with no foreign counted frame in the last ``ALARM_GONE_S``, and
     the next vote is floored at that tick + 1 ms, as ``Alarm._end`` and ``maybe_start`` do.
-    Idle stretches are skipped: neither rule can start at a tick with no counted frame in
-    the ``DETER_WINDOW_S`` before it (both need ≥ ``DETER_MIN_FRAMES`` there, or are stale).
+    ``visit_starts`` are the bridged visits' ``start_ts``, ascending: the new rule votes over
+    the visit holding the newest counted frame (``visit_start_at``). Idle stretches are
+    skipped: neither rule can start at a tick with no counted frame in the
+    ``DETER_WINDOW_S`` before it (both are stale there).
     """
     decide = _DECIDERS[rule]
-    lookback = _LOOKBACK_MS[rule]
     gone_ms = int(deterrent.ALARM_GONE_S * 1000)
     window_ms = int(deterrent.DETER_WINDOW_S * 1000)
     ts = [f[1] for f in frames]
@@ -234,13 +325,12 @@ def simulate(
                 last_end = t
         if not running:
             floor = None if last_end is None else last_end + 1
-            lo_ts = (
-                deterrent.vote_floor(t, floor) if rule == "new"
-                else (t - lookback if floor is None else max(t - lookback, floor))
-            )
-            lo = bisect.bisect_left(ts, lo_ts)
+            lo = bisect.bisect_left(ts, _vote_floor(rule, t, floor))
             if hi - lo >= deterrent.DETER_MIN_FRAMES:
-                d = decide(frames[lo:hi], t, floor, t, threshold, names, residents)
+                d = decide(
+                    frames[lo:hi], t, floor, t, threshold, names, residents,
+                    visit_start_ts=visit_start_at(visit_starts, ts[hi - 1]),
+                )
                 if d is not None:
                     out.append((t, d))
                     running = True
@@ -255,23 +345,12 @@ def simulate(
     return out
 
 
-def _presences(frames) -> "tuple[int, int]":
-    """``(longest presence ms, presences longer than ALARM_PRESENCE_MAX_S)`` over the timeline."""
-    gap = int(deterrent.ALARM_PRESENCE_GAP_S * 1000)
+def _visit_lengths(visits: "list[Visit]") -> "tuple[int, int]":
+    """``(longest visit ms, visits longer than ALARM_PRESENCE_MAX_S)`` — the bridged visits
+    the new rule votes over, and how many outlast its two-minute lookback (the vote slides)."""
     cap = int(deterrent.ALARM_PRESENCE_MAX_S * 1000)
-    longest = over = 0
-    start = prev = None
-    for _f, t, _c, _d in frames:
-        if prev is None or t - prev > gap:
-            if start is not None:
-                longest = max(longest, prev - start)
-                over += (prev - start) > cap
-            start = t
-        prev = t
-    if start is not None:
-        longest = max(longest, prev - start)
-        over += (prev - start) > cap
-    return longest, over
+    lengths = [v.end_ts - v.start_ts for v in visits]
+    return max(lengths, default=0), sum(1 for n in lengths if n > cap)
 
 
 def replay(store: Store, since: date, until: date, *, now_ms: "int | None" = None) -> Report:
@@ -294,31 +373,35 @@ def replay(store: Store, since: date, until: date, *, now_ms: "int | None" = Non
     if since_id is None or until_id is None or since_id > until_id:
         raise ReplayRefused(f"the store holds no frames from {since} to {until}")
 
-    days_walked = max(1, math.ceil((max(now_ms, end_ms) - start_ms) / _DAY_MS))
+    # The frames read reach past both edges of the range: back by the vote's two-minute
+    # bound, so a visit under way at the first midnight is voted whole (and the episode state
+    # it leaves carries in), and on past the last midnight to the end of the last visit that
+    # STARTED in the range, so its tail is not cut off. Starts decided before the range
+    # still shape that state but are not reported. The feed walk starts at the same point,
+    # so the new rule knows where such a visit began.
+    lookback_ms = max(_LOOKBACK_MS.values())
+    read_from = start_ms - lookback_ms
+    walk_from, _ = store.resolve_ts_range(read_from, end_ms - 1)
+    days_walked = max(1, math.ceil((max(now_ms, end_ms) - read_from) / _DAY_MS))
     events, truncated = store._walk_events(
-        since_id, max_pages=_PAGES_PER_DAY * days_walked, with_subject=False
+        walk_from, max_pages=_PAGES_PER_DAY * days_walked, with_subject=False, bridge_since_ms=0
     )
     if truncated:
         raise ReplayRefused(
             "the feed walk came back truncated — a report on part of the range would read as the whole"
         )
+    visit_starts = sorted(e["start_ts"] for e in events)
     visits: "list[Visit]" = []
     for e in events:
-        if not (start_ms <= e["start_ts"] < end_ms):
-            continue  # the walk runs on to now; visits starting after the range are dropped
+        # Reported: every visit in the range, including one under way at its first midnight
+        # (whole, from its true start). The walk runs on to now; later visits are dropped.
+        if not (e["start_ts"] < end_ms and e["end_ts"] >= start_ms):
+            continue
         card, name, votes = _card(e.get("identity"))
         visits.append(Visit(e["start_id"], e["end_id"], e["start_ts"], e["end_ts"], card, name, votes))
     visits.sort(key=lambda v: (v.start_ts, v.start_id))
     if not visits:
         raise ReplayRefused(f"the store holds frames but no visits from {since} to {until}")
-
-    # The frames read reach past both edges of the range: back by the presence bound, so a
-    # presence under way at the first midnight is voted whole (and the episode state it
-    # leaves carries in), and on past the last midnight to the end of the last visit that
-    # STARTED in the range, so its tail is not cut off. Starts decided before the range
-    # still shape that state but are not reported.
-    lookback_ms = int(deterrent.ALARM_PRESENCE_MAX_S * 1000)
-    read_from = start_ms - lookback_ms
     read_until = max(end_ms - 1, max(v.end_ts for v in visits) + _VISIT_GAP_MS)
     frames = store.alarm_frames(model["id"], read_from, until_ts=read_until)
     n_in_range = sum(1 for f in frames if start_ms <= f[1] < end_ms)
@@ -342,30 +425,34 @@ def replay(store: Store, since: date, until: date, *, now_ms: "int | None" = Non
     names = {c["id"]: c["name"] for c in cats}
     residents = {c["id"]: c["is_resident"] for c in cats}
     report.names = names
-    visit_starts = [v.start_ts for v in visits]
+    reported_starts = [v.start_ts for v in visits]
     # Run past the last frame read long enough for it to decide and episodes to end.
     t_last = read_until + int(max(deterrent.DETER_WINDOW_S, deterrent.ALARM_GONE_S) * 1000) + _TICK_MS
     for rule in RULES:
         for phase in PHASES_MS:
-            # Ticks keep the range's phase alignment while starting a lookback early.
-            for at, d in simulate(frames, rule, phase, read_from, t_last, threshold, names, residents):
+            # Ticks keep the range's phase alignment while starting a lookback early. The
+            # simulation sees EVERY walked visit's start (those before the range too).
+            for at, d in simulate(
+                frames, rule, phase, read_from, t_last, threshold, names, residents, visit_starts
+            ):
                 if at < start_ms:
                     continue
                 s = Start(rule, phase, at, d)
-                i = bisect.bisect_right(visit_starts, d.frame_recv_ts) - 1
+                i = bisect.bisect_right(reported_starts, d.frame_recv_ts) - 1
                 if i >= 0 and d.frame_recv_ts <= visits[i].end_ts + _VISIT_GAP_MS:
                     s.visit = i
                     s.in_view = at <= visits[i].end_ts
                 report.starts.append(s)
 
-    report.presence_longest_ms, report.presence_over_cap = _presences(frames)
+    report.visit_longest_ms, report.visits_over_cap = _visit_lengths(visits)
     report.real_actions = store.alarm_actions_between(start_ms, end_ms - 1)
 
     counted_by_day = Counter(Store.local_date(f[1]) for f in frames)
     day = since
     while day <= until:
         key = day.isoformat()
-        day_visits = [v for v in visits if Store.local_date(v.start_ts) == key]
+        # A visit under way at the first midnight counts on the first day.
+        day_visits = [v for v in visits if Store.local_date(max(v.start_ts, start_ms)) == key]
         unclaimed = {}
         for rule in RULES:
             for phase in PHASES_MS:
@@ -413,7 +500,7 @@ def _phase(p: int) -> str:
 def _alarm_desc(s: Start) -> str:
     d = s.decision
     who = "unknown cat" if d.verdict == "unknown" else (d.cat_name or f"cat #{d.cat_id}")
-    trig = "" if s.rule == "today" else f" [{d.trigger}]"
+    trig = f" [{d.trigger}]"
     return f"{who}, {d.n_votes}/{d.n_counted} votes{trig}"
 
 
@@ -475,7 +562,7 @@ def print_report(report: Report) -> None:
             late = [s for s in report.starts_for("new", phase) if s.visit == i]
             print(f"  {_phase(phase)}: {_clock(x.start_ts)}  {x.card} {x.name or ''}".rstrip()
                   + ("  (new rule started late)" if late else "")
-                  + "  — check it in the player: a presence spanning two visits can credit the other")
+                  + "  — check it in the player: its vote may have begun on an earlier card")
     print()
 
     print("Late starts (decided after the visit's last frame):")
@@ -504,8 +591,8 @@ def print_report(report: Report) -> None:
     print()
 
     cap_s = deterrent.ALARM_PRESENCE_MAX_S
-    print(f"Longest presence: {report.presence_longest_ms / 1000:.1f} s; presences longer than the "
-          f"{cap_s:.0f} s bound: {report.presence_over_cap}")
+    print(f"Longest visit: {report.visit_longest_ms / 1000:.1f} s; visits longer than the new rule's "
+          f"{cap_s:.0f} s lookback: {report.visits_over_cap}")
     print()
 
     print("Visits named as ours that set an alarm off (check each in the player):")

@@ -168,6 +168,35 @@ _SCORECARD_ORACLES = ANALYZER_NAMES
 _VISIT_GAP_MS = 2000
 _VISIT_WINDOW_MS = 3000
 
+# The household's visit BRIDGES a cat sitting still (one-visit-for-feed-and-alarm spec). Under
+# motion-only storage a still cat stores nothing, so the feed's 2 s split cut one sit into
+# several cards and the alarm restarted its vote from zero. Two consecutive motion clusters
+# are one visit when the last motion frame before the gap and the first after it both carry a
+# `yolo-serial` cat box (`_best_box`) at or above `_ANNOTATE_MIN_CONF`, those two boxes overlap
+# by IoU >= `_BRIDGE_MIN_IOU`, every cat box of the frame after the gap (any confidence)
+# overlaps some cat box of the frame before it by the same IoU — so a stranger walking up to a
+# resident sitting still blocks the bridge whenever it shows in that first frame — the gap is
+# at most `_BRIDGE_MAX_GAP_MS` (an outage also looks like stillness; past the cap the visit
+# splits as before), and the later frame is at or after the saved start date
+# (`VISIT_BRIDGE_SINCE_KEY`), so nothing before it is regrouped. Computed on read from stored
+# frames and boxes, never saved: timing can only make a bridge MISSING (a boundary frame not
+# yet detected has no box), never wrong. `Store._bridges` is the one rule; `events()` and
+# `visit_start` both go through it, so the feed and the alarm agree on where a visit starts.
+_BRIDGE_MIN_IOU = 0.5
+# Matches the alarm's two-minute lookback (`deterrent.ALARM_PRESENCE_MAX_S`).
+_BRIDGE_MAX_GAP_MS = 120_000
+# The bridge start date, ms epoch, in the settings KV. Written once by the API app at launch
+# when absent (`ensure_visit_bridge_since`) — never by a CLI tool. A TIMESTAMP, not an id, so
+# it stays valid across a Clear. Absent reads as "bridge nothing".
+VISIT_BRIDGE_SINCE_KEY = "visit_bridge_since_ms"
+# Default of the `bridge_since_ms` override on `events` / `visit_start`: read the saved date.
+# Only the replay tool overrides it (0 = bridge every gap; it simulates and stores nothing).
+_BRIDGE_SAVED = object()
+# Rows per page of `visit_start`'s backward walk (as `open_visit` pages its own), and ids per
+# statement of the boundary-box read (well under SQLite's bound-parameter limit).
+_VISIT_START_PAGE = 512
+_BRIDGE_IDS_PER_READ = 500
+
 # Server-side cap on how many frames ``sample_frames`` returns, so a wide window
 # can never request tens of thousands of thumbnails: the density viewer computes
 # ``count = X × span-minutes`` and this clamps it into ``[1, _MAX_SAMPLE]``.
@@ -1491,6 +1520,30 @@ class Store:
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
             )
             self._conn.commit()
+
+    def visit_bridge_since(self) -> "int | None":
+        """The bridge start date (ms epoch), or ``None`` — bridge nothing — when unset or
+        unreadable. See ``_BRIDGE_MIN_IOU`` for the rule it gates."""
+        raw = self.get_setting(VISIT_BRIDGE_SINCE_KEY)
+        try:
+            return None if raw is None else int(raw)
+        except ValueError:
+            return None
+
+    def ensure_visit_bridge_since(self, now_ms: int) -> "int | None":
+        """Save ``now_ms`` as the bridge start date if none is saved yet; return the saved one.
+
+        Called once at launch by the API app (a live app only), so the first run of this
+        build fixes the date and every later launch keeps it: no visit, count, label or flag
+        from before it is regrouped. ``INSERT OR IGNORE`` makes it a no-op when present.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (VISIT_BRIDGE_SINCE_KEY, str(int(now_ms))),
+            )
+            self._conn.commit()
+        return self.visit_bridge_since()
 
     # --- The operating stage ------------------------------------------------
     #
@@ -4700,6 +4753,95 @@ class Store:
             (latest,) = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM frames").fetchone()
         return start_id, int(latest)
 
+    def visit_start(
+        self,
+        frame_id: int,
+        floor_ts: "int | None",
+        *,
+        bridge_since_ms=_BRIDGE_SAVED,
+    ) -> "int | None":
+        """The ``recv_ts`` the household visit holding ``frame_id`` starts at — floored.
+
+        The alarm's read of the visit ``events()`` shows (one-visit-for-feed-and-alarm spec):
+        it walks BACK over motion frames from the newest one at or before ``frame_id`` (in
+        ``(recv_ts, id)`` order), through every gap of at most ``_VISIT_GAP_MS`` and every
+        longer gap ``_bridges`` joins, and returns the first frame of that run. For a frame
+        after a visit's last motion frame (a non-motion frame, in Tuning) that is the latest
+        visit starting at or before it.
+
+        ``floor_ts`` bounds the walk: when the visit reaches back past it, ``floor_ts`` is
+        returned. The alarm passes its vote's own floor (the two-minute lookback, or the
+        previous alarm's end if later) — nothing older can vote — so the read once a second
+        costs at most two minutes of motion frames however long a cat naps, the starvation
+        class of entries 102-105 that ``open_visit``'s bounded walk also avoids. ``None`` is
+        the one unbounded walk made when an alarm starts, to record the exact start.
+
+        ``frame_id`` gone (evicted, cleared) or no motion frame at or before it: ``floor_ts``.
+        Not ``open_visit``: that walk is floored at the live-naming watermark, which sits
+        above the earlier, already-named part of a still cat's visit — the frames the vote needs.
+        """
+        since = self.visit_bridge_since() if bridge_since_ms is _BRIDGE_SAVED else bridge_since_ms
+        floor = None if floor_ts is None else int(floor_ts)
+        # Keyset on (recv_ts, id) descending off idx_frames_motion_recv, as open_visit walks;
+        # `recv_ts <= ?` is the range the index seeks on, the OR only trims the tie. Plans
+        # pinned by a test.
+        prev_sql = (
+            "SELECT id, recv_ts FROM frames WHERE motion = 1"
+            " AND recv_ts <= ? AND (recv_ts < ? OR id < ?)"
+        )
+        with self._lock:
+            row = self._conn.execute("SELECT recv_ts FROM frames WHERE id = ?", (int(frame_id),)).fetchone()
+            if row is None:
+                return floor
+            ts = int(row[0])
+            first = self._conn.execute(
+                prev_sql + " ORDER BY recv_ts DESC, id DESC LIMIT 1", (ts, ts, int(frame_id) + 1)
+            ).fetchone()
+        if first is None:
+            return floor
+        cur_id, cur_ts = int(first[0]), int(first[1])
+        if floor is not None and cur_ts < floor:
+            return floor
+        while True:
+            if floor is None:
+                sql, params = prev_sql, [cur_ts, cur_ts, cur_id]
+            else:
+                sql, params = prev_sql + " AND recv_ts >= ?", [cur_ts, cur_ts, cur_id, floor]
+            with self._lock:
+                rows = self._conn.execute(
+                    sql + " ORDER BY recv_ts DESC, id DESC LIMIT ?", params + [_VISIT_START_PAGE]
+                ).fetchall()
+            for pid, pts in rows:
+                if not self._joins((int(pid), int(pts)), (cur_id, cur_ts), since):
+                    return cur_ts
+                cur_id, cur_ts = int(pid), int(pts)
+            if len(rows) < _VISIT_START_PAGE:
+                break
+        if floor is None:
+            return cur_ts  # the oldest motion frame in the store
+        # The walk reached the floor: one probe below it says whether the visit goes on past it.
+        with self._lock:
+            pred = self._conn.execute(
+                prev_sql + " ORDER BY recv_ts DESC, id DESC LIMIT 1", (cur_ts, cur_ts, cur_id)
+            ).fetchone()
+        if pred is not None and self._joins((int(pred[0]), int(pred[1])), (cur_id, cur_ts), since):
+            return floor
+        return cur_ts
+
+    def _joins(self, before: "tuple[int, int]", after: "tuple[int, int]", since_ms: "int | None") -> bool:
+        """Whether two consecutive motion frames ``(id, recv_ts)`` are in one household visit:
+        within ``_VISIT_GAP_MS`` (one cluster), or a longer gap ``_bridges`` joins. Reads the
+        two frames' boxes only when the gap could bridge."""
+        gap = after[1] - before[1]
+        if gap <= _VISIT_GAP_MS:
+            return True
+        if since_ms is None or after[1] < since_ms or gap > _BRIDGE_MAX_GAP_MS:
+            return False
+        details = self._yolo_details([before[0], after[0]])
+        return self._bridges(
+            (before[1], details.get(before[0])), (after[1], details.get(after[0])), since_ms
+        )
+
     def alarm_frames(
         self,
         model_version_id: int,
@@ -4754,6 +4896,7 @@ class Store:
         with_subject: bool = True,
         with_labels: bool = False,
         with_alarms: bool = False,
+        bridge_since_ms=_BRIDGE_SAVED,
     ) -> dict:
         """The user-facing activity feed: motion frames clustered into events, newest-first.
 
@@ -4850,7 +4993,22 @@ class Store:
         _VISIT_GAP_MS]``, in start order, each ``{start_ts, end_ts, ended, verdict,
         cat_id, cat_name, clips_played, clips_failed, pi_disabled}``. Always present under
         the opt-in, as an empty list when none. Opt-in for the same reason as
-        ``with_labels``: only the activity route reads it.
+        ``with_labels``: only the activity route reads it. An episode decided under the
+        bridged-visit vote — ``start_ts`` at or after the bridge start date — also carries
+        ``frame_recv_ts``, ``n_votes``, ``n_counted`` and ``trigger``, which the player's
+        Alarm row explains it with (one-visit-for-feed-and-alarm spec). An older episode's
+        vote could reach into earlier cards, so those fields would mislead about it and it
+        carries none.
+
+        **Bridging** (one-visit-for-feed-and-alarm spec): after ``_gap_split``, consecutive
+        clusters the bridge rule joins (``_bridges`` — a cat sitting still across a gap the
+        motion-only store left empty) become ONE event, BEFORE ``min_frames`` and the page
+        cap, since bridging changes how many events there are. A bridged event is the union
+        of its clusters: ``start_*`` from the first, ``end_*`` from the last, ``n_frames``
+        summed, ``rep_frame_id`` the peak-area frame over all. Only gaps ending at or after
+        the saved bridge start date bridge; ``bridge_since_ms`` overrides that date (the
+        replay tool passes 0, "bridge everything"). Every per-span read below then runs over
+        the bridged span, unchanged.
         """
         limit = max(1, min(int(limit), _MAX_EVENTS))
         min_frames = max(1, int(min_frames))
@@ -4881,7 +5039,12 @@ class Store:
         # below. Kept out of the returned record (subject carries it when relevant);
         # start_id is unique per event (clusters are disjoint id ranges).
         peak_area_by_start: "dict[int, float]" = {}
-        for cluster in self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[1]):
+        bridge_since = self.visit_bridge_since() if bridge_since_ms is _BRIDGE_SAVED else bridge_since_ms
+        # Bridging runs HERE — after the gap split, before the min_frames floor and the page
+        # cap — because it changes how many events there are. A group is one cluster, or the
+        # several a cat sitting still was split into; it is built as the union of its rows.
+        for group in self._bridge_clusters(self._gap_split(rows, _VISIT_GAP_MS, lambda r: r[1]), bridge_since):
+            cluster = group[0] if len(group) == 1 else [r for c in group for r in c]
             n_frames = len(cluster)
             if n_frames < min_frames:
                 continue
@@ -4912,6 +5075,8 @@ class Store:
         # the tail), so drop it as potentially-partial. It's the last element after the
         # newest-first sort; if there were already > limit clusters it sits beyond the
         # cap and the pop is a no-op on the returned slice, so the pop is always safe.
+        # The same drop covers a BRIDGED visit whose head lies past the window: its
+        # earliest cluster is the window's oldest, so it is that oldest event.
         truncated = len(events) > limit or scan_capped
         if scan_capped and events:
             events.pop()
@@ -5117,7 +5282,8 @@ class Store:
             with self._lock:
                 alarm_rows = self._conn.execute(
                     "SELECT a.start_ts, a.end_ts, a.ended, a.verdict, a.cat_id, a.clips_played,"
-                    " a.clips_failed, a.pi_disabled, a.frame_recv_ts, c.name"
+                    " a.clips_failed, a.pi_disabled, a.frame_recv_ts, c.name,"
+                    " a.n_votes, a.n_counted, a.trigger"
                     " FROM actions a LEFT JOIN cats c ON c.id = a.cat_id"
                     " WHERE a.mode = 'on' AND a.frame_recv_ts BETWEEN ? AND ?"
                     " ORDER BY a.start_ts, a.id",
@@ -5130,11 +5296,11 @@ class Store:
             by_start = events[::-1]   # `events` is newest-first by (start_ts, start_id)
             starts = [e["start_ts"] for e in by_start]
             for (a_start, a_end, ended, verdict, cat_id, played, failed, pi_disabled,
-                 frame_ts, cat_name) in alarm_rows:
+                 frame_ts, cat_name, n_votes, n_counted, trigger) in alarm_rows:
                 k = bisect.bisect_right(starts, int(frame_ts)) - 1
                 if k < 0 or int(frame_ts) > by_start[k]["end_ts"] + _VISIT_GAP_MS:
                     continue   # unattributed: its visit is not on this page (or anywhere)
-                by_start[k]["alarms"].append({
+                entry = {
                     "start_ts": int(a_start),
                     "end_ts": None if a_end is None else int(a_end),
                     "ended": ended,
@@ -5144,7 +5310,19 @@ class Store:
                     "clips_played": int(played),
                     "clips_failed": int(failed),
                     "pi_disabled": bool(pi_disabled),
-                })
+                }
+                # Only an episode decided under the bridged-visit vote (on or after the
+                # bridge start date) says how it decided: an older one voted over a presence
+                # or window that could reach into EARLIER cards, so "decided N s into this
+                # visit, on M frames" would be false about it, and its row reads as before.
+                if bridge_since is not None and int(a_start) >= bridge_since:
+                    entry.update({
+                        "frame_recv_ts": int(frame_ts),
+                        "n_votes": None if n_votes is None else int(n_votes),
+                        "n_counted": None if n_counted is None else int(n_counted),
+                        "trigger": trigger,
+                    })
+                by_start[k]["alarms"].append(entry)
 
         # --- Active-model identity join (identification-gallery-activity spec).
         # Annotate each RETURNED event with the active gallery's aggregated identity
@@ -5463,6 +5641,113 @@ class Store:
             return None
         best = max(usable, key=lambda b: b[4])
         return [float(best[0]), float(best[1]), float(best[2]), float(best[3])], float(best[4])
+
+    # --- The visit bridge (one-visit-for-feed-and-alarm spec; see `_BRIDGE_MIN_IOU`) -------
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        """Intersection over union of two ``[x1, y1, x2, y2, ...]`` boxes (0.0 when either is empty)."""
+        ix = min(float(a[2]), float(b[2])) - max(float(a[0]), float(b[0]))
+        iy = min(float(a[3]), float(b[3])) - max(float(a[1]), float(b[1]))
+        if ix <= 0 or iy <= 0:
+            return 0.0
+        inter = ix * iy
+        area_a = (float(a[2]) - float(a[0])) * (float(a[3]) - float(a[1]))
+        area_b = (float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1]))
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _bridges(
+        before: "tuple[int, str | None]", after: "tuple[int, str | None]", since_ms: "int | None"
+    ) -> bool:
+        """Whether the gap between two CONSECUTIVE motion frames joins their clusters into one visit.
+
+        ``before`` / ``after`` are ``(recv_ts, yolo-serial detail)`` of the last motion frame
+        before the gap and the first after it; ``since_ms`` is the bridge start date
+        (``None`` = bridge nothing). The single rule every reader of the household's visit
+        goes through — the five conditions are at ``_BRIDGE_MIN_IOU``. Missing detection
+        (no row, no box) only ever answers no: the visit then splits as before.
+        """
+        (b_ts, b_detail), (a_ts, a_detail) = before, after
+        if since_ms is None or int(a_ts) < int(since_ms):
+            return False
+        if int(a_ts) - int(b_ts) > _BRIDGE_MAX_GAP_MS:
+            return False
+        b_best, a_best = Store._best_box(b_detail), Store._best_box(a_detail)
+        if b_best is None or a_best is None:
+            return False
+        if b_best[1] < _ANNOTATE_MIN_CONF or a_best[1] < _ANNOTATE_MIN_CONF:
+            return False
+        if Store._iou(b_best[0], a_best[0]) < _BRIDGE_MIN_IOU:
+            return False
+        # No new cat: every cat box after the gap — at ANY confidence, so a faint entering
+        # cat still blocks it — must overlap some cat box from before it.
+        b_boxes = [b for b in Store._detail_boxes(b_detail) if Store._box_class(b) == _COCO_CAT_CLASS_ID]
+        for a in Store._detail_boxes(a_detail):
+            if Store._box_class(a) != _COCO_CAT_CLASS_ID:
+                continue
+            if not any(Store._iou(a, b) >= _BRIDGE_MIN_IOU for b in b_boxes):
+                return False
+        return True
+
+    def _yolo_details(self, frame_ids) -> "dict[int, str | None]":
+        """``frame_id`` → its ``yolo-serial`` ``analysis.detail``, for the frames that have a row.
+
+        The bridge's boundary-box read: a primary-key probe per id (``(frame_id,
+        analyzer)``), batched. Plan pinned by a test — on a store with no ANALYZE stats the
+        planner could otherwise prefer ``idx_analysis_analyzer_verdict`` on the analyzer
+        equality and walk the whole partition (entries 229/265/276/307/385/391).
+        """
+        ids = sorted({int(i) for i in frame_ids})
+        out: "dict[int, str | None]" = {}
+        for k in range(0, len(ids), _BRIDGE_IDS_PER_READ):
+            chunk = ids[k:k + _BRIDGE_IDS_PER_READ]
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT frame_id, detail FROM analysis WHERE analyzer = 'yolo-serial'"
+                    " AND frame_id IN (" + ",".join("?" * len(chunk)) + ")",
+                    chunk,
+                ).fetchall()
+            out.update((int(fid), detail) for fid, detail in rows)
+        return out
+
+    def _bridge_clusters(self, clusters: "list[list]", since_ms: "int | None") -> "list[list[list]]":
+        """Group ``_gap_split``'s recv_ts-ascending motion clusters into visits by the bridge rule.
+
+        Each cluster is a list of rows whose ``[0]`` is the frame id and ``[1]`` its recv_ts.
+        Returns the clusters in order, grouped: consecutive clusters land in one group
+        exactly when ``_bridges`` joins the gap between them, so a long sit with several
+        pauses is one group (the rule is transitive). Only gaps that could bridge — at most
+        ``_BRIDGE_MAX_GAP_MS``, ending at or after ``since_ms`` — have their boundary boxes
+        read, in one batched read.
+        """
+        if not clusters:
+            return []
+        candidates = []
+        if since_ms is not None:
+            for i in range(len(clusters) - 1):
+                b_ts, a_ts = int(clusters[i][-1][1]), int(clusters[i + 1][0][1])
+                if a_ts >= since_ms and a_ts - b_ts <= _BRIDGE_MAX_GAP_MS:
+                    candidates.append(i)
+        joined: "set[int]" = set()
+        if candidates:
+            details = self._yolo_details(
+                [clusters[i][-1][0] for i in candidates] + [clusters[i + 1][0][0] for i in candidates]
+            )
+            for i in candidates:
+                b, a = clusters[i][-1], clusters[i + 1][0]
+                if self._bridges(
+                    (int(b[1]), details.get(int(b[0]))), (int(a[1]), details.get(int(a[0]))), since_ms
+                ):
+                    joined.add(i)
+        groups: "list[list[list]]" = [[clusters[0]]]
+        for i in range(len(clusters) - 1):
+            if i in joined:
+                groups[-1].append(clusters[i + 1])
+            else:
+                groups.append([clusters[i + 1]])
+        return groups
 
     @staticmethod
     def _best_detection_box(detail_text: "str | None") -> "tuple[list[float], float, int] | None":
@@ -8335,7 +8620,7 @@ class Store:
         return result
 
     def _walk_events(
-        self, since_id: int, *, max_pages: int, with_subject: bool
+        self, since_id: int, *, max_pages: int, with_subject: bool, bridge_since_ms=_BRIDGE_SAVED
     ) -> "tuple[list[dict], bool]":
         """Every ``events`` record from ``since_id`` to now, newest first → ``(events, truncated)``.
 
@@ -8350,13 +8635,22 @@ class Store:
         ``with_subject`` is passed straight to ``events``: ``door_stats``' totals ladder
         reads the subject, a per-cat count reads only ``identity`` and skips the feed's
         most expensive annotation (the ``cats_overview`` precedent, CHANGELOG 257).
+        ``bridge_since_ms`` is ``events``' bridge-date override, for the replay tool only.
+
+        Pages split only at visit boundaries, so a bridged visit is never cut across two:
+        a page's oldest KEPT visit is whole (its first cluster was in the read window), and
+        the bridge between it and the next page's newest is a pure function of the two
+        boundary frames, which that page already answered "no" to.
         """
         events: "list[dict]" = []
         truncated = False
         until_id: "int | None" = None
         pages = 0
         while pages < max_pages:
-            page = self.events(since_id, until_id, limit=_MAX_EVENTS, with_subject=with_subject)
+            page = self.events(
+                since_id, until_id, limit=_MAX_EVENTS, with_subject=with_subject,
+                bridge_since_ms=bridge_since_ms,
+            )
             rows = page["events"]
             events.extend(rows)
             pages += 1

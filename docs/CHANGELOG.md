@@ -2248,3 +2248,64 @@ a clean one.
      reads a short latency. And the column stays named `trigger`, as the spec names it: SQLite
      takes the keyword as an identifier, and Postgres does not reserve it.
 
+594. The household visit now BRIDGES a cat sitting still: two consecutive motion clusters are one
+     visit when both boundary frames carry a cat box ≥ 0.3, those best boxes overlap (IoU ≥ 0.5),
+     no new cat box appears after the gap, and the gap is ≤ 2 min. ONE rule, `Store._bridges`,
+     read by the feed and the alarm alike. Spec: docs/specs/2026-11-10-one-visit-for-feed-and-alarm.md.
+
+595. Bridging applies only to gaps ending at or after `visit_bridge_since_ms`, which a LIVE API app
+     saves at its first launch of this build — never a CLI tool; a timestamp, so it survives a
+     Clear; absent bridges nothing. So no visit, count, label or flag from before changes.
+     Computed on read, never saved: timing can only make a bridge MISSING, never wrong.
+
+596. `events()` bridges after `_gap_split` and BEFORE `min_frames` and the page cap, since it
+     changes how many visits there are; a bridged record is the union of its clusters. Everything
+     on the feed follows: Visits counts, daily charts, `cats_overview`, clip, flags, Yes, the alarm
+     mark. The queue, calendar, scorecards and live-naming work units keep the 2 s split, so the
+     calendar's daily count can read slightly above the Visits page's.
+
+597. Measured on a 2M-frame replica with no ANALYZE: the boundary-box read is a primary-key probe
+     (plan pinned by a test), 7 ms lock-held per 200k-frame scan window; a feed page went 87 →
+     114-133 ms, mostly JSON parsing outside the lock. A whole bridged walk is FASTER (2.9 s vs
+     5.9 s): fewer visits to annotate. Headroom left: bridge newest-first and stop at `limit`.
+
+598. The alarm votes over the household visit SO FAR (`Store.visit_start`), not a 5 s-gap presence;
+     `ALARM_PRESENCE_GAP_S` is retired. A sit no longer restarts the vote (Saffi, 9/11 18:55, lost
+     144 frames to one). The read is floored at the vote's own floor, so it stays 0.4 ms however long
+     a cat naps; the row's `visit_start_ts` is one unbounded walk at start. Stored trigger stays `presence`.
+
+599. `ALARM_HOLD_S` 1.0 → 2.0. Replayed over 8-10 Nov, 1 s still sounded at 3 of 5 resident cards —
+     a lookalike leading Sultan's first seconds under IR — and 2 s at none, keeping every neighbour
+     alarm about 1 s later. Rejected: a 50-60% vote share, which also dropped neighbour alarms whose
+     truth is unknown. The margin is thin: at 9/11 18:47 the wrong name led for 1.5 s.
+
+600. The alarm's frontier is the tick's START when the pass caught up, not the clock after it: the
+     pass reads the newest frame when it begins, so the 1-2 s it ran was claimed as checked and used
+     up the hold. The gone check measures to the PREVIOUS pass's frontier too — to the clock, frames
+     nobody had checked read as an absent cat. A sounding alarm may now last one tick longer.
+
+601. The replay's baseline is the SHIPPED presence rule (1 s hold, 5 s presence, takeover net), frozen
+     with its own constants; "new" is `start_decision` over visits bridged across the whole range
+     (`bridge_since_ms=0`). Its walk starts a lookback early, so a visit under way at the first
+     midnight is reported whole, from its true start. Neither frontier fix can show in it.
+
+602. The user player's Alarm row explains an alarm decided from the bridge start date on: "Decided
+     0.4 s into this visit, on 13 frames (Store Jihn 8). The whole visit says Saffi." `alarms[]` gains
+     `frame_recv_ts`, `n_votes`, `n_counted`, `trigger` for those episodes ONLY: an older one voted over
+     frames reaching into earlier cards, so the sentence would be false about it.
+
+603. Known limits. A bridged visit has no length cap — one would make where a nap splits depend on
+     grouping order. A bridged nap past `_MAX_VISIT_SPAN` (~16 min in Tuning) meets the long-visit
+     refusal; one past the feed's 200k-motion-frame scan window would drop as partial (hours of
+     motion). A stranger appearing only after the first post-gap frame folds into the resident's visit.
+
+604. An alarm's start runs the UNBOUNDED visit walk only when the floored once-a-second read stopped
+     at its floor (a visit over 2 min, or the previous alarm's end); otherwise that read already is
+     the exact start. The walk sat before the row write and the first clip, and a long bridged nap
+     makes it long — the deterrent must not wait on a bookkeeping field.
+
+605. Known limit, found in review and left for a decision: a window bound (`since_id`) can cut a
+     BRIDGED visit. A cat sitting still across a Visits-page window start (or the daily walk's
+     floor) shows in the window as its later part only, named from those frames — so the Visits
+     page and the feed can disagree about that visit, against entry 341. A fix reads back past
+     `since_id` by up to the bridge cap, transitively, which changes what every window bound means.

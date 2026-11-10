@@ -31,9 +31,11 @@ processing step and the switches are unchanged.
 
 - On the compute PC, run
   `python -m compute.tools.alarm_replay --since 2026-10-25 --until 2026-11-05`.
-  - It reports model 6 with counted frames on every day of the range.
+  - It reports model 6 with counted frames on every day of the range that has recordings.
+    27–31 Oct have none.
   - At both tick phases, the added-misses list is empty, and the new rule has no late starts
-    on visits not named as ours.
+    on visits not named as ours. The one exception is the accepted borderline 26 Oct 06:00:30
+    (see Amendments).
   - Alarms on visits named as ours read about 20 for today's rule against 5–7 for the new
     one.
   - The new rule's median decision delay is within about 1.5 s of the baseline's.
@@ -83,8 +85,10 @@ processing step and the switches are unchanged.
 - **Every window is measured in camera time** (diverges). Today's start window runs back
   5 s from the wall clock, so a 3 s processing delay leaves it ~2 s of identified frames.
   Here every window and gap is measured from the newest counted frame's `recv_ts`: the hold,
-  the takeover window, and the presence gap. Wall-clock age is consulted only when the pass
-  has caught up, the same condition under which the gone check trusts it.
+  the takeover window, and the presence gap. Age is measured up to the **processing
+  frontier**, the `recv_ts` through which every frame has been processed. That is `now` once
+  the pass has caught up, so wall-clock age counts only then, the same condition under which
+  the gone check trusts it.
 - **A takeover net** (new). This path starts the alarm with no hold, when in the 5 s up to the
   newest counted frame:
   - there are at least 20 counted frames;
@@ -194,15 +198,25 @@ Caveats a reviewer should weigh:
   `recv_ts` in `[max(now − 120 s, floor), now]`;
 - `now`;
 - the previous-alarm `floor`;
-- `caught_up` (the last pass left no frame unprocessed);
+- `frontier`, the `recv_ts` through which every frame has been processed:
+  - `now` when the last pass caught up;
+  - the last processed frame's `recv_ts` when it is behind;
+  - none when that frame is gone, for example after a Clear or an eviction.
 - the threshold, the names, and the resident roster.
 
 It returns nothing, or a start with its verdict, evidence and trigger. Below, `newest` is the
-`recv_ts` of the newest frame. First, the **staleness check**: if `caught_up` and
-`now − newest > DETER_WINDOW_S`, nobody is present and there is no start. While the pass is
-behind, nothing is stale, because the frames still to come may continue the presence. Then
-both paths are evaluated, and the alarm starts when either is met. *Which is recorded*, below,
-says what the row carries.
+`recv_ts` of the newest frame, and `edge = max(frontier, newest)`, which is just `newest` when
+the frontier is unknown.
+
+First, the **staleness check**: if `edge − newest > DETER_WINDOW_S`, nobody is present and
+there is no start. Frames still to be processed all arrived after the frontier, so they cannot
+fill a gap that is already over 5 s by the frontier. Without that, an old presence that never
+alarmed would fire at the next cat's arrival. It might never have alarmed because the switch
+was Off, or because its frames were named later by the closed-visit pass. A new visit's first
+pass is behind with nothing counted yet, and the old presence would not read as stale.
+
+Then both paths are evaluated, and the alarm starts when either is met. *Which is recorded*,
+below, says what the row carries.
 
 1. **Takeover.** Take the frames with `recv_ts ≥ newest − DETER_WINDOW_S` (5 s). The path is
    met when there are at least `ALARM_TAKEOVER_MIN_FRAMES` (20) and at least
@@ -222,9 +236,10 @@ says what the row carries.
      ends at it. Let `t0` be the `recv_ts` of the frame that *ends* the run's shortest prefix:
      the frame at which the vote turned foreign and has stayed foreign since. It is not the
      presence's first frame, which every prefix shares. The hold is met when
-     `newest − t0 ≥ ALARM_HOLD_S` (1 s), or when `caught_up` and `now − t0 ≥ 1 s`.
-     The second branch lets a short visit whose cat has already left complete its hold. The
-     first stops a lagging pass from meeting the hold on frames it has not yet seen.
+     `edge − t0 ≥ ALARM_HOLD_S` (1 s). Every counted frame up to the frontier has been seen
+     and kept the vote foreign, so a lagging pass never meets the hold on frames it has not
+     processed. Once caught up, `edge` is `now`, so a short visit whose cat has already left
+     still completes its hold.
    - The path is met when the last prefix is foreign and the hold is met.
 
 **Which is recorded.** The trigger, verdict and evidence follow the presence vote, not the
@@ -254,8 +269,8 @@ recorded verdict came from:
 ### What the worker changes
 
 - `Alarm.maybe_start` reads `alarm_frames(model, max(now − 120 s, last_end + 1))` instead of
-  the 5 s window, and hands it to `start_decision` with the `caught_up` the pass just
-  reported.
+  the 5 s window. It hands the frames to `start_decision` with the frontier the pass just
+  reached.
 - During a long presence this returns up to ~1,400 rows a tick instead of ~60. It is the
   pinned `CROSS JOIN` plan (entry 529), probing by primary key per row, so it costs
   milliseconds. Pin the plan again with the new bound.
@@ -359,11 +374,11 @@ is out of its scope by design.
 *Not part of the design — a starting point for whoever builds this.*
 
 - **Single agent, Opus 5.5.** One thread through `deterrent.py` (`start_decision`, the
-  constants, the seeded floor), `live_identify.py` (calling it with `caught_up`, the timing
+  constants, the seeded floor), `live_identify.py` (calling it with the frontier, the timing
   split) and `store.py` (`alarm_frames(until_ts=)`, `actions.trigger`). The replay tool calls
   that same function, so it has to come after it. The admin log line and the docs are small.
   The design risk sits in getting the prefix tallies to match `_aggregate_identity` exactly,
-  and in the camera-time and `caught_up` edges, which parallel agents would only guess at.
+  and in the camera-time and frontier edges, which parallel agents would only guess at.
 
 ## Amendments
 
@@ -374,3 +389,21 @@ is out of its scope by design.
   `takeover`, which defeated the column's purpose. The label now follows the presence vote:
   `takeover` means the net overrode a vote that did not call the cat foreign. When an alarm
   starts is unchanged.
+- **2026-11-05.** "While the pass is behind, nothing is stale" let an old presence that never
+  alarmed start one at the next cat's arrival. `caught_up` is replaced by the processing
+  frontier: staleness and the hold are measured up to `max(frontier, newest)`. Once caught up
+  the results are the same, so the replay is unchanged.
+- **2026-11-05, verified on the compute PC.** The replay over 25 Oct–5 Nov gave:
+  - alarms on visits named as ours: 18 → 4–5;
+  - neighbour or unknown-cat visits alarmed in view: 35 → 34–35;
+  - median decision delay into neighbour visits: +1.2 s;
+  - 04:15, 22:24 and the trigger labels: as expected.
+
+  One added miss is **accepted by the user** as a borderline. On 26 Oct 06:00:30, at tick
+  phase 0 only, the new rule decided 0.4 s after the visit's last frame where today's rule was
+  in view.
+  - It was a dark 4.5 s night visit: one silhouetted cat whose per-frame names wander across
+    six cats, with the card saying Store Sultan on 11 of 37 frames.
+  - At the real door, the ~2.6 s processing delay puts both rules after it left.
+
+  Shortening the hold to 0.5 s was offered and declined.

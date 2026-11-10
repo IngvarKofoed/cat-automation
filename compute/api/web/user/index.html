@@ -964,6 +964,8 @@
             font-family: inherit;
             font-weight: 500;
             text-align: right;
+            /* One alarm episode per line when they explain how they decided. */
+            white-space: pre-line;
         }
 
         /* ================= "mark for labelling" ================= */
@@ -1820,6 +1822,41 @@
                 if (a.pi_disabled) what += ' · then the Pi’s speaker was switched off';
             }
             return `${what}, judged ${judged}`;
+        }
+        // How an alarm decided, read against the card it sits on (one-visit-for-feed-and-alarm
+        // spec): "Decided 0.4 s into this visit, on 13 frames (Store Jihn 8). The whole visit
+        // says Saffi." Only an episode decided under the visit vote carries the fields it needs
+        // (the server sends them from the bridge start date on); an older one voted over frames
+        // that could reach into EARLIER cards, so the sentence would be false about it, and
+        // its row reads as before — as it does against an older compute build.
+        function alarmDecided(a, ev) {
+            if (a.frame_recv_ts == null || a.n_counted == null) return '';
+            const into = Math.max(0, (a.frame_recv_ts - ev.start_ts) / 1000);
+            const n = a.n_counted, votes = a.n_votes == null ? 0 : a.n_votes;
+            const frames = `${n} frame${n === 1 ? '' : 's'}`;
+            let on;
+            if (a.trigger === 'takeover') {
+                // The net's window is the deterrent's DETER_WINDOW_S (5 s).
+                on = `on ${frames} in 5 s, ${votes} of them foreign`;
+            } else if (a.verdict === 'neighbour') {
+                on = `on ${frames} (${a.cat_name || `cat #${a.cat_id}`} ${votes})`;
+            } else {
+                on = `on ${frames}, none close to a known cat`;
+            }
+            let text = `Decided ${into.toFixed(1)} s into this visit, ${on}.`;
+            // Against the card: when its whole-visit vote names a different cat — a resident
+            // included — say so. Nothing to add when it agrees or names no one.
+            const card = ev.identity;
+            if (card && card.cat_id != null && card.cat_id !== a.cat_id) {
+                text += ` The whole visit says ${card.cat_name || `cat #${card.cat_id}`}.`;
+            }
+            return text;
+        }
+        // One episode's Alarm-row text: the phrase, then — for an episode that carries the
+        // fields — how it decided.
+        function alarmText(a, ev) {
+            const decided = alarmDecided(a, ev);
+            return decided ? `${alarmPhrase(a)}. ${decided}` : alarmPhrase(a);
         }
         const ALARM_ARIA = {
             sounding: ' Alarm sounding.',
@@ -2966,7 +3003,10 @@
                     'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
             }
             if (alarmed) {
-                row('Alarm', ev.alarms.map(alarmPhrase).join('; '),
+                // Episodes that explain how they decided are full sentences, one per line;
+                // a row with none of those reads exactly as before.
+                const explained = ev.alarms.some(a => alarmDecided(a, ev));
+                row('Alarm', ev.alarms.map(a => alarmText(a, ev)).join(explained ? '\n' : '; '),
                     'What the foreign-cat alarm did at this visit, and what it took the cat for. '
                     + 'It decides on a few seconds of frames, so it can disagree with the name on the card.',
                     'phrase');

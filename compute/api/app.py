@@ -1214,6 +1214,11 @@ def create_app(
     # `tuning` in memory without persisting it.
     if start_collector:
         store.derive_stage_if_unset()
+        # Fix the visit-bridge start date the first time this build runs (and keep it on every
+        # later launch): from it on, a cat sitting still stays one visit in the feed and for the
+        # alarm; before it nothing is regrouped. Live app only, for the same reason — this
+        # writes — and so a CLI tool opening the store never sets it.
+        store.ensure_visit_bridge_since(int(time.time() * 1000))
 
     if start_collector:
         # The collector is now WIRED (live client above, shutdown hook below) but

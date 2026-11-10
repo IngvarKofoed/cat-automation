@@ -267,10 +267,13 @@ class LiveIdentifyManager:
         # re-seeded by ``reset_watermark`` exactly as the watermark is.
         self._alarm_hwm = 0
         # The previous pass's outcome, read by the next tick's bookkeeping: whether it
-        # raised (an alarm must not keep sounding on a step that can't see), and whether it
-        # caught up with the store (the "gone" check is meaningless otherwise). Worker-only.
+        # raised (an alarm must not keep sounding on a step that can't see), whether it
+        # caught up with the store (the "gone" check is meaningless otherwise), and its
+        # FRONTIER — the recv_ts through which every stored frame had been processed, which
+        # both the start and the gone check measure their absences to. Worker-only.
         self._alarm_pass_failed = False
         self._alarm_caught_up = False
+        self._alarm_frontier: "int | None" = None
 
     # --- The tick ------------------------------------------------------------------------
 
@@ -508,12 +511,14 @@ class LiveIdentifyManager:
         gate = mode_on and is_calibrated(model)
 
         # 1. Episode bookkeeping: end it, or play the next clip once the last is due to end.
+        # It runs before this tick's pass, so it reads the PREVIOUS pass's frontier.
         try:
             self._alarm.bookkeeping(
                 mode_on=mode_on,
                 model=model,
                 pass_failed=self._alarm_pass_failed,
                 caught_up=self._alarm_caught_up,
+                frontier_ms=self._alarm_frontier,
                 now_ms=now,
             )
         except Exception as exc:  # noqa: BLE001 - its reads/writes are store calls
@@ -524,6 +529,7 @@ class LiveIdentifyManager:
         self._alarm_pass_failed = False
         if not gate:
             self._alarm_caught_up = False
+            self._alarm_frontier = None
             return False, None
 
         # 2. Process the newest frames.
@@ -532,37 +538,40 @@ class LiveIdentifyManager:
             open_span, info = self._alarm_process(stop_event, model, now)
         except EmbedCancelled:
             self._alarm_caught_up = False  # a stop — not a fault
+            self._alarm_frontier = None
             return True, open_span
         except Exception as exc:  # noqa: BLE001
             logger.exception("live-identify: alarm pass failed")
             self._alarm_pass_failed = True
             self._alarm_caught_up = False
+            self._alarm_frontier = None
             self._alarm.record_pass(None, str(exc))
             with self._lock:
                 self._last_error = str(exc)
             return True, open_span
         self._alarm_caught_up = info["caught_up"]
+        # The frontier: every stored frame up to it has been processed. Caught up, that is the
+        # tick's own start — the pass read the newest frame when it began, so frames received
+        # while it ran (1-2 s with a cat in view) are unchecked, and the clock after the pass
+        # would claim them. Behind, it is the last frame this pass processed (None if gone).
+        if info["caught_up"]:
+            self._alarm_frontier = now
+        else:
+            try:
+                with self._lock:
+                    hwm = self._alarm_hwm
+                self._alarm_frontier = self._store.frame_recv_ts(hwm)
+            except Exception:  # noqa: BLE001 - unknown frontier: camera time alone speaks
+                logger.exception("live-identify: could not read the alarm frontier")
+                self._alarm_frontier = None
         self._alarm.record_pass(info, None)
         if stop_event.is_set():
             return True, open_span
 
-        # 3. Start, if no alarm is running and the recent counted frames vote foreign.
+        # 3. Start, if no alarm is running and the visit's counted frames vote foreign.
         if not self._alarm.running:
             try:
-                visit_start_ts = (
-                    self._store.frame_recv_ts(open_span[0]) if open_span is not None else None
-                )
-                # Behind, the frontier is the last frame this pass processed: every frame
-                # still to come lies after it, so it bounds what an absence may say.
-                frontier_ms = None
-                if not info["caught_up"]:
-                    with self._lock:
-                        hwm = self._alarm_hwm
-                    frontier_ms = self._store.frame_recv_ts(hwm)
-                self._alarm.maybe_start(
-                    model, self._now_ms(), visit_start_ts,
-                    caught_up=info["caught_up"], frontier_ms=frontier_ms,
-                )
+                self._alarm.maybe_start(model, self._now_ms(), frontier_ms=self._alarm_frontier)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("live-identify: alarm start failed")
                 self._alarm_pass_failed = True
@@ -603,10 +612,10 @@ class LiveIdentifyManager:
             # before now: replaying a long visit oldest-first (switch turned On, or the
             # worker restarted, mid-visit) would only delay the start by minutes. The
             # skipped frames are the closed pass's to name, as every other closed visit's
-            # are. Known limit, accepted (alarm-presence-vote spec): the presence vote
+            # are. Known limit, accepted (alarm-presence-vote spec): the visit vote
             # reaches back further than this, so frames skipped here — after a switch-on or
-            # restart mid-presence, or whenever the step lags the camera by more than
-            # DETER_WINDOW_S — are absent from that vote.
+            # restart mid-visit, or whenever the step lags the camera by more than
+            # DETER_WINDOW_S — are absent from that vote unless the closed pass named them.
             window_first, _ = self._store.resolve_ts_range(now - int(DETER_WINDOW_S * 1000), None)
             floor = start_id - 1 if window_first is None else max(start_id, window_first) - 1
             hwm = max(hwm, floor)

@@ -1,10 +1,11 @@
-"""The alarm's start rule as a pure function (docs/specs/2026-11-05-alarm-presence-vote.md).
+"""The alarm's start rule as a pure function (docs/specs/2026-11-05-alarm-presence-vote.md,
+its vote moved onto the household visit by docs/specs/2026-11-10-one-visit-for-feed-and-alarm.md).
 
 ``deterrent.start_decision`` is the whole rule — the worker and the replay tool both call
 it — so its edges are pinned here directly on synthetic counted frames, with no store and
-no worker: the prefix tallies against the feed's own voter, the camera-time hold and its
-``caught_up`` branch, the staleness check, the presence gap and 2-minute bound, the floor,
-and the takeover net's thresholds and verdict.
+no worker: the prefix tallies against the feed's own voter, the 2 s camera-time hold measured
+to the frontier, the staleness check, the visit bound (``visit_start_ts``), the 2-minute
+lookback, the floor, and the takeover net's thresholds and verdict.
 """
 from __future__ import annotations
 
@@ -35,12 +36,17 @@ def frames_at(spec, start=T, step=100, first_id=1):
     return [(first_id + i, start + i * step, cid, d) for i, (cid, d) in enumerate(spec)]
 
 
-def decide(frames, now=None, floor=None, caught_up=True, threshold=TH, frontier=None):
+_FIRST = object()
+
+
+def decide(frames, now=None, floor=None, caught_up=True, threshold=TH, frontier=None, visit_start=_FIRST):
     """Caught up, the frontier is ``now``; behind, it is ``frontier`` (``None`` = unknown,
-    so only camera time — the newest counted frame — may speak)."""
+    so only camera time — the newest counted frame — may speak). The visit starts at the
+    first frame given unless ``visit_start`` says otherwise."""
     now = frames[-1][1] if now is None else now
     return start_decision(
-        frames, now, floor, now if caught_up else frontier, threshold, NAMES, RESIDENTS
+        frames, now, floor, now if caught_up else frontier, threshold, NAMES, RESIDENTS,
+        visit_start_ts=frames[0][1] if visit_start is _FIRST else visit_start,
     )
 
 
@@ -83,20 +89,20 @@ def test_presence_verdict_is_the_voter_over_the_whole_presence():
 
 
 # =====================================================================================
-#  Presence vote + 1 s hold, in camera time
+#  Visit vote + 2 s hold, in camera time
 # =====================================================================================
 
 
-def test_ten_foreign_frames_need_a_further_second_of_camera_time():
+def test_ten_foreign_frames_need_two_further_seconds_of_camera_time():
     # 2 fps of Tom: the 10th frame turns the vote foreign at t0 = 4.5 s; the hold is met
-    # once the newest frame is a second past it.
-    fr = frames_at([(TOM, NEAR)] * 12, step=500)
+    # once the newest frame is two seconds past it.
+    fr = frames_at([(TOM, NEAR)] * 14, step=500)
     t0 = fr[9][1]
     assert decide(fr[:10], caught_up=False) is None            # just turned foreign
-    assert decide(fr[:11], caught_up=False) is None            # 0.5 s held
-    d = decide(fr[:12], caught_up=False)                       # 1.0 s held
+    assert decide(fr[:13], caught_up=False) is None            # 1.5 s held
+    d = decide(fr[:14], caught_up=False)                       # 2.0 s held
     assert d is not None and d.trigger == TRIGGER_PRESENCE and d.verdict == "neighbour"
-    assert fr[11][1] - t0 == 1_000
+    assert fr[13][1] - t0 == 2_000
 
 
 def test_a_lagging_pass_cannot_meet_the_hold_on_frames_it_has_not_seen():
@@ -107,25 +113,37 @@ def test_a_lagging_pass_cannot_meet_the_hold_on_frames_it_has_not_seen():
     assert d is not None and d.trigger == TRIGGER_PRESENCE     # a short visit completes
 
 
-def test_caught_up_wall_clock_branch_needs_the_full_second():
+def test_caught_up_the_frontier_needs_the_full_two_seconds():
     fr = frames_at([(TOM, NEAR)] * 10, step=500)
     t0 = fr[-1][1]
-    assert decide(fr, now=t0 + 999, caught_up=True) is None
-    assert decide(fr, now=t0 + 1_000, caught_up=True) is not None
+    assert decide(fr, now=t0 + 1_999, caught_up=True) is None
+    assert decide(fr, now=t0 + 2_000, caught_up=True) is not None
+
+
+def test_the_hold_is_measured_to_the_frontier_not_the_clock():
+    # The pass that saw the vote turn took 2.5 s: the clock (now) is well past the hold,
+    # but every frame after the turn is unchecked, so the frontier is the tick's start.
+    # Measured to the clock this started on frames nobody had looked at.
+    fr = frames_at([(TOM, NEAR)] * 10, step=500)
+    t0 = fr[-1][1]
+    tick_start = t0 + 300
+    assert decide(fr, now=tick_start + 2_500, caught_up=False, frontier=tick_start) is None
+    assert decide(fr, now=tick_start + 2_500, caught_up=True) is not None   # the old reading
+    assert decide(fr, now=t0 + 5_000, caught_up=False, frontier=t0 + 2_000) is not None
 
 
 def test_t0_is_where_the_vote_turned_foreign_not_the_presence_start():
     # Mittens leads for 8 frames, then Tom catches up: the vote turns foreign on the frame
     # where Tom's count passes hers, and the hold runs from THERE.
-    spec = [(MITTENS, NEAR)] * 8 + [(TOM, NEAR)] * 12
+    spec = [(MITTENS, NEAR)] * 8 + [(TOM, NEAR)] * 15
     fr = frames_at(spec, step=400)
     turned = 8 + 9 - 1                         # Tom's 9th frame: 9 to 8
     assert prefix_winners([(c, x) for _f, _t, c, x in fr], TH)[turned] == TOM
     assert prefix_winners([(c, x) for _f, _t, c, x in fr], TH)[turned - 1] == MITTENS
     t0 = fr[turned][1]
-    upto = [f for f in fr if f[1] < t0 + 1_000]
+    upto = [f for f in fr if f[1] < t0 + 2_000]
     assert decide(upto, caught_up=False) is None
-    upto = [f for f in fr if f[1] <= t0 + 1_200]
+    upto = [f for f in fr if f[1] <= t0 + 2_000]
     d = decide(upto, caught_up=False)
     assert d is not None and d.trigger == TRIGGER_PRESENCE and d.cat_id == TOM
 
@@ -139,8 +157,10 @@ def test_a_broken_foreign_run_restarts_the_hold():
     )
     fr = frames_at(spec, step=400)
     assert decide(fr, caught_up=False) is None           # 0.4 s held since the retake
-    more = fr + frames_at([(TOM, NEAR)] * 2, start=fr[-1][1] + 400, step=400, first_id=100)
-    d = decide(more, caught_up=False)
+    more = fr + frames_at([(TOM, NEAR)] * 3, start=fr[-1][1] + 400, step=400, first_id=100)
+    assert decide(more, caught_up=False) is None         # 1.6 s
+    more = fr + frames_at([(TOM, NEAR)] * 4, start=fr[-1][1] + 400, step=400, first_id=100)
+    d = decide(more, caught_up=False)                    # 2.0 s
     assert d is not None and d.trigger == TRIGGER_PRESENCE
 
 
@@ -149,12 +169,27 @@ def test_a_resident_presence_never_starts_however_long():
     assert decide(fr, now=fr[-1][1] + 500) is None
 
 
-def test_a_lookalike_window_inside_a_resident_presence_does_not_start():
+def test_a_lookalike_window_inside_a_resident_visit_does_not_start():
     # 5 Nov 04:15's shape: a long resident visit in which a neighbour edges ahead of the
-    # last 5 s. The presence still names the resident.
+    # last 5 s. The visit still names the resident.
     spec = [(KALI, NEAR)] * 40 + [(TOM, 0.3)] * 8 + [(KALI, NEAR)] * 2 + [(TOM, 0.3)] * 8
     fr = frames_at(spec, step=300)
     assert decide(fr, now=fr[-1][1] + 100) is None
+
+
+def test_a_lookalike_leading_a_visits_first_second_and_a_half_does_not_start():
+    # Sultan at night (9/11 18:47's shape): a lookalike neighbour leads the vote from the
+    # 10th frame (0.9 s) until the resident overtakes it at 2.4 s — 1.5 s of foreign. The
+    # shipped 1 s hold sounded; 2 s does not. Under the takeover net's 90% throughout.
+    fr = frames_at([(TOM, NEAR)] * 12 + [(MITTENS, NEAR)] * 50, step=100)
+    for k in range(10, len(fr) + 1):
+        assert decide(fr[:k], caught_up=False) is None, k
+    assert decide(fr[:k], now=fr[k - 1][1] + 2_000) is None
+    # Control: the shipped 1 s rule, frozen in the replay, does sound on this visit.
+    from compute.tools.alarm_replay import baseline_decision
+    upto = fr[:21]                                          # 2.0 s: turned at 0.9, held 1.1
+    d = baseline_decision(upto, upto[-1][1], None, upto[-1][1], TH, NAMES, RESIDENTS)
+    assert d is not None and d.cat_id == TOM
 
 
 def test_fewer_than_ten_frames_never_start():
@@ -168,12 +203,12 @@ def test_an_uncalibrated_gallery_never_starts():
 
 
 # =====================================================================================
-#  Staleness, the presence gap, the 2-minute bound, the floor
+#  Staleness, the visit bound, the 2-minute lookback, the floor
 # =====================================================================================
 
 
 def test_stale_when_the_frontier_is_a_window_past_the_newest_frame():
-    fr = frames_at([(TOM, NEAR)] * 12, step=500)
+    fr = frames_at([(TOM, NEAR)] * 14, step=500)
     newest = fr[-1][1]
     assert decide(fr, now=newest + 5_000, caught_up=True) is not None
     assert decide(fr, now=newest + 5_001, caught_up=True) is None
@@ -198,30 +233,50 @@ def test_a_minute_old_foreign_presence_is_stale_to_a_pass_that_is_behind():
 
 def test_behind_the_hold_runs_to_the_frontier():
     # 2 fps of Tom: the vote turns foreign on the 10th frame, the newest. Behind with the
-    # frontier 1 s past it — every frame up to there processed, none counted — the vote
-    # has stayed foreign a second: met. Short of that, not.
+    # frontier 2 s past it — every frame up to there processed, none counted — the vote
+    # has stayed foreign two seconds: met. Short of that, not.
     fr = frames_at([(TOM, NEAR)] * 10, step=500)
     t0 = fr[-1][1]
-    assert decide(fr, now=t0 + 4_000, caught_up=False, frontier=t0 + 999) is None
-    d = decide(fr, now=t0 + 4_000, caught_up=False, frontier=t0 + 1_000)
+    assert decide(fr, now=t0 + 4_000, caught_up=False, frontier=t0 + 1_999) is None
+    d = decide(fr, now=t0 + 4_000, caught_up=False, frontier=t0 + 2_000)
     assert d is not None and d.trigger == TRIGGER_PRESENCE
 
 
-def test_a_gap_over_five_seconds_starts_a_new_presence():
-    # Mittens, a 5.1 s gap, then Tom: the earlier frames are another presence and cannot
-    # outvote him. Exactly 5 s is no gap.
+def test_the_vote_is_over_the_visit_so_far():
+    # Mittens, then Tom after a pause. Where the visit starts decides who votes: a NEW
+    # visit (the pause did not bridge) holds only Tom; a cat sitting still bridged into
+    # one visit keeps Mittens' frames in the vote, however long the pause — no 5 s split.
     mittens = frames_at([(MITTENS, NEAR)] * 30, step=400)
-    tom_start = mittens[-1][1] + 5_100
-    tom = frames_at([(TOM, NEAR)] * 13, start=tom_start, step=400, first_id=100)
-    d = decide(mittens + tom, caught_up=False)
-    assert d is not None and d.n_counted == 13
-    joined = frames_at([(TOM, NEAR)] * 13, start=mittens[-1][1] + 5_000, step=400, first_id=100)
-    assert decide(mittens + joined, caught_up=False) is None   # same presence: Mittens 30 to 13
+    tom_start = mittens[-1][1] + 5_400
+    tom = frames_at([(TOM, NEAR)] * 15, start=tom_start, step=400, first_id=100)
+    d = decide(mittens + tom, caught_up=False, visit_start=tom_start)
+    assert d is not None and d.n_counted == 15 and d.cat_id == TOM
+    assert decide(mittens + tom, caught_up=False, visit_start=mittens[0][1]) is None
+    # One frame past Tom's start excludes it from the vote too (at-or-after is inclusive).
+    d = decide(mittens + tom, caught_up=False, visit_start=tom_start + 1)
+    assert d is None or d.n_counted == 14
+
+
+def test_the_saffi_sit_is_one_vote():
+    # 9/11 18:55's shape: Saffi moves, sits still 5.4 s (no frames), and her next frames
+    # are lookalike-led for a while. Voting from the gap discards her 30 frames and sounds;
+    # the bridged visit keeps them and does not.
+    fr = frames_at([(MITTENS, NEAR)] * 30, step=100)
+    after = frames_at(([(TOM, NEAR)] * 6 + [(MITTENS, NEAR)] * 4) * 4,
+                      start=fr[-1][1] + 5_400, step=100, first_id=100)
+    assert decide(fr + after, caught_up=False, visit_start=fr[0][1]) is None
+    assert decide(fr + after, caught_up=False, visit_start=after[0][1]) is not None
+
+
+def test_an_unknown_visit_start_falls_back_to_the_lookback():
+    mittens = frames_at([(MITTENS, NEAR)] * 30, step=400)
+    tom = frames_at([(TOM, NEAR)] * 15, start=mittens[-1][1] + 5_400, step=400, first_id=100)
+    assert decide(mittens + tom, caught_up=False, visit_start=None) is None   # Mittens 30 to 15
 
 
 def test_the_presence_reaches_back_two_minutes_and_then_slides():
-    # 150 s of Mittens at 1 fps then 20 s of Tom at 1 fps: within the bound Mittens still
-    # leads; once her older frames fall out of the 2-minute read, Tom takes the vote.
+    # 150 s of Mittens at 1 fps then Tom at 1 fps, all one visit: within the bound Mittens
+    # still leads; once her older frames fall out of the 2-minute read, Tom takes the vote.
     spec = [(MITTENS, NEAR)] * 150 + [(TOM, NEAR)] * 140
     fr = frames_at(spec, step=1_000)
     at = lambda i: decide(fr[: i + 1], caught_up=False)  # noqa: E731
@@ -267,16 +322,17 @@ def test_takeover_fires_at_ninety_percent_of_twenty():
 
 def test_takeover_below_the_share_or_the_count_does_not_fire():
     assert decide(_tailgate(3, 17)) is None                # 0.85
-    # 19 foreign frames in a fresh presence: never the net, only the held presence vote.
+    # 19 foreign frames in a fresh visit: never the net, only the held visit vote.
     lead = frames_at([(MITTENS, NEAR)] * 100, step=200)
     few = frames_at([(REX, FAR)] * 19, start=lead[-1][1] + 5_100, step=100, first_id=1_000)
-    d = decide(lead + few, now=few[-1][1] + 200)
+    assert decide(lead + few, now=few[-1][1] + 1_000, visit_start=few[0][1]) is None   # 1.9 s held
+    d = decide(lead + few, now=few[-1][1] + 1_100, visit_start=few[0][1])               # 2.0 s
     assert d is not None and d.trigger == TRIGGER_PRESENCE
 
 
 def test_takeover_window_is_the_five_seconds_up_to_the_newest_frame():
     # 19 foreign frames in the last 5 s, a 20th just outside it: no takeover. The resident
-    # presence before them keeps the presence vote on Mittens.
+    # visit before them keeps the visit vote on Mittens.
     lead = frames_at([(MITTENS, NEAR)] * 100, step=200)
     start = lead[-1][1] + 200
     tail = frames_at([(REX, FAR)] * 20, start=start, step=264, first_id=1_000)
@@ -303,9 +359,9 @@ def test_takeover_never_names_a_resident_as_its_target():
 
 
 def test_a_lone_neighbour_meeting_both_paths_is_recorded_as_presence():
-    # 10 fps of Tom: on the tick his 20th frame lands, the net (20, all foreign) and the
-    # presence hold (turned foreign at his 10th, a second ago) are BOTH met. The row
-    # follows the vote, not the order the paths are checked in.
+    # 10 fps of Tom: on the tick his 20th frame lands, the net (20, all foreign) is met and
+    # the visit vote has called him foreign since his 10th — its 2 s hold still running.
+    # The row follows the vote, not the order the paths are checked in.
     fr = frames_at([(TOM, NEAR)] * 20, step=100)
     window_all_foreign = all(deterrent.is_foreign(c, x, TH, RESIDENTS) for _f, _t, c, x in fr)
     assert len(fr) >= deterrent.ALARM_TAKEOVER_MIN_FRAMES and window_all_foreign
@@ -340,8 +396,9 @@ def test_takeover_is_also_stale_checked():
 
 
 def test_constants_are_the_spec_values():
-    assert deterrent.ALARM_PRESENCE_GAP_S == deterrent.DETER_WINDOW_S == 5.0
+    assert deterrent.DETER_WINDOW_S == 5.0
+    assert not hasattr(deterrent, "ALARM_PRESENCE_GAP_S")       # retired: the visit bridges it
     assert deterrent.ALARM_PRESENCE_MAX_S == 120.0
-    assert deterrent.ALARM_HOLD_S == 1.0
+    assert deterrent.ALARM_HOLD_S == 2.0
     assert (deterrent.ALARM_TAKEOVER_MIN_FRAMES, deterrent.ALARM_TAKEOVER_SHARE) == (20, 0.9)
     assert deterrent.DETER_MIN_FRAMES == 10

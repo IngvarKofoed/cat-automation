@@ -125,7 +125,7 @@ The Pi holds **no ML models** and makes **no recognition decisions**.
 | **Decision engine** | The policy brain. Maps (identity, confidence, direction, context) → **intents** (allow / deny / deter / notify). Knows nothing about specific hardware. |
 | **Event store & state** | Durable record of cats, sightings, identifications, transitions, actions; derives current occupancy ("who's home"). |
 | **Notifier** | Turns notify intents into push notifications to the owner. |
-| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. The Activity card of a visit that **set the foreign-cat alarm off** carries a speaker mark (crossed out when it triggered but nothing played), its player an *Alarm* line (how long, how many clips, what the alarm took the cat for), and no feed filter hides it. Any visit in the player can be **downloaded as a video**: `GET /api/clip` stitches every stored frame of the visit into an H.264 MP4 timed from each frame's `recv_ts` (so it runs as long as the visit did), encoded on request with `imageio-ffmpeg` — one at a time, at below-normal priority on bounded threads, killed if the phone leaves — and never stored. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. Each cat on it drills down to a **per-cat daily chart** over 30, 60 or 90 days (`GET /api/door-stats/daily`): one walk of that same feed counts every cat over 90 days and is kept in memory 10 minutes, keyed on the active model and threshold, and every day carries a state, so an unrecorded, partly recorded, expired, unnamed or uncounted day is marked rather than drawn as zero. Each line of the Visits page's *At the door* card drills down the same way: a **line chart** of that figure per day, served from the same cached count (which now also walks with no usable gallery, so *All movement* never waits on a model). *Cat visits* there is Our cats + Neighbours + Unknown cats, so it leaves out cat visits not yet named. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
+| **Dashboard + API (main UI)** | Two browser surfaces on the compute PC, split by audience. The **user dashboard** is the at-a-glance app: occupancy (who's home/out + when), the enter/leave timeline, and the foreign-cat log. The Activity card of a visit that **set the foreign-cat alarm off** carries a speaker mark (crossed out when it triggered but nothing played), its player an *Alarm* line (how long, how many clips, what the alarm took the cat for — and, for an alarm decided from the bridge start date on, how far into the visit and on how many frames it decided, and what the whole visit says when the two differ), and no feed filter hides it. A **visit bridges a cat sitting still**: two consecutive motion clusters are one visit when the last motion frame before the gap and the first after it carry overlapping (IoU ≥ 0.5) `yolo-serial` cat boxes ≥ 0.3, no new cat box appears after the gap, and the gap is at most 2 minutes. Computed on read, never saved, and only for gaps after a start date the app saves at its first launch of that build (`visit_bridge_since_ms`), so nothing earlier is regrouped; the feed, its counts, the alarm's vote and the alarm mark all read this one visit, while processing and tuning units (the annotation queue, the calendar, scorecards, the live-naming work units) keep the 2 s split. Any visit in the player can be **downloaded as a video**: `GET /api/clip` stitches every stored frame of the visit into an H.264 MP4 timed from each frame's `recv_ts` (so it runs as long as the visit did), encoded on request with `imageio-ffmpeg` — one at a time, at below-normal priority on bounded threads, killed if the phone leaves — and never stored. Its **Visits** page is the "how much" counterpart to that timeline — per-cat visit counts over trailing windows, day/night split, and share of the door's named traffic — counted off the same event feed, so the two can never name a visit differently. Each cat on it drills down to a **per-cat daily chart** over 30, 60 or 90 days (`GET /api/door-stats/daily`): one walk of that same feed counts every cat over 90 days and is kept in memory 10 minutes, keyed on the active model and threshold, and every day carries a state, so an unrecorded, partly recorded, expired, unnamed or uncounted day is marked rather than drawn as zero. Each line of the Visits page's *At the door* card drills down the same way: a **line chart** of that figure per day, served from the same cached count (which now also walks with no usable gallery, so *All movement* never waits on a model). *Cat visits* there is Our cats + Neighbours + Unknown cats, so it leaves out cat visits not yet named. The **admin workbench** is the operator console: review/correct identifications, work the annotation queue, switch operating mode, tune the motion gate, and build/promote models. Both are distinct from the Pi's camera-setup page. |
 | **Dataset / annotation / training** | Store collected crops and their labels, serve the annotation queue, and run training jobs that (re)build the gallery/model and promote a new version. Enrollment of a new cat is a focused case of this. |
 | **Model store** | Versioned detection, embedding, and gallery artifacts served to the inference service. |
 
@@ -413,28 +413,33 @@ which while the switch is On ticks at a fixed 1 s:
   `yolo-serial` cat box ≥ 0.3 — the feed's own noise floor — with a gallery match). Every
   window is measured in **camera time**, from the newest counted frame's `recv_ts`, so a
   pass lagging the camera never reads its own delay as the cat's behaviour. An absence is
-  measured to the step's processing **frontier** (now when caught up, else the last frame
-  processed): every frame still to come lies after it, so a presence whose newest frame is
-  over 5 s behind it is stale even while the pass is behind. Two paths;
+  measured to the step's processing **frontier** — the `recv_ts` through which every stored
+  frame has been processed: the tick's own start when its pass caught up (the pass read the
+  newest frame when it began, so frames arriving while it ran are unchecked), else the last
+  frame processed. Every frame still to come lies after it, so a visit whose newest counted
+  frame is over 5 s behind it is stale even while the pass is behind. Two paths;
   either one met starts it:
-  - *Presence vote.* The feed's `_aggregate_identity` over the cat's whole **presence** —
-    its run of counted frames with no gap over 5 s (not the feed's 2 s visit), reaching
-    back at most 2 minutes — calls it foreign (a named non-resident won, or nothing came
-    within the threshold) on ≥ 10 frames, and has stayed foreign for **1 s** of camera
-    time. A long resident visit therefore no longer gets a fresh draw every second.
+  - *Visit vote.* The feed's `_aggregate_identity` over the counted frames of the cat's
+    **visit so far** — the household visit the feed shows, bridged across a cat sitting
+    still (`Store.visit_start`), reaching back at most 2 minutes — calls it foreign (a named
+    non-resident won, or nothing came within the threshold) on ≥ 10 frames, and has stayed
+    foreign for **2 s** of checked camera time. A long resident visit therefore gets no
+    fresh draw every second, a sit no fresh start, and a lookalike leading a visit's first
+    second and a half (a resident under IR) no alarm.
   - *Takeover net.* ≥ 20 counted frames in the 5 s up to the newest, ≥ 90% of them
     foreign by the stop rule's own test; starts at once. It catches a stranger following
-    one of ours into the same presence, whose frames the presence vote would hand to the
+    one of ours into the same visit, whose frames the visit vote would hand to the
     resident; it never names a resident as its target.
-  The row records the presence vote whenever it calls the cat foreign at that tick — a lone
+  The row records the visit vote (stored as `presence`) whenever it calls the cat foreign at that tick — a lone
   neighbour at ~10 fps meets both paths at once — and `takeover` only when the net started
   an alarm the vote would not have. Neither counts frames received before the previous alarm ended — a floor seeded from the
   log at start-up, so a restart cannot recount the last stranger. An **uncalibrated**
   gallery never starts one. Frames the step skipped (switched On or restarted mid-visit, or
   lagging the camera by over 5 s) are absent from the vote — an accepted limit. A missed
   stranger writes no row, so the replay is the only way to see a miss.
-- **Stop.** No *foreign* counted frame for 3 s, the switch Off, the gallery
-  uncalibrated, or a pass that raised. A frame matched to a resident WITHIN the
+- **Stop.** No *foreign* counted frame in the 3 s before the previous pass's frontier,
+  once that pass caught up (frames received since it began are unchecked, so they never
+  read as an absent cat), the switch Off, the gallery uncalibrated, or a pass that raised. A frame matched to a resident WITHIN the
   threshold never prolongs it — but one beyond the threshold reads unknown, so foreign,
   whoever it is: including unknown ties the alarm to the threshold, and a resident the
   gallery declines sets it off. The `actions` log is how that shows. The playing clip

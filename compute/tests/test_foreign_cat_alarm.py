@@ -22,7 +22,7 @@ import threading
 
 import pytest
 
-from compute.collection.store import Store, _VISIT_GAP_MS
+from compute.collection.store import VISIT_BRIDGE_SINCE_KEY, Store, _VISIT_GAP_MS
 from compute.ingest import EdgeUnavailable, StreamFrame
 from compute.learning import deterrent
 from compute.learning.live_identify import LiveIdentifyManager
@@ -400,6 +400,38 @@ class Door:
         if tick:
             self.mgr._tick(self.stop)
 
+    def burst(self, what, n, motion=True, tick=True):
+        """``n`` frames 100 ms apart holding ``what``, then (optionally) a tick."""
+        for i in range(n):
+            fid = _add(self.store, self.now + i * 100, motion, self.seq)
+            self.truth[fid] = what
+        self.now += n * 100
+        if tick:
+            self.mgr._tick(self.stop)
+
+    def still_second(self):
+        """One second in which nothing is stored — a cat sitting still under motion-only
+        capture — then a tick."""
+        self.now += 1000
+        self.mgr._tick(self.stop)
+
+    def slow_next_pass(self, ms, during):
+        """Make the next identify call take ``ms`` of simulated time while frames holding
+        ``during`` keep arriving at 10 fps. The pass read the newest frame when it began,
+        so those frames are left unchecked, and it still reports caught up."""
+        real = self.mgr._identify
+
+        def slow(*args, **kwargs):
+            out = real(*args, **kwargs)
+            self.mgr._identify = real
+            for i in range(ms // 100):
+                fid = _add(self.store, self.now + i * 100, True, self.seq)
+                self.truth[fid] = during
+            self.now += ms
+            return out
+
+        self.mgr._identify = slow
+
     def rows(self):
         return [r for r in self.store.list_actions() if r["mode"] == "on"]
 
@@ -434,8 +466,9 @@ def test_neighbour_visit_loops_alternating_clips_and_stops_when_gone(tmp_path):
     assert row["start_ts"] - first_tom_ts <= 2_000
     assert row["trigger"] == deterrent.TRIGGER_PRESENCE and row["n_counted"] == 20
     assert row["visit_start_ts"] == first_tom_ts
-    # Stops within 3 s of the last foreign frame, plus at most one tick.
-    assert 3_000 <= row["end_ts"] - last_tom_ts <= 4_000
+    # Stops 3 s after the last foreign frame, measured to the PREVIOUS pass's frontier —
+    # its tick's start — so up to a tick later than the clock would say, plus the tick.
+    assert 3_000 <= row["end_ts"] - last_tom_ts <= 5_000
     # The deciding frame is a real Tom frame, resolvable on its pair.
     assert row["frame_live"] is True and door.truth[row["frame_id"]] == door.tom_at()
     assert row["n_counted"] >= deterrent.DETER_MIN_FRAMES and row["n_votes"] == row["n_counted"]
@@ -504,7 +537,7 @@ def test_resident_following_a_stranger_stops_it_and_never_restarts_it(tmp_path):
     [row] = door.rows()
     assert row["ended"] == "gone"
     # Mittens' frames did not prolong it: it ended on Tom's frames, not hers.
-    assert row["end_ts"] - last_tom_ts <= 4_000
+    assert row["end_ts"] - last_tom_ts <= 5_000
 
 
 def test_boxes_the_feed_calls_noise_never_start_it(tmp_path):
@@ -771,11 +804,13 @@ def test_the_previous_alarm_floor_is_seeded_from_the_log(tmp_path):
 
 
 def _restart_after_gone(door, seed=True):
-    """Tom 4 s -> alarm; 3 empty seconds -> gone; restart; Tom back within 5 s of his last
-    frame, so his old frames are in the same presence. Returns the rows after one new second."""
+    """Tom 4 s -> alarm; 4 empty seconds -> gone; restart; Tom back where he was, so the
+    pause bridges and his old frames are in the same visit. Returns the rows after one new
+    second."""
+    door.store.set_setting(VISIT_BRIDGE_SINCE_KEY, str(BASE))
     for _ in range(4):
         door.second(door.tom_at())
-    for _ in range(3):
+    for _ in range(4):
         door.second()
     [row] = door.rows()
     assert row["ended"] == "gone"
@@ -794,12 +829,153 @@ def _restart_after_gone(door, seed=True):
 
 
 def test_a_restart_does_not_recount_the_last_episodes_stranger(tmp_path):
-    # The presence vote reaches back 2 minutes, so after a restart the floor has to come
+    # The visit vote reaches back 2 minutes, so after a restart the floor has to come
     # from the log. Control first: with the floor unseeded, the same door DOES restart the
     # alarm on the departed episode's frames — so the seeded case below is not passing
     # merely because the scenario never reached that condition.
     assert len(_restart_after_gone(Door(tmp_path / "control"), seed=False)) == 2
     assert len(_restart_after_gone(Door(tmp_path / "seeded"))) == 1
+
+
+# --- The frontier, for both checks (one-visit-for-feed-and-alarm spec) -------------------
+
+
+def _roster(door):
+    cats = door.store.list_cats()
+    return {c["id"]: c["name"] for c in cats}, {c["id"]: c["is_resident"] for c in cats}
+
+
+def test_a_slow_pass_at_the_turn_does_not_start_but_a_later_checked_one_does(tmp_path):
+    # Three counted frames a second (never the takeover net). The 10th counted frame turns
+    # the vote foreign, and the pass that checks it takes 2.5 s while Tom keeps coming. Its
+    # frontier is the tick's start, a second past the turn: no start, however late the
+    # clock. The next pass checks the frames that arrived meanwhile — 2 s past the turn and
+    # more — and starts it.
+    door = Door(tmp_path)
+    noise = door.tom_at(score=0.2)
+    pattern = [door.tom_at(), noise, noise, door.tom_at(), noise, noise, door.tom_at(), noise, noise, noise]
+    door.second()
+    for _ in range(3):
+        door.mixed_second(pattern)                       # 9 counted
+    turn_ts = door.now                                   # the next second's first frame: the 10th
+    door.mixed_second(pattern, tick=False)
+    door.slow_next_pass(2_500, pattern[0])
+    tick_start = door.now
+    door.mgr._tick(door.stop)
+    assert door.mgr.alarm_status()["last_pass"]["caught_up"] is True
+    assert door.now == tick_start + 2_500 and door.rows() == []
+    # Control: measured to the clock after the pass (the old frontier), the very frames
+    # checked so far DO start it — so the scenario reaches the condition it is about.
+    names, residents = _roster(door)
+    checked = [f for f in door.store.alarm_frames(door.model_id, 0)]
+    assert checked[-1][1] < tick_start
+    assert deterrent.start_decision(
+        checked, door.now, None, door.now, THRESHOLD, names, residents, visit_start_ts=checked[0][1]
+    ) is not None
+    door.mgr._tick(door.stop)                            # checks the frames the slow pass left
+    [row] = door.rows()
+    assert row["frame_recv_ts"] >= tick_start and row["frame_recv_ts"] - turn_ts >= 2_000
+    assert row["trigger"] == deterrent.TRIGGER_PRESENCE and row["cat_id"] == door.tom
+
+
+def test_unchecked_frames_never_end_a_sounding_alarm_as_gone(tmp_path):
+    # Tom is sounding the alarm when one pass takes 3.5 s, Tom still at the door. At the
+    # next tick nothing received in the last 3 s has been checked: measured to the clock
+    # that read as gone. Measured to that pass's frontier — its tick's start — Tom's
+    # checked frames are within 3 s, so it sounds on until a pass has looked.
+    door = Door(tmp_path)
+    for _ in range(3):
+        door.second(door.tom_at())
+    assert door.mgr.alarm_status()["sounding"] is True
+    door.second(door.tom_at(), tick=False)
+    door.slow_next_pass(3_500, door.tom_at())
+    door.mgr._tick(door.stop)
+    # Control: the old check (3 s before the clock, after a caught-up pass) reads gone here.
+    assert door.mgr.alarm_status()["last_pass"]["caught_up"] is True
+    assert not door.mgr._alarm._foreign_since(door.store.active_model(), door.now - 3_000)
+    door.mgr._tick(door.stop)                            # its bookkeeping reads the old frontier
+    assert door.mgr.alarm_status()["sounding"] is True and door.rows()[0]["end_ts"] is None
+    for _ in range(3):
+        door.second(door.tom_at())                       # the backlog is checked; Tom still here
+    assert door.mgr.alarm_status()["sounding"] is True
+    last_tom_ts = door.now - 100
+    for _ in range(6):
+        door.second()
+    [row] = door.rows()
+    assert row["ended"] == "gone" and 3_000 <= row["end_ts"] - last_tom_ts <= 5_000
+
+
+# --- The household visit, bridged (one-visit-for-feed-and-alarm spec) ------------------
+
+
+def _saffi_sit(door):
+    """Mittens moves 3 s, sits still 5 s (nothing stored), then 4 s in which a lookalike
+    neighbour leads her frames 6 to 4 a second — 9/11 18:55's shape."""
+    for _ in range(3):
+        door.second(door.mittens_at())
+    for _ in range(5):
+        door.still_second()
+    lookalike = [door.tom_at()] * 6 + [door.mittens_at()] * 4
+    for _ in range(4):
+        door.mixed_second(lookalike)
+    for _ in range(5):
+        door.still_second()
+
+
+def test_a_cat_sitting_still_stays_one_visit_and_its_frames_keep_their_vote(tmp_path):
+    # Control first: with nothing bridged, the vote restarts after the sit and the
+    # lookalike-led frames sound the alarm at our own cat.
+    control = Door(tmp_path / "control")
+    _saffi_sit(control)
+    assert len(control.rows()) == 1
+    assert len(control.store.events(None, None)["events"]) == 2
+    door = Door(tmp_path / "bridged")
+    door.store.set_setting(VISIT_BRIDGE_SINCE_KEY, str(BASE))
+    _saffi_sit(door)
+    assert door.rows() == []
+    [card] = door.store.events(None, None)["events"]
+    assert card["identity"]["cat_id"] == door.mittens
+
+
+def test_an_alarm_records_the_bridged_visits_start(tmp_path):
+    # Tom shows for half a second (5 counted frames, too few to vote on), sits still 4 s,
+    # then moves again: the alarm starts after the sit, and its row's visit start is the
+    # visit the feed shows — from his first frame, before the sit.
+    def run(door):
+        first = door.now
+        door.burst(door.tom_at(), 5)
+        for _ in range(4):
+            door.still_second()
+        after = door.now
+        for _ in range(4):
+            door.second(door.tom_at())
+        [row] = door.rows()
+        return first, after, row
+
+    first, after, row = run(Door(tmp_path / "control"))
+    assert row["visit_start_ts"] == after                # unbridged: the visit after the sit
+    door = Door(tmp_path / "bridged")
+    door.store.set_setting(VISIT_BRIDGE_SINCE_KEY, str(BASE))
+    first, after, row = run(door)
+    assert row["start_ts"] > after and row["visit_start_ts"] == first
+    [card] = door.store.events(None, None, with_alarms=True)["events"]
+    assert card["start_ts"] == first and len(card["alarms"]) == 1
+
+
+def test_a_visit_longer_than_the_lookback_records_its_true_start(tmp_path):
+    # Mittens is at the door for longer than the vote's two-minute floor before Tom takes
+    # over in the same visit: the once-a-second read stops at that floor, so the row's
+    # visit start has to come from the unbounded walk — her first frame, not the floor.
+    door = Door(tmp_path)
+    first = door.now
+    for _ in range(int(deterrent.ALARM_PRESENCE_MAX_S) + 10):
+        door.second(door.mittens_at())
+    assert door.rows() == []
+    for _ in range(8):
+        door.second(door.tom_at())
+    [row] = door.rows()
+    assert row["visit_start_ts"] == first
+    assert row["frame_recv_ts"] - first > deterrent.ALARM_PRESENCE_MAX_S * 1000
 
 
 def test_pass_summary_splits_detection_from_identification(tmp_path):

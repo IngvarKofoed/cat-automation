@@ -1,35 +1,40 @@
 """The foreign-cat alarm: when to sound, when to stop, and the record of each episode.
 
 The decision half of the system's first actuator (docs/specs/2026-11-01-foreign-cat-alarm.md;
-its start rule replaced by docs/specs/2026-11-05-alarm-presence-vote.md). The live-naming
-worker (``live_identify.py``) owns the GPU work — it detects and identifies the newest frames
-once a second while the switch is On — and drives the ``Alarm`` here once per tick. This
-module holds the rules and the episode state:
+its start rule replaced by docs/specs/2026-11-05-alarm-presence-vote.md, then by
+docs/specs/2026-11-10-one-visit-for-feed-and-alarm.md). The live-naming worker
+(``live_identify.py``) owns the GPU work — it detects and identifies the newest frames once a
+second while the switch is On — and drives the ``Alarm`` here once per tick. This module
+holds the rules and the episode state:
 
 - **Start** — ``start_decision``, a pure function the worker and the read-only replay tool
   (``compute.tools.alarm_replay``) both call. Every window is measured in CAMERA time, from
-  the newest counted frame's ``recv_ts``. Two paths; either one met starts it:
+  the newest counted frame's ``recv_ts``, and every absence up to the processing FRONTIER —
+  the ``recv_ts`` through which every stored frame has been processed. Two paths; either one
+  met starts it:
 
-  - *Presence*: ``Store._aggregate_identity`` (the feed's own voter) over everything seen of
-    the cat since it appeared — the run of counted frames with no gap over
-    ``ALARM_PRESENCE_GAP_S``, reaching back at most ``ALARM_PRESENCE_MAX_S`` — has called
-    them foreign (a named non-resident won, or nothing came within the threshold), with at
-    least ``DETER_MIN_FRAMES`` frames, for ``ALARM_HOLD_S`` of camera time straight.
+  - *Visit vote*: ``Store._aggregate_identity`` (the feed's own voter) over the counted
+    frames of the household visit so far — the visit the feed shows, which bridges a cat
+    sitting still (``Store.visit_start``), reaching back at most ``ALARM_PRESENCE_MAX_S`` —
+    has called them foreign (a named non-resident won, or nothing came within the
+    threshold), with at least ``DETER_MIN_FRAMES`` frames, for ``ALARM_HOLD_S`` of checked
+    camera time straight.
   - *Takeover*: in the ``DETER_WINDOW_S`` up to the newest counted frame there are at least
     ``ALARM_TAKEOVER_MIN_FRAMES`` counted frames and at least ``ALARM_TAKEOVER_SHARE`` of
     them are foreign by ``is_foreign``. Starts at once. It catches a stranger following one
-    of our cats into the same presence, whose frames the presence vote hands to the resident.
+    of our cats into the same visit, whose frames the visit vote hands to the resident.
 
-  The row records the presence vote whenever it calls the cat foreign at that tick, and
+  The row records the visit vote (``trigger`` = ``presence``, the stored value kept so the
+  log's history does not split) whenever it calls the cat foreign at that tick, and
   ``takeover`` only when the net started an alarm the vote would not have.
 
   Neither reaches back past the previous alarm's end (seeded from the log at start-up, so a
   restart cannot recount the last episode's stranger). An uncalibrated gallery (NULL
   threshold) never starts one — there every cat reads *unknown*, so every resident would
   trip it.
-- **Gone** — no *foreign* counted frame for ``ALARM_GONE_S``. A frame that matches a
-  resident within the threshold never prolongs the alarm, so a resident following a
-  stranger in stops the noise.
+- **Gone** — no *foreign* counted frame in the ``ALARM_GONE_S`` before the previous pass's
+  frontier, once that pass caught up. A frame that matches a resident within the threshold
+  never prolongs the alarm, so a resident following a stranger in stops the noise.
 - **The loop** — the Pi plays one clip per call; this asks for the next (``alarm1``,
   ``alarm2``, alternating) once the previous one is due to end. If the compute dies, the
   clip in progress finishes and the Pi goes quiet: fail-safe by construction.
@@ -58,18 +63,21 @@ MODE_OFF = "off"
 MODE_ON = "on"
 MODES = (MODE_OFF, MODE_ON)
 
-# The fewest counted frames a presence vote may start on.
+# The fewest counted frames a visit vote may start on.
 DETER_MIN_FRAMES = 10
-# The takeover window, the presence gap, and how long a caught-up step waits for a frame
-# before it reads the cat as absent (the staleness check). Camera time.
+# The takeover window, and how far past the newest counted frame the frontier may be before
+# the cat reads as absent (the staleness check). Camera time.
 DETER_WINDOW_S = 5.0
-# A presence is the run of counted frames with no gap over this between consecutive ones —
-# not the feed's 2 s visit, so it remembers at least as far back as the old 5 s window did.
-ALARM_PRESENCE_GAP_S = DETER_WINDOW_S
-# How far back a presence reaches. Bounds the read; past it the vote slides.
+# How far back the vote reaches. Bounds the read; past it the vote slides. (The 5 s
+# presence gap it once split on is retired: the vote is over the household visit, which
+# bridges the pause that mattered — a cat sitting still.)
 ALARM_PRESENCE_MAX_S = 120.0
-# How long, in camera time, the presence vote must have stayed foreign before it starts.
-ALARM_HOLD_S = 1.0
+# How long, in checked camera time, the visit vote must have stayed foreign before it
+# starts. 2 s, not 1: replayed over 8-10 Nov, a 1 s hold still sounded at three resident
+# cards whose first seconds a lookalike led (Sultan under IR), and 2 s at none, with every
+# neighbour-card alarm kept about 1 s later. A 50-60% vote share also removed them but
+# dropped neighbour alarms whose truth is unknown.
+ALARM_HOLD_S = 2.0
 # The takeover net: at least this many counted frames in the last DETER_WINDOW_S, and at
 # least this share of them foreign.
 ALARM_TAKEOVER_MIN_FRAMES = 20
@@ -172,10 +180,10 @@ def is_foreign(cat_id: int, distance: float, threshold: "float | None", resident
 class StartDecision:
     """A start, as ``start_decision`` returns it: the recorded trigger, verdict and evidence.
 
-    ``trigger`` is ``presence`` whenever the presence vote called the cat foreign at the
+    ``trigger`` is ``presence`` whenever the visit vote called the cat foreign at the
     deciding tick, ``takeover`` only when the net overrode it. ``n_counted``, ``n_votes``
-    and ``distance`` are read over the frames the recorded verdict came from — the
-    presence, or the takeover window. ``n_votes`` is the winner's below-threshold count for
+    and ``distance`` are read over the frames the recorded verdict came from — the visit
+    so far, or the takeover window. ``n_votes`` is the winner's below-threshold count for
     a presence row and the foreign frames for a takeover. The deciding frame is the newest
     frame in that set.
     """
@@ -240,6 +248,8 @@ def start_decision(
     threshold: "float | None",
     names: dict,
     residents: dict,
+    *,
+    visit_start_ts: "int | None",
 ) -> "StartDecision | None":
     """The whole start rule, as a pure function: a start, or ``None``.
 
@@ -247,37 +257,42 @@ def start_decision(
     first; only those with ``recv_ts`` in ``[vote_floor(now_ms, floor_ms), now_ms]`` are
     considered (``floor_ms`` is the previous alarm's end + 1, or ``None``).
 
+    ``visit_start_ts`` is where the household visit holding the newest counted frame
+    starts (``Store.visit_start``: the feed's visit, which bridges a cat sitting still).
+    Required, so no caller drops it by accident; ``None`` means unknown, and the vote is
+    then bounded by the lookback and the floor alone.
+
     ``frontier_ms`` is the ``recv_ts`` through which the step has processed every stored
-    frame: ``now_ms`` when the last pass caught up, the last processed frame's when it is
-    behind, ``None`` when unknown. Every frame still to come lies after it, so it — not a
-    caught-up flag — is how far the absence of a counted frame may speak. ``eff`` below is
+    frame: the tick's own start when its pass caught up (the pass reads the newest frame
+    when it begins, so "caught up" means "every frame received by the tick's start" — not
+    the clock after the pass, which is 1-2 s later with a cat in view), the last processed
+    frame's when it is behind, ``None`` when unknown. Every frame still to come lies after
+    it, so it is how far the absence of a counted frame may speak. ``eff`` below is
     ``max(frontier_ms, newest)`` (``newest`` alone when unknown), ``newest`` being the
     newest counted frame's ``recv_ts``. Every window is camera time, so a pass lagging the
     camera never reads its own delay as the cat's behaviour.
 
     - **Stale**: ``eff − newest > DETER_WINDOW_S`` — nothing still to come can continue the
-      presence, so nobody is present. (A ``caught_up`` flag could not say this while behind,
-      and a minute-old foreign presence then started an alarm at the next cat to arrive.)
+      visit's counted frames, so nobody is present.
 
     Then both paths are evaluated, and it starts when EITHER is met:
 
     - **Takeover**: ≥ ``ALARM_TAKEOVER_MIN_FRAMES`` frames in ``[newest − DETER_WINDOW_S,
       newest]``, ≥ ``ALARM_TAKEOVER_SHARE`` of them foreign by ``is_foreign``. No hold.
-    - **Presence**: the frames after the last gap over ``ALARM_PRESENCE_GAP_S`` (from the
-      oldest frame considered when no such gap is in range). Its last prefix must be foreign
-      (a prefix is foreign at ≥ ``DETER_MIN_FRAMES`` frames with a foreign winner), and
-      ``t0`` — the frame ending the SHORTEST prefix of the unbroken run of foreign prefixes
-      ending at it, where the vote turned foreign and stayed so — must be ``ALARM_HOLD_S``
-      old: ``eff − t0 ≥ hold``. The vote has stayed foreign through every frame processed
-      since, so a short visit whose cat already left completes its hold, while a lagging
-      pass cannot meet it on frames it has not seen.
+    - **Visit vote**: the frames at or after ``visit_start_ts`` — the visit so far. Its last
+      prefix must be foreign (a prefix is foreign at ≥ ``DETER_MIN_FRAMES`` frames with a
+      foreign winner), and ``t0`` — the frame ending the SHORTEST prefix of the unbroken run
+      of foreign prefixes ending at it, where the vote turned foreign and stayed so — must be
+      ``ALARM_HOLD_S`` old: ``eff − t0 ≥ hold``. The vote has stayed foreign through every
+      frame processed since, so a short visit whose cat already left completes its hold,
+      while a pass that has not checked the frames past the turn cannot meet it.
 
-    What is RECORDED follows the presence vote, never the order the paths were checked in —
+    What is RECORDED follows the visit vote, never the order the paths were checked in —
     a lone neighbour at ~10 fps, or any lagging pass, meets both on one tick:
 
-    - the presence's last prefix is foreign → ``presence``, with the verdict and evidence of
-      ``_aggregate_identity`` over the presence, even when only the net was met because the
-      hold had not yet run out;
+    - the visit's last prefix is foreign → ``presence``, with the verdict and evidence of
+      ``_aggregate_identity`` over the visit so far, even when only the net was met because
+      the hold had not yet run out;
     - otherwise the net overrode the vote → ``takeover``, read over the net's window: its
       vote when that names a neighbour, else ``unknown`` — a resident's within-threshold
       matches can still win a window whose foreign frames are mostly beyond it, and the
@@ -306,12 +321,10 @@ def start_decision(
         foreign = [f for f in window if is_foreign(f[2], f[3], threshold, residents)]
         takeover_met = len(foreign) / len(window) >= ALARM_TAKEOVER_SHARE
 
-    # The presence path: the vote over every prefix of the presence, and its hold.
-    gap_ms = int(ALARM_PRESENCE_GAP_S * 1000)
-    p = len(frames) - 1
-    while p > 0 and frames[p][1] - frames[p - 1][1] <= gap_ms:
-        p -= 1
-    presence = frames[p:]
+    # The visit path: the vote over every prefix of the visit so far, and its hold. The
+    # recorded row still says `presence` (`presence` below is the visit's counted frames).
+    v_lo = lo if visit_start_ts is None else max(lo, int(visit_start_ts))
+    presence = [f for f in frames if f[1] >= v_lo]
     idents = [(cid, dist) for _f, _t, cid, dist in presence]
     run_start: "int | None" = None
     if len(presence) >= DETER_MIN_FRAMES:
@@ -407,7 +420,7 @@ class Alarm:
         # When the previous episode ended. A new start counts only frames received after
         # it: at "gone" the vote can still hold the departed cat's last frames, which would
         # otherwise re-start the alarm in the same tick. SEEDED from the log, because the
-        # presence vote reaches back up to ALARM_PRESENCE_MAX_S: memory-only, a restart
+        # visit vote reaches back up to ALARM_PRESENCE_MAX_S: memory-only, a restart
         # would let it recount the last episode's stranger. On a live app the launch sweep
         # has closed any row the previous process left open before this runs.
         seeded = store.last_alarm_end()
@@ -426,14 +439,25 @@ class Alarm:
     # --- driven by the worker ----------------------------------------------------------
 
     def bookkeeping(
-        self, *, mode_on: bool, model: "dict | None", pass_failed: bool, caught_up: bool, now_ms: int
+        self,
+        *,
+        mode_on: bool,
+        model: "dict | None",
+        pass_failed: bool,
+        caught_up: bool,
+        frontier_ms: "int | None",
+        now_ms: int,
     ) -> None:
         """Step 1 of a tick: end the episode if a reason applies, else play the next clip when due.
 
         Reasons, first that applies: the switch is Off; no calibrated gallery; the
         previous pass raised (an alarm must not keep sounding on a step that can't see);
-        the cat is gone — checked only after a pass that caught up, or frames that simply
-        haven't been identified yet would read as an absent cat.
+        the cat is gone — no foreign counted frame in the ``ALARM_GONE_S`` before
+        ``frontier_ms``, the PREVIOUS pass's frontier (this runs before this tick's pass),
+        checked only when that pass caught up. Measured to the current clock instead, the
+        frames received since that pass began — nobody has checked them yet — read as an
+        absent cat, and could end the alarm on a stranger still in view. The episode's
+        recorded end stays ``now_ms``, the tick's clock.
         """
         with self._lock:
             episode = self._episode
@@ -446,7 +470,11 @@ class Alarm:
             reason = ENDED_UNCALIBRATED
         elif pass_failed:
             reason = ENDED_ERROR
-        elif caught_up and not self._foreign_since(model, now_ms - int(ALARM_GONE_S * 1000)):
+        elif (
+            caught_up
+            and frontier_ms is not None
+            and not self._foreign_since(model, int(frontier_ms) - int(ALARM_GONE_S * 1000))
+        ):
             reason = ENDED_GONE
         if reason is not None:
             self._end(reason, now_ms)
@@ -459,42 +487,52 @@ class Alarm:
         if self.running:
             self._end(reason, now_ms)
 
-    def maybe_start(
-        self,
-        model: dict,
-        now_ms: int,
-        visit_start_ts: "int | None" = None,
-        *,
-        caught_up: bool = True,
-        frontier_ms: "int | None" = None,
-    ) -> bool:
+    def maybe_start(self, model: dict, now_ms: int, *, frontier_ms: "int | None") -> bool:
         """Step 3: start an episode if ``start_decision`` says so. True if it started.
 
-        ``caught_up`` is what the pass just reported: whether it left no frame unprocessed.
-        When it did not, ``frontier_ms`` is the ``recv_ts`` of the last frame it processed
-        (``None`` if that frame is gone); caught up, the frontier is ``now_ms``.
+        ``frontier_ms`` is the pass's frontier, as the worker computed it: the tick's own
+        start when the pass caught up, the last processed frame's ``recv_ts`` when it is
+        behind, ``None`` when that frame is gone. ``now_ms`` (a fresh clock) is only the
+        vote's upper bound — the frontier alone claims "processed through here".
+
+        The vote is over the household visit holding the newest counted frame, read with
+        ``Store.visit_start`` floored at the vote's own floor (nothing older can vote, so
+        a cat napping for hours cannot grow the once-a-second read). When an alarm starts,
+        the row records the exact ``visit_start_ts`` — that floored read when it ended short
+        of its floor, else one unbounded walk — so the admin log's latency reads against the
+        visit the feed shows.
         """
         if self.running or not is_calibrated(model):
             return False
         with self._lock:
             last_end = self._last_end_ms
         floor = None if last_end is None else last_end + 1
-        frontier = now_ms if caught_up else frontier_ms
         since = vote_floor(now_ms, floor)
-        if frontier is not None:
+        if frontier_ms is not None:
             # Stale unless some counted frame lies within DETER_WINDOW_S of the frontier —
             # the usual answer, all day, with the door empty. A read of those few seconds
-            # settles it without reading the whole two-minute presence and the roster.
-            recent = max(since, int(frontier) - int(DETER_WINDOW_S * 1000))
+            # settles it without reading the whole two-minute visit and the roster.
+            recent = max(since, int(frontier_ms) - int(DETER_WINDOW_S * 1000))
             if not self._store.alarm_frames(model["id"], recent):
                 return False
-        frames = self._store.alarm_frames(model["id"], since)
+        frames = [f for f in self._store.alarm_frames(model["id"], since) if f[1] <= now_ms]
         if len(frames) < DETER_MIN_FRAMES:
-            return False  # neither path can fire on fewer; skips the roster read
+            return False  # neither path can fire on fewer; skips the roster and visit reads
+        visit_start_ts = self._store.visit_start(frames[-1][0], since)
         names, residents = self._roster()
-        decision = start_decision(frames, now_ms, floor, frontier, model["threshold"], names, residents)
+        decision = start_decision(
+            frames, now_ms, floor, frontier_ms, model["threshold"], names, residents,
+            visit_start_ts=visit_start_ts,
+        )
         if decision is None:
             return False
+        # The exact start of the visit the feed shows, for the row. The floored read above
+        # already IS it unless it stopped at the floor (or the deciding frame differs), so
+        # the unbounded walk — which a long bridged nap can make long — runs only then, and
+        # stays off the path to the first clip otherwise.
+        exact_start = visit_start_ts
+        if exact_start == since or decision.frame_id != frames[-1][0]:
+            exact_start = self._store.visit_start(decision.frame_id, None)
         action_id = self._store.add_action({
             "kind": "sound",
             "mode": MODE_ON,
@@ -508,7 +546,7 @@ class Alarm:
             "threshold": model["threshold"],
             "frame_id": decision.frame_id,
             "frame_recv_ts": decision.frame_recv_ts,
-            "visit_start_ts": visit_start_ts,
+            "visit_start_ts": exact_start,
             "trigger": decision.trigger,
         })
         with self._lock:

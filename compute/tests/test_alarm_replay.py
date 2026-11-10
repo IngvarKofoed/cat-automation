@@ -1,13 +1,16 @@
-"""The alarm replay tool (``compute.tools.alarm_replay``; alarm-presence-vote spec).
+"""The alarm replay tool (``compute.tools.alarm_replay``; alarm-presence-vote spec, its
+baseline and new rule moved on by the one-visit-for-feed-and-alarm spec).
 
 Driven over a REAL ``Store`` holding motion frames, ``yolo-serial`` verdicts and
 identifications under a promoted, calibrated model — the rows the live worker writes — so
 the feed walk, the counted-frame read, the attribution and both rules run as they would on
-the compute PC. Scenarios are built so each answer is known in advance: a lookalike window
-inside a resident visit (today's rule only), a neighbour (both), a stranger tailgating a
-resident (both, the new rule by the takeover net), a plain resident visit (neither), and a
-short neighbour visit the new rule decides only after it ended — an added miss the report
-must surface rather than swallow.
+the compute PC. Scenarios are built so each answer is known in advance: a resident sitting
+still whose next frames a lookalike leads (the shipped rule only: its 5 s presence restarts,
+the new rule votes over the bridged visit), a resident whose first 1.5 s a lookalike leads
+(the shipped 1 s hold only), a neighbour (both), a stranger tailgating a resident (both, by
+the takeover net), a plain resident visit (neither), and a short neighbour visit the new
+rule decides only after it ended — an added miss the report must surface rather than swallow.
+The store saves NO bridge start date: the replay bridges regardless.
 """
 from __future__ import annotations
 
@@ -79,10 +82,17 @@ class Door:
 
 
 def _scenario(door):
-    """Four visits, each 5 minutes apart, whose answers are known."""
+    """Five visits, each 5 minutes apart, whose answers are known."""
     m, t, x = door.mittens_at(), door.tom_at(), door.stranger()
-    # A: Mittens 10 s, then 6 s in which Tom leads 6 to 4 a second. Card: Mittens.
-    door.frames(H10, [m] * 100 + ([t] * 6 + [m] * 4) * 6)
+    # A: Mittens 6 s, sits still 5.4 s (nothing stored), then 4 s in which Tom leads 6 to 4
+    # a second. One bridged visit; card: Mittens. The shipped rule's presence restarts
+    # after the 5 s gap and sounds; the new rule votes over the whole visit.
+    door.frames(H10, [m] * 60)
+    door.frames(H10 + 5_900 + 5_400, ([t] * 6 + [m] * 4) * 4)
+    # S: Tom fills Mittens' first 1.4 s, then she takes over (Sultan at night). Card:
+    # Mittens. The vote is foreign 0.9-2.7 s: the shipped 1 s hold sounds at either tick
+    # phase, 2 s at neither.
+    door.frames(H10 + 150_000, [t] * 14 + [m] * 50)
     # B: Tom alone for 4 s. Card: Tom (neighbour).
     door.frames(H10 + 300_000, [t] * 40)
     # C: Mittens 15 s, a stranger straight behind her for 6 s. Card: Mittens (the
@@ -90,7 +100,7 @@ def _scenario(door):
     door.frames(H10 + 600_000, [m] * 150 + [x] * 60)
     # D: Mittens alone for 8 s.
     door.frames(H10 + 900_000, [m] * 80)
-    return {"A": H10, "B": H10 + 300_000, "C": H10 + 600_000, "D": H10 + 900_000}
+    return {"A": H10, "S": H10 + 150_000, "B": H10 + 300_000, "C": H10 + 600_000, "D": H10 + 900_000}
 
 
 def _visit(report, start_ts):
@@ -103,30 +113,33 @@ def test_the_scenario_reads_as_designed(tmp_path):
     at = _scenario(door)
     report = replay(door.store, DAY, DAY, now_ms=MIDNIGHT + 86_400_000)
     assert (report.model_id, report.threshold) == (door.model_id, TH)
-    assert [v.card for v in report.visits] == ["ours", "neighbour", "ours", "ours"]
-    a, b, c, d = (_visit(report, at[k]) for k in "ABCD")
+    # A is ONE visit although no bridge date is saved: the replay bridges everything.
+    assert [v.card for v in report.visits] == ["ours", "ours", "neighbour", "ours", "ours"]
+    a, s_, b, c, d = (_visit(report, at[k]) for k in "ASBCD")
     for phase in alarm_replay.PHASES_MS:
         today, new = report.alarmed("today", phase), report.alarmed("new", phase)
-        assert set(today) == {a, b, c}, phase       # the lookalike window fires today's rule
-        assert set(new) == {b, c}, phase            # ... but not the presence vote
-        # A lone neighbour meets both paths on one tick; the row follows the presence vote.
+        assert set(today) == {a, s_, b, c}, phase   # the sit and the 1.5 s lead fire the shipped rule
+        assert set(new) == {b, c}, phase            # ... but not the bridged, 2 s-held vote
+        # A lone neighbour meets both paths on one tick; the row follows the visit vote.
         assert new[b].decision.trigger == deterrent.TRIGGER_PRESENCE
+        # Never earlier than the shipped rule (here the takeover net meets both on one tick).
+        assert new[b].at_ms >= today[b].at_ms, phase
         # The tailgate: the presence names Mittens, so the net overrode the vote.
         assert new[c].decision.trigger == deterrent.TRIGGER_TAKEOVER
         assert new[c].decision.verdict == "unknown"
         assert report.added_misses(phase) == []
         assert not [s for s in report.starts if s.visit is not None and not s.in_view]
         assert not [s for s in report.starts if s.visit is None]
-    assert report.days[0]["visits"] == 4 and report.days[0]["with_counted"] == 4
+    assert report.days[0]["visits"] == 5 and report.days[0]["with_counted"] == 5
 
 
 def test_a_new_rule_start_after_the_visit_ended_is_an_added_miss_and_a_late_start(tmp_path):
-    # A 1.5 s neighbour visit: 15 frames, under the net's 20. Today's rule decides at the
-    # first tick holding 10 frames; the presence vote's 1 s hold is met only after the cat
-    # has gone. At phase 0 the old rule's tick falls inside the visit — so that phase
-    # reports an added miss, which the report must list, never smooth over.
+    # A 3.4 s neighbour visit at 5 fps: 18 frames, never the net's 20. The vote turns
+    # foreign at 1.8 s; the shipped 1 s hold is met at the 3.0 s tick, inside the visit,
+    # the new 2 s hold only at 4.0 s, after the cat has gone. So phase 0 reports an added
+    # miss, which the report must list, never smooth over.
     door = Door(tmp_path)
-    door.frames(H10, [door.tom_at()] * 15)
+    door.frames(H10, [door.tom_at()] * 18, step=200)
     report = replay(door.store, DAY, DAY, now_ms=MIDNIGHT + 86_400_000)
     [v] = report.visits
     assert report.added_misses(0) == [0]
@@ -224,7 +237,7 @@ def test_main_exits_non_zero_on_a_refusal_and_prints_on_success(tmp_path, capsys
 # =====================================================================================
 
 
-def _naive(frames, rule, phase, t_first, t_last, threshold, names, residents):
+def _naive(frames, rule, phase, t_first, t_last, threshold, names, residents, visit_starts):
     """``simulate`` without the idle-stretch skip: every tick, always."""
     decide = alarm_replay._DECIDERS[rule]
     lookback = alarm_replay._LOOKBACK_MS[rule]
@@ -243,7 +256,9 @@ def _naive(frames, rule, phase, t_first, t_last, threshold, names, residents):
             if rule == "new":
                 assert lo == deterrent.vote_floor(t, floor)
             if len(window) >= deterrent.DETER_MIN_FRAMES:
-                d = decide(window, t, floor, t, threshold, names, residents)
+                vs = [v for v in visit_starts if v <= window[-1][1]]
+                d = decide(window, t, floor, t, threshold, names, residents,
+                           visit_start_ts=vs[-1] if vs else None)
                 if d is not None:
                     out.append((t, d))
                     running = True
@@ -257,41 +272,58 @@ def test_skipping_idle_ticks_changes_no_decision(seed, rule):
     rng = random.Random(seed)
     names = {1: "M", 2: "T"}
     residents = {1: True, 2: False}
-    frames, t, fid = [], 0, 0
+    frames, t, fid, starts = [], 0, 0, []
     for _burst in range(8):
         t += rng.randint(1_000, 40_000)
+        if rng.random() < 0.6:
+            starts.append(t + 1)          # some bursts begin a visit; others continue one
         for _ in range(rng.randint(5, 80)):
             t += rng.choice([100, 100, 200, 400, 1_500])
             fid += 1
             frames.append((fid, t, rng.choice([1, 2]), rng.choice([0.2, 0.3, 0.9])))
     end = t + 10_000
     for phase in alarm_replay.PHASES_MS:
-        fast = simulate(frames, rule, phase, 0, end, TH, names, residents)
-        slow = _naive(frames, rule, phase, 0, end, TH, names, residents)
+        fast = simulate(frames, rule, phase, 0, end, TH, names, residents, starts)
+        slow = _naive(frames, rule, phase, 0, end, TH, names, residents, starts)
         assert [(a, d.frame_id, d.trigger) for a, d in fast] == [(a, d.frame_id, d.trigger) for a, d in slow]
 
 
-def test_baseline_is_the_old_five_second_rule():
+def test_baseline_is_the_shipped_presence_rule():
+    # 1 s hold, a presence split on a gap over 5 s, frozen whatever deterrent now says.
     names, residents = {1: "M", 2: "T"}, {1: True, 2: False}
-    fr = [(i, i * 100, 2, 0.2) for i in range(10)]
-    d = alarm_replay.baseline_decision(fr, 900, None, True, TH, names, residents)
-    assert d is not None and (d.verdict, d.cat_id, d.n_counted) == ("neighbour", 2, 10)
-    assert alarm_replay.baseline_decision(fr, 5_100, None, True, TH, names, residents) is None  # 9 left
-    assert alarm_replay.baseline_decision(fr, 900, 1, True, TH, names, residents) is None       # floored
-    assert alarm_replay.baseline_decision(fr, 900, None, True, None, names, residents) is None  # uncalibrated
+    b = alarm_replay.baseline_decision
+    fr = [(i, i * 100, 2, 0.2) for i in range(10)]          # Tom: turns foreign at 900 ms
+    assert b(fr, 900, None, 1_899, TH, names, residents) is None
+    d = b(fr, 900, None, 1_900, TH, names, residents)       # held 1 s to the frontier
+    assert d is not None and (d.trigger, d.verdict, d.cat_id, d.n_counted) == ("presence", "neighbour", 2, 10)
+    assert b(fr, 900, 1, 1_900, TH, names, residents) is None             # floored: 9 left
+    assert b(fr, 900, None, 1_900, None, names, residents) is None        # uncalibrated
+    # A 5.1 s gap restarts the presence (Mittens' frames before it are not voted); 5.0 s does not.
+    m = [(100 + i, -10_000 + i * 100, 1, 0.2) for i in range(30)]
+    gap = fr[0][1] - m[-1][1]
+    shifted = [(f, t + 5_100 - gap, c, x) for f, t, c, x in fr]
+    assert b(m + shifted, shifted[-1][1], None, shifted[-1][1] + 1_000, TH, names, residents) is not None
+    joined = [(f, t + 5_000 - gap, c, x) for f, t, c, x in fr]
+    assert b(m + joined, joined[-1][1], None, joined[-1][1] + 1_000, TH, names, residents) is None
+    # It ignores the visit start the new rule votes from.
+    assert b(m + joined, joined[-1][1], None, joined[-1][1] + 1_000, TH, names, residents,
+             visit_start_ts=joined[0][1]) is None
 
 
-def test_a_presence_under_way_at_the_first_midnight_is_voted_whole(tmp_path):
+def test_a_visit_under_way_at_the_first_midnight_is_voted_and_reported_whole(tmp_path):
     # Mittens for 10 s up to midnight, then 6 s in which Tom leads 6 to 4. Read from
-    # midnight only, the presence would be the Tom-led remainder and the new rule would
-    # start on a resident's visit that never alarmed live; read a lookback early, her
-    # earlier frames are in the vote.
+    # midnight only, the visit would be the Tom-led remainder and the new rule would
+    # start on a resident's visit that never alarmed live; walked a lookback early, her
+    # earlier frames are in the vote, and the visit is reported from its true start.
     door = Door(tmp_path)
     m, t = door.mittens_at(), door.tom_at()
     door.frames(MIDNIGHT - 10_000, [m] * 100 + ([t] * 6 + [m] * 4) * 6)
     report = replay(door.store, DAY, DAY, now_ms=MIDNIGHT + 86_400_000)
     assert report.starts_for("new", 0) == [] and report.starts_for("new", 500) == []
     assert all(s.at_ms >= MIDNIGHT for s in report.starts)       # none reported before the range
+    [v] = report.visits
+    assert (v.start_ts, v.card) == (MIDNIGHT - 10_000, "ours")
+    assert report.days[0]["visits"] == 1                         # counted on the range's first day
 
 
 def test_a_visit_starting_just_before_the_last_midnight_keeps_its_tail(tmp_path):

@@ -14,7 +14,7 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from compute.collection.store import _VISIT_GAP_MS, Store
+from compute.collection.store import _VISIT_GAP_MS, VISIT_BRIDGE_SINCE_KEY, Store
 from compute.ingest import StreamFrame
 from shared.wire import StreamFrameMeta
 
@@ -201,6 +201,61 @@ def test_payload_shape_and_types(tmp_path):
     assert still["end_ts"] is None and still["ended"] is None
     assert still["verdict"] == "unknown" and still["cat_id"] is None and still["cat_name"] is None
     assert still["pi_disabled"] is False
+
+
+_DECISION_KEYS = {"frame_recv_ts", "n_votes", "n_counted", "trigger"}
+
+
+def test_only_alarms_decided_under_the_visit_vote_say_how_they_decided(tmp_path):
+    # One-visit-for-feed-and-alarm spec: an episode from the bridge start date on carries
+    # what the player explains it with; an older one — whose vote could reach into earlier
+    # cards — reads exactly as before.
+    store = _store(tmp_path)
+    _visit(store, _BASE)
+    store.set_setting(VISIT_BRIDGE_SINCE_KEY, str(_BASE + 1_000))
+    _alarm(store, _BASE + 100, start_ts=_BASE + 999, n_counted=13, n_votes=8, trigger="presence")
+    _alarm(store, _BASE + 200, start_ts=_BASE + 1_000, n_counted=24, n_votes=22, trigger="takeover")
+    _alarm(store, _BASE + 200, start_ts=_BASE + 1_001, n_counted=11, n_votes=0)   # trigger NULL
+    old, at_date, null_trigger = _alarms_by_start(store)[_BASE]
+    assert not (_DECISION_KEYS & set(old))
+    assert {k: at_date[k] for k in _DECISION_KEYS} == {
+        "frame_recv_ts": _BASE + 200, "n_votes": 22, "n_counted": 24, "trigger": "takeover",
+    }
+    assert null_trigger["trigger"] is None and null_trigger["n_counted"] == 11
+
+
+def test_without_a_saved_start_date_no_alarm_carries_the_decision_fields(tmp_path):
+    store = _store(tmp_path)
+    _visit(store, _BASE)
+    _alarm(store, _BASE + 100, n_counted=13, n_votes=8, trigger="presence")
+    [entry] = _alarms_by_start(store)[_BASE]
+    assert not (_DECISION_KEYS & set(entry))
+
+
+def test_a_live_app_saves_the_start_date_once_and_a_test_app_never(tmp_path):
+    from compute.api.app import create_app
+
+    class _Inert:
+        def restore(self, flag):
+            pass
+
+    def build(store, live):
+        kw = dict(live_identify_manager=_Inert(), yolo_oracle_manager=_Inert()) if live else {}
+        return create_app(store=store, client=_NoPi(), start_collector=live, **kw)
+
+    store = _store(tmp_path)
+    build(store, live=False)
+    assert store.visit_bridge_since() is None            # a test app (or a CLI tool) never writes it
+    build(store, live=True)
+    saved = store.visit_bridge_since()
+    assert saved is not None
+    build(store, live=True)
+    assert store.visit_bridge_since() == saved           # kept on every later launch
+
+
+class _NoPi:
+    def get_status(self):
+        raise RuntimeError("no pi")
 
 
 def test_alarms_ride_the_feed_with_no_active_model(tmp_path):

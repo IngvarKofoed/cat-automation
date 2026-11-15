@@ -2309,3 +2309,39 @@ a clean one.
      floor) shows in the window as its later part only, named from those frames — so the Visits
      page and the feed can disagree about that visit, against entry 341. A fix reads back past
      `since_id` by up to the bridge cap, transitively, which changes what every window bound means.
+
+606. The user player's frame is sized from the STAGE, never from the picture: `.stage` is a size
+     container and the frame is the largest `--frame-r` rectangle inside it (the first container
+     query in either dashboard). Sized from the picture, it collapsed to the alt text (103×66)
+     whenever no picture was present — on open, on a hop, and on WebKit for every frame playback
+     reached early. Spec: docs/specs/2026-11-14-user-player-frame-size.md.
+
+607. The old `max-width/max-height: 100%` pair never clamped: a short stage was OVERFLOWED onto
+     Play/scrub rather than letterboxed (measured). The frame letterboxes now. An `<img>` with no
+     picture (src removed, or a failed load) is `visibility: hidden` until its next `load`, or the
+     full-size frame would draw "Event frame" on the dark stage.
+
+608. The Play tick HOLDS until the next frame's preloaded `Image` is `complete` (loaded or failed):
+     a slow link stutters instead of showing an unloaded frame. Only the tick waits — scrub, tile
+     tap and arrows still jump straight to their frame. Rejected: every control waiting, which
+     needs a requested-vs-shown split. No bound on a hold, by decision; the reader can scrub past.
+
+609. A failed frame shows as an empty full-size stage with no box for its turn, and playback
+     moves past it (`complete` covers failure).
+
+610. The player's stats give up height BEFORE the stage: a vertical scroll area with a ~two-line
+     floor (3rem) and a flex-shrink weight 1000× the stage's, the stage shrinking only past that
+     floor so the footer nav stays reachable (entry 253). The filmstrip no longer shrinks. Measured
+     at 390×750 on an explained alarm visit: the stage went 173 → 279 px, so its 372×240 frame no
+     longer overflows onto Play/scrub.
+
+611. The Alarm row is now the FIRST stats line — at the floor only the first lines show without
+     scrolling, and the alarm's verdict matters more there than three detector percentages. A
+     bottom-edge mask fades the stats while more lies below (off once scrolled to the end), since
+     iOS hides scrollbars at rest. The stats scroll resets to the top on every hop.
+
+612. Review repair: a scrub, tile tap or arrow to a frame with no picture yet — still loading, or
+     failed — hides the `<img>` and its box until that frame's own `load`, as open/hop already did.
+     Only the Play tick waits, so a jump past the preload drew the alt text across the full-size
+     frame on WebKit (a dark stage now, as the spec intended), and a failed frame flashed the
+     broken-image glyph. Without container units (Safari < 16) the frame fills the stage's width.

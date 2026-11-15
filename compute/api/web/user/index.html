@@ -831,34 +831,49 @@
         .dialog-head .clip-btn.making { animation: savepulse 1s ease-in-out infinite; cursor: progress; color: var(--porch); }
         /* Ready: the accent, the same pairing as a marked ⚑. */
         .dialog-head .clip-btn.ready { background: var(--porch-soft); border-color: var(--porch); color: var(--porch); }
-        /* min-height:0 lets the stage be the dialog column's shrinking item. A flex
-           item's default min-height:auto refuses to go below its aspect-ratio-derived
-           height, so on a short viewport the footer nav fell past the dialog's
-           max-height:94vh and .dialog's overflow:hidden CLIPPED it — the nav is exactly
-           what must stay reachable. Shrinking here instead keeps the head and footer on
-           screen at any height, with no hardcoded chrome-height math: the frame inside
-           is already max-height:100% in a centering grid, so it letterboxes. */
+        /* min-height:0 lets the stage shrink. A flex item's default min-height:auto
+           refuses to go below its aspect-ratio-derived height, so on a short viewport
+           the footer nav fell past the dialog's max-height:94vh and .dialog's
+           overflow:hidden CLIPPED it — the nav is exactly what must stay reachable.
+           It is the LAST resort: .player-stats below gives up its height first, and only
+           once that sits at its floor does the stage shrink (user-player-frame-size spec).
+           `container-type: size` makes it the frame's size container. Safe because the
+           stage's size never came from its content — the dialog's width, its 4/3 ratio
+           and the flex column set it. */
         .stage {
             background: #0d0906;
             aspect-ratio: 4 / 3;
             display: grid;
             place-items: center;
             min-height: 0;
+            container-type: size;
         }
         /* The image is wrapped in an aspect-locked positioned frame so a YOLO box can
            be overlaid as a percentage of the image's natural dimensions. The frame is
-           constrained max-width/height:100% INSIDE the fixed 4/3 stage, so it occupies
-           exactly the contained-image rectangle without ever resizing the stage — the
-           fixed stage still prevents reflow on open / Prev / Next. aspect-ratio is a 4/3
-           fallback until JS learns the real natural dims (constant: one camera feeds all
-           events) and pins it, so the box maps 1:1 onto the drawn image at any size. */
+           sized from the STAGE, never from the picture: the largest --frame-r rectangle
+           that fits it, so it letterboxes when the stage shrinks and keeps its full size
+           while no picture has loaded. Sized from the picture (width:auto, as it was),
+           it collapsed to the alt text whenever no picture was present — on open, on a
+           hop, and on WebKit for every frame playback reached before it loaded. And the
+           old max-width/max-height:100% pair never clamped: the frame overflowed a short
+           stage onto Play/scrub instead (measured). --frame-r is a 4/3 fallback until JS
+           learns the real natural dims (constant: one camera feeds all events) and sets
+           it, so the box maps 1:1 onto the drawn image at any size. */
         .player-frame {
+            --frame-r: 4 / 3;
             position: relative;
-            max-width: 100%;
-            max-height: 100%;
-            aspect-ratio: 4 / 3;
+            width: min(100cqw, 100cqh * var(--frame-r));
+            aspect-ratio: var(--frame-r);
         }
+        /* Without container units (Safari < 16) the width above is invalid at computed-value
+           time and falls back to auto — shrink-to-fit, the collapse it replaced. Fill the
+           stage's width instead (it then overflows a short stage, as before). */
+        @supports not (width: 1cqw) { .player-frame { width: 100%; } }
         .player-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        /* No picture (src removed on open/hop, or the frame failed to load): hidden, or
+           the full-size <img> would draw its alt text on the dark stage. Shown again by
+           its next `load`. */
+        .player-frame img.nopic { visibility: hidden; }
         /* Swipe drag-follow: the frame tracks the finger 1:1 with NO transition (so the
            drag feels direct), and `.snapping` is added only for the release so the reset
            animates back. The prefers-reduced-motion block below zeroes all transitions,
@@ -900,7 +915,10 @@
            dialog edge. */
         .player-controls input[type="range"] { flex: 1; min-width: 0; accent-color: var(--porch); cursor: pointer; }
         .player-controls .btn { padding: .4rem .8rem; }
+        /* flex:none — it is a scroll container (overflow-x), so its min-height is 0 and
+           a squeezed column cropped its tiles and gave it a vertical scrollbar. */
         .filmstrip {
+            flex: none;
             display: flex;
             gap: .35rem;
             padding: .55rem 1rem .8rem;
@@ -940,7 +958,13 @@
            under the filmstrip: one stat per line in a two-column grid so every label
            shares a left edge and every value shares a right edge (numbers aligned).
            '—' means not measured (the visit's motion frames weren't swept), distinct
-           from a measured 0% / low confidence. */
+           from a measured 0% / low confidence.
+             It is the column's FIRST shrinking item: a vertical scroll area that absorbs
+           any squeeze before the stage does, down to a floor of ~two lines (3rem — the
+           bottom padding still shows scrolled text, so that is two lines of it). Flex
+           shrinks in proportion to weight × base size, so a weight 1000× the stage's
+           makes the order effectively strict. Past the floor the stage shrinks, so the
+           footer nav stays reachable at any height. */
         .player-stats {
             display: grid;
             grid-template-columns: auto 1fr;
@@ -948,8 +972,19 @@
             align-items: baseline;
             padding: .3rem 1rem 1rem;
             border-top: 1px solid var(--hairline);
+            flex: 0 1000 auto;
+            min-height: 3rem;
+            overflow-y: auto;
         }
         .player-stats.hidden { display: none; }
+        /* `.more` = content continues below the visible part: the bottom edge fades out.
+           iOS hides scrollbars at rest, so without it a cut-off Alarm sentence reads as
+           the whole sentence. A mask, so it sits in the area's own box and never draws
+           over the filmstrip or footer. Set by updateStatsFade(). */
+        .player-stats.more {
+            -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
+            mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
+        }
         .player-stats .k { color: var(--muted); font-size: .85rem; }
         .player-stats .v {
             justify-self: end;
@@ -1087,8 +1122,8 @@
            screen ("saving 3…" cannot answer "did my Mittens go through"). Motion is what
            peripheral vision catches, hence the pulse rather than a grey word.
            The slot is permanently reserved so the frame never steps under the reader when
-           the pill appears; `.stage { min-height: 0 }` makes the stage absorb the height
-           instead of the dialog overflowing its 94vh cap and clipping the nav. */
+           the pill appears; .player-stats and then `.stage { min-height: 0 }` absorb the
+           height instead of the dialog overflowing its 94vh cap and clipping the nav. */
         .saving-slot { display: flex; align-items: center; min-height: 28px; padding: .35rem 1rem 0; }
         .saving {
             display: inline-flex;
@@ -2963,16 +2998,28 @@
                 : `${clsLabel(f.cls)} ${Math.round(f.score * 100)}%`;
             playerBboxEl.classList.remove('hidden');
         }
-        // Learn the constant natural dims from the first loaded frame and pin the frame
-        // wrapper's aspect-ratio, then (re)draw the current box now that dims are known.
+        // Learn the constant natural dims from the first loaded frame and set the frame
+        // wrapper's --frame-r — the ratio both its aspect-ratio and its stage-derived
+        // width read — then (re)draw the current box now that dims are known.
         playerImgEl.addEventListener('load', () => {
             if (playerNatW == null && playerImgEl.naturalWidth) {
                 playerNatW = playerImgEl.naturalWidth;
                 playerNatH = playerImgEl.naturalHeight;
-                playerFrameEl.style.aspectRatio = `${playerNatW} / ${playerNatH}`;
+                playerFrameEl.style.setProperty('--frame-r', `${playerNatW} / ${playerNatH}`);
             }
+            playerImgEl.classList.remove('nopic');
             positionBbox(playerFrames[playerIndex]);
         });
+        // A frame that failed to load: an empty stage at full size for its turn, no box.
+        playerImgEl.addEventListener('error', () => {
+            playerImgEl.classList.add('nopic');
+            playerBboxEl.classList.add('hidden');
+        });
+        // Its preloaded Image holds a picture: loaded, not failed and not still in flight.
+        function frameReady(idx) {
+            const im = playerImages[idx];
+            return !!im && im.complete && im.naturalWidth > 0;
+        }
 
         // Per-visit YOLO detection aggregates (ev.detection = {ratio, conf_max,
         // conf_mean}; visit-detection-aggregates spec) under the filmstrip, one stat
@@ -2983,25 +3030,20 @@
         //   The Alarm row (user-visit-alarm-mark spec) appears only for a visit that set
         // the alarm off. It is ABSENT, not "none", otherwise: an alarm switched Off also
         // produces no row, so "none" would claim more than the data supports.
+        //   The Alarm row comes FIRST: the stats scroll, and at their floor only the first
+        // lines show without scrolling — the alarm's verdict matters more there than three
+        // detector percentages (user-player-frame-size spec).
         function renderPlayerStats(ev) {
             const det = ev.detection;
             const alarmed = hasAlarm(ev);
             playerStatsEl.innerHTML = '';
-            if (!det && !alarmed) { playerStatsEl.classList.add('hidden'); return; }
+            if (!det && !alarmed) { playerStatsEl.classList.add('hidden'); updateStatsFade(); return; }
             // All three shown as a percentage via the shared detPct (confidences 0–1 → ×100).
             const row = (label, val, title, extra) => {
                 const k = document.createElement('div'); k.className = 'k'; k.textContent = label; k.title = title;
                 const v = document.createElement('div'); v.className = 'v' + (extra ? ' ' + extra : ''); v.textContent = val; v.title = title;
                 playerStatsEl.append(k, v);
             };
-            if (det) {
-                row('Detection rate', detPct(det.ratio),
-                    "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
-                row('Peak confidence', detPct(det.conf_max),
-                    'Highest detector confidence across the visit (0–100%). “—” means not measured.');
-                row('Mean confidence', detPct(det.conf_mean),
-                    'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
-            }
             if (alarmed) {
                 // Episodes that explain how they decided are full sentences, one per line;
                 // a row with none of those reads exactly as before.
@@ -3011,8 +3053,28 @@
                     + 'It decides on a few seconds of frames, so it can disagree with the name on the card.',
                     'phrase');
             }
+            if (det) {
+                row('Detection rate', detPct(det.ratio),
+                    "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
+                row('Peak confidence', detPct(det.conf_max),
+                    'Highest detector confidence across the visit (0–100%). “—” means not measured.');
+                row('Mean confidence', detPct(det.conf_mean),
+                    'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
+            }
             playerStatsEl.classList.remove('hidden');
+            updateStatsFade();
         }
+        // The bottom-edge fade: on while the stats have content below their visible part
+        // (a pixel of slack for fractional layout), off once scrolled to the end.
+        function updateStatsFade() {
+            const el = playerStatsEl;
+            el.classList.toggle('more', el.scrollTop + el.clientHeight < el.scrollHeight - 1);
+        }
+        playerStatsEl.addEventListener('scroll', updateStatsFade, { passive: true });
+        // On resize: of the window, and of the area itself when the column around it
+        // settles (the filmstrip's "Loading frames…" is taller than its tiles).
+        if (typeof ResizeObserver === 'function') new ResizeObserver(updateStatsFade).observe(playerStatsEl);
+        else window.addEventListener('resize', updateStatsFade);
 
         async function openEvent(i) {
             if (i < 0 || i >= activityVisible.length) return;
@@ -3050,6 +3112,8 @@
             playerChipSlotEl.innerHTML = '';
             const chip = subjectChip(ev);
             if (chip) playerChipSlotEl.appendChild(chip);
+            // Every hop starts the stats at the top, where the Alarm row is.
+            playerStatsEl.scrollTop = 0;
             renderPlayerStats(ev);
             // The flag toggle + analyse button reflect THIS event (openEvent is also the
             // Prev/Next hop, which repoints both at another visit).
@@ -3074,6 +3138,7 @@
             playerFrames = []; playerImages = []; playerTiles = [];
             playerIndex = 0;
             playerImgEl.removeAttribute('src');
+            playerImgEl.classList.add('nopic');   // the frame keeps its size; no alt text
             playerBboxEl.classList.add('hidden');
             playerCountEl.textContent = '—';
             playerFilmstripEl.innerHTML = '<div class="loading">Loading frames…</div>';
@@ -3160,7 +3225,13 @@
             playerImgEl.src = f.url;
             // Position the box now for an already-loaded (cached) frame; the img 'load'
             // listener re-runs positionBbox once natural dims / a fresh decode are ready.
-            positionBbox(f);
+            // A frame with no picture yet — failed, or still loading (a scrub, tile tap or
+            // arrow past the preload) — hides the <img> and draws no box until its own
+            // `load` re-shows both. Otherwise WebKit draws the alt text across the
+            // full-size frame, and a failed frame flashes the broken-image glyph until its
+            // `error` lands; the box would sit on a picture it doesn't belong to.
+            if (frameReady(idx)) positionBbox(f);
+            else { playerImgEl.classList.add('nopic'); playerBboxEl.classList.add('hidden'); }
             playerCountEl.textContent = `${idx + 1} / ${playerFrames.length}`;
             if (playerScrubEl.value !== String(idx)) playerScrubEl.value = String(idx);
             playerTiles.forEach((t, j) => t.classList.toggle('film-current', j === idx));
@@ -3182,9 +3253,17 @@
             stopPlayerTimer();
             playerPlaying = true;
             playerPlayBtn.textContent = 'Pause';
+            // The tick HOLDS until the next frame's preloaded Image is `complete` (loaded
+            // or failed), so a slow link stutters instead of drawing a frame that hasn't
+            // arrived. Only the tick waits: scrub, tile tap and arrows still jump straight
+            // to their frame. showPlayerFrame preloads ahead of the current index, so the
+            // frame waited on is always requested. No bound on a hold, by decision — the
+            // reader can scrub or tap past a frame that never completes.
             playerTimer = setInterval(() => {
                 let next = playerIndex + 1;
                 if (next >= playerFrames.length) next = 0;   // loop
+                const im = playerImages[next];
+                if (!im || !im.complete) return;   // hold; the next tick checks again
                 showPlayerFrame(next);
             }, PLAYER_FPS_MS);
         }

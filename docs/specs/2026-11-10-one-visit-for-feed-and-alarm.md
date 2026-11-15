@@ -219,7 +219,8 @@ cap. Bridging changes how many visits there are, so it must run before either.
 
 Everything built on `events()` follows without changes of its own: `_walk_events`, `door_stats`,
 the daily counts, `cats_overview`, the user and admin feeds, the clip download, flags, visit
-confirm, and the alarm mark.
+confirm, and the alarm mark. The one exception is a window's lower bound (see the known limits
+below).
 
 **Consequences:**
 - The alarm mark's window `[start_ts, end_ts + _VISIT_GAP_MS]` stays disjoint, since bridged
@@ -232,6 +233,18 @@ confirm, and the alarm mark.
   message. That is the refusal a continuous 16-minute visit in Tuning already meets. In
   Collecting a nap stores far fewer frames. The bridge does not cap total length: a cap would
   make where a nap splits depend on grouping order, so the feed and the alarm could disagree.
+- **Known limit, accepted:** a window's lower bound can cut a bridged visit. A caller that
+  passes `since_id` groups only frames from there on.
+  - **The Visits page's 24 h column:** a cat sitting still across the moment 24 hours ago
+    counts as a visit starting inside the window. That visit is named from its in-window frames
+    only, so the page and the feed can disagree about it.
+  - **The daily walk:** it reads an hour early and drops visits starting before its window, so
+    its counts are unaffected.
+  - **Today:** a continuous visit straddling that moment already reads this way. Bridging only
+    makes a straddle a little more likely.
+
+  A fix would read back past `since_id` by up to the bridge cap, transitively, which changes
+  what a window bound means for every caller.
 
 `events()` takes an optional override of the start date, which only the replay passes ("bridge
 everything").
@@ -338,3 +351,10 @@ left out and the row reads as today.
   it is too small to be worth its own agent.
 - The bridge read and `visit_start` run under the shared lock. Measure both on a no-`ANALYZE`
   replica, per entry 266.
+
+## Amendments
+
+- **2026-11-10.** *The feed* claimed that every caller of `events()` follows the bridge
+  unchanged. That is not true at a window's lower bound: `since_id` can cut a bridged visit, so
+  the Visits page's 24 h column can count and name it differently from the feed. It is recorded
+  as an accepted known limit (CHANGELOG 605), which is what was built.

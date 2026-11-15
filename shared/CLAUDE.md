@@ -1,8 +1,8 @@
 # Cat Automation — shared
 
-The contracts both tiers agree on: the data model, the event/intent schemas, the Pi control-API shape, and shared constants. Deliberately small — see `docs/ARCHITECTURE.md`.
+The contracts both tiers agree on — the data model, the event/intent schemas, the Pi control-API shape, shared constants — and the cross-tier **logic** both tiers instantiate: the `MotionGate` core, so the compute tier re-runs the edge's exact gate offline with no drift from the live one, and the frame wire format. Deliberately small — see `docs/ARCHITECTURE.md`.
 
-Contents: data-model definitions, event & intent schemas, the control-API shape, and shared constants.
+Contents: `motion.py` (the `MotionGate` core), `wire.py` (the frame wire format), `tests/`. The data model, event/intent schemas and control-API shape belong here too once they are written down as code; today they live in `docs/ARCHITECTURE.md`.
 
 ## Required tools
 
@@ -19,4 +19,4 @@ Contents: data-model definitions, event & intent schemas, the control-API shape,
 
 ## Required skills
 
-None beyond the global `code-review` mandate (in the root `CLAUDE.md`).
+None beyond the commit-time review gate in the root `CLAUDE.md`.

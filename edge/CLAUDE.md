@@ -25,4 +25,4 @@ Unit tests live alongside the edge packages using **pytest**. The edge is I/O- a
 
 ## Required skills
 
-None beyond the global `code-review` mandate (in the root `CLAUDE.md`).
+None beyond the commit-time review gate in the root `CLAUDE.md`.

@@ -6,7 +6,7 @@ LAN (no auth between components; door actuation deferred).
 
 - **What & why:** [`docs/CONCEPT.md`](docs/CONCEPT.md)
 - **How it's built:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- **Change log:** [`docs/CHANGELOG.md`](docs/CHANGELOG.md)
+- **Change log:** [`docs/changelog/`](docs/changelog/) — one file per change
 
 Two tiers on the LAN: a thin **edge** (Raspberry Pi + camera — a pure HTTP server
 streaming MJPEG) and the **compute** brain (an NVIDIA PC doing all the vision, the

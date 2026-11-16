@@ -8,3 +8,7 @@ is not a record of anything; `docs/changelog/` is. A line you add here is read a
   the alarm step reports an idle caught-up pass and sets the frontier to the tick's start, so
   frames nobody identified count toward the 2 s hold; it sounded at Sultan on 14 Nov 17:28.
   Surfaced by `2026-11-15-night-lighting-priority-parked`.
+- **Space on a focused player button plays/pauses instead of pressing it** — the player's key
+  handler takes Space for playback on any focused button and prevents the default, so a
+  keyboard user can only press Read more, Yes or Label later with Enter. Surfaced by
+  `2026-11-16-player-alarm-row-one-line`.

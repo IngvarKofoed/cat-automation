@@ -764,7 +764,10 @@
             backdrop-filter: blur(3px);
         }
         .modal.hidden { display: none; }
+        /* position:relative so the Alarm popup (.alarm-pop) covers the dialog, never the
+           page. */
         .dialog {
+            position: relative;
             width: min(680px, 100%);
             max-height: 94vh;
             display: flex;
@@ -976,11 +979,10 @@
             min-height: 3rem;
             overflow-y: auto;
         }
-        .player-stats.hidden { display: none; }
         /* `.more` = content continues below the visible part: the bottom edge fades out.
-           iOS hides scrollbars at rest, so without it a cut-off Alarm sentence reads as
-           the whole sentence. A mask, so it sits in the area's own box and never draws
-           over the filmstrip or footer. Set by updateStatsFade(). */
+           iOS hides scrollbars at rest, so without it a cut-off stats list reads as the
+           whole list. A mask, so it sits in the area's own box and never draws over the
+           filmstrip or footer. Set by updateStatsFade(). */
         .player-stats.more {
             -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
             mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
@@ -993,14 +995,92 @@
             font-weight: 600;
             font-size: .85rem;
         }
-        /* The Alarm row's value is a phrase, not a number: body font, and right-aligned
-           so a wrapped second line keeps the column's right edge. */
-        .player-stats .v.phrase {
-            font-family: inherit;
+        /* The Alarm row (player-alarm-row-read-more spec): ALWAYS present and exactly one
+           line tall, so the panel's height no longer depends on the visit — the dialog is
+           vertically centred, and a panel that changed height moved the stage on every hop.
+           It spans both grid columns: beside "Read more" the value column left ~139px at
+           390px wide, the full width ~210px. Not a .v cell — `justify-self: end` sizes a
+           cell to its content, so a long status overflowed across the label instead of
+           being cut. One flex line: label, status (cut with "…"), Read more (never cut).
+           The fixed height is what makes a blank row and an alarm row identical. */
+        .player-stats .alarm-row {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+            min-width: 0;
+            font-size: .85rem;
+            line-height: 1.5;
+            height: 1.5em;
+        }
+        .player-stats .alarm-row .k { flex: none; }
+        .player-stats .alarm-status {
+            flex: 1 1 auto;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
             font-weight: 500;
-            text-align: right;
-            /* One alarm episode per line when they explain how they decided. */
-            white-space: pre-line;
+        }
+        /* A text link in the row's own font size. The ::after widens the tap target past
+           the line box without touching the row's height (a positioned box adds no line
+           height, and paints over the next row's unpositioned cells for hit-testing). */
+        .player-stats .alarm-more {
+            flex: none;
+            position: relative;
+            margin: 0;
+            padding: 0;
+            border: 0;
+            background: none;
+            color: var(--ink);
+            font-weight: 600;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+            cursor: pointer;
+        }
+        .player-stats .alarm-more::after { content: ''; position: absolute; inset: -.75rem -.5rem; }
+
+        /* The Alarm popup: the whole account behind "Read more", an overlay INSIDE the
+           player dialog (the .modal/.dialog pattern, scoped to #playerDialog; the rest of
+           the dialog is `inert` while it is open). z-index 2: the filmstrip's .film-conf
+           bar (z-index 1, in a tile that forms no stacking context) would paint over it.
+           Qualified hidden rule — this page has no bare `.hidden` (changelog 287). */
+        .alarm-pop {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            background: color-mix(in srgb, #100b06 55%, transparent);
+        }
+        .alarm-pop.hidden { display: none; }
+        /* No taller than the dialog minus the scrim's padding; a long account scrolls in
+           the card, with Close kept in view at its foot. Close sits INSIDE the scroll
+           area, so the arrow keys scroll the card while it has focus. */
+        .alarm-pop-card {
+            width: min(30rem, 100%);
+            max-height: 100%;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding: 1rem 1rem 0;
+            background: var(--surface);
+            border: 1px solid var(--hairline);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-lift);
+        }
+        .alarm-pop-card:focus { outline: none; }
+        .alarm-pop-card h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+        .alarm-pop-card p { margin: 0 0 .6rem; font-size: .92rem; }
+        .alarm-pop-card .alarm-pop-note { color: var(--muted); font-size: .85rem; }
+        .alarm-pop-foot {
+            position: sticky;
+            bottom: 0;
+            display: flex;
+            justify-content: flex-end;
+            padding: .4rem 0 1rem;
+            background: var(--surface);
         }
 
         /* ================= "mark for labelling" ================= */
@@ -1314,7 +1394,7 @@
                 <span class="count mono" id="playerCount">—</span>
             </div>
             <div class="filmstrip" id="playerFilmstrip"></div>
-            <div class="player-stats hidden" id="playerStats"></div>
+            <div class="player-stats" id="playerStats"></div>
             <div class="player-actions">
                 <!-- Shown only where it can act: an undecided span, carrying a NAMED
                      identity, resolving to an active cat (see
@@ -1352,6 +1432,18 @@
                     <button class="btn ghost" id="playerPrev" disabled aria-label="Newer visit"><span aria-hidden="true">&lsaquo;</span> Newer</button>
                     <span class="visit-pos" id="playerVisitPos">—</span>
                     <button class="btn ghost" id="playerNext" disabled aria-label="Older visit">Older <span aria-hidden="true">&rsaquo;</span></button>
+                </div>
+            </div>
+            <!-- The Alarm row's "Read more": the whole account, one paragraph per episode.
+                 An overlay inside the player, so every dismissal returns to the player. -->
+            <div class="alarm-pop hidden" id="alarmPop">
+                <div class="alarm-pop-card" id="alarmPopCard" role="dialog" aria-modal="true" aria-labelledby="alarmPopTitle" tabindex="-1">
+                    <h2 id="alarmPopTitle">Alarm</h2>
+                    <div id="alarmPopBody"></div>
+                    <p class="alarm-pop-note">What the foreign-cat alarm did at this visit, and what it took the cat for. It decides on a few seconds of frames, so it can disagree with the name on the card.</p>
+                    <div class="alarm-pop-foot">
+                        <button class="btn ghost" id="alarmPopClose" type="button">Close</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1505,6 +1597,8 @@
         const skipDoneEl = $('skipDone'), skipDoneLabelEl = $('skipDoneLabel');
         const playerCloseBtn = $('playerClose'), playerFilmstripEl = $('playerFilmstrip');
         const playerStatsEl = $('playerStats');
+        const alarmPopEl = $('alarmPop'), alarmPopCardEl = $('alarmPopCard');
+        const alarmPopBodyEl = $('alarmPopBody'), alarmPopCloseBtn = $('alarmPopClose');
         const playerFlagBtn = $('playerFlag'), playerFlagMsgEl = $('playerFlagMsg');
         const playerClipBtn = $('playerClip'), playerClipLinkEl = $('playerClipLink');
         const playerAnalyseBtn = $('playerAnalyse');
@@ -1892,6 +1986,23 @@
         function alarmText(a, ev) {
             const decided = alarmDecided(a, ev);
             return decided ? `${alarmPhrase(a)}. ${decided}` : alarmPhrase(a);
+        }
+        // The Alarm row's one line, "state · verdict" (player-alarm-row-read-more spec): the
+        // whole account is in the popup, so this only has to say what happened and what the
+        // alarm took the cat for. Never a count — the popup lists each episode.
+        const ALARM_STATE_WORD = { sounding: 'Sounding now', sounded: 'Sounded', silenced: 'Silent' };
+        function alarmVerdictShort(ev) {
+            const [first, ...rest] = ev.alarms;
+            // "Mixed", not a count of cats: two episodes can be one cat judged two ways.
+            const same = rest.every(a => a.verdict === first.verdict
+                && (first.verdict !== 'neighbour' || a.cat_id === first.cat_id));
+            if (!same) return 'mixed verdicts';
+            if (first.verdict === 'unknown') return 'unknown cat';
+            if (first.verdict === 'neighbour') return first.cat_name || `cat #${first.cat_id}`;
+            return first.verdict;
+        }
+        function alarmShort(ev) {
+            return `${ALARM_STATE_WORD[alarmState(ev)]} · ${alarmVerdictShort(ev)}`;
         }
         const ALARM_ARIA = {
             sounding: ' Alarm sounding.',
@@ -3027,32 +3138,42 @@
         // motion frames weren't swept) from a measured value (rate 0% = swept, nothing
         // detected). The detection rows are absent for a legacy event with no `detection`
         // field; the panel shows when there is either detection or an alarm to report.
-        //   The Alarm row (user-visit-alarm-mark spec) appears only for a visit that set
-        // the alarm off. It is ABSENT, not "none", otherwise: an alarm switched Off also
-        // produces no row, so "none" would claim more than the data supports.
+        //   The Alarm row is ALWAYS there and always one line (player-alarm-row-read-more
+        // spec), so the panel is the same height on every hop and the centred dialog no
+        // longer moves the stage. BLANK, not "none", for a visit with no alarm: an alarm
+        // switched Off also produces no episode, so "none" would claim more than the data
+        // supports, and "—" already means "not measured" in this panel. With an alarm it
+        // reads "state · verdict" and "Read more" opens the whole account in a popup.
         //   The Alarm row comes FIRST: the stats scroll, and at their floor only the first
         // lines show without scrolling — the alarm's verdict matters more there than three
         // detector percentages (user-player-frame-size spec).
         function renderPlayerStats(ev) {
             const det = ev.detection;
-            const alarmed = hasAlarm(ev);
             playerStatsEl.innerHTML = '';
-            if (!det && !alarmed) { playerStatsEl.classList.add('hidden'); updateStatsFade(); return; }
             // All three shown as a percentage via the shared detPct (confidences 0–1 → ×100).
-            const row = (label, val, title, extra) => {
+            const row = (label, val, title) => {
                 const k = document.createElement('div'); k.className = 'k'; k.textContent = label; k.title = title;
-                const v = document.createElement('div'); v.className = 'v' + (extra ? ' ' + extra : ''); v.textContent = val; v.title = title;
+                const v = document.createElement('div'); v.className = 'v'; v.textContent = val; v.title = title;
                 playerStatsEl.append(k, v);
             };
-            if (alarmed) {
-                // Episodes that explain how they decided are full sentences, one per line;
-                // a row with none of those reads exactly as before.
-                const explained = ev.alarms.some(a => alarmDecided(a, ev));
-                row('Alarm', ev.alarms.map(a => alarmText(a, ev)).join(explained ? '\n' : '; '),
-                    'What the foreign-cat alarm did at this visit, and what it took the cat for. '
-                    + 'It decides on a few seconds of frames, so it can disagree with the name on the card.',
-                    'phrase');
+            const alarmRow = document.createElement('div');
+            alarmRow.className = 'alarm-row';
+            const k = document.createElement('span'); k.className = 'k'; k.textContent = 'Alarm';
+            alarmRow.append(k);
+            if (hasAlarm(ev)) {
+                const status = document.createElement('span');
+                status.className = 'alarm-status';
+                status.textContent = alarmShort(ev);
+                const more = document.createElement('button');
+                more.type = 'button';
+                more.className = 'alarm-more';
+                more.textContent = 'Read more';
+                more.setAttribute('aria-haspopup', 'dialog');
+                more.setAttribute('aria-label', 'Read more about the alarm');
+                more.addEventListener('click', () => openAlarmPop(ev, more));
+                alarmRow.append(status, more);
             }
+            playerStatsEl.append(alarmRow);
             if (det) {
                 row('Detection rate', detPct(det.ratio),
                     "How often the cat detector found a subject across this visit's motion frames — a recall proxy. “—” means these frames weren't analysed.");
@@ -3061,7 +3182,6 @@
                 row('Mean confidence', detPct(det.conf_mean),
                     'Average detector confidence across the detected frames (0–100%). “—” means not measured.');
             }
-            playerStatsEl.classList.remove('hidden');
             updateStatsFade();
         }
         // The bottom-edge fade: on while the stats have content below their visible part
@@ -3076,8 +3196,63 @@
         if (typeof ResizeObserver === 'function') new ResizeObserver(updateStatsFade).observe(playerStatsEl);
         else window.addEventListener('resize', updateStatsFade);
 
+        // ---- the Alarm popup (player-alarm-row-read-more spec) ----
+        // An overlay inside #playerDialog: everything else in the dialog is `inert` while it
+        // is open, and every dismissal — Esc, the scrim, the player's own backdrop — closes
+        // the popup only, never the player. Its text is fixed when it opens.
+        let alarmPopReturnEl = null;   // the Read more button that opened it
+        function alarmPopOpen() { return !alarmPopEl.classList.contains('hidden'); }
+        function openAlarmPop(ev, btn) {
+            alarmPopBodyEl.innerHTML = '';
+            // One paragraph per episode, in start order, word for word what the row said
+            // before it was cut to one line.
+            const episodes = ev.alarms.slice().sort((a, b) => a.start_ts - b.start_ts);
+            for (const a of episodes) {
+                const p = document.createElement('p');
+                p.textContent = alarmText(a, ev);
+                alarmPopBodyEl.append(p);
+            }
+            pausePlayback();
+            // The reader has moved (openEvent's rule): a hop waiting on a page is dropped,
+            // so the landing page only updates the nav.
+            navPendingHop = false;
+            for (const child of dialogEl.children) {
+                if (child !== alarmPopEl) child.setAttribute('inert', '');
+            }
+            alarmPopReturnEl = btn;
+            alarmPopEl.classList.remove('hidden');
+            alarmPopCardEl.scrollTop = 0;
+            // preventScroll: Close sits at the card's foot, and focusing it must not scroll
+            // a long account to its end.
+            alarmPopCloseBtn.focus({ preventScroll: true });
+        }
+        // forced: closed by closePlayer/openEvent rather than by the reader. Focus then goes
+        // to the dialog if it was inside the popup — never left on a hidden button.
+        function closeAlarmPop(forced = false) {
+            if (!alarmPopOpen()) return;
+            const focusInside = alarmPopEl.contains(document.activeElement);
+            alarmPopEl.classList.add('hidden');
+            for (const child of dialogEl.children) child.removeAttribute('inert');
+            const back = alarmPopReturnEl;
+            alarmPopReturnEl = null;
+            if (forced) { if (focusInside) dialogEl.focus(); return; }
+            // A stats re-render while open (the Analyse job) replaced the button.
+            if (back && back.isConnected) back.focus(); else dialogEl.focus();
+        }
+        alarmPopCloseBtn.addEventListener('click', () => closeAlarmPop());
+        // Scrim tap outside the card: press AND release on the scrim itself, as the
+        // player's backdrop does, so a text selection dragged out of the card doesn't close.
+        let pressOnScrim = false;
+        alarmPopEl.addEventListener('mousedown', (e) => { pressOnScrim = e.target === alarmPopEl; });
+        alarmPopEl.addEventListener('click', (e) => {
+            if (e.target === alarmPopEl && pressOnScrim) closeAlarmPop();
+        });
+
         async function openEvent(i) {
             if (i < 0 || i >= activityVisible.length) return;
+            // A hop landing removes the Alarm popup (a safety net: opening it already
+            // dropped any waiting hop).
+            closeAlarmPop(true);
             const ev = activityVisible[i];
             const seq = ++playerSeq;
             // The reader has moved, so a hop still waiting on a page is stale — dropped,
@@ -3275,6 +3450,7 @@
         function togglePlayback() { if (playerPlaying) pausePlayback(); else startPlayback(); }
 
         function closePlayer() {
+            closeAlarmPop(true);
             pausePlayback();
             resetClip();   // leaving the visit: abort the fetch, revoke the blob
             modalEl.classList.add('hidden');
@@ -3466,12 +3642,25 @@
         let pressOnBackdrop = false;
         modalEl.addEventListener('mousedown', (e) => { pressOnBackdrop = e.target === modalEl; });
         modalEl.addEventListener('click', (e) => {
-            if (e.target === modalEl && pressOnBackdrop) closePlayer();
+            if (e.target !== modalEl || !pressOnBackdrop) return;
+            // While the Alarm popup is open the backdrop closes the popup only.
+            if (alarmPopOpen()) closeAlarmPop(); else closePlayer();
         });
 
         // Keyboard: only while the modal is open. Esc closes (checked before the typing
         // guard); Space toggles play, arrows scrub (suppressed while focused in an input).
         document.addEventListener('keydown', (e) => {
+            // The Alarm popup first: Esc closes it alone; every other key returns before
+            // the player's Space/arrows, WITHOUT preventDefault, so Space presses the
+            // focused Close and the arrows scroll the card. Tab is the exception: `inert`
+            // covers only the rest of the dialog, and the page behind the player is neither
+            // inert nor trapped, so Tab walked out to the feed (measured). Close is the
+            // popup's one control, so Tab and Shift+Tab hold focus there.
+            if (alarmPopOpen()) {
+                if (e.key === 'Escape') { closeAlarmPop(); e.preventDefault(); }
+                else if (e.key === 'Tab') { alarmPopCloseBtn.focus(); e.preventDefault(); }
+                return;
+            }
             if (modalEl.classList.contains('hidden')) return;
             if (e.key === 'Escape') { closePlayer(); e.preventDefault(); return; }
             const tag = (e.target && e.target.tagName) || '';
